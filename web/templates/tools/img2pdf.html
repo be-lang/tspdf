@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}Image &rarr; PDF{% endblock %}
+{% block content %}
+<div class="tool-page">
+  <a href="/" class="back-link">&larr; All Tools</a>
+  <div class="tool-header">
+    <span class="icon">&#x1F5BC;&#xFE0F;</span>
+    <div><h1>Image &rarr; PDF</h1><p>Convert JPEGs and PNGs into a multi-page PDF</p></div>
+  </div>
+  <div class="form-section">
+    <div class="step-label">1. Upload Images</div>
+    <div class="drop-zone" id="drop-zone">
+      <input type="file" id="images" accept=".jpg,.jpeg,.png" multiple>
+      <div class="dz-icon">&#x1F5BC;&#xFE0F;</div>
+      <p>Drop images here or click to upload</p>
+      <div class="dz-hint">JPEG, PNG supported &middot; Multiple files &middot; Each becomes one page</div>
+    </div>
+    <div id="file-list" style="margin-top:8px;font-size:11px;color:var(--text-muted)"></div>
+  </div>
+  <div class="form-section">
+    <div class="step-label">2. Generate</div>
+    <div class="actions">
+      <button class="btn btn-primary" id="btn-generate"><span class="spinner"></span>Generate PDF</button>
+    </div>
+  </div>
+  <div class="result-area" id="result-area">
+    <span class="result-icon">&#x2713;</span>
+    <div class="result-text"><h3>Ready</h3><p id="result-desc">Your images have been converted.</p></div>
+    <a class="btn-download" id="btn-download">&darr; Download</a>
+  </div>
+  <div class="error-area" id="error-area"></div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+document.getElementById('images').addEventListener('change', function() {
+  const list = document.getElementById('file-list');
+  list.textContent = Array.from(this.files).map(f => f.name).join(', ');
+});
+
+document.getElementById('btn-generate').addEventListener('click', async () => {
+  const resultArea = document.getElementById('result-area');
+  const errorArea = document.getElementById('error-area');
+  const btn = document.getElementById('btn-generate');
+  resultArea.classList.remove('show');
+  errorArea.classList.remove('show');
+  btn.disabled = true;
+
+  const files = document.getElementById('images').files;
+  if (!files.length) {
+    errorArea.textContent = 'Please select at least one image.';
+    errorArea.classList.add('show');
+    btn.disabled = false;
+    return;
+  }
+
+  const formData = new FormData();
+  for (const f of files) formData.append('images', f);
+
+  try {
+    const res = await fetch('/api/img2pdf', {method: 'POST', body: formData});
+    if (!res.ok) throw new Error(await res.text());
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    document.getElementById('btn-download').href = url;
+    document.getElementById('btn-download').download = 'images.pdf';
+    document.getElementById('result-desc').textContent =
+      `${files.length} image${files.length > 1 ? 's' : ''} converted to PDF.`;
+    resultArea.classList.add('show');
+  } catch (err) {
+    errorArea.textContent = err.message;
+    errorArea.classList.add('show');
+  } finally {
+    btn.disabled = false;
+  }
+});
+</script>
+{% endblock %}

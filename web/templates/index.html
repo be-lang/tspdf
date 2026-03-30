@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block title %}tspdf{% endblock %}
+{% block content %}
+<div class="index-page">
+  <div class="filter-tabs">
+    <button class="filter-tab active" data-filter="all">All</button>
+    <button class="filter-tab" data-filter="edit">Edit</button>
+    <button class="filter-tab" data-filter="secure">Secure</button>
+    <button class="filter-tab" data-filter="annotate">Annotate</button>
+    <button class="filter-tab" data-filter="create">Create</button>
+  </div>
+  <div class="tool-grid">
+    <a href="/tool/merge" class="tool-card" data-category="edit">
+      <div class="icon">&#x1F517;</div><div class="name">Merge</div>
+    </a>
+    <a href="/tool/split" class="tool-card" data-category="edit">
+      <div class="icon">&#x2702;&#xFE0F;</div><div class="name">Split</div>
+    </a>
+    <a href="/tool/delete-pages" class="tool-card" data-category="edit">
+      <div class="icon">&#x1F5D1;&#xFE0F;</div><div class="name">Delete Pages</div>
+    </a>
+    <a href="/tool/rotate" class="tool-card" data-category="edit">
+      <div class="icon">&#x1F504;</div><div class="name">Rotate</div>
+    </a>
+    <a href="/tool/reorder" class="tool-card" data-category="edit">
+      <div class="icon">&#x2195;&#xFE0F;</div><div class="name">Reorder</div>
+    </a>
+    <a href="/tool/compress" class="tool-card" data-category="secure">
+      <div class="icon">&#x1F4E6;</div><div class="name">Compress</div>
+    </a>
+    <a href="/tool/unlock" class="tool-card" data-category="secure">
+      <div class="icon">&#x1F513;</div><div class="name">Unlock</div>
+    </a>
+    <a href="/tool/password-protect" class="tool-card" data-category="secure">
+      <div class="icon">&#x1F512;</div><div class="name">Protect</div>
+    </a>
+    <a href="/tool/metadata" class="tool-card" data-category="secure">
+      <div class="icon">&#x1F4CB;</div><div class="name">Metadata</div>
+    </a>
+    <a href="/tool/watermark-existing" class="tool-card" data-category="annotate">
+      <div class="icon">&#x1F4A7;</div><div class="name">Watermark</div>
+    </a>
+    <a href="/tool/img2pdf" class="tool-card" data-category="create">
+      <div class="icon">&#x1F5BC;&#xFE0F;</div><div class="name">Image &rarr; PDF</div>
+    </a>
+    <a href="/tool/md2pdf" class="tool-card" data-category="create">
+      <div class="icon">&#x270D;&#xFE0F;</div><div class="name">Markdown &rarr; PDF</div>
+    </a>
+    <a href="/tool/qrcode" class="tool-card" data-category="create">
+      <div class="icon">&#x1F4F1;</div><div class="name">QR Code</div>
+    </a>
+  </div>
+  <div class="index-footer">No data leaves your device</div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+document.querySelectorAll('.filter-tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.filter-tab').forEach(t => t.classList.remove('active'));
+    tab.classList.add('active');
+    const filter = tab.dataset.filter;
+    document.querySelectorAll('.tool-card').forEach(card => {
+      card.style.display = (filter === 'all' || card.dataset.category === filter) ? '' : 'none';
+    });
+  });
+});
+</script>
+{% endblock %}

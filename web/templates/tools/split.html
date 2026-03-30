@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Split PDF{% endblock %}
+{% block content %}
+<div class="tool-page">
+  <a href="/" class="back-link">&larr; All Tools</a>
+  <div class="tool-header">
+    <span class="icon">&#x2702;&#xFE0F;</span>
+    <div><h1>Split PDF</h1><p>Extract specific page ranges from a PDF</p></div>
+  </div>
+  <div class="form-section">
+    <div class="drop-zone">
+      <input type="file" id="pdf_file" accept=".pdf">
+      <div class="dz-icon">&#x1F4C4;</div>
+      <p>Drop a PDF here or click to browse</p>
+      <div class="dz-hint">Single PDF file</div>
+    </div>
+  </div>
+  <div class="form-section">
+    <div class="form-group">
+      <label>Page Ranges</label>
+      <input type="text" id="pages" placeholder="1-3,5,7-9">
+      <small>Enter page numbers and ranges separated by commas</small>
+    </div>
+  </div>
+  <div class="actions">
+    <button class="btn btn-primary" id="btn-generate"><span class="spinner"></span>Split PDF</button>
+  </div>
+  <div class="result-area" id="result-area">
+    <span class="result-icon">&#x2713;</span>
+    <div class="result-text"><h3>Ready</h3><p>Your extracted pages are ready.</p></div>
+    <a class="btn-download" id="btn-download">&darr; Download</a>
+  </div>
+  <div class="error-area" id="error-area"></div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+setupTool('split', () => ({
+  config: { pages: document.getElementById('pages').value },
+  files: { pdf_file: document.getElementById('pdf_file').files[0] }
+}));
+</script>
+{% endblock %}

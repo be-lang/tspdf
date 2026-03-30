@@ -1,0 +1,27 @@
+#ifndef TSPDF_ERROR_H
+#define TSPDF_ERROR_H
+
+typedef enum {
+    TSPDF_OK = 0,
+    TSPDF_ERR_ALLOC,
+    TSPDF_ERR_IO,
+    TSPDF_ERR_FONT_PARSE,
+    TSPDF_ERR_FONT_LIMIT,
+    TSPDF_ERR_PAGE_LIMIT,
+    TSPDF_ERR_IMAGE_LIMIT,
+    TSPDF_ERR_IMAGE_PARSE,
+    TSPDF_ERR_INVALID_ARG,
+    TSPDF_ERR_OVERFLOW,
+    TSPDF_ERR_ENCODING,
+    // Reader-specific
+    TSPDF_ERR_INVALID_PDF,
+    TSPDF_ERR_PARSE,
+    TSPDF_ERR_XREF,
+    TSPDF_ERR_UNSUPPORTED,
+    TSPDF_ERR_ENCRYPTED,
+    TSPDF_ERR_BAD_PASSWORD,
+} TspdfError;
+
+const char *tspdf_error_string(TspdfError err);
+
+#endif

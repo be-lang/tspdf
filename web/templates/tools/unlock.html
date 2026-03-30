@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Unlock PDF{% endblock %}
+{% block content %}
+<div class="tool-page">
+  <a href="/" class="back-link">&larr; All Tools</a>
+  <div class="tool-header">
+    <span class="icon">&#x1F513;</span>
+    <div><h1>Unlock PDF</h1><p>Remove password protection from an encrypted PDF</p></div>
+  </div>
+  <div class="form-section">
+    <div class="drop-zone">
+      <input type="file" id="pdf_file" accept=".pdf">
+      <div class="dz-icon">&#x1F4C4;</div>
+      <p>Drop an encrypted PDF here or click to browse</p>
+      <div class="dz-hint">Single PDF file</div>
+    </div>
+  </div>
+  <div class="form-section">
+    <div class="form-group">
+      <label>PDF Password</label>
+      <input type="password" id="password" placeholder="Enter the document password">
+      <small>Leave empty if the PDF only has owner-level protection</small>
+    </div>
+  </div>
+  <div class="actions">
+    <button class="btn btn-primary" id="btn-generate"><span class="spinner"></span>Unlock PDF</button>
+  </div>
+  <div class="result-area" id="result-area">
+    <span class="result-icon">&#x2713;</span>
+    <div class="result-text"><h3>Unlocked</h3><p>Your unlocked PDF is ready.</p></div>
+    <a class="btn-download" id="btn-download">&darr; Download</a>
+  </div>
+  <div class="error-area" id="error-area"></div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+setupTool('unlock', () => ({
+  config: { password: document.getElementById('password').value },
+  files: { pdf_file: document.getElementById('pdf_file').files[0] }
+}));
+</script>
+{% endblock %}

@@ -1,0 +1,10 @@
+.worktrees/
+build/
+*.o
+*.pdf
+!tests/data/*.pdf
+.claude/
+docs/wasm-demo/
+.superpowers/
+docs/superpowers/
+

@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}Rotate Pages{% endblock %}
+{% block content %}
+<div class="tool-page">
+  <a href="/" class="back-link">&larr; All Tools</a>
+  <div class="tool-header">
+    <span class="icon">&#x1F504;</span>
+    <div><h1>Rotate Pages</h1><p>Rotate selected pages in your PDF</p></div>
+  </div>
+  <div class="form-section">
+    <div class="drop-zone">
+      <input type="file" id="pdf_file" accept=".pdf">
+      <div class="dz-icon">&#x1F4C4;</div>
+      <p>Drop a PDF here or click to browse</p>
+      <div class="dz-hint">Single PDF file</div>
+    </div>
+  </div>
+  <div class="form-section">
+    <div class="form-row">
+      <div class="form-group">
+        <label>Pages to Rotate</label>
+        <input type="text" id="pages" placeholder="all" value="all">
+        <small>Page numbers (e.g. 1,3,5) or "all"</small>
+      </div>
+      <div class="form-group">
+        <label>Rotation Angle</label>
+        <select id="angle">
+          <option value="90">90&deg; clockwise</option>
+          <option value="180">180&deg;</option>
+          <option value="270">270&deg; (90&deg; counter-clockwise)</option>
+        </select>
+      </div>
+    </div>
+  </div>
+  <div class="actions">
+    <button class="btn btn-primary" id="btn-generate"><span class="spinner"></span>Rotate PDF</button>
+  </div>
+  <div class="result-area" id="result-area">
+    <span class="result-icon">&#x2713;</span>
+    <div class="result-text"><h3>Ready</h3><p>Your rotated PDF is ready.</p></div>
+    <a class="btn-download" id="btn-download">&darr; Download</a>
+  </div>
+  <div class="error-area" id="error-area"></div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+setupTool('rotate', () => ({
+  config: { pages: document.getElementById('pages').value, angle: document.getElementById('angle').value },
+  files: { pdf_file: document.getElementById('pdf_file').files[0] }
+}));
+</script>
+{% endblock %}
