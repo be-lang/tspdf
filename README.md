@@ -1,60 +1,77 @@
 # tspdf
 
-PDF toolkit in pure C. Zero dependencies. Read, write, merge, encrypt — everything local.
+Every PDF tool wants your files. This one doesn't.
 
-- **No external libraries** — not even zlib. Builds anywhere, including WASM.
-- **Read and manipulate existing PDFs** — merge, split, rotate, encrypt, watermark, annotate
-- **Generate PDFs from scratch** — flexbox layout engine with tables, text wrapping, pagination
-- **Full Unicode** via CIDFont Type2 + Identity-H
-- **AES-128/256 encryption** with password support
-- ~12K lines of C11.
+tspdf is a local-first PDF toolkit. Merge, split, encrypt, watermark, compress, and more — all on your machine. No uploads, no cloud, no tracking. Just a single binary you build from source.
 
-Created by [Benjamin Lang](https://github.com/be-lang). Built in collaboration with [Claude Code](https://claude.ai/claude-code).
-
-## Install
-
-```bash
-git clone https://github.com/be-lang/tspdf
-cd tspdf
-make && make install PREFIX=~/.local
-```
-
-That's it. Requires a C compiler and `make` — nothing else.
-
-Use `sudo make install` to install system-wide to `/usr/local` instead. Uninstall with `make uninstall PREFIX=~/.local` (or `sudo make uninstall`).
-
-## CLI
-
-```bash
-tspdf merge a.pdf b.pdf -o combined.pdf
-tspdf split report.pdf --pages 1-5 -o extract.pdf
-tspdf rotate doc.pdf --angle 90 -o rotated.pdf
-tspdf delete doc.pdf --pages 2,4 -o trimmed.pdf
-tspdf reorder doc.pdf --order 3,1,2 -o reordered.pdf
-tspdf encrypt doc.pdf -o locked.pdf --password secret
-tspdf decrypt locked.pdf -o unlocked.pdf --password secret
-tspdf metadata doc.pdf                                    # view
-tspdf metadata doc.pdf --set title="My Doc" -o out.pdf    # edit
-tspdf info doc.pdf
-tspdf watermark doc.pdf -o draft.pdf --text "DRAFT"
-tspdf compress doc.pdf -o smaller.pdf
-tspdf img2pdf photo1.jpg photo2.png -o album.pdf
-tspdf md2pdf notes.md -o notes.pdf
-tspdf qrcode "https://example.com" -o link.pdf
-```
-
-Run `tspdf help <command>` for detailed usage.
+![tspdf web UI](docs/webui-screenshot.png)
 
 ## Web UI
 
 ```bash
-tspdf serve              # starts at http://localhost:8080
-tspdf serve --port 3000  # custom port
+tspdf serve
 ```
 
-Opens a local web interface for all PDF operations. Everything runs on your machine — no data leaves localhost. The UI is embedded in the binary; no extra files needed.
+Opens a local web interface at http://localhost:8080 for all PDF operations. The UI is embedded in the binary — no extra files, no internet connection needed. Your documents never leave your computer.
 
-## Library Quick Start
+```bash
+tspdf serve --port 3000   # custom port
+```
+
+## Command Line
+
+```bash
+tspdf merge a.pdf b.pdf -o combined.pdf
+tspdf split report.pdf --pages 1-5 -o extract.pdf
+tspdf encrypt doc.pdf -o locked.pdf --password secret
+tspdf decrypt locked.pdf -o unlocked.pdf --password secret
+tspdf rotate doc.pdf --angle 90 -o rotated.pdf
+tspdf watermark doc.pdf -o draft.pdf --text "DRAFT"
+tspdf compress doc.pdf -o smaller.pdf
+tspdf metadata doc.pdf
+tspdf md2pdf notes.md -o notes.pdf
+tspdf img2pdf photo.jpg -o photo.pdf
+tspdf qrcode "https://example.com" -o qr.pdf
+```
+
+Run `tspdf help <command>` for details.
+
+## Install
+
+Requires a C compiler and `make`. Nothing else.
+
+```bash
+git clone https://github.com/be-lang/tspdf
+cd tspdf
+make
+```
+
+Install to your PATH:
+
+```bash
+make install PREFIX=~/.local        # user-local
+sudo make install                   # system-wide (/usr/local)
+```
+
+Uninstall with `make uninstall PREFIX=~/.local` or `sudo make uninstall`.
+
+## Why tspdf?
+
+Most PDF tools are either cloud services that require uploading your documents, or desktop apps bundled with hundreds of megabytes of dependencies. tspdf is different:
+
+- **Fully local** — your files stay on your machine, always
+- **Zero dependencies** — pure C with no external libraries, not even zlib
+- **Single binary** — one tool for reading, writing, merging, encrypting, and generating PDFs
+- **Builds anywhere** — Linux, macOS, Windows, and compiles to WASM for browser use
+- **~12K lines of C11** — small, auditable, and fast
+
+Everything is implemented from scratch: deflate compression, PNG decoding, AES encryption, TrueType font parsing, and a flexbox-style layout engine.
+
+## Use as a C Library
+
+tspdf is also a C library for reading, manipulating, and generating PDFs programmatically.
+
+### Generate a PDF
 
 ```c
 #include "include/tspdf.h"
@@ -65,7 +82,6 @@ static double measure_cb(const char *font, double size, const char *text, void *
 
 int main(void) {
     TspdfWriter *doc = tspdf_writer_create();
-
     const char *font = tspdf_writer_add_builtin_font(doc, "Helvetica");
 
     TspdfArena arena = tspdf_arena_create(1024 * 1024);
@@ -98,19 +114,20 @@ int main(void) {
 gcc -o hello hello.c src/**/*.c -lm && ./hello
 ```
 
-## PDF Manipulation
+### Manipulate existing PDFs
 
 ```c
 #include "include/tspdf.h"
 
-// Open, extract pages 1-3, save
 TspdfError err;
 TspdfReader *doc = tspdf_reader_open_file("input.pdf", &err);
+
+// Extract pages
 size_t pages[] = {0, 1, 2};
 TspdfReader *extract = tspdf_reader_extract(doc, pages, 3, &err);
 tspdf_reader_save(extract, "pages_1_3.pdf");
 
-// Merge two PDFs
+// Merge
 TspdfReader *docs[] = {doc1, doc2};
 TspdfReader *merged = tspdf_reader_merge(docs, 2, &err);
 tspdf_reader_save(merged, "merged.pdf");
@@ -119,52 +136,26 @@ tspdf_reader_save(merged, "merged.pdf");
 tspdf_reader_save_encrypted(doc, "locked.pdf", "password", "owner", 0, 256);
 ```
 
-## Features
+## Full Feature List
 
-**PDF Reading & Manipulation** — open existing PDFs, extract/delete/rotate/reorder/merge pages. Add watermarks, annotations (links, text notes, stamps), and page numbers. Content overlay for drawing on existing pages. AES-128/256 encryption and decryption.
+**Reading and manipulation** — open existing PDFs, extract/delete/rotate/reorder/merge pages, add watermarks, annotations (links, text notes, stamps), page numbers, content overlay, AES-128/256 encryption and decryption.
 
-**PDF Generation** — flexbox-style layout with fixed, grow, fit-content, and percentage sizing. Automatic page breaks with repeating headers.
+**Generation** — flexbox-style layout engine with fixed, grow, fit-content, and percentage sizing. Automatic page breaks with repeating headers. Tables with auto-sized columns, colspan, alternating row colors.
 
-**Text** — TrueType font parsing and embedding with automatic subsetting. Full Unicode support. Word/character wrapping, alignment, decorations, inline rich text spans.
+**Text** — TrueType font parsing and embedding with automatic subsetting, full Unicode via CIDFont Type2 + Identity-H, word/character wrapping, alignment, decorations, inline rich text spans.
 
-**Tables** — auto-sized columns, colspan support, alternating row colors, header/data styling.
+**Graphics** — rounded corners, borders, shadows, backgrounds, opacity, clipping, transforms, vector paths (move, line, cubic Bezier, arc), linear and radial gradients.
 
-**Drawing** — rounded corners, borders, shadows, backgrounds, opacity, clipping, transforms.
+**Media** — JPEG pass-through, PNG decoding from scratch, QR code generation, Markdown to PDF conversion.
 
-**Vector Paths** — move, line, cubic Bezier, arc, close. Fill and/or stroke.
-
-**Gradients** — linear and radial, multi-stop.
-
-**Images** — JPEG pass-through, PNG decoding from scratch.
-
-**Forms** — text inputs, checkboxes.
+**Crypto** — AES-128/256, MD5, SHA-256, RC4 — all implemented from scratch.
 
 **Compression** — deflate/inflate from scratch (RFC 1950/1951).
 
-**QR Codes** — generate QR code PDFs from text or URLs.
+## Credits
 
-**Markdown to PDF** — convert Markdown files to styled PDFs.
-
-**Image to PDF** — convert JPEG/PNG images to PDF documents.
-
-## Architecture
-
-```
-src/
-  pdf/         PDF writing (objects, xref, streams, writer API)
-  reader/      PDF reading and manipulation
-  layout/      Flexbox layout engine, tables, lists, vector paths
-  font/        TrueType parser, font subsetting
-  image/       JPEG embedding, PNG decoder
-  compress/    Deflate compressor/decompressor
-  crypto/      AES, MD5, SHA-256, RC4
-  qr/          QR code generation
-  util/        Arena allocator, buffer
-include/
-  tspdf.h          Unified public header
-  tspdf_overlay.h  Content overlay API
-```
+Created by [Benjamin Lang](https://github.com/be-lang). Built in collaboration with [Claude Code](https://claude.ai/claude-code).
 
 ## License
 
-MIT License. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
