@@ -1,5 +1,6 @@
 #include "png_decoder.h"
 #include "../compress/deflate.h"
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -67,8 +68,18 @@ bool png_image_load(const char *path, PngImage *img) {
         return false;
     }
     const uint8_t *ihdr = file_data + pos + 8;
-    img->width = (int)read_u32_be(ihdr);
-    img->height = (int)read_u32_be(ihdr + 4);
+    uint32_t width_u = read_u32_be(ihdr);
+    uint32_t height_u = read_u32_be(ihdr + 4);
+    if (width_u == 0u || height_u == 0u) {
+        free(file_data);
+        return false;
+    }
+    if (width_u > (uint32_t)INT_MAX || height_u > (uint32_t)INT_MAX) {
+        free(file_data);
+        return false;
+    }
+    img->width = (int)width_u;
+    img->height = (int)height_u;
     img->bit_depth = ihdr[8];
     int color_type = ihdr[9];
     int compression = ihdr[10];
@@ -99,26 +110,31 @@ bool png_image_load(const char *path, PngImage *img) {
         return false;
     }
 
-    // Collect all IDAT chunks
+    // Collect all IDAT chunks (only count bytes from chunks that fully fit in the file)
     size_t idat_total = 0;
     pos = 8;
     while (pos + 12 <= (size_t)file_size) {
         uint32_t chunk_len = read_u32_be(file_data + pos);
+        if (chunk_len > (size_t)file_size - pos - 12) break;
         if (memcmp(file_data + pos + 4, "IDAT", 4) == 0) {
-            idat_total += chunk_len;
+            size_t add = (size_t)chunk_len;
+            if (idat_total > SIZE_MAX - add) {
+                free(file_data);
+                return false;
+            }
+            idat_total += add;
         }
-        if (chunk_len > (size_t)file_size - pos - 12) break;  // bounds check
         pos += 12 + chunk_len;
     }
 
     uint8_t *idat_data = (uint8_t *)malloc(idat_total);
-    if (!idat_data) { free(file_data); return false; }
+    if (!idat_data && idat_total > 0) { free(file_data); return false; }
 
     size_t idat_pos = 0;
     pos = 8;
     while (pos + 12 <= (size_t)file_size) {
         uint32_t chunk_len = read_u32_be(file_data + pos);
-        if (pos + 8 + chunk_len > (size_t)file_size) break;  // bounds check
+        if (chunk_len > (size_t)file_size - pos - 12) break;
         if (memcmp(file_data + pos + 4, "IDAT", 4) == 0) {
             memcpy(idat_data + idat_pos, file_data + pos + 8, chunk_len);
             idat_pos += chunk_len;
@@ -128,6 +144,8 @@ bool png_image_load(const char *path, PngImage *img) {
 
     free(file_data);
 
+    if (idat_pos != idat_total) return false;
+
     // Decompress IDAT data (zlib/deflate)
     size_t raw_len = 0;
     uint8_t *raw = deflate_decompress(idat_data, idat_total, &raw_len);
@@ -136,8 +154,17 @@ bool png_image_load(const char *path, PngImage *img) {
     if (!raw) return false;
 
     // Expected raw size: (1 + width*bpp) * height (1 filter byte per row)
-    size_t stride = (size_t)(img->width * bpp);
-    size_t expected = (stride + 1) * (size_t)img->height;
+    size_t bpp_sz = (size_t)bpp;
+    if ((uint32_t)img->width > SIZE_MAX / bpp_sz) {
+        free(raw);
+        return false;
+    }
+    size_t stride = (size_t)img->width * bpp_sz;
+    if ((size_t)img->height > SIZE_MAX / (stride + 1u)) {
+        free(raw);
+        return false;
+    }
+    size_t expected = (stride + 1u) * (size_t)img->height;
     if (raw_len != expected) {
         free(raw);
         return false;
@@ -146,7 +173,20 @@ bool png_image_load(const char *path, PngImage *img) {
     // Allocate output pixels (always RGB or RGBA, 3 or 4 channels)
     int out_channels = (color_type == 4 || color_type == 6) ? 4 : 3;
     img->channels = out_channels;
-    img->pixels = (uint8_t *)malloc(img->width * img->height * out_channels);
+    size_t oc = (size_t)out_channels;
+    size_t w = (size_t)img->width;
+    size_t h = (size_t)img->height;
+    if (h > 0 && w > SIZE_MAX / h) {
+        free(raw);
+        return false;
+    }
+    size_t npx = w * h;
+    if (oc > 0 && npx > SIZE_MAX / oc) {
+        free(raw);
+        return false;
+    }
+    size_t pix_bytes = npx * oc;
+    img->pixels = (uint8_t *)malloc(pix_bytes);
     if (!img->pixels) { free(raw); return false; }
 
     // Unfilter scanlines

@@ -61,12 +61,15 @@ CLI_SOURCES = \
 
 CLI_TARGET = $(BUILDDIR)/tspdf
 
-.PHONY: all install uninstall clean test test-all test-cli test-reader test-crypto \
+.PHONY: all cli install uninstall clean test test-all test-cli test-reader test-crypto \
         lib demo bench bench-reader minimal reader-demo generate-test-pdfs
 
 # --- Default: build the CLI ---
 
 all: $(CLI_TARGET)
+
+# Phony alias: a directory named `cli/` exists, so `make cli` must not be a no-op.
+cli: $(CLI_TARGET)
 
 $(CLI_TARGET): $(CLI_SOURCES) $(ALL_SOURCES)
 	@mkdir -p $(BUILDDIR)

@@ -6,18 +6,20 @@
 
 // --- Helpers ---
 
-// Find the Nth startxref from the end (0 = last, 1 = second-to-last, etc.)
-static bool find_startxref_nth(const uint8_t *data, size_t len, size_t *out_offset, int skip) {
+// Find the last startxref in the tail of the file (last 4096 bytes).
+static bool find_startxref(const uint8_t *data, size_t len, size_t *out_offset) {
     const char *needle = "startxref";
     size_t needle_len = 9;
-    int found = 0;
+
+    if (len < needle_len) {
+        return false;
+    }
 
     // Search the last 4096 bytes (enough for linearized PDFs with two startxref markers)
     size_t search_start = (len > 4096) ? len - 4096 : 0;
 
     for (size_t i = len - needle_len; i >= search_start; i--) {
         if (memcmp(data + i, needle, needle_len) == 0) {
-            if (found < skip) { found++; if (i == 0) break; continue; }
             // Parse the offset that follows
             size_t pos = i + needle_len;
             while (pos < len && (data[pos] == ' ' || data[pos] == '\t' ||
@@ -28,23 +30,28 @@ static bool find_startxref_nth(const uint8_t *data, size_t len, size_t *out_offs
             while (pos < len && data[pos] >= '0' && data[pos] <= '9') {
                 pos++;
             }
-            if (pos == num_start) { if (i == 0) break; found++; continue; }
+            if (pos == num_start) {
+                if (i == 0) {
+                    break;
+                }
+                continue;
+            }
 
             char buf[32];
             size_t nlen = pos - num_start;
-            if (nlen >= sizeof(buf)) return false;
+            if (nlen >= sizeof(buf)) {
+                return false;
+            }
             memcpy(buf, data + num_start, nlen);
             buf[nlen] = '\0';
             *out_offset = (size_t)strtoull(buf, NULL, 10);
             return true;
         }
-        if (i == 0) break;
+        if (i == 0) {
+            break;
+        }
     }
     return false;
-}
-
-static bool find_startxref(const uint8_t *data, size_t len, size_t *out_offset) {
-    return find_startxref_nth(data, len, out_offset, 0);
 }
 
 static bool ensure_xref_capacity(TspdfReaderXref *xref, size_t needed, TspdfArena *arena) {

@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+// Hard limit on inflate output (decompressed) size per call. Streams that would
+// exceed this are rejected to bound memory use (RFC 1951 has no length field).
+#define TSPDF_DEFLATE_MAX_OUTPUT (128u * 1024u * 1024u)
+
 // Compress data using deflate (RFC 1951) with zlib wrapper (RFC 1950).
 // Returns malloc'd buffer with compressed data, or NULL on failure.
 // Sets *out_len to the length of the compressed data.
