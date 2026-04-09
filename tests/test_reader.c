@@ -557,6 +557,35 @@ TEST(test_open_truncated_pdf) {
     ASSERT(doc == NULL);
 }
 
+TEST(test_open_pdf_header_only_no_startxref_scan_crash) {
+    static const char header_only[] = "%PDF-";
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open(
+        (const uint8_t *)header_only, strlen(header_only), &err);
+    ASSERT(doc == NULL);
+    ASSERT_EQ_INT(err, TSPDF_ERR_XREF);
+}
+
+TEST(test_open_pdf_rejects_overflowing_xref_subsection) {
+    char pdf[256];
+    int pdf_len = snprintf(pdf, sizeof(pdf),
+                           "%%PDF-1.4\n"
+                           "xref\n"
+                           "%zu 1\n"
+                           "0000000000 65535 f \n"
+                           "trailer\n<< /Size 1 >>\n"
+                           "startxref\n9\n%%EOF",
+                           (size_t)-1);
+    ASSERT(pdf_len > 0);
+    ASSERT((size_t)pdf_len < sizeof(pdf));
+
+    TspdfError err = TSPDF_OK;
+    TspdfReader *doc = tspdf_reader_open(
+        (const uint8_t *)pdf, (size_t)pdf_len, &err);
+    ASSERT(doc == NULL);
+    ASSERT_EQ_INT(err, TSPDF_ERR_XREF);
+}
+
 TEST(test_extract_out_of_bounds) {
     TspdfError err;
     TspdfReader *doc = tspdf_reader_open_file("tests/data/one_page.pdf", &err);
@@ -1308,6 +1337,8 @@ int main(void) {
     printf("\n  Error handling:\n");
     RUN(test_open_null_data);
     RUN(test_open_truncated_pdf);
+    RUN(test_open_pdf_header_only_no_startxref_scan_crash);
+    RUN(test_open_pdf_rejects_overflowing_xref_subsection);
     RUN(test_extract_out_of_bounds);
     RUN(test_rotate_invalid_angle);
     RUN(test_merge_zero_docs);

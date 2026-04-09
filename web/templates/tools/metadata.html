@@ -81,9 +81,22 @@ viewBtn.addEventListener('click', async () => {
     if (!resp.ok) throw new Error(await resp.text());
     const data = await resp.json();
     const el = document.getElementById('current-metadata');
-    el.innerHTML = Object.entries(data).map(([k,v]) =>
-      `<div><strong>${k}:</strong> ${v || '<em>not set</em>'}</div>`
-    ).join('');
+    el.replaceChildren();
+    for (const [k, v] of Object.entries(data)) {
+      const row = document.createElement('div');
+      const strong = document.createElement('strong');
+      strong.textContent = k + ':';
+      row.appendChild(strong);
+      row.appendChild(document.createTextNode(' '));
+      if (v === null || v === undefined || v === '') {
+        const em = document.createElement('em');
+        em.textContent = 'not set';
+        row.appendChild(em);
+      } else {
+        row.appendChild(document.createTextNode(String(v)));
+      }
+      el.appendChild(row);
+    }
     document.getElementById('title').placeholder = data.title || 'Not set';
     document.getElementById('author').placeholder = data.author || 'Not set';
     document.getElementById('subject').placeholder = data.subject || 'Not set';

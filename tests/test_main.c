@@ -9,6 +9,7 @@
 #include "../src/util/buffer.h"
 #include "../src/util/arena.h"
 #include "../src/compress/deflate.h"
+#include "../src/image/png_decoder.h"
 #include "../src/pdf/pdf_base14.h"
 #include "../src/layout/layout.h"
 #include "../src/pdf/tspdf_writer.h"
@@ -208,6 +209,136 @@ TEST(test_deflate_large_input) {
     free(data);
     free(comp);
     free(decomp);
+}
+
+// Crafted zlib: stored block with LEN that does not match one's-complement NLEN (RFC 1951).
+TEST(test_deflate_rejects_invalid_stored_nlen) {
+    uint8_t zlib[] = {
+        0x78, 0x01,
+        0x01,
+        0x03, 0x00,
+        0x00, 0x00,
+        'a', 'b', 'c',
+        0x00, 0x00, 0x00, 0x00,
+    };
+    size_t out_len = 0;
+    uint8_t *out = deflate_decompress(zlib, sizeof zlib, &out_len);
+    ASSERT(out == NULL);
+}
+
+// Invalid deflate block type 11 (reserved) after valid zlib header.
+TEST(test_deflate_rejects_invalid_block_type) {
+    uint8_t zlib[] = {
+        0x78, 0x01,
+        0x07,
+        0x00, 0x00, 0x00, 0x00,
+    };
+    size_t out_len = 0;
+    uint8_t *out = deflate_decompress(zlib, sizeof zlib, &out_len);
+    ASSERT(out == NULL);
+}
+
+// Decompressed payload larger than TSPDF_DEFLATE_MAX_OUTPUT must fail.
+TEST(test_deflate_rejects_output_over_max) {
+    size_t n = (size_t)TSPDF_DEFLATE_MAX_OUTPUT + 1u;
+    uint8_t *buf = (uint8_t *)malloc(n);
+    ASSERT(buf != NULL);
+    memset(buf, 0, n);
+    size_t comp_len = 0;
+    uint8_t *comp = deflate_compress(buf, n, &comp_len);
+    free(buf);
+    ASSERT(comp != NULL);
+    size_t decomp_len = 0;
+    uint8_t *decomp = deflate_decompress(comp, comp_len, &decomp_len);
+    ASSERT(decomp == NULL);
+    free(comp);
+}
+
+static void test_png_write_chunk(FILE *f, const char *type, const uint8_t *data, size_t n) {
+    uint8_t lenbe[4] = {
+        (uint8_t)((n >> 24) & 0xff), (uint8_t)((n >> 16) & 0xff),
+        (uint8_t)((n >> 8) & 0xff), (uint8_t)(n & 0xff),
+    };
+    fwrite(lenbe, 1, 4, f);
+    fwrite(type, 1, 4, f);
+    if (n > 0 && data) {
+        fwrite(data, 1, n, f);
+    }
+    uint8_t crc[4] = {0, 0, 0, 0};
+    fwrite(crc, 1, 4, f);
+}
+
+// IHDR with width 0 must be rejected before pixel / IDAT processing.
+TEST(test_png_rejects_zero_width) {
+    const char *path = "/tmp/tspdf_test_png_zero_w.png";
+    FILE *f = fopen(path, "wb");
+    ASSERT(f != NULL);
+    static const uint8_t sig[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+    fwrite(sig, 1, 8, f);
+    uint8_t ihdr[13] = {
+        0, 0, 0, 0,
+        0, 0, 0, 1,
+        8, 2, 0, 0, 0,
+    };
+    test_png_write_chunk(f, "IHDR", ihdr, 13);
+    test_png_write_chunk(f, "IEND", NULL, 0);
+    fclose(f);
+
+    PngImage img;
+    bool ok = png_image_load(path, &img);
+    remove(path);
+    ASSERT(ok == false);
+    ASSERT(img.pixels == NULL);
+}
+
+// Oversized dimensions: raw raster size math must not wrap / allocate blindly.
+TEST(test_png_rejects_oversized_dimensions) {
+    const char *path = "/tmp/tspdf_test_png_huge.png";
+    FILE *f = fopen(path, "wb");
+    ASSERT(f != NULL);
+    static const uint8_t sig[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+    fwrite(sig, 1, 8, f);
+    uint8_t ihdr[13] = {
+        0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff,
+        8, 2, 0, 0, 0,
+    };
+    test_png_write_chunk(f, "IHDR", ihdr, 13);
+    test_png_write_chunk(f, "IEND", NULL, 0);
+    fclose(f);
+
+    PngImage img;
+    bool ok = png_image_load(path, &img);
+    remove(path);
+    ASSERT(ok == false);
+    ASSERT(img.pixels == NULL);
+}
+
+// Truncated IDAT (declared length larger than file): must not treat phantom bytes as IDAT.
+TEST(test_png_rejects_truncated_idat) {
+    const char *path = "/tmp/tspdf_test_png_trunc_idat.png";
+    FILE *f = fopen(path, "wb");
+    ASSERT(f != NULL);
+    static const uint8_t sig[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+    fwrite(sig, 1, 8, f);
+    uint8_t ihdr[13] = {
+        0, 0, 0, 1, 0, 0, 0, 1,
+        8, 2, 0, 0, 0,
+    };
+    test_png_write_chunk(f, "IHDR", ihdr, 13);
+    uint8_t lenbe[4] = {0, 0, 1, 0};
+    fwrite(lenbe, 1, 4, f);
+    fwrite("IDAT", 1, 4, f);
+    for (int i = 0; i < 8; i++) {
+        fputc(0, f);
+    }
+    fclose(f);
+
+    PngImage img;
+    bool ok = png_image_load(path, &img);
+    remove(path);
+    ASSERT(ok == false);
+    ASSERT(img.pixels == NULL);
 }
 
 // ============================================================
@@ -914,6 +1045,14 @@ int main(void) {
     RUN(test_deflate_roundtrip);
     RUN(test_deflate_roundtrip_repeated);
     RUN(test_deflate_large_input);
+    RUN(test_deflate_rejects_invalid_stored_nlen);
+    RUN(test_deflate_rejects_invalid_block_type);
+    RUN(test_deflate_rejects_output_over_max);
+
+    printf("\n  PNG decoder:\n");
+    RUN(test_png_rejects_zero_width);
+    RUN(test_png_rejects_oversized_dimensions);
+    RUN(test_png_rejects_truncated_idat);
 
     printf("\n  Base14 Fonts:\n");
     RUN(test_base14_get);

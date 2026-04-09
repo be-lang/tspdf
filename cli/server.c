@@ -10,8 +10,10 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <signal.h>
 #include <errno.h>
+#include <limits.h>
 #include <math.h>
 #include "../src/qr/qr_encode.h"
 
@@ -22,6 +24,7 @@
 #define MAX_REQUEST    (50 * 1024 * 1024)  /* 50 MB for multi-file uploads */
 #define MAX_HEADERS    64
 #define MAX_FORM_PARTS 64
+#define REQUEST_READ_TIMEOUT_SEC 5
 
 /* ── HTTP Request ──────────────────────────────────────────────────── */
 
@@ -34,18 +37,148 @@ typedef struct {
     size_t body_len;
     char content_type[512];
     size_t content_length;
+    int    content_length_set;
 } HttpRequest;
+
+/* Parse Content-Length: digits only, optional OWS; rejects negative, overflow, garbage. */
+static int parse_content_length_value(const char *val, size_t *out)
+{
+    if (!val || !out) return -1;
+    const char *s = val;
+    while (*s == ' ' || *s == '\t') s++;
+    if (*s == '\0') return -1;
+    if (*s == '-' || *s == '+') return -1;
+    if (*s < '0' || *s > '9') return -1;
+    unsigned long long v = 0ULL;
+    for (; *s >= '0' && *s <= '9'; s++) {
+        int digit = *s - '0';
+        if (v > (ULLONG_MAX - (unsigned long long)digit) / 10ULL)
+            return -1;
+        v = v * 10ULL + (unsigned long long)digit;
+    }
+    while (*s == ' ' || *s == '\t') s++;
+    if (*s != '\0') return -1;
+#if ULLONG_MAX > SIZE_MAX
+    if (v > (unsigned long long)SIZE_MAX) return -1;
+#endif
+    *out = (size_t)v;
+    return 0;
+}
+
+/* Count header field lines after the request line. hdr_scan_end is exclusive: it must be
+ * the first byte of the blank line (memmem(..., "\r\n\r\n") + 2), so [buf, hdr_scan_end)
+ * includes the CRLF that terminates the last header but not the blank line's CRLF.
+ * parse_request stores at most MAX_HEADERS colon-headers; rejecting here keeps scans aligned. */
+static int count_header_field_lines(const char *buf, const char *hdr_scan_end, int *out_n)
+{
+    const char *req_eol = NULL;
+    for (const char *q = buf; q + 1 < hdr_scan_end; q++) {
+        if (q[0] == '\r' && q[1] == '\n') {
+            req_eol = q;
+            break;
+        }
+    }
+    if (!req_eol)
+        return -1;
+    const char *p = req_eol + 2;
+    int n = 0;
+    while (p < hdr_scan_end) {
+        const char *eol = NULL;
+        for (const char *q = p; q + 1 < hdr_scan_end; q++) {
+            if (q[0] == '\r' && q[1] == '\n') {
+                eol = q;
+                break;
+            }
+        }
+        if (!eol)
+            return -1;
+        if (eol > p)
+            n++;
+        p = eol + 2;
+    }
+    *out_n = n;
+    return 0;
+}
+
+/* Scan raw header field bytes [buf, hdr_scan_end) for Content-Length; last header wins.
+ * hdr_scan_end is exclusive, same as count_header_field_lines (memmem + 2). */
+static int scan_content_length_raw(const char *buf, const char *hdr_scan_end,
+                                   int *have_cl, size_t *cl_out)
+{
+    *have_cl = 0;
+    const char *p = buf;
+    while (p < hdr_scan_end) {
+        const char *eol = NULL;
+        for (const char *q = p; q + 1 < hdr_scan_end; q++) {
+            if (q[0] == '\r' && q[1] == '\n') { eol = q; break; }
+        }
+        if (!eol) break;
+        if (eol > p && (size_t)(eol - p) >= 15 &&
+            !strncasecmp(p, "Content-Length:", 15)) {
+            const char *v = p + 15;
+            while (v < eol && (*v == ' ' || *v == '\t')) v++;
+            size_t vlen = (size_t)(eol - v);
+            if (vlen >= 512) vlen = 511;
+            char tmp[512];
+            memcpy(tmp, v, vlen);
+            tmp[vlen] = '\0';
+            size_t cl;
+            if (parse_content_length_value(tmp, &cl) != 0)
+                return -1;
+            *have_cl = 1;
+            *cl_out = cl;
+        }
+        p = eol + 2;
+    }
+    return 0;
+}
+
+/* First \r\n in [start, end); does not read past end (raw socket buffer is not NUL-terminated). */
+static const char *find_crlf_bounded(const char *start, const char *end)
+{
+    for (const char *q = start; q + 1 < end; q++) {
+        if (q[0] == '\r' && q[1] == '\n')
+            return q;
+    }
+    return NULL;
+}
+
+static const char *find_content_type_param_value(const char *content_type, const char *name)
+{
+    if (!content_type || !name) return NULL;
+
+    size_t name_len = strlen(name);
+    const char *p = content_type;
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == ';')
+            p++;
+        if (!strncasecmp(p, name, name_len) && p[name_len] == '=') {
+            return p + name_len + 1;
+        }
+        const char *next = strchr(p, ';');
+        if (!next)
+            break;
+        p = next + 1;
+    }
+    return NULL;
+}
 
 static int parse_request(const char *raw, size_t raw_len, HttpRequest *req)
 {
     memset(req, 0, sizeof(*req));
-    const char *line_end = strstr(raw, "\r\n");
+    const char *raw_end = raw + raw_len;
+    const char *line_end = find_crlf_bounded(raw, raw_end);
     if (!line_end) return -1;
-    if (sscanf(raw, "%7s %2047s", req->method, req->path) != 2) return -1;
+    size_t line1_len = (size_t)(line_end - raw);
+    char line1_buf[8192];
+    if (line1_len >= sizeof(line1_buf)) return -1;
+    memcpy(line1_buf, raw, line1_len);
+    line1_buf[line1_len] = '\0';
+    if (sscanf(line1_buf, "%7s %2047s", req->method, req->path) != 2) return -1;
 
     const char *p = line_end + 2;
-    while (p < raw + raw_len) {
-        const char *eol = strstr(p, "\r\n");
+    while (p < raw_end) {
+        const char *eol = find_crlf_bounded(p, raw_end);
         if (!eol) break;
         if (eol == p) { p = eol + 2; break; }
         if (req->header_count >= MAX_HEADERS) { p = eol + 2; continue; }
@@ -69,8 +202,11 @@ static int parse_request(const char *raw, size_t raw_len, HttpRequest *req)
     for (int i = 0; i < req->header_count; i++) {
         if (!strcasecmp(req->headers[i][0], "Content-Type"))
             strncpy(req->content_type, req->headers[i][1], sizeof(req->content_type) - 1);
-        else if (!strcasecmp(req->headers[i][0], "Content-Length"))
-            req->content_length = (size_t)atol(req->headers[i][1]);
+        else if (!strcasecmp(req->headers[i][0], "Content-Length")) {
+            if (parse_content_length_value(req->headers[i][1], &req->content_length) != 0)
+                return -1;
+            req->content_length_set = 1;
+        }
     }
 
     size_t header_len = (size_t)(p - raw);
@@ -78,6 +214,8 @@ static int parse_request(const char *raw, size_t raw_len, HttpRequest *req)
         req->body = (char *)raw + header_len;
         req->body_len = raw_len - header_len;
     }
+    if (req->content_length_set && req->body_len != req->content_length)
+        return -1;
     return 0;
 }
 
@@ -87,6 +225,7 @@ static const char *status_text(int code)
 {
     switch (code) {
         case 200: return "OK";
+        case 408: return "Request Timeout";
         case 400: return "Bad Request";
         case 404: return "Not Found";
         case 500: return "Internal Server Error";
@@ -413,6 +552,93 @@ static int json_get_string(const char *json, const char *key, char *buf, size_t 
     memcpy(buf, p, len);
     buf[len] = '\0';
     return 0;
+}
+
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+} JsonBuffer;
+
+static void json_buffer_destroy(JsonBuffer *buf)
+{
+    if (!buf) return;
+    free(buf->data);
+    buf->data = NULL;
+    buf->len = 0;
+    buf->cap = 0;
+}
+
+static bool json_buffer_reserve(JsonBuffer *buf, size_t extra)
+{
+    if (!buf) return false;
+    if (extra > MAX_REQUEST || buf->len > MAX_REQUEST - extra)
+        return false;
+    size_t needed = buf->len + extra;
+    if (needed <= buf->cap)
+        return true;
+
+    size_t new_cap = buf->cap ? buf->cap : 256u;
+    while (new_cap < needed) {
+        if (new_cap >= MAX_REQUEST) {
+            break;
+        }
+        if (new_cap <= MAX_REQUEST / 2u) {
+            new_cap *= 2u;
+        } else {
+            new_cap = MAX_REQUEST;
+        }
+    }
+    if (new_cap < needed || new_cap > MAX_REQUEST)
+        return false;
+
+    char *new_data = (char *)realloc(buf->data, new_cap);
+    if (!new_data)
+        return false;
+    buf->data = new_data;
+    buf->cap = new_cap;
+    return true;
+}
+
+static bool json_buffer_append_bytes(JsonBuffer *buf, const void *data, size_t len)
+{
+    if (!json_buffer_reserve(buf, len))
+        return false;
+    memcpy(buf->data + buf->len, data, len);
+    buf->len += len;
+    return true;
+}
+
+static bool json_buffer_append_cstr(JsonBuffer *buf, const char *lit)
+{
+    return json_buffer_append_bytes(buf, lit, strlen(lit));
+}
+
+static bool json_buffer_append_byte(JsonBuffer *buf, char ch)
+{
+    return json_buffer_append_bytes(buf, &ch, 1u);
+}
+
+static bool json_buffer_append_str_json(JsonBuffer *buf, const char *s)
+{
+    if (!s) s = "";
+    if (!json_buffer_append_byte(buf, '"'))
+        return false;
+    for (const unsigned char *u = (const unsigned char *)s; *u; u++) {
+        if (*u < 0x20u) {
+            char esc[7];
+            int nw = snprintf(esc, sizeof(esc), "\\u%04x", (unsigned)*u);
+            if (nw != 6 || !json_buffer_append_bytes(buf, esc, (size_t)nw))
+                return false;
+        } else if (*u == '"' || *u == '\\') {
+            char esc[2] = {'\\', (char)*u};
+            if (!json_buffer_append_bytes(buf, esc, sizeof(esc)))
+                return false;
+        } else if (!json_buffer_append_byte(buf, (char)*u)) {
+            return false;
+        }
+    }
+    return json_buffer_append_byte(buf, '"');
 }
 
 /* ── GET route handling ────────────────────────────────────────────── */
@@ -875,24 +1101,52 @@ static void api_metadata_view(int fd, MultipartForm *form)
     const char *producer = tspdf_reader_get_producer(doc);
     const char *created = tspdf_reader_get_creation_date(doc);
     const char *modified = tspdf_reader_get_mod_date(doc);
+    size_t pages = tspdf_reader_page_count(doc);
 
-    char json[4096];
-    int n = snprintf(json, sizeof(json),
-        "{\"title\":\"%s\",\"author\":\"%s\",\"subject\":\"%s\","
-        "\"keywords\":\"%s\",\"creator\":\"%s\",\"producer\":\"%s\","
-        "\"created\":\"%s\",\"modified\":\"%s\",\"pages\":%zu}",
-        title ? title : "",
-        author ? author : "",
-        subject ? subject : "",
-        keywords ? keywords : "",
-        creator ? creator : "",
-        producer ? producer : "",
-        created ? created : "",
-        modified ? modified : "",
-        tspdf_reader_page_count(doc));
+    if (!title) title = "";
+    if (!author) author = "";
+    if (!subject) subject = "";
+    if (!keywords) keywords = "";
+    if (!creator) creator = "";
+    if (!producer) producer = "";
+    if (!created) created = "";
+    if (!modified) modified = "";
+
+    JsonBuffer json = {0};
+    char pbuf[32];
+    int plen;
+
+    if (!json_buffer_append_cstr(&json, "{\"title\":")) goto meta_json_err;
+    if (!json_buffer_append_str_json(&json, title)) goto meta_json_err;
+    if (!json_buffer_append_cstr(&json, ",\"author\":")) goto meta_json_err;
+    if (!json_buffer_append_str_json(&json, author)) goto meta_json_err;
+    if (!json_buffer_append_cstr(&json, ",\"subject\":")) goto meta_json_err;
+    if (!json_buffer_append_str_json(&json, subject)) goto meta_json_err;
+    if (!json_buffer_append_cstr(&json, ",\"keywords\":")) goto meta_json_err;
+    if (!json_buffer_append_str_json(&json, keywords)) goto meta_json_err;
+    if (!json_buffer_append_cstr(&json, ",\"creator\":")) goto meta_json_err;
+    if (!json_buffer_append_str_json(&json, creator)) goto meta_json_err;
+    if (!json_buffer_append_cstr(&json, ",\"producer\":")) goto meta_json_err;
+    if (!json_buffer_append_str_json(&json, producer)) goto meta_json_err;
+    if (!json_buffer_append_cstr(&json, ",\"created\":")) goto meta_json_err;
+    if (!json_buffer_append_str_json(&json, created)) goto meta_json_err;
+    if (!json_buffer_append_cstr(&json, ",\"modified\":")) goto meta_json_err;
+    if (!json_buffer_append_str_json(&json, modified)) goto meta_json_err;
+    if (!json_buffer_append_cstr(&json, ",\"pages\":")) goto meta_json_err;
+    plen = snprintf(pbuf, sizeof(pbuf), "%zu", pages);
+    if (plen <= 0 || (size_t)plen >= sizeof(pbuf)) goto meta_json_err;
+    if (!json_buffer_append_bytes(&json, pbuf, (size_t)plen)) goto meta_json_err;
+    if (!json_buffer_append_cstr(&json, "}")) goto meta_json_err;
 
     tspdf_reader_destroy(doc);
-    send_response(fd, 200, "application/json", json, (size_t)n);
+    send_response(fd, 200, "application/json", json.data, json.len);
+    json_buffer_destroy(&json);
+    return;
+
+meta_json_err:
+    tspdf_reader_destroy(doc);
+    json_buffer_destroy(&json);
+    send_error(fd, 500, "Metadata JSON overflow");
 }
 
 static void api_metadata(int fd, MultipartForm *form)
@@ -1382,9 +1636,8 @@ static void api_md2pdf(int fd, MultipartForm *form)
 static void handle_post(int fd, HttpRequest *req)
 {
     /* Extract boundary from Content-Type */
-    const char *bnd = strstr(req->content_type, "boundary=");
+    const char *bnd = find_content_type_param_value(req->content_type, "boundary");
     if (!bnd) { send_error(fd, 400, "Missing boundary in Content-Type"); return; }
-    bnd += 9;
     /* Remove optional quotes */
     char boundary[256];
     if (*bnd == '"') {
@@ -1487,65 +1740,149 @@ static int start_server(int port)
             continue;
         }
 
+        /* Bound blocking reads so one stalled client cannot monopolize the single-threaded server. */
+        struct timeval request_read_timeout = {
+            .tv_sec = REQUEST_READ_TIMEOUT_SEC,
+            .tv_usec = 0
+        };
+        if (setsockopt(client, SOL_SOCKET, SO_RCVTIMEO,
+                       &request_read_timeout, sizeof(request_read_timeout)) < 0) {
+            send_error(client, 500, "Failed to configure request timeout");
+            close(client);
+            continue;
+        }
+
         /* Read the full request */
         size_t buf_cap = 8192;
         char *buf = malloc(buf_cap);
+        if (!buf) {
+            send_error(client, 500, "Out of memory");
+            close(client);
+            continue;
+        }
         size_t buf_len = 0;
+        int request_aborted = 0;
 
-        /* Read headers first */
-        while (buf_len < buf_cap) {
-            ssize_t n = read(client, buf + buf_len, buf_cap - buf_len);
-            if (n <= 0) break;
-            buf_len += (size_t)n;
-
-            /* Check if we have all headers */
-            if (memmem(buf, buf_len, "\r\n\r\n", 4)) break;
+        /* Read until end of headers or I/O error */
+        for (;;) {
+            if (memmem(buf, buf_len, "\r\n\r\n", 4))
+                break;
 
             if (buf_len >= buf_cap) {
-                buf_cap *= 2;
-                if (buf_cap > MAX_REQUEST) break;
-                buf = realloc(buf, buf_cap);
-            }
-        }
-
-        /* Parse Content-Length and read remaining body */
-        const char *cl_str = NULL;
-        const char *hdr_end = memmem(buf, buf_len, "\r\n\r\n", 4);
-        if (hdr_end) {
-            /* Scan for Content-Length in headers */
-            const char *p = buf;
-            while (p < hdr_end) {
-                if (!strncasecmp(p, "Content-Length:", 15)) {
-                    cl_str = p + 15;
-                    while (*cl_str == ' ') cl_str++;
+                if (buf_cap >= MAX_REQUEST) {
+                    send_error(client, 400, "Request too large");
+                    request_aborted = 1;
                     break;
                 }
-                const char *eol = strstr(p, "\r\n");
-                if (!eol) break;
-                p = eol + 2;
+                size_t new_cap = buf_cap <= MAX_REQUEST / 2 ? buf_cap * 2 : MAX_REQUEST;
+                if (new_cap <= buf_cap)
+                    new_cap = MAX_REQUEST;
+                void *nb = realloc(buf, new_cap);
+                if (!nb) {
+                    send_error(client, 500, "Out of memory");
+                    request_aborted = 1;
+                    break;
+                }
+                buf = (char *)nb;
+                buf_cap = new_cap;
             }
 
-            if (cl_str) {
-                size_t content_length = (size_t)atol(cl_str);
-                size_t header_size = (size_t)(hdr_end - buf) + 4;
-                size_t total_needed = header_size + content_length;
+            ssize_t n = read(client, buf + buf_len, buf_cap - buf_len);
+            if (n < 0) {
+                if (errno == EINTR)
+                    continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    send_error(client, 408, "Request Timeout");
+                    request_aborted = 1;
+                }
+                break;
+            }
+            if (n == 0)
+                break;
+            buf_len += (size_t)n;
+        }
 
-                if (total_needed > MAX_REQUEST) {
+        if (request_aborted) {
+            close(client);
+            free(buf);
+            continue;
+        }
+
+        const char *hdr_end = memmem(buf, buf_len, "\r\n\r\n", 4);
+        if (hdr_end) {
+            /* hdr_end points at first \r of "\r\n\r\n"; include last header's CRLF in scans. */
+            const char *hdr_scan_end = hdr_end + 2;
+
+            int header_lines = 0;
+            if (count_header_field_lines(buf, hdr_scan_end, &header_lines) != 0) {
+                send_error(client, 400, "Bad request");
+                close(client);
+                free(buf);
+                continue;
+            }
+            if (header_lines > MAX_HEADERS) {
+                send_error(client, 400, "Bad request");
+                close(client);
+                free(buf);
+                continue;
+            }
+
+            int have_cl = 0;
+            size_t content_length = 0;
+            if (scan_content_length_raw(buf, hdr_scan_end, &have_cl, &content_length) != 0) {
+                send_error(client, 400, "Bad request");
+                close(client);
+                free(buf);
+                continue;
+            }
+
+            if (have_cl) {
+                size_t header_size = (size_t)(hdr_end - buf) + 4;
+                if (content_length > MAX_REQUEST || header_size > MAX_REQUEST ||
+                    content_length > MAX_REQUEST - header_size) {
                     send_error(client, 400, "Request too large");
                     close(client);
                     free(buf);
                     continue;
                 }
+                size_t total_needed = header_size + content_length;
 
                 if (total_needed > buf_cap) {
+                    void *nb = realloc(buf, total_needed);
+                    if (!nb) {
+                        send_error(client, 500, "Out of memory");
+                        close(client);
+                        free(buf);
+                        continue;
+                    }
+                    buf = (char *)nb;
                     buf_cap = total_needed;
-                    buf = realloc(buf, buf_cap);
                 }
 
+                int incomplete_body = 0;
                 while (buf_len < total_needed) {
                     ssize_t n = read(client, buf + buf_len, total_needed - buf_len);
-                    if (n <= 0) break;
+                    if (n < 0) {
+                        if (errno == EINTR)
+                            continue;
+                        if (errno == EAGAIN || errno == EWOULDBLOCK)
+                            send_error(client, 408, "Request Timeout");
+                        else
+                            send_error(client, 400, "Bad request");
+                        incomplete_body = 1;
+                        break;
+                    }
+                    if (n == 0) {
+                        send_error(client, 400, "Bad request");
+                        incomplete_body = 1;
+                        break;
+                    }
                     buf_len += (size_t)n;
+                }
+                if (incomplete_body) {
+                    close(client);
+                    free(buf);
+                    continue;
                 }
             }
         }

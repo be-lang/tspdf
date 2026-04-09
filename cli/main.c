@@ -20,7 +20,7 @@ static void print_usage(void) {
     printf("  decrypt    Decrypt a password-protected PDF\n");
     printf("  metadata   View or edit PDF metadata\n");
     printf("  info       Print information about a PDF\n");
-    printf("  watermark  Add a text or image watermark to a PDF\n");
+    printf("  watermark  Add a text watermark to a PDF\n");
     printf("  compress   Compress a PDF to reduce file size\n");
     printf("  img2pdf    Convert images (JPEG/PNG) to a PDF\n");
     printf("  qrcode     Generate a QR code PDF\n");
@@ -176,6 +176,11 @@ static void print_command_help(const char *cmd) {
         printf("Arguments:\n");
         printf("  <input.md>       Input Markdown file\n");
         printf("  -o <output.pdf>  Output file path (required)\n");
+    } else if (strcmp(cmd, "serve") == 0) {
+        printf("Usage: tspdf serve [--port <port>]\n");
+        printf("\n");
+        printf("Start a local web server for PDF tools.\n");
+        printf("Default port: 8080\n");
     } else {
         /* Unknown command — fall back to general help */
         print_usage();
