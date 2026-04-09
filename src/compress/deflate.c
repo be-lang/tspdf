@@ -1,8 +1,16 @@
 #include "deflate.h"
 #include "../util/buffer.h"
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+
+// See TSPDF_DEFLATE_MAX_OUTPUT in deflate.h (documented public cap).
+
+static bool deflate_out_has_room(const TspdfBuffer *out, size_t extra) {
+    if (extra > TSPDF_DEFLATE_MAX_OUTPUT) return false;
+    return out->len <= TSPDF_DEFLATE_MAX_OUTPUT - extra;
+}
 
 // ============================================================
 // Minimal deflate compressor with zlib wrapper
@@ -517,6 +525,7 @@ static int inflate_block(BitReader *br, HuffTree *lit, HuffTree *dist, TspdfBuff
         if (sym < 0) return -1;
 
         if (sym < 256) {
+            if (!deflate_out_has_room(out, 1)) return -1;
             tspdf_buffer_append_byte(out, (uint8_t)sym);
         } else if (sym == 256) {
             return 0;  // end of block
@@ -532,6 +541,7 @@ static int inflate_block(BitReader *br, HuffTree *lit, HuffTree *dist, TspdfBuff
 
             // Copy from output buffer
             if ((size_t)distance > out->len) return -1;
+            if (!deflate_out_has_room(out, (size_t)length)) return -1;
             for (int j = 0; j < length; j++) {
                 tspdf_buffer_append_byte(out, out->data[out->len - distance]);
             }
@@ -548,10 +558,23 @@ uint8_t *deflate_decompress(const uint8_t *data, size_t len, size_t *out_len) {
     if ((cmf & 0x0F) != 8) return NULL;  // CM must be 8 (deflate)
     if (((cmf * 256 + data[1]) % 31) != 0) return NULL;  // FCHECK
 
-    BitReader br;
-    br_init(&br, data + 2, len - 6);  // skip header, leave 4 bytes for checksum
+    size_t infl_len = len - 6;
 
-    TspdfBuffer out = tspdf_buffer_create(len * 4);  // initial guess at output size
+    size_t initial_cap;
+    if (infl_len > SIZE_MAX / 4) {
+        initial_cap = TSPDF_DEFLATE_MAX_OUTPUT;
+    } else {
+        initial_cap = infl_len * 4;
+        if (initial_cap > TSPDF_DEFLATE_MAX_OUTPUT) {
+            initial_cap = TSPDF_DEFLATE_MAX_OUTPUT;
+        }
+    }
+    if (initial_cap < 16) initial_cap = 16;
+
+    BitReader br;
+    br_init(&br, data + 2, infl_len);  // skip header, leave 4 bytes for checksum
+
+    TspdfBuffer out = tspdf_buffer_create(initial_cap);
 
     int bfinal;
     do {
@@ -564,11 +587,19 @@ uint8_t *deflate_decompress(const uint8_t *data, size_t len, size_t *out_len) {
             if (br.pos + 4 > br.len) { tspdf_buffer_destroy(&out); return NULL; }
             // Read from underlying byte stream
             uint16_t block_len = br.data[br.pos] | ((uint16_t)br.data[br.pos + 1] << 8);
-            // uint16_t nlen = br.data[br.pos + 2] | ((uint16_t)br.data[br.pos + 3] << 8);
+            uint16_t nlen = br.data[br.pos + 2] | ((uint16_t)br.data[br.pos + 3] << 8);
+            if ((uint16_t)(block_len ^ nlen) != 0xFFFFu) {
+                tspdf_buffer_destroy(&out);
+                return NULL;
+            }
             br.pos += 4;
             br.bits = 0;
             br.nbits = 0;
             if (br.pos + block_len > br.len) { tspdf_buffer_destroy(&out); return NULL; }
+            if (!deflate_out_has_room(&out, block_len)) {
+                tspdf_buffer_destroy(&out);
+                return NULL;
+            }
             for (int j = 0; j < block_len; j++) {
                 tspdf_buffer_append_byte(&out, br.data[br.pos++]);
             }

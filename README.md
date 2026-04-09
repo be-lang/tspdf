@@ -62,8 +62,8 @@ Most PDF tools are either cloud services that require uploading your documents, 
 - **Fully local** — your files stay on your machine, always
 - **Zero dependencies** — pure C with no external libraries, not even zlib
 - **Single binary** — one tool for reading, writing, merging, encrypting, and generating PDFs
-- **Builds anywhere** — Linux, macOS, Windows, and compiles to WASM for browser use
-- **~12K lines of C11** — small, auditable, and fast
+- **Cross-platform CLI** — developed on Linux; also builds on macOS and Windows with a C11 toolchain
+- **~28K lines of C11** (sources and headers) — auditable and fast
 
 Everything is implemented from scratch: deflate compression, PNG decoding, AES encryption, TrueType font parsing, and a flexbox-style layout engine.
 
@@ -111,7 +111,8 @@ int main(void) {
 ```
 
 ```bash
-gcc -o hello hello.c src/**/*.c -lm && ./hello
+# Portable: expand sources explicitly (shell globs like src/**/*.c are not portable).
+gcc -o hello hello.c $(find src -name '*.c' -print | tr '\n' ' ') -lm && ./hello
 ```
 
 ### Manipulate existing PDFs
@@ -138,7 +139,7 @@ tspdf_reader_save_encrypted(doc, "locked.pdf", "password", "owner", 0, 256);
 
 ## Full Feature List
 
-**Reading and manipulation** — open existing PDFs, extract/delete/rotate/reorder/merge pages, add watermarks, annotations (links, text notes, stamps), page numbers, content overlay, AES-128/256 encryption and decryption.
+**Reading and manipulation** — open existing PDFs, extract/delete/rotate/reorder/merge pages, add text watermarks, annotations (links, text notes, stamps), page numbers, content overlay, AES-128/256 encryption and decryption.
 
 **Generation** — flexbox-style layout engine with fixed, grow, fit-content, and percentage sizing. Automatic page breaks with repeating headers. Tables with auto-sized columns, colspan, alternating row colors.
 
