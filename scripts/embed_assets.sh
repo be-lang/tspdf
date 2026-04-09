@@ -25,7 +25,8 @@ embed_file "web/static/style.css" "asset_style_css"
 embed_file "web/static/app.js" "asset_app_js"
 
 # Tool templates
-for f in web/templates/tools/*.html; do
+mapfile -t TOOL_TEMPLATES < <(find web/templates/tools -maxdepth 1 -type f -name '*.html' | LC_ALL=C sort)
+for f in "${TOOL_TEMPLATES[@]}"; do
     # Convert filename to variable name: web/templates/tools/merge.html -> asset_tool_merge
     base=$(basename "$f" .html)
     varname="asset_tool_$(echo "$base" | tr '-' '_')"

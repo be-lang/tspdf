@@ -10,6 +10,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <signal.h>
 #include <errno.h>
 #include <limits.h>
@@ -23,6 +24,7 @@
 #define MAX_REQUEST    (50 * 1024 * 1024)  /* 50 MB for multi-file uploads */
 #define MAX_HEADERS    64
 #define MAX_FORM_PARTS 64
+#define REQUEST_READ_TIMEOUT_SEC 5
 
 /* ── HTTP Request ──────────────────────────────────────────────────── */
 
@@ -141,6 +143,26 @@ static const char *find_crlf_bounded(const char *start, const char *end)
     return NULL;
 }
 
+static const char *find_content_type_param_value(const char *content_type, const char *name)
+{
+    if (!content_type || !name) return NULL;
+
+    size_t name_len = strlen(name);
+    const char *p = content_type;
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == ';')
+            p++;
+        if (!strncasecmp(p, name, name_len) && p[name_len] == '=') {
+            return p + name_len + 1;
+        }
+        const char *next = strchr(p, ';');
+        if (!next)
+            break;
+        p = next + 1;
+    }
+    return NULL;
+}
+
 static int parse_request(const char *raw, size_t raw_len, HttpRequest *req)
 {
     memset(req, 0, sizeof(*req));
@@ -203,6 +225,7 @@ static const char *status_text(int code)
 {
     switch (code) {
         case 200: return "OK";
+        case 408: return "Request Timeout";
         case 400: return "Bad Request";
         case 404: return "Not Found";
         case 500: return "Internal Server Error";
@@ -531,42 +554,91 @@ static int json_get_string(const char *json, const char *key, char *buf, size_t 
     return 0;
 }
 
-/* Append literal bytes to JSON buffer; returns new cursor or NULL on overflow. */
-static char *json_append_cstr(char *p, const char *lim, const char *lit)
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+} JsonBuffer;
+
+static void json_buffer_destroy(JsonBuffer *buf)
 {
-    size_t n = strlen(lit);
-    if ((size_t)(lim - p) < n)
-        return NULL;
-    memcpy(p, lit, n);
-    return p + n;
+    if (!buf) return;
+    free(buf->data);
+    buf->data = NULL;
+    buf->len = 0;
+    buf->cap = 0;
 }
 
-/* Append a JSON string (UTF-8 bytes) with required escaping. */
-static char *json_append_str_json(char *p, const char *lim, const char *s)
+static bool json_buffer_reserve(JsonBuffer *buf, size_t extra)
 {
-    if (!s) s = "";
-    if (p >= lim) return NULL;
-    *p++ = '"';
-    for (const unsigned char *u = (const unsigned char *)s; *u; u++) {
-        if (*u < 0x20u) {
-            int nw = snprintf(p, (size_t)(lim - p), "\\u%04x", (unsigned)*u);
-            if (nw <= 0 || (size_t)nw >= (size_t)(lim - p))
-                return NULL;
-            p += (size_t)nw;
-        } else if (*u == '"' || *u == '\\') {
-            if ((size_t)(lim - p) < 2u)
-                return NULL;
-            *p++ = '\\';
-            *p++ = (char)*u;
+    if (!buf) return false;
+    if (extra > MAX_REQUEST || buf->len > MAX_REQUEST - extra)
+        return false;
+    size_t needed = buf->len + extra;
+    if (needed <= buf->cap)
+        return true;
+
+    size_t new_cap = buf->cap ? buf->cap : 256u;
+    while (new_cap < needed) {
+        if (new_cap >= MAX_REQUEST) {
+            break;
+        }
+        if (new_cap <= MAX_REQUEST / 2u) {
+            new_cap *= 2u;
         } else {
-            if (p >= lim)
-                return NULL;
-            *p++ = (char)*u;
+            new_cap = MAX_REQUEST;
         }
     }
-    if (p >= lim) return NULL;
-    *p++ = '"';
-    return p;
+    if (new_cap < needed || new_cap > MAX_REQUEST)
+        return false;
+
+    char *new_data = (char *)realloc(buf->data, new_cap);
+    if (!new_data)
+        return false;
+    buf->data = new_data;
+    buf->cap = new_cap;
+    return true;
+}
+
+static bool json_buffer_append_bytes(JsonBuffer *buf, const void *data, size_t len)
+{
+    if (!json_buffer_reserve(buf, len))
+        return false;
+    memcpy(buf->data + buf->len, data, len);
+    buf->len += len;
+    return true;
+}
+
+static bool json_buffer_append_cstr(JsonBuffer *buf, const char *lit)
+{
+    return json_buffer_append_bytes(buf, lit, strlen(lit));
+}
+
+static bool json_buffer_append_byte(JsonBuffer *buf, char ch)
+{
+    return json_buffer_append_bytes(buf, &ch, 1u);
+}
+
+static bool json_buffer_append_str_json(JsonBuffer *buf, const char *s)
+{
+    if (!s) s = "";
+    if (!json_buffer_append_byte(buf, '"'))
+        return false;
+    for (const unsigned char *u = (const unsigned char *)s; *u; u++) {
+        if (*u < 0x20u) {
+            char esc[7];
+            int nw = snprintf(esc, sizeof(esc), "\\u%04x", (unsigned)*u);
+            if (nw != 6 || !json_buffer_append_bytes(buf, esc, (size_t)nw))
+                return false;
+        } else if (*u == '"' || *u == '\\') {
+            char esc[2] = {'\\', (char)*u};
+            if (!json_buffer_append_bytes(buf, esc, sizeof(esc)))
+                return false;
+        } else if (!json_buffer_append_byte(buf, (char)*u)) {
+            return false;
+        }
+    }
+    return json_buffer_append_byte(buf, '"');
 }
 
 /* ── GET route handling ────────────────────────────────────────────── */
@@ -1040,42 +1112,40 @@ static void api_metadata_view(int fd, MultipartForm *form)
     if (!created) created = "";
     if (!modified) modified = "";
 
-    char json[8192];
-    char *p = json;
-    const char *lim = json + sizeof(json);
+    JsonBuffer json = {0};
     char pbuf[32];
     int plen;
 
-    p = json_append_cstr(p, lim, "{\"title\":");
-    if (!(p = json_append_str_json(p, lim, title))) goto meta_json_err;
-    p = json_append_cstr(p, lim, ",\"author\":");
-    if (!(p = json_append_str_json(p, lim, author))) goto meta_json_err;
-    p = json_append_cstr(p, lim, ",\"subject\":");
-    if (!(p = json_append_str_json(p, lim, subject))) goto meta_json_err;
-    p = json_append_cstr(p, lim, ",\"keywords\":");
-    if (!(p = json_append_str_json(p, lim, keywords))) goto meta_json_err;
-    p = json_append_cstr(p, lim, ",\"creator\":");
-    if (!(p = json_append_str_json(p, lim, creator))) goto meta_json_err;
-    p = json_append_cstr(p, lim, ",\"producer\":");
-    if (!(p = json_append_str_json(p, lim, producer))) goto meta_json_err;
-    p = json_append_cstr(p, lim, ",\"created\":");
-    if (!(p = json_append_str_json(p, lim, created))) goto meta_json_err;
-    p = json_append_cstr(p, lim, ",\"modified\":");
-    if (!(p = json_append_str_json(p, lim, modified))) goto meta_json_err;
-    p = json_append_cstr(p, lim, ",\"pages\":");
+    if (!json_buffer_append_cstr(&json, "{\"title\":")) goto meta_json_err;
+    if (!json_buffer_append_str_json(&json, title)) goto meta_json_err;
+    if (!json_buffer_append_cstr(&json, ",\"author\":")) goto meta_json_err;
+    if (!json_buffer_append_str_json(&json, author)) goto meta_json_err;
+    if (!json_buffer_append_cstr(&json, ",\"subject\":")) goto meta_json_err;
+    if (!json_buffer_append_str_json(&json, subject)) goto meta_json_err;
+    if (!json_buffer_append_cstr(&json, ",\"keywords\":")) goto meta_json_err;
+    if (!json_buffer_append_str_json(&json, keywords)) goto meta_json_err;
+    if (!json_buffer_append_cstr(&json, ",\"creator\":")) goto meta_json_err;
+    if (!json_buffer_append_str_json(&json, creator)) goto meta_json_err;
+    if (!json_buffer_append_cstr(&json, ",\"producer\":")) goto meta_json_err;
+    if (!json_buffer_append_str_json(&json, producer)) goto meta_json_err;
+    if (!json_buffer_append_cstr(&json, ",\"created\":")) goto meta_json_err;
+    if (!json_buffer_append_str_json(&json, created)) goto meta_json_err;
+    if (!json_buffer_append_cstr(&json, ",\"modified\":")) goto meta_json_err;
+    if (!json_buffer_append_str_json(&json, modified)) goto meta_json_err;
+    if (!json_buffer_append_cstr(&json, ",\"pages\":")) goto meta_json_err;
     plen = snprintf(pbuf, sizeof(pbuf), "%zu", pages);
     if (plen <= 0 || (size_t)plen >= sizeof(pbuf)) goto meta_json_err;
-    p = json_append_cstr(p, lim, pbuf);
-    if (!p) goto meta_json_err;
-    p = json_append_cstr(p, lim, "}");
-    if (!p) goto meta_json_err;
+    if (!json_buffer_append_bytes(&json, pbuf, (size_t)plen)) goto meta_json_err;
+    if (!json_buffer_append_cstr(&json, "}")) goto meta_json_err;
 
     tspdf_reader_destroy(doc);
-    send_response(fd, 200, "application/json", json, (size_t)(p - json));
+    send_response(fd, 200, "application/json", json.data, json.len);
+    json_buffer_destroy(&json);
     return;
 
 meta_json_err:
     tspdf_reader_destroy(doc);
+    json_buffer_destroy(&json);
     send_error(fd, 500, "Metadata JSON overflow");
 }
 
@@ -1566,9 +1636,8 @@ static void api_md2pdf(int fd, MultipartForm *form)
 static void handle_post(int fd, HttpRequest *req)
 {
     /* Extract boundary from Content-Type */
-    const char *bnd = strstr(req->content_type, "boundary=");
+    const char *bnd = find_content_type_param_value(req->content_type, "boundary");
     if (!bnd) { send_error(fd, 400, "Missing boundary in Content-Type"); return; }
-    bnd += 9;
     /* Remove optional quotes */
     char boundary[256];
     if (*bnd == '"') {
@@ -1671,6 +1740,18 @@ static int start_server(int port)
             continue;
         }
 
+        /* Bound blocking reads so one stalled client cannot monopolize the single-threaded server. */
+        struct timeval request_read_timeout = {
+            .tv_sec = REQUEST_READ_TIMEOUT_SEC,
+            .tv_usec = 0
+        };
+        if (setsockopt(client, SOL_SOCKET, SO_RCVTIMEO,
+                       &request_read_timeout, sizeof(request_read_timeout)) < 0) {
+            send_error(client, 500, "Failed to configure request timeout");
+            close(client);
+            continue;
+        }
+
         /* Read the full request */
         size_t buf_cap = 8192;
         char *buf = malloc(buf_cap);
@@ -1707,7 +1788,16 @@ static int start_server(int port)
             }
 
             ssize_t n = read(client, buf + buf_len, buf_cap - buf_len);
-            if (n <= 0)
+            if (n < 0) {
+                if (errno == EINTR)
+                    continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    send_error(client, 408, "Request Timeout");
+                    request_aborted = 1;
+                }
+                break;
+            }
+            if (n == 0)
                 break;
             buf_len += (size_t)n;
         }
@@ -1772,7 +1862,17 @@ static int start_server(int port)
                 int incomplete_body = 0;
                 while (buf_len < total_needed) {
                     ssize_t n = read(client, buf + buf_len, total_needed - buf_len);
-                    if (n <= 0) {
+                    if (n < 0) {
+                        if (errno == EINTR)
+                            continue;
+                        if (errno == EAGAIN || errno == EWOULDBLOCK)
+                            send_error(client, 408, "Request Timeout");
+                        else
+                            send_error(client, 400, "Bad request");
+                        incomplete_body = 1;
+                        break;
+                    }
+                    if (n == 0) {
                         send_error(client, 400, "Bad request");
                         incomplete_body = 1;
                         break;

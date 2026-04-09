@@ -20,6 +20,9 @@ RAW_PORT_64H=$((CLI_TEST_PORT_BASE + 31))
 RAW_PORT_65H=$((CLI_TEST_PORT_BASE + 32))
 RAW_PORT_CLNEG=$((CLI_TEST_PORT_BASE + 33))
 RAW_PORT_CLBIG=$((CLI_TEST_PORT_BASE + 34))
+RAW_PORT_STALL=$((CLI_TEST_PORT_BASE + 35))
+RAW_PORT_METAJSON=$((CLI_TEST_PORT_BASE + 36))
+RAW_PORT_BOUNDARY_CI=$((CLI_TEST_PORT_BASE + 37))
 
 # Need a test PDF — use the existing test data
 INPUT=tests/data/three_pages.pdf
@@ -45,6 +48,24 @@ run_test() {
 
 echo ""
 echo "CLI tests:"
+
+run_test "cli regenerates embedded assets on build" bash -c '
+  set -e
+  ASSETS_H="cli/assets.h"
+  ASSETS_BAK="'"$TMPDIR"'/assets.h.bak"
+  cp "$ASSETS_H" "$ASSETS_BAK"
+  restore_cli_assets_h() {
+    cp "$ASSETS_BAK" "$ASSETS_H" 2>/dev/null || true
+  }
+  trap restore_cli_assets_h EXIT
+  rm -f "$ASSETS_H"
+  make cli > /dev/null 2>&1
+  [ -f "$ASSETS_H" ]
+  grep -q "Auto-generated from web/" "$ASSETS_H"
+  [ -x "'"$TSPDF"'" ]
+  "'"$TSPDF"'" --version > /dev/null
+  cmp -s "$ASSETS_BAK" "$ASSETS_H"
+'
 
 # info
 run_test "info" $TSPDF info $INPUT
@@ -291,6 +312,94 @@ s.shutdown(socket.SHUT_WR)
 data = s.recv(8192)
 s.close()
 if not data.startswith(b'HTTP/1.1 400'):
+    sys.exit(1)
+\"
+    kill \$sp 2>/dev/null || true
+    wait \$sp 2>/dev/null || true
+  "
+  run_test "serve returns 408 when POST body read stalls" bash -c "
+    set -e
+    \"$TSPDF\" serve --port $RAW_PORT_STALL > /dev/null 2>&1 & sp=\$!
+    sleep 2
+    python3 -c \"
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(12)
+s.connect(('127.0.0.1', $RAW_PORT_STALL))
+req = (b'POST /api/compress HTTP/1.1\\\\r\\\\nHost: localhost\\\\r\\\\n'
+       b'Content-Length: 100\\\\r\\\\n'
+       b'Content-Type: multipart/form-data; boundary=x\\\\r\\\\n\\\\r\\\\n'
+       b'short')
+s.sendall(req)
+data = s.recv(8192)
+s.close()
+if not data.startswith(b'HTTP/1.1 408'):
+    sys.exit(1)
+\"
+    kill \$sp 2>/dev/null || true
+    wait \$sp 2>/dev/null || true
+  "
+  run_test "serve metadata-view handles large escaped titles" bash -c "
+    set -e
+    \"$TSPDF\" serve --port $RAW_PORT_METAJSON > /dev/null 2>&1 & sp=\$!
+    sleep 2
+    TSPDF=\"$TSPDF\" TMPDIR=\"$TMPDIR\" python3 -c \"
+import http.client, json, os, subprocess, sys
+title = (chr(92) + chr(34)) * 2500 + 'END'
+pdf_path = os.path.join(os.environ['TMPDIR'], 'meta_large.json.pdf')
+subprocess.run([
+    os.environ['TSPDF'], 'metadata', 'tests/data/one_page.pdf',
+    '--set', 'title=' + title, '-o', pdf_path
+], check=True)
+with open(pdf_path, 'rb') as fh:
+    pdf_bytes = fh.read()
+boundary = 'TSPDFBOUNDARY'
+body = (
+    ('--' + boundary + '\\\\r\\\\n'
+     'Content-Disposition: form-data; name=\\\"pdf_file\\\"; filename=\\\"meta_large.json.pdf\\\"\\\\r\\\\n'
+     'Content-Type: application/pdf\\\\r\\\\n\\\\r\\\\n').encode('utf-8')
+    + pdf_bytes +
+    ('\\\\r\\\\n--' + boundary + '--\\\\r\\\\n').encode('utf-8')
+)
+conn = http.client.HTTPConnection('127.0.0.1', $RAW_PORT_METAJSON, timeout=10)
+conn.request('POST', '/api/metadata-view', body=body, headers={
+    'Content-Type': 'multipart/form-data; boundary=' + boundary,
+    'Content-Length': str(len(body)),
+})
+resp = conn.getresponse()
+payload = resp.read()
+conn.close()
+if resp.status != 200:
+    sys.exit(1)
+data = json.loads(payload.decode('utf-8'))
+if data.get('title') != title:
+    sys.exit(1)
+\"
+    kill \$sp 2>/dev/null || true
+    wait \$sp 2>/dev/null || true
+  "
+  run_test "serve accepts case-insensitive multipart Boundary parameter" bash -c "
+    set -e
+    \"$TSPDF\" serve --port $RAW_PORT_BOUNDARY_CI > /dev/null 2>&1 & sp=\$!
+    sleep 2
+    python3 -c \"
+import http.client, sys
+boundary = 'TSPDFBOUNDARYCI'
+body = (
+    ('--' + boundary + '\\\\r\\\\n'
+     'Content-Disposition: form-data; name=\\\"config\\\"\\\\r\\\\n\\\\r\\\\n'
+     '{\\\"url\\\":\\\"https://example.com\\\",\\\"title\\\":\\\"CaseInsensitiveBoundary\\\"}\\\\r\\\\n'
+     '--' + boundary + '--\\\\r\\\\n').encode('utf-8')
+)
+conn = http.client.HTTPConnection('127.0.0.1', $RAW_PORT_BOUNDARY_CI, timeout=10)
+conn.request('POST', '/api/qrcode', body=body, headers={
+    'Content-Type': 'multipart/form-data; Boundary=' + boundary,
+    'Content-Length': str(len(body)),
+})
+resp = conn.getresponse()
+payload = resp.read()
+conn.close()
+if resp.status != 200 or not payload.startswith(b'%PDF-'):
     sys.exit(1)
 \"
     kill \$sp 2>/dev/null || true

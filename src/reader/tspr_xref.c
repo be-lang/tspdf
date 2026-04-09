@@ -54,9 +54,32 @@ static bool find_startxref(const uint8_t *data, size_t len, size_t *out_offset) 
     return false;
 }
 
+static bool checked_add_size(size_t a, size_t b, size_t *out)
+{
+    if (a > SIZE_MAX - b) {
+        return false;
+    }
+    *out = a + b;
+    return true;
+}
+
+static bool checked_mul_size(size_t a, size_t b, size_t *out)
+{
+    if (a != 0 && b > SIZE_MAX / a) {
+        return false;
+    }
+    *out = a * b;
+    return true;
+}
+
 static bool ensure_xref_capacity(TspdfReaderXref *xref, size_t needed, TspdfArena *arena) {
     if (needed <= xref->count) return true;
-    TspdfReaderXrefEntry *new_entries = (TspdfReaderXrefEntry *)tspdf_arena_alloc_zero(arena, sizeof(TspdfReaderXrefEntry) * needed);
+    size_t alloc_size;
+    if (!checked_mul_size(sizeof(TspdfReaderXrefEntry), needed, &alloc_size)) {
+        return false;
+    }
+    TspdfReaderXrefEntry *new_entries =
+        (TspdfReaderXrefEntry *)tspdf_arena_alloc_zero(arena, alloc_size);
     if (!new_entries) return false;
     if (xref->entries && xref->count > 0) {
         memcpy(new_entries, xref->entries, sizeof(TspdfReaderXrefEntry) * xref->count);
@@ -114,7 +137,13 @@ static TspdfError parse_classic_xref(TspdfParser *p, TspdfReaderXref *xref, Tspd
         if (p->pos < p->len && p->data[p->pos] == '\n') p->pos++;
 
         // Ensure capacity
-        size_t needed = first_obj + entry_count;
+        size_t needed;
+        if (!checked_add_size(first_obj, entry_count, &needed)) {
+            return TSPDF_ERR_XREF;
+        }
+        if (needed > SIZE_MAX / sizeof(TspdfReaderXrefEntry)) {
+            return TSPDF_ERR_XREF;
+        }
         if (!ensure_xref_capacity(xref, needed, p->arena)) {
             return TSPDF_ERR_ALLOC;
         }
@@ -153,7 +182,10 @@ static TspdfError parse_classic_xref(TspdfParser *p, TspdfReaderXref *xref, Tspd
             if (p->pos >= p->len) return TSPDF_ERR_XREF;
             uint8_t type_ch = p->data[p->pos++];
 
-            size_t idx = first_obj + i;
+            size_t idx;
+            if (!checked_add_size(first_obj, i, &idx)) {
+                return TSPDF_ERR_XREF;
+            }
             if (!xref->entries[idx].seen) {
                 xref->entries[idx].offset = offset;
                 xref->entries[idx].gen = gen;
@@ -275,6 +307,10 @@ static TspdfError parse_xref_stream(TspdfParser *p, TspdfReaderXref *xref, Tspdf
     }
 
     // Ensure capacity
+    if (total_objects > SIZE_MAX / sizeof(TspdfReaderXrefEntry)) {
+        if (filter) free(decompressed);
+        return TSPDF_ERR_XREF;
+    }
     if (!ensure_xref_capacity(xref, total_objects, p->arena)) {
         if (filter) free(decompressed);
         return TSPDF_ERR_ALLOC;
@@ -285,6 +321,12 @@ static TspdfError parse_xref_stream(TspdfParser *p, TspdfReaderXref *xref, Tspdf
     for (size_t s = 0; s < num_subsections; s++) {
         size_t first = subsections[s * 2];
         size_t count = subsections[s * 2 + 1];
+        size_t subsection_end;
+        if (!checked_add_size(first, count, &subsection_end)) {
+            if (filter) free(decompressed);
+            return TSPDF_ERR_XREF;
+        }
+        (void)subsection_end;
 
         for (size_t i = 0; i < count; i++) {
             if (data_pos + (size_t)entry_size > decompressed_len) {
@@ -302,7 +344,11 @@ static TspdfError parse_xref_stream(TspdfParser *p, TspdfReaderXref *xref, Tspdf
 
             // Default: if w[0] == 0, type defaults to 1
             uint64_t type = (w[0] == 0) ? 1 : fields[0];
-            size_t idx = first + i;
+            size_t idx;
+            if (!checked_add_size(first, i, &idx)) {
+                if (filter) free(decompressed);
+                return TSPDF_ERR_XREF;
+            }
             if (idx >= xref->count) continue;
 
             if (!xref->entries[idx].seen) {

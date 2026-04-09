@@ -60,6 +60,13 @@ CLI_SOURCES = \
 	cli/server.c
 
 CLI_TARGET = $(BUILDDIR)/tspdf
+WEB_EMBED_CORE = \
+	web/templates/base.html \
+	web/templates/index.html \
+	web/static/style.css \
+	web/static/app.js
+WEB_EMBED_TOOLS = $(sort $(wildcard web/templates/tools/*.html))
+WEB_EMBED_INPUTS = scripts/embed_assets.sh $(WEB_EMBED_CORE) $(WEB_EMBED_TOOLS)
 
 .PHONY: all cli install uninstall clean test test-all test-cli test-reader test-crypto \
         lib demo bench bench-reader minimal reader-demo generate-test-pdfs
@@ -71,7 +78,10 @@ all: $(CLI_TARGET)
 # Phony alias: a directory named `cli/` exists, so `make cli` must not be a no-op.
 cli: $(CLI_TARGET)
 
-$(CLI_TARGET): $(CLI_SOURCES) $(ALL_SOURCES)
+cli/assets.h: $(WEB_EMBED_INPUTS)
+	bash scripts/embed_assets.sh
+
+$(CLI_TARGET): cli/assets.h $(CLI_SOURCES) $(ALL_SOURCES)
 	@mkdir -p $(BUILDDIR)
 	$(CC) $(CFLAGS) -o $@ $(CLI_SOURCES) $(ALL_SOURCES) -lm
 
