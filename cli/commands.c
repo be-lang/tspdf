@@ -149,3 +149,10 @@ int collect_positional(int argc, char **argv, const char **out, int out_max) {
     }
     return count;
 }
+
+size_t first_out_of_range(const size_t *pages, size_t count, size_t total) {
+    for (size_t i = 0; i < count; i++) {
+        if (pages[i] >= total) return pages[i];
+    }
+    return total;
+}

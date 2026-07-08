@@ -20,6 +20,9 @@ int find_flags(int argc, char **argv, const char *flag, const char **out, int ou
 // Collect positional args (not flags). Returns count.
 int collect_positional(int argc, char **argv, const char **out, int out_max);
 
+// First page index in pages[] that is >= total, or total if none is.
+size_t first_out_of_range(const size_t *pages, size_t count, size_t total);
+
 // Command entry points (argc/argv shifted past the subcommand name)
 int cmd_merge(int argc, char **argv);
 int cmd_split(int argc, char **argv);

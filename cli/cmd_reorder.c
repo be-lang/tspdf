@@ -6,13 +6,6 @@
 #include <ctype.h>
 
 // First 0-based page index in `pages` that is out of range for `total`.
-static size_t first_out_of_range(const size_t *pages, size_t count, size_t total) {
-    for (size_t i = 0; i < count; i++) {
-        if (pages[i] >= total) return pages[i];
-    }
-    return total;
-}
-
 int cmd_reorder(int argc, char **argv) {
     if (argc == 0 || has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
         printf("Usage: tspdf reorder <input.pdf> --order 3,1,2 -o <output.pdf>\n");
