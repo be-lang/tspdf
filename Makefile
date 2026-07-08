@@ -123,7 +123,7 @@ WEB_EMBED_INPUTS = scripts/embed_assets.sh $(WEB_EMBED_CORE) $(WEB_EMBED_TOOLS)
 
 .PHONY: all cli install install-lib uninstall clean test test-all test-cli test-reader test-crypto \
         test-asan test-asan-bin test-asan-reader test-asan-reader-bin test-external \
-        check ci fuzz fuzz-corpus print-version \
+        check ci fuzz fuzz-corpus print-version amalgamation \
         lib shared demo bench bench-reader minimal reader-demo generate-test-pdfs
 
 # --- Default: build the CLI ---
@@ -401,6 +401,30 @@ $(BUILDDIR)/$(SHLIB_FILE): $(ALL_SOURCES)
 	@mkdir -p $(BUILDDIR)/shobj
 	for f in $(ALL_SOURCES); do $(CC) $(CPPFLAGS) $(ALL_CFLAGS) -fPIC -c $$f -o $(BUILDDIR)/shobj/$$(basename $$f .c).o; done
 	$(CC) $(LDFLAGS) $(SHLIB_LDFLAGS) -o $@ $(BUILDDIR)/shobj/*.o -lm
+
+# --- Single-file amalgamation ---
+#
+# `make amalgamation` generates build/amalgamation/tspdf.{c,h} via
+# scripts/amalgamate.sh and then proves the result: a standalone hardened
+# -Werror compile, a link + run of examples/minimal.c against it, and a
+# qpdf --check of the produced PDF when qpdf is installed (test-time only,
+# skipped gracefully — the zero-dependency promise holds).
+AMAL_DIR = $(BUILDDIR)/amalgamation
+AMAL_CFLAGS = -Wall -Wextra -std=c11 -O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2 -Werror
+
+amalgamation:
+	bash scripts/amalgamate.sh $(AMAL_DIR)
+	$(CC) $(AMAL_CFLAGS) -c $(AMAL_DIR)/tspdf.c -o $(AMAL_DIR)/tspdf.o
+	sed 's|#include "../include/tspdf.h"|#include "tspdf.h"|' examples/minimal.c \
+	    > $(AMAL_DIR)/minimal_amal.c
+	$(CC) $(AMAL_CFLAGS) -I $(AMAL_DIR) -o $(AMAL_DIR)/minimal_amal \
+	    $(AMAL_DIR)/minimal_amal.c $(AMAL_DIR)/tspdf.o -lm
+	cd $(AMAL_DIR) && ./minimal_amal
+	@if command -v qpdf > /dev/null 2>&1; then \
+		qpdf --check $(AMAL_DIR)/minimal.pdf && echo "qpdf --check: OK"; \
+	else \
+		echo "note: qpdf not installed; skipping conformance check"; \
+	fi
 
 # --- Examples & benchmarks ---
 
