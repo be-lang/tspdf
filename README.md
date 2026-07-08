@@ -70,6 +70,7 @@ please [open an issue](../../issues) with the file if you can share it. See
 
 `make install` also installs `libtspdf.a`, headers under `<tspdf/...>`, and a
 pkg-config file. The headers are `extern "C"` guarded for C++.
+API overview, ownership rules, and examples: [docs/library.md](docs/library.md).
 
 ```bash
 cc app.c $(pkg-config --cflags --libs tspdf) -o app
