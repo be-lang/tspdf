@@ -6742,6 +6742,782 @@ TEST(test_save_preserve_ids_producer_is_tspdf_with_version) {
     tspdf_reader_destroy(doc);
 }
 
+// ============================================================
+// Doc trees (feat/doctrees): outlines + AcroForm across merge/extract
+// ============================================================
+
+// Resolve a catalog entry of a reopened document.
+static TspdfObj *dt_catalog_get(TspdfReader *doc, const char *key) {
+    return test_resolve_ref(doc, tspdf_dict_get(doc->catalog, key));
+}
+
+static TspdfObj *dt_get(TspdfReader *doc, TspdfObj *dict, const char *key) {
+    return test_resolve_ref(doc, tspdf_dict_get(dict, key));
+}
+
+static bool dt_str_eq(TspdfObj *s, const char *want) {
+    return s && (s->type == TSPDF_OBJ_STRING || s->type == TSPDF_OBJ_NAME) &&
+           s->string.len == strlen(want) &&
+           memcmp(s->string.data, want, s->string.len) == 0;
+}
+
+// Page index the item's destination points at, or SIZE_MAX. Requires an
+// explicit dest array (named dests must have been flattened).
+static size_t dt_dest_page(TspdfReader *doc, TspdfObj *item) {
+    TspdfObj *dest = dt_get(doc, item, "Dest");
+    if (dest && dest->type == TSPDF_OBJ_DICT) {
+        dest = dt_get(doc, dest, "D");
+    }
+    if (!dest || dest->type != TSPDF_OBJ_ARRAY || dest->array.count == 0) {
+        return SIZE_MAX;
+    }
+    TspdfObj *p = &dest->array.items[0];
+    if (p->type != TSPDF_OBJ_REF) return SIZE_MAX;
+    for (size_t i = 0; i < doc->pages.count; i++) {
+        if (doc->pages.pages[i].obj_num == p->ref.num) return i;
+    }
+    return SIZE_MAX;
+}
+
+// Writer-generated source with `npages` pages, a small outline tree
+// ("<tag>-CH1" -> page 0 with child "<tag>-CH1-SUB" -> page min(1, last),
+// "<tag>-CH2" -> last page) and two fields ("<tag>_text" on page 0,
+// "<tag>_check" on the last page).
+static uint8_t *dt_writer_pdf(int npages, bool outlines, bool fields,
+                              const char *tag, const char *font_name,
+                              size_t *out_len) {
+    TspdfWriter *w = tspdf_writer_create();
+    if (!w) return NULL;
+    const char *font = tspdf_writer_add_builtin_font(w, font_name);
+    for (int i = 0; i < npages; i++) {
+        TspdfStream *page = tspdf_writer_add_page(w);
+        tspdf_stream_begin_text(page);
+        tspdf_stream_set_font(page, font, 14);
+        tspdf_stream_move_to(page, 72, 700);
+        char buf[128];
+        snprintf(buf, sizeof(buf), "%s page %d", tag, i + 1);
+        tspdf_stream_show_text(page, buf);
+        tspdf_stream_end_text(page);
+    }
+    if (outlines) {
+        char t[128];
+        snprintf(t, sizeof(t), "%s-CH1", tag);
+        int ch1 = tspdf_writer_add_bookmark(w, t, 0);
+        snprintf(t, sizeof(t), "%s-CH1-SUB", tag);
+        tspdf_writer_add_child_bookmark(w, ch1, t, npages > 1 ? 1 : 0);
+        snprintf(t, sizeof(t), "%s-CH2", tag);
+        tspdf_writer_add_bookmark(w, t, npages - 1);
+    }
+    if (fields) {
+        char n[128];
+        snprintf(n, sizeof(n), "%s_text", tag);
+        tspdf_writer_add_text_field(w, 0, n, 72, 600, 200, 20, "hello",
+                                    font_name, 12);
+        snprintf(n, sizeof(n), "%s_check", tag);
+        tspdf_writer_add_checkbox(w, npages - 1, n, 72, 560, 14, true);
+    }
+    uint8_t *data = NULL;
+    TspdfError err = tspdf_writer_save_to_memory(w, &data, out_len);
+    tspdf_writer_destroy(w);
+    if (err != TSPDF_OK) {
+        free(data);
+        return NULL;
+    }
+    return data;
+}
+
+// Hand-built two-page PDF exercising named destinations (both the /Names name
+// tree and the PDF 1.1 catalog /Dests dict), a /GoTo action with a named /D,
+// and an outline item that only carries a URI action.
+static char *dt_make_named_dest_pdf(size_t *out_len) {
+    char *pdf = (char *)malloc(8192);
+    if (!pdf) return NULL;
+    size_t pos = 0;
+    size_t off[16] = {0};
+
+    if (!appendf(pdf, 8192, &pos, "%%PDF-1.4\n")) goto fail;
+
+    off[1] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Outlines 3 0 R "
+                 "/Names << /Dests 8 0 R >> /Dests 11 0 R >>\nendobj\n")) goto fail;
+    off[2] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [4 0 R 5 0 R] /Count 2 >>\nendobj\n")) goto fail;
+    off[3] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "3 0 obj\n<< /Type /Outlines /First 6 0 R /Last 14 0 R /Count 4 >>\nendobj\n")) goto fail;
+    off[4] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n")) goto fail;
+    off[5] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "5 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n")) goto fail;
+    off[6] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "6 0 obj\n<< /Title (NAMED1) /Parent 3 0 R /Next 7 0 R "
+                 "/Dest (target1) >>\nendobj\n")) goto fail;
+    off[7] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "7 0 obj\n<< /Title (NAMED2) /Parent 3 0 R /Prev 6 0 R /Next 13 0 R "
+                 "/A << /S /GoTo /D (target2) >> >>\nendobj\n")) goto fail;
+    off[8] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "8 0 obj\n<< /Names [(target1) 9 0 R (target2) 10 0 R] >>\nendobj\n")) goto fail;
+    off[9] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "9 0 obj\n[4 0 R /XYZ 0 792 0]\nendobj\n")) goto fail;
+    off[10] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "10 0 obj\n<< /D [5 0 R /Fit] >>\nendobj\n")) goto fail;
+    off[11] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "11 0 obj\n<< /target3 12 0 R >>\nendobj\n")) goto fail;
+    off[12] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "12 0 obj\n[4 0 R /Fit]\nendobj\n")) goto fail;
+    off[13] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "13 0 obj\n<< /Title (NAMED3) /Parent 3 0 R /Prev 7 0 R /Next 14 0 R "
+                 "/Dest /target3 >>\nendobj\n")) goto fail;
+    off[14] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "14 0 obj\n<< /Title (URIITEM) /Parent 3 0 R /Prev 13 0 R "
+                 "/A << /S /URI /URI (http://example.org/x) >> >>\nendobj\n")) goto fail;
+
+    size_t xref = pos;
+    if (!appendf(pdf, 8192, &pos, "xref\n0 15\n0000000000 65535 f \n")) goto fail;
+    for (int i = 1; i <= 14; i++) {
+        if (!appendf(pdf, 8192, &pos, "%010zu 00000 n \n", off[i])) goto fail;
+    }
+    if (!appendf(pdf, 8192, &pos,
+                 "trailer\n<< /Size 15 /Root 1 0 R >>\nstartxref\n%zu\n%%%%EOF",
+                 xref)) goto fail;
+
+    *out_len = pos;
+    return pdf;
+fail:
+    free(pdf);
+    return NULL;
+}
+
+// Hand-built three-page PDF with one hierarchical form field: a parent field
+// whose two widget kids sit on pages 0 and 1 (the second without /P, so the
+// page has to be found through its /Annots entry). The AcroForm dict is
+// inline in the catalog, like tspdf's own writer emits it.
+static char *dt_make_field_kids_pdf(size_t *out_len) {
+    char *pdf = (char *)malloc(8192);
+    if (!pdf) return NULL;
+    size_t pos = 0;
+    size_t off[16] = {0};
+
+    if (!appendf(pdf, 8192, &pos, "%%PDF-1.4\n")) goto fail;
+
+    off[1] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R "
+                 "/AcroForm << /Fields [6 0 R] /DA (/Helv 0 Tf 0 g) "
+                 "/NeedAppearances true >> >>\nendobj\n")) goto fail;
+    off[2] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>\nendobj\n")) goto fail;
+    off[3] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                 "/Annots [7 0 R] >>\nendobj\n")) goto fail;
+    off[4] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                 "/Annots [8 0 R] >>\nendobj\n")) goto fail;
+    off[5] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "5 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n")) goto fail;
+    off[6] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "6 0 obj\n<< /T (parentfield) /FT /Tx /Kids [7 0 R 8 0 R] >>\nendobj\n")) goto fail;
+    off[7] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "7 0 obj\n<< /Type /Annot /Subtype /Widget /Rect [10 10 60 30] "
+                 "/Parent 6 0 R /P 3 0 R /F 4 >>\nendobj\n")) goto fail;
+    off[8] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "8 0 obj\n<< /Type /Annot /Subtype /Widget /Rect [10 40 60 60] "
+                 "/Parent 6 0 R /F 4 >>\nendobj\n")) goto fail;
+
+    size_t xref = pos;
+    if (!appendf(pdf, 8192, &pos, "xref\n0 9\n0000000000 65535 f \n")) goto fail;
+    for (int i = 1; i <= 8; i++) {
+        if (!appendf(pdf, 8192, &pos, "%010zu 00000 n \n", off[i])) goto fail;
+    }
+    if (!appendf(pdf, 8192, &pos,
+                 "trailer\n<< /Size 9 /Root 1 0 R >>\nstartxref\n%zu\n%%%%EOF",
+                 xref)) goto fail;
+
+    *out_len = pos;
+    return pdf;
+fail:
+    free(pdf);
+    return NULL;
+}
+
+TEST(test_merge_preserves_outlines) {
+    size_t len_a = 0, len_b = 0;
+    uint8_t *pdf_a = dt_writer_pdf(2, true, false, "AA", "Helvetica", &len_a);
+    uint8_t *pdf_b = dt_writer_pdf(1, true, false, "BB", "Helvetica", &len_b);
+    ASSERT(pdf_a != NULL && pdf_b != NULL);
+
+    TspdfError err;
+    TspdfReader *doc_a = tspdf_reader_open(pdf_a, len_a, &err);
+    TspdfReader *doc_b = tspdf_reader_open(pdf_b, len_b, &err);
+    ASSERT(doc_a != NULL && doc_b != NULL);
+
+    TspdfReader *docs[] = {doc_a, doc_b};
+    TspdfReader *merged = tspdf_reader_merge(docs, 2, &err);
+    ASSERT(merged != NULL);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(merged, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(re), 3);
+
+    TspdfObj *root = dt_catalog_get(re, "Outlines");
+    ASSERT(root != NULL && root->type == TSPDF_OBJ_DICT);
+
+    // Top level: AA-CH1, AA-CH2, BB-CH1, BB-CH2 in source order.
+    TspdfObj *count = tspdf_dict_get(root, "Count");
+    ASSERT(count != NULL && count->type == TSPDF_OBJ_INT);
+    ASSERT_EQ_INT((int)count->integer, 4);
+
+    TspdfObj *it1 = dt_get(re, root, "First");
+    ASSERT(it1 != NULL);
+    ASSERT(dt_str_eq(tspdf_dict_get(it1, "Title"), "AA-CH1"));
+    ASSERT_EQ_SIZE(dt_dest_page(re, it1), 0);
+
+    // AA-CH1 keeps its child, pointing at merged page 1.
+    TspdfObj *sub = dt_get(re, it1, "First");
+    ASSERT(sub != NULL);
+    ASSERT(dt_str_eq(tspdf_dict_get(sub, "Title"), "AA-CH1-SUB"));
+    ASSERT_EQ_SIZE(dt_dest_page(re, sub), 1);
+
+    TspdfObj *it2 = dt_get(re, it1, "Next");
+    ASSERT(it2 != NULL);
+    ASSERT(dt_str_eq(tspdf_dict_get(it2, "Title"), "AA-CH2"));
+    ASSERT_EQ_SIZE(dt_dest_page(re, it2), 1);
+
+    TspdfObj *it3 = dt_get(re, it2, "Next");
+    ASSERT(it3 != NULL);
+    ASSERT(dt_str_eq(tspdf_dict_get(it3, "Title"), "BB-CH1"));
+    ASSERT_EQ_SIZE(dt_dest_page(re, it3), 2);
+
+    TspdfObj *it4 = dt_get(re, it3, "Next");
+    ASSERT(it4 != NULL);
+    ASSERT(dt_str_eq(tspdf_dict_get(it4, "Title"), "BB-CH2"));
+    ASSERT_EQ_SIZE(dt_dest_page(re, it4), 2);
+    ASSERT(tspdf_dict_get(it4, "Next") == NULL);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(merged);
+    tspdf_reader_destroy(doc_a);
+    tspdf_reader_destroy(doc_b);
+    free(pdf_a);
+    free(pdf_b);
+}
+
+TEST(test_merge_concatenates_acroform_fields) {
+    size_t len_a = 0, len_b = 0;
+    uint8_t *pdf_a = dt_writer_pdf(1, false, true, "AA", "Helvetica", &len_a);
+    uint8_t *pdf_b = dt_writer_pdf(1, false, true, "BB", "Times-Roman", &len_b);
+    ASSERT(pdf_a != NULL && pdf_b != NULL);
+
+    TspdfError err;
+    TspdfReader *doc_a = tspdf_reader_open(pdf_a, len_a, &err);
+    TspdfReader *doc_b = tspdf_reader_open(pdf_b, len_b, &err);
+    ASSERT(doc_a != NULL && doc_b != NULL);
+
+    TspdfReader *docs[] = {doc_a, doc_b};
+    TspdfReader *merged = tspdf_reader_merge(docs, 2, &err);
+    ASSERT(merged != NULL);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(merged, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(re), 2);
+
+    TspdfObj *acro = dt_catalog_get(re, "AcroForm");
+    ASSERT(acro != NULL && acro->type == TSPDF_OBJ_DICT);
+
+    TspdfObj *fields = dt_get(re, acro, "Fields");
+    ASSERT(fields != NULL && fields->type == TSPDF_OBJ_ARRAY);
+    ASSERT_EQ_SIZE(fields->array.count, 4);
+
+    // All four fields are registered with their names intact.
+    bool seen_aa_text = false, seen_aa_check = false;
+    bool seen_bb_text = false, seen_bb_check = false;
+    for (size_t i = 0; i < fields->array.count; i++) {
+        TspdfObj *field = test_resolve_ref(re, &fields->array.items[i]);
+        ASSERT(field != NULL && field->type == TSPDF_OBJ_DICT);
+        TspdfObj *name = tspdf_dict_get(field, "T");
+        if (dt_str_eq(name, "AA_text")) seen_aa_text = true;
+        if (dt_str_eq(name, "AA_check")) seen_aa_check = true;
+        if (dt_str_eq(name, "BB_text")) seen_bb_text = true;
+        if (dt_str_eq(name, "BB_check")) seen_bb_check = true;
+    }
+    ASSERT(seen_aa_text && seen_aa_check && seen_bb_text && seen_bb_check);
+
+    // /NeedAppearances carries through; /DR font dicts merge, first source
+    // wins the F1 name collision (Helvetica, not Times-Roman).
+    TspdfObj *needap = tspdf_dict_get(acro, "NeedAppearances");
+    ASSERT(needap != NULL && needap->type == TSPDF_OBJ_BOOL && needap->boolean);
+    TspdfObj *dr = dt_get(re, acro, "DR");
+    ASSERT(dr != NULL && dr->type == TSPDF_OBJ_DICT);
+    TspdfObj *dr_fonts = dt_get(re, dr, "Font");
+    ASSERT(dr_fonts != NULL && dr_fonts->type == TSPDF_OBJ_DICT);
+    TspdfObj *f1 = dt_get(re, dr_fonts, "F1");
+    ASSERT(f1 != NULL && f1->type == TSPDF_OBJ_DICT);
+    ASSERT(dt_str_eq(tspdf_dict_get(f1, "BaseFont"), "Helvetica"));
+
+    // Both widgets remain wired into their pages' /Annots.
+    TspdfObj *page0_annots = dt_get(re, re->pages.pages[0].page_dict, "Annots");
+    TspdfObj *page1_annots = dt_get(re, re->pages.pages[1].page_dict, "Annots");
+    ASSERT(page0_annots != NULL && page0_annots->type == TSPDF_OBJ_ARRAY &&
+           page0_annots->array.count >= 2);
+    ASSERT(page1_annots != NULL && page1_annots->type == TSPDF_OBJ_ARRAY &&
+           page1_annots->array.count >= 2);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(merged);
+    tspdf_reader_destroy(doc_a);
+    tspdf_reader_destroy(doc_b);
+    free(pdf_a);
+    free(pdf_b);
+}
+
+TEST(test_merge_without_doctrees_stays_clean) {
+    size_t len_a = 0, len_b = 0;
+    uint8_t *pdf_a = dt_writer_pdf(1, false, false, "AA", "Helvetica", &len_a);
+    uint8_t *pdf_b = dt_writer_pdf(2, false, false, "BB", "Helvetica", &len_b);
+    ASSERT(pdf_a != NULL && pdf_b != NULL);
+
+    TspdfError err;
+    TspdfReader *doc_a = tspdf_reader_open(pdf_a, len_a, &err);
+    TspdfReader *doc_b = tspdf_reader_open(pdf_b, len_b, &err);
+    ASSERT(doc_a != NULL && doc_b != NULL);
+
+    TspdfReader *docs[] = {doc_a, doc_b};
+    TspdfReader *merged = tspdf_reader_merge(docs, 2, &err);
+    ASSERT(merged != NULL);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(merged, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    ASSERT(!bytes_contains(out, out_len, "/Outlines"));
+    ASSERT(!bytes_contains(out, out_len, "/AcroForm"));
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(re), 3);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(merged);
+    tspdf_reader_destroy(doc_a);
+    tspdf_reader_destroy(doc_b);
+    free(pdf_a);
+    free(pdf_b);
+}
+
+TEST(test_extract_keeps_outline_subtree_for_kept_pages) {
+    size_t len = 0;
+    uint8_t *pdf = dt_writer_pdf(3, true, false, "CC", "Helvetica", &len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open(pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    // Keep pages 0 and 1: CC-CH1 (page 0) and its child (page 1) survive,
+    // CC-CH2 (page 2) is pruned.
+    size_t pages[] = {0, 1};
+    TspdfReader *result = tspdf_reader_extract(doc, pages, 2, &err);
+    ASSERT(result != NULL);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(result, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    ASSERT(!bytes_contains(out, out_len, "CC-CH2"));
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(re), 2);
+
+    TspdfObj *root = dt_catalog_get(re, "Outlines");
+    ASSERT(root != NULL && root->type == TSPDF_OBJ_DICT);
+    TspdfObj *count = tspdf_dict_get(root, "Count");
+    ASSERT(count != NULL && count->type == TSPDF_OBJ_INT);
+    ASSERT_EQ_INT((int)count->integer, 1);
+
+    TspdfObj *ch1 = dt_get(re, root, "First");
+    ASSERT(ch1 != NULL);
+    ASSERT(dt_str_eq(tspdf_dict_get(ch1, "Title"), "CC-CH1"));
+    ASSERT_EQ_SIZE(dt_dest_page(re, ch1), 0);
+    ASSERT(tspdf_dict_get(ch1, "Next") == NULL);
+
+    TspdfObj *sub = dt_get(re, ch1, "First");
+    ASSERT(sub != NULL);
+    ASSERT(dt_str_eq(tspdf_dict_get(sub, "Title"), "CC-CH1-SUB"));
+    ASSERT_EQ_SIZE(dt_dest_page(re, sub), 1);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(result);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_extract_keeps_parent_when_only_child_survives) {
+    size_t len = 0;
+    uint8_t *pdf = dt_writer_pdf(3, true, false, "DD", "Helvetica", &len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open(pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    // Keep only page 1: DD-CH1 points at dropped page 0 but its child
+    // DD-CH1-SUB points at the kept page, so the parent stays (dest dropped).
+    size_t pages[] = {1};
+    TspdfReader *result = tspdf_reader_extract(doc, pages, 1, &err);
+    ASSERT(result != NULL);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(result, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+
+    TspdfObj *root = dt_catalog_get(re, "Outlines");
+    ASSERT(root != NULL && root->type == TSPDF_OBJ_DICT);
+    TspdfObj *ch1 = dt_get(re, root, "First");
+    ASSERT(ch1 != NULL);
+    ASSERT(dt_str_eq(tspdf_dict_get(ch1, "Title"), "DD-CH1"));
+    ASSERT_EQ_SIZE(dt_dest_page(re, ch1), SIZE_MAX);  // dest to dropped page gone
+    TspdfObj *sub = dt_get(re, ch1, "First");
+    ASSERT(sub != NULL);
+    ASSERT(dt_str_eq(tspdf_dict_get(sub, "Title"), "DD-CH1-SUB"));
+    ASSERT_EQ_SIZE(dt_dest_page(re, sub), 0);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(result);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_extract_omits_outlines_when_nothing_survives) {
+    size_t len = 0;
+    uint8_t *pdf = dt_writer_pdf(3, true, false, "EE", "Helvetica", &len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open(pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    // EE bookmarks point at pages 0, 1 and 2... page 2 has EE-CH2. Build a
+    // fresh 3-page source whose bookmarks all target page 0 instead.
+    tspdf_reader_destroy(doc);
+    free(pdf);
+
+    TspdfWriter *w = tspdf_writer_create();
+    ASSERT(w != NULL);
+    const char *font = tspdf_writer_add_builtin_font(w, "Helvetica");
+    for (int i = 0; i < 3; i++) {
+        TspdfStream *page = tspdf_writer_add_page(w);
+        tspdf_stream_begin_text(page);
+        tspdf_stream_set_font(page, font, 14);
+        tspdf_stream_move_to(page, 72, 700);
+        tspdf_stream_show_text(page, "x");
+        tspdf_stream_end_text(page);
+    }
+    tspdf_writer_add_bookmark(w, "FIRSTONLY", 0);
+    uint8_t *data = NULL;
+    ASSERT_EQ_INT(tspdf_writer_save_to_memory(w, &data, &len), TSPDF_OK);
+    tspdf_writer_destroy(w);
+
+    doc = tspdf_reader_open(data, len, &err);
+    ASSERT(doc != NULL);
+
+    size_t pages[] = {2};
+    TspdfReader *result = tspdf_reader_extract(doc, pages, 1, &err);
+    ASSERT(result != NULL);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(result, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    ASSERT(!bytes_contains(out, out_len, "/Outlines"));
+    ASSERT(!bytes_contains(out, out_len, "FIRSTONLY"));
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(re), 1);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(result);
+    tspdf_reader_destroy(doc);
+    free(data);
+}
+
+TEST(test_extract_prunes_acroform_fields_by_page) {
+    size_t len = 0;
+    uint8_t *pdf = dt_writer_pdf(3, false, true, "FF", "Helvetica", &len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open(pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    // FF_text sits on page 0, FF_check on page 2. Keep page 0 only.
+    size_t pages[] = {0};
+    TspdfReader *result = tspdf_reader_extract(doc, pages, 1, &err);
+    ASSERT(result != NULL);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(result, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    ASSERT(!bytes_contains(out, out_len, "FF_check"));
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+
+    TspdfObj *acro = dt_catalog_get(re, "AcroForm");
+    ASSERT(acro != NULL && acro->type == TSPDF_OBJ_DICT);
+    TspdfObj *fields = dt_get(re, acro, "Fields");
+    ASSERT(fields != NULL && fields->type == TSPDF_OBJ_ARRAY);
+    ASSERT_EQ_SIZE(fields->array.count, 1);
+    TspdfObj *field = test_resolve_ref(re, &fields->array.items[0]);
+    ASSERT(field != NULL);
+    ASSERT(dt_str_eq(tspdf_dict_get(field, "T"), "FF_text"));
+
+    tspdf_reader_destroy(re);
+    free(out);
+
+    // Keeping only the middle page (no fields) omits /AcroForm entirely.
+    size_t middle[] = {1};
+    TspdfReader *none = tspdf_reader_extract(doc, middle, 1, &err);
+    ASSERT(none != NULL);
+    err = tspdf_reader_save_to_memory(none, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(!bytes_contains(out, out_len, "/AcroForm"));
+    ASSERT(!bytes_contains(out, out_len, "FF_text"));
+    free(out);
+    tspdf_reader_destroy(none);
+
+    tspdf_reader_destroy(result);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_extract_flattens_named_dests) {
+    size_t len = 0;
+    char *pdf = dt_make_named_dest_pdf(&len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(doc), 2);
+
+    // Keep page 0: NAMED1 (name tree -> page 0) and NAMED3 (/Dests dict ->
+    // page 0) survive with explicit dest arrays; NAMED2 (GoTo -> page 1) and
+    // URIITEM (no page target) are dropped.
+    size_t pages[] = {0};
+    TspdfReader *result = tspdf_reader_extract(doc, pages, 1, &err);
+    ASSERT(result != NULL);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(result, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    ASSERT(!bytes_contains(out, out_len, "/Names"));
+    ASSERT(!bytes_contains(out, out_len, "NAMED2"));
+    ASSERT(!bytes_contains(out, out_len, "URIITEM"));
+    ASSERT(!bytes_contains(out, out_len, "target1"));  // flattened away
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+
+    TspdfObj *root = dt_catalog_get(re, "Outlines");
+    ASSERT(root != NULL && root->type == TSPDF_OBJ_DICT);
+    TspdfObj *count = tspdf_dict_get(root, "Count");
+    ASSERT(count != NULL && count->type == TSPDF_OBJ_INT);
+    ASSERT_EQ_INT((int)count->integer, 2);
+
+    TspdfObj *n1 = dt_get(re, root, "First");
+    ASSERT(n1 != NULL);
+    ASSERT(dt_str_eq(tspdf_dict_get(n1, "Title"), "NAMED1"));
+    ASSERT_EQ_SIZE(dt_dest_page(re, n1), 0);
+
+    TspdfObj *n3 = dt_get(re, n1, "Next");
+    ASSERT(n3 != NULL);
+    ASSERT(dt_str_eq(tspdf_dict_get(n3, "Title"), "NAMED3"));
+    ASSERT_EQ_SIZE(dt_dest_page(re, n3), 0);
+    ASSERT(tspdf_dict_get(n3, "Next") == NULL);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(result);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_merge_flattens_named_dests_and_keeps_uri_actions) {
+    size_t len_a = 0, len_b = 0;
+    char *pdf_a = dt_make_named_dest_pdf(&len_a);
+    uint8_t *pdf_b = dt_writer_pdf(1, false, false, "PL", "Helvetica", &len_b);
+    ASSERT(pdf_a != NULL && pdf_b != NULL);
+
+    TspdfError err;
+    TspdfReader *doc_a = tspdf_reader_open((const uint8_t *)pdf_a, len_a, &err);
+    TspdfReader *doc_b = tspdf_reader_open(pdf_b, len_b, &err);
+    ASSERT(doc_a != NULL && doc_b != NULL);
+
+    TspdfReader *docs[] = {doc_a, doc_b};
+    TspdfReader *merged = tspdf_reader_merge(docs, 2, &err);
+    ASSERT(merged != NULL);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(merged, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(re), 3);
+
+    TspdfObj *root = dt_catalog_get(re, "Outlines");
+    ASSERT(root != NULL && root->type == TSPDF_OBJ_DICT);
+    TspdfObj *count = tspdf_dict_get(root, "Count");
+    ASSERT(count != NULL && count->type == TSPDF_OBJ_INT);
+    ASSERT_EQ_INT((int)count->integer, 4);
+
+    TspdfObj *n1 = dt_get(re, root, "First");
+    ASSERT(n1 != NULL && dt_str_eq(tspdf_dict_get(n1, "Title"), "NAMED1"));
+    ASSERT_EQ_SIZE(dt_dest_page(re, n1), 0);
+
+    // The named /GoTo action is flattened to an explicit dest on page 1.
+    TspdfObj *n2 = dt_get(re, n1, "Next");
+    ASSERT(n2 != NULL && dt_str_eq(tspdf_dict_get(n2, "Title"), "NAMED2"));
+    ASSERT_EQ_SIZE(dt_dest_page(re, n2), 1);
+
+    TspdfObj *n3 = dt_get(re, n2, "Next");
+    ASSERT(n3 != NULL && dt_str_eq(tspdf_dict_get(n3, "Title"), "NAMED3"));
+    ASSERT_EQ_SIZE(dt_dest_page(re, n3), 0);
+
+    // The URI item survives a merge with its action untouched.
+    TspdfObj *n4 = dt_get(re, n3, "Next");
+    ASSERT(n4 != NULL && dt_str_eq(tspdf_dict_get(n4, "Title"), "URIITEM"));
+    TspdfObj *action = dt_get(re, n4, "A");
+    ASSERT(action != NULL && action->type == TSPDF_OBJ_DICT);
+    ASSERT(dt_str_eq(tspdf_dict_get(action, "S"), "URI"));
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(merged);
+    tspdf_reader_destroy(doc_a);
+    tspdf_reader_destroy(doc_b);
+    free(pdf_a);
+    free(pdf_b);
+}
+
+TEST(test_extract_prunes_field_kids_and_carries_da) {
+    size_t len = 0;
+    char *pdf = dt_make_field_kids_pdf(&len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(doc), 3);
+
+    // Keep page 1: the parent field survives with only the second widget
+    // (whose page is only discoverable through /Annots, it has no /P).
+    size_t pages[] = {1};
+    TspdfReader *result = tspdf_reader_extract(doc, pages, 1, &err);
+    ASSERT(result != NULL);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(result, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+
+    TspdfObj *acro = dt_catalog_get(re, "AcroForm");
+    ASSERT(acro != NULL && acro->type == TSPDF_OBJ_DICT);
+    ASSERT(dt_str_eq(tspdf_dict_get(acro, "DA"), "/Helv 0 Tf 0 g"));
+    TspdfObj *needap = tspdf_dict_get(acro, "NeedAppearances");
+    ASSERT(needap != NULL && needap->type == TSPDF_OBJ_BOOL && needap->boolean);
+
+    TspdfObj *fields = dt_get(re, acro, "Fields");
+    ASSERT(fields != NULL && fields->type == TSPDF_OBJ_ARRAY);
+    ASSERT_EQ_SIZE(fields->array.count, 1);
+    TspdfObj *parent = test_resolve_ref(re, &fields->array.items[0]);
+    ASSERT(parent != NULL);
+    ASSERT(dt_str_eq(tspdf_dict_get(parent, "T"), "parentfield"));
+    TspdfObj *kids = dt_get(re, parent, "Kids");
+    ASSERT(kids != NULL && kids->type == TSPDF_OBJ_ARRAY);
+    ASSERT_EQ_SIZE(kids->array.count, 1);
+    TspdfObj *kid = test_resolve_ref(re, &kids->array.items[0]);
+    ASSERT(kid != NULL && kid->type == TSPDF_OBJ_DICT);
+    ASSERT(dt_str_eq(tspdf_dict_get(kid, "Subtype"), "Widget"));
+
+    // The kept widget stays in its page's /Annots.
+    TspdfObj *annots = dt_get(re, re->pages.pages[0].page_dict, "Annots");
+    ASSERT(annots != NULL && annots->type == TSPDF_OBJ_ARRAY);
+    ASSERT_EQ_SIZE(annots->array.count, 1);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(result);
+
+    // Keep page 2 (no widgets anywhere): the whole field, and with it the
+    // /AcroForm, disappears.
+    size_t last[] = {2};
+    TspdfReader *none = tspdf_reader_extract(doc, last, 1, &err);
+    ASSERT(none != NULL);
+    err = tspdf_reader_save_to_memory(none, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(!bytes_contains(out, out_len, "/AcroForm"));
+    ASSERT(!bytes_contains(out, out_len, "parentfield"));
+    free(out);
+    tspdf_reader_destroy(none);
+
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
 int main(void) {
     printf("tspr reader tests:\n");
 
@@ -6964,6 +7740,17 @@ int main(void) {
     RUN(test_save_producer_is_tspdf_with_version);
     RUN(test_save_preserve_ids_producer_is_tspdf_with_version);
 
+    printf("\n  Doc trees (outlines/AcroForm across merge/extract):\n");
+    RUN(test_merge_preserves_outlines);
+    RUN(test_merge_concatenates_acroform_fields);
+    RUN(test_merge_without_doctrees_stays_clean);
+    RUN(test_extract_keeps_outline_subtree_for_kept_pages);
+    RUN(test_extract_keeps_parent_when_only_child_survives);
+    RUN(test_extract_omits_outlines_when_nothing_survives);
+    RUN(test_extract_prunes_acroform_fields_by_page);
+    RUN(test_extract_flattens_named_dests);
+    RUN(test_merge_flattens_named_dests_and_keeps_uri_actions);
+    RUN(test_extract_prunes_field_kids_and_carries_da);
 
     printf("\n%d tests, %d passed, %d failed\n",
            tests_run, tests_passed, tests_failed);
