@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}Compress PDF{% endblock %}
+{% block content %}
+<div class="tool-page">
+  <a href="/" class="back-link">&larr; All Tools</a>
+  <div class="tool-header">
+    <span class="icon">&#x1F4E6;</span>
+    <div><h1>Compress PDF</h1><p>Reduce file size by recompressing streams</p></div>
+  </div>
+  <div class="form-section">
+    <div class="drop-zone">
+      <input type="file" id="pdf_file" accept=".pdf">
+      <div class="dz-icon">&#x1F4C4;</div>
+      <p>Drop a PDF here or click to browse</p>
+      <div class="dz-hint">Single PDF file</div>
+    </div>
+  </div>
+  <div class="form-section">
+    <div class="form-row">
+      <div class="form-group">
+        <label><input type="checkbox" id="recompress" checked> Recompress Streams</label>
+        <small>Decompress and recompress all FlateDecode streams</small>
+      </div>
+      <div class="form-group">
+        <label><input type="checkbox" id="strip_unused" checked> Strip Unused Objects</label>
+        <small>Remove objects not referenced by any page</small>
+      </div>
+    </div>
+  </div>
+  <div class="actions">
+    <button class="btn btn-primary" id="btn-generate"><span class="spinner"></span>Compress PDF</button>
+  </div>
+  <div class="result-area" id="result-area">
+    <span class="result-icon">&#x2713;</span>
+    <div class="result-text"><h3>Compressed</h3><p>Your compressed PDF is ready.</p></div>
+    <a class="btn-download" id="btn-download">&darr; Download</a>
+  </div>
+  <div class="error-area" id="error-area"></div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+setupTool('compress', () => ({
+  config: {
+    recompress: document.getElementById('recompress').checked ? '1' : '0',
+    strip_unused: document.getElementById('strip_unused').checked ? '1' : '0',
+  },
+  files: { pdf_file: document.getElementById('pdf_file').files[0] }
+}));
+</script>
+{% endblock %}

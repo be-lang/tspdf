@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}QR Code PDF{% endblock %}
+{% block content %}
+<div class="tool-page">
+  <a href="/" class="back-link">&larr; All Tools</a>
+  <div class="tool-header">
+    <span class="icon">&#x1F4F1;</span>
+    <div><h1>QR Code PDF</h1><p>Generate a PDF with a scannable QR code</p></div>
+  </div>
+  <div class="form-section">
+    <div class="step-label">1. QR Code Content</div>
+    <div class="form-group">
+      <label>URL or Text to Encode</label>
+      <input type="text" id="url" placeholder="https://example.com">
+    </div>
+    <div class="form-row">
+      <div class="form-group">
+        <label>Title (optional)</label>
+        <input type="text" id="title" placeholder="Scan Me">
+      </div>
+      <div class="form-group">
+        <label>Subtitle (optional)</label>
+        <input type="text" id="subtitle" placeholder="Scan with your phone camera">
+      </div>
+    </div>
+    <div class="form-group" style="margin-top:8px">
+      <label><input type="checkbox" id="show_link" checked> Show link below QR code</label>
+    </div>
+  </div>
+  <div class="form-section">
+    <div class="step-label">2. Generate</div>
+    <div class="actions">
+      <button class="btn btn-primary" id="btn-generate"><span class="spinner"></span>Generate PDF</button>
+    </div>
+  </div>
+  <div class="result-area" id="result-area">
+    <span class="result-icon">&#x2713;</span>
+    <div class="result-text"><h3>QR Code Ready</h3><p>Your QR code PDF is ready.</p></div>
+    <a class="btn-download" id="btn-download">&darr; Download</a>
+  </div>
+  <div class="error-area" id="error-area"></div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+setupTool('qrcode', () => ({
+  config: {
+    url: document.getElementById('url').value,
+    title: document.getElementById('title').value,
+    subtitle: document.getElementById('subtitle').value,
+    show_link: document.getElementById('show_link').checked ? 'true' : 'false'
+  }
+}));
+</script>
+{% endblock %}

@@ -1,0 +1,15 @@
+# libFuzzer / AFL run artifacts — keep the hand-picked seed corpus, ignore
+# everything the fuzzer generates at runtime so a `make fuzz` run never leaves
+# thousands of mutated inputs staged for commit.
+
+# Crash / leak / timeout / OOM reproducers dropped in the run directory.
+crash-*
+leak-*
+oom-*
+timeout-*
+
+# Coverage-increasing units libFuzzer appends to the corpus dir are named by the
+# 40-char SHA-1 of their contents. Ignore those, but keep our descriptive seeds
+# (hello.zlib, minimal.ttf, sample.png, *.pdf reader fixtures copied by the
+# fuzz-corpus target).
+corpus/*/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]

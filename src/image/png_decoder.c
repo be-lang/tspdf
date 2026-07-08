@@ -1,0 +1,282 @@
+#include "png_decoder.h"
+#include "../compress/deflate.h"
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+// PNG file format: signature + chunks (IHDR, IDAT*, IEND)
+// IDAT contains zlib-compressed filtered scanlines
+
+static uint32_t read_u32_be(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | p[3];
+}
+
+static const uint8_t PNG_SIG[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+
+// PNG filter types
+#define FILTER_NONE    0
+#define FILTER_SUB     1
+#define FILTER_UP      2
+#define FILTER_AVERAGE 3
+#define FILTER_PAETH   4
+
+static int paeth_predictor(int a, int b, int c) {
+    int p = a + b - c;
+    int pa = abs(p - a);
+    int pb = abs(p - b);
+    int pc = abs(p - c);
+    if (pa <= pb && pa <= pc) return a;
+    if (pb <= pc) return b;
+    return c;
+}
+
+bool png_image_load(const char *path, PngImage *img) {
+    if (!path || !img) return false;
+    memset(img, 0, sizeof(*img));
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+
+    // Read entire file
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (file_size < 8) { fclose(f); return false; }
+
+    uint8_t *file_data = (uint8_t *)malloc(file_size);
+    if (!file_data) { fclose(f); return false; }
+    if (fread(file_data, 1, file_size, f) != (size_t)file_size) {
+        free(file_data);
+        fclose(f);
+        return false;
+    }
+    fclose(f);
+
+    // Decode the in-memory bytes; png_image_load_mem only reads file_data, so we
+    // remain responsible for freeing the buffer we allocated here.
+    bool ok = png_image_load_mem(file_data, (size_t)file_size, img);
+    free(file_data);
+    return ok;
+}
+
+bool png_image_load_mem(const uint8_t *file_data, size_t data_len, PngImage *img) {
+    if (!file_data || !img) return false;
+    memset(img, 0, sizeof(*img));
+
+    // The signature (8) + IHDR length/tag/data/CRC (4+4+13+4) is the minimum a
+    // valid PNG can be; bail before any read past the buffer.
+    if (data_len < 33) return false;
+    size_t file_size = data_len;
+
+    // Check PNG signature
+    if (memcmp(file_data, PNG_SIG, 8) != 0) {
+        return false;
+    }
+
+    // Parse IHDR
+    size_t pos = 8;
+    uint32_t ihdr_len = read_u32_be(file_data + pos);
+    if (memcmp(file_data + pos + 4, "IHDR", 4) != 0 || ihdr_len != 13) {
+        return false;
+    }
+    const uint8_t *ihdr = file_data + pos + 8;
+    uint32_t width_u = read_u32_be(ihdr);
+    uint32_t height_u = read_u32_be(ihdr + 4);
+    if (width_u == 0u || height_u == 0u) {
+        return false;
+    }
+    if (width_u > (uint32_t)INT_MAX || height_u > (uint32_t)INT_MAX) {
+        return false;
+    }
+    // Reject absurd dimensions up front. INT_MAX-sized axes pass the SIZE_MAX
+    // multiply guards below on a 64-bit host yet would still demand gigabytes of
+    // RAM, so a sane cap is the real defence against a tiny malformed IHDR
+    // triggering a huge allocation. See TSPDF_PNG_MAX_DIMENSION in the header.
+    if (width_u > TSPDF_PNG_MAX_DIMENSION || height_u > TSPDF_PNG_MAX_DIMENSION) {
+        return false;
+    }
+    img->width = (int)width_u;
+    img->height = (int)height_u;
+    img->bit_depth = ihdr[8];
+    int color_type = ihdr[9];
+    int compression = ihdr[10];
+    int filter_method = ihdr[11];
+    int interlace = ihdr[12];
+
+    if (compression != 0 || filter_method != 0 || interlace != 0) {
+        // Only support standard non-interlaced PNG
+        return false;
+    }
+
+    // Determine bytes per pixel
+    int bpp;
+    switch (color_type) {
+        case 0: bpp = 1; img->channels = 1; break;  // grayscale
+        case 2: bpp = 3; img->channels = 3; break;  // RGB
+        case 4: bpp = 2; img->channels = 2; break;  // grayscale + alpha
+        case 6: bpp = 4; img->channels = 4; break;  // RGBA
+        default:
+            return false;  // indexed/palette not supported yet
+    }
+
+    // Only support 8-bit depth for now
+    if (img->bit_depth != 8) {
+        return false;
+    }
+
+    // Collect all IDAT chunks (only count bytes from chunks that fully fit in the file)
+    size_t idat_total = 0;
+    pos = 8;
+    while (pos + 12 <= file_size) {
+        uint32_t chunk_len = read_u32_be(file_data + pos);
+        if (chunk_len > file_size - pos - 12) break;
+        if (memcmp(file_data + pos + 4, "IDAT", 4) == 0) {
+            size_t add = (size_t)chunk_len;
+            if (idat_total > SIZE_MAX - add) {
+                return false;
+            }
+            idat_total += add;
+        }
+        pos += 12 + chunk_len;
+    }
+
+    uint8_t *idat_data = (uint8_t *)malloc(idat_total);
+    if (!idat_data && idat_total > 0) { return false; }
+
+    size_t idat_pos = 0;
+    pos = 8;
+    while (pos + 12 <= file_size) {
+        uint32_t chunk_len = read_u32_be(file_data + pos);
+        if (chunk_len > file_size - pos - 12) break;
+        if (memcmp(file_data + pos + 4, "IDAT", 4) == 0) {
+            memcpy(idat_data + idat_pos, file_data + pos + 8, chunk_len);
+            idat_pos += chunk_len;
+        }
+        pos += 12 + chunk_len;
+    }
+
+    if (idat_pos != idat_total) { free(idat_data); return false; }
+
+    // Decompress IDAT data (zlib/deflate)
+    size_t raw_len = 0;
+    uint8_t *raw = deflate_decompress(idat_data, idat_total, &raw_len);
+    free(idat_data);
+
+    if (!raw) return false;
+
+    // Expected raw size: (1 + width*bpp) * height (1 filter byte per row)
+    size_t bpp_sz = (size_t)bpp;
+    if ((uint32_t)img->width > SIZE_MAX / bpp_sz) {
+        free(raw);
+        return false;
+    }
+    size_t stride = (size_t)img->width * bpp_sz;
+    if ((size_t)img->height > SIZE_MAX / (stride + 1u)) {
+        free(raw);
+        return false;
+    }
+    size_t expected = (stride + 1u) * (size_t)img->height;
+    if (raw_len != expected) {
+        free(raw);
+        return false;
+    }
+
+    // Allocate output pixels (always RGB or RGBA, 3 or 4 channels)
+    int out_channels = (color_type == 4 || color_type == 6) ? 4 : 3;
+    img->channels = out_channels;
+    size_t oc = (size_t)out_channels;
+    size_t w = (size_t)img->width;
+    size_t h = (size_t)img->height;
+    if (h > 0 && w > SIZE_MAX / h) {
+        free(raw);
+        return false;
+    }
+    size_t npx = w * h;
+    if (oc > 0 && npx > SIZE_MAX / oc) {
+        free(raw);
+        return false;
+    }
+    size_t pix_bytes = npx * oc;
+    img->pixels = (uint8_t *)malloc(pix_bytes);
+    if (!img->pixels) { free(raw); return false; }
+
+    // Unfilter scanlines
+    uint8_t *prev_row = (uint8_t *)calloc(stride, 1);
+    uint8_t *cur_row = (uint8_t *)malloc(stride);
+    if (!prev_row || !cur_row) {
+        free(prev_row); free(cur_row); free(raw); free(img->pixels);
+        img->pixels = NULL;
+        return false;
+    }
+
+    for (int y = 0; y < img->height; y++) {
+        size_t row_offset = (size_t)y * (stride + 1);
+        uint8_t filter_type = raw[row_offset];
+        const uint8_t *src = raw + row_offset + 1;
+        memcpy(cur_row, src, stride);
+
+        // Apply inverse filter
+        for (size_t x = 0; x < stride; x++) {
+            uint8_t a = (x >= (size_t)bpp) ? cur_row[x - bpp] : 0;
+            uint8_t b = prev_row[x];
+            uint8_t c = (x >= (size_t)bpp) ? prev_row[x - bpp] : 0;
+
+            switch (filter_type) {
+                case FILTER_NONE:    break;
+                case FILTER_SUB:     cur_row[x] += a; break;
+                case FILTER_UP:      cur_row[x] += b; break;
+                case FILTER_AVERAGE: cur_row[x] += (uint8_t)((a + b) / 2); break;
+                case FILTER_PAETH:   cur_row[x] += (uint8_t)paeth_predictor(a, b, c); break;
+                default: free(raw); free(prev_row); free(cur_row); free(img->pixels);
+                         img->pixels = NULL; return false;
+            }
+        }
+
+        // Convert to output format. Use size_t for the row-offset arithmetic so
+        // the product cannot overflow int, even though pix_bytes above already
+        // bounds it; this keeps the index math well-defined for any valid image.
+        uint8_t *out = img->pixels + (size_t)y * (size_t)img->width * (size_t)out_channels;
+        for (int x = 0; x < img->width; x++) {
+            switch (color_type) {
+                case 0:  // grayscale → RGB
+                    out[x * 3 + 0] = cur_row[x];
+                    out[x * 3 + 1] = cur_row[x];
+                    out[x * 3 + 2] = cur_row[x];
+                    break;
+                case 2:  // RGB → RGB
+                    out[x * 3 + 0] = cur_row[x * 3 + 0];
+                    out[x * 3 + 1] = cur_row[x * 3 + 1];
+                    out[x * 3 + 2] = cur_row[x * 3 + 2];
+                    break;
+                case 4:  // gray+alpha → RGBA
+                    out[x * 4 + 0] = cur_row[x * 2 + 0];
+                    out[x * 4 + 1] = cur_row[x * 2 + 0];
+                    out[x * 4 + 2] = cur_row[x * 2 + 0];
+                    out[x * 4 + 3] = cur_row[x * 2 + 1];
+                    break;
+                case 6:  // RGBA → RGBA
+                    out[x * 4 + 0] = cur_row[x * 4 + 0];
+                    out[x * 4 + 1] = cur_row[x * 4 + 1];
+                    out[x * 4 + 2] = cur_row[x * 4 + 2];
+                    out[x * 4 + 3] = cur_row[x * 4 + 3];
+                    break;
+            }
+        }
+
+        memcpy(prev_row, cur_row, stride);
+    }
+
+    free(raw);
+    free(prev_row);
+    free(cur_row);
+    img->bit_depth = 8;
+    return true;
+}
+
+void png_image_free(PngImage *img) {
+    free(img->pixels);
+    img->pixels = NULL;
+}

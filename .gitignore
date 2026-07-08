@@ -1,0 +1,22 @@
+.worktrees/
+build/
+*.o
+*.pdf
+!tests/data/*.pdf
+.claude/
+docs/wasm-demo/
+.superpowers/
+docs/superpowers/
+
+# Build/library artifacts (static + shared) and generated pkg-config
+*.a
+*.so
+*.dylib
+/tspdf.pc
+output.pdf
+
+# Local install staging / relocatability test dirs
+/stage/
+/dist/
+/tmp/
+

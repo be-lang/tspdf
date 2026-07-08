@@ -1,0 +1,146 @@
+name: CI
+
+# Build and test on every push and pull request. This workflow enforces a
+# zero-warning, all-green state across the Linux and macOS toolchains.
+#
+# Zero-dependency identity: only the system compiler + make are used to build
+# and test. No third-party actions beyond actions/checkout, and the only
+# packages installed are a C compiler (already present on the runners) and the
+# Liberation fonts so the TTF subsetting / Unicode tests actually execute
+# instead of silently skipping. The shipped binary still has no dependencies.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }} / ${{ matrix.cc }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        cc: [gcc, clang]
+    env:
+      CC: ${{ matrix.cc }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Install Liberation fonts and link them to the path the TTF tests probe
+      # (tests/test_main.c hardcodes /usr/share/fonts/liberation/...). Without
+      # this the font-dependent tests `return` early and report a silent PASS.
+      - name: Install Liberation fonts (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fonts-liberation
+          sudo mkdir -p /usr/share/fonts/liberation
+          for f in /usr/share/fonts/truetype/liberation/*.ttf; do
+            sudo ln -sf "$f" "/usr/share/fonts/liberation/$(basename "$f")"
+          done
+          ls -l /usr/share/fonts/liberation/
+
+      - name: Install Liberation fonts (macOS)
+        if: runner.os == 'macOS'
+        # Best-effort only: modern macOS runners mount /usr/share on a read-only
+        # system volume, so the fonts often cannot be linked to the path the
+        # tests probe. That is fine — the TTF/Unicode tests skip cleanly when the
+        # fonts are absent, so nothing here may fail the build/test job.
+        continue-on-error: true
+        run: |
+          set +e
+          brew install --cask font-liberation || true
+          sudo mkdir -p /usr/share/fonts/liberation
+          # Homebrew drops the fonts under the user font dir; link them to the
+          # path the tests expect so the TTF/Unicode path runs on macOS too.
+          found=0
+          for dir in "$HOME/Library/Fonts" /Library/Fonts; do
+            for f in "$dir"/LiberationSans-Regular.ttf "$dir"/Liberation*.ttf; do
+              if [ -f "$f" ]; then
+                sudo ln -sf "$f" "/usr/share/fonts/liberation/$(basename "$f")"
+                found=1
+              fi
+            done
+          done
+          ls -l /usr/share/fonts/liberation/ || true
+          if [ "$found" -eq 0 ]; then
+            echo "::warning::Liberation fonts not found; TTF tests will skip"
+          fi
+
+      - name: Print toolchain versions
+        run: |
+          ${CC} --version
+          make --version
+
+      # `make check` does a clean -Werror rebuild of the CLI + library and runs
+      # the full suite (unit + reader + crypto + CLI), locking the zero-warning
+      # invariant and proving the all-green state on this OS/compiler.
+      - name: Build and test (-Werror gate)
+        run: make check
+
+      - name: Verify static library + asset embedding
+        run: |
+          make clean
+          make lib
+          test -f build/libtspdf.a
+
+  sanitizers:
+    name: ASan + UBSan + Leak
+    runs-on: ubuntu-latest
+    env:
+      CC: gcc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Liberation fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fonts-liberation
+          sudo mkdir -p /usr/share/fonts/liberation
+          for f in /usr/share/fonts/truetype/liberation/*.ttf; do
+            sudo ln -sf "$f" "/usr/share/fonts/liberation/$(basename "$f")"
+          done
+
+      # The two sanitizer targets each do their own clean rebuild with
+      # -fsanitize=address,undefined and leak detection, so any out-of-bounds
+      # access, undefined behavior, or leak fails the job.
+      - name: Sanitize writer/crypto suite
+        run: make test-asan
+
+      - name: Sanitize reader/parser suite
+        run: make test-asan-reader
+
+  conformance:
+    name: PDF conformance (qpdf + mutool)
+    runs-on: ubuntu-latest
+    env:
+      CC: gcc
+    steps:
+      - uses: actions/checkout@v4
+
+      # External validators are installed at TEST TIME ONLY — the shipped tspdf
+      # binary stays zero-dependency. This turns "our output is spec-valid and
+      # openable by real readers" from a claim into an enforced gate.
+      - name: Install qpdf + mupdf-tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qpdf mupdf-tools
+          qpdf --version
+          mutool -v 2>&1 | head -1 || true
+
+      # Builds the CLI (default CFLAGS) and runs every command + reader
+      # round-trip through qpdf --check / mutool. Writer output is validated
+      # strictly; reader-re-serialized output is gated on backlog T19 (the
+      # /TspdfSize -> /Size trailer fix) and auto-activates once that lands.
+      - name: Run external conformance gate
+        run: make test-external

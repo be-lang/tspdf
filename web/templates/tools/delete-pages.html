@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Delete Pages{% endblock %}
+{% block content %}
+<div class="tool-page">
+  <a href="/" class="back-link">&larr; All Tools</a>
+  <div class="tool-header">
+    <span class="icon">&#x1F5D1;&#xFE0F;</span>
+    <div><h1>Delete Pages</h1><p>Remove specific pages from a PDF</p></div>
+  </div>
+  <div class="form-section">
+    <div class="drop-zone">
+      <input type="file" id="pdf_file" accept=".pdf">
+      <div class="dz-icon">&#x1F4C4;</div>
+      <p>Drop a PDF here or click to browse</p>
+      <div class="dz-hint">Single PDF file</div>
+    </div>
+  </div>
+  <div class="form-section">
+    <div class="form-group">
+      <label>Pages to Delete</label>
+      <input type="text" id="pages" placeholder="2,5,8">
+      <small>Enter page numbers to remove, separated by commas</small>
+    </div>
+  </div>
+  <div class="actions">
+    <button class="btn btn-primary" id="btn-generate"><span class="spinner"></span>Delete Pages</button>
+  </div>
+  <div class="result-area" id="result-area">
+    <span class="result-icon">&#x2713;</span>
+    <div class="result-text"><h3>Ready</h3><p>Pages removed. Your PDF is ready.</p></div>
+    <a class="btn-download" id="btn-download">&darr; Download</a>
+  </div>
+  <div class="error-area" id="error-area"></div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+setupTool('delete-pages', () => ({
+  config: { pages: document.getElementById('pages').value },
+  files: { pdf_file: document.getElementById('pdf_file').files[0] }
+}));
+</script>
+{% endblock %}

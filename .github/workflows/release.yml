@@ -1,0 +1,79 @@
+# Builds release binaries when a v* tag is pushed and attaches them to a GitHub
+# Release. Zero-dependency identity is preserved: only the system compiler +
+# make are used to build; no third-party build actions.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux-x86_64
+          - os: macos-latest
+            label: macos-arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (release)
+        run: |
+          make clean
+          make CFLAGS="-Wall -Wextra -std=c11 -O2"
+          ./build/tspdf --version
+
+      - name: Smoke test
+        run: |
+          ./build/tspdf merge tests/data/one_page.pdf tests/data/three_pages.pdf -o /tmp/merged.pdf
+          ./build/tspdf info /tmp/merged.pdf
+
+      - name: Package
+        run: |
+          ver="${GITHUB_REF_NAME}"
+          dist="tspdf-${ver}-${{ matrix.label }}"
+          mkdir -p "$dist"
+          cp build/tspdf "$dist/"
+          cp README.md LICENSE CHANGELOG.md "$dist/"
+          tar -czf "${dist}.tar.gz" "$dist"
+          sha256sum "${dist}.tar.gz" > "${dist}.tar.gz.sha256" 2>/dev/null \
+            || shasum -a 256 "${dist}.tar.gz" > "${dist}.tar.gz.sha256"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tspdf-${{ matrix.label }}
+          path: |
+            tspdf-*.tar.gz
+            tspdf-*.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/tspdf-*.tar.gz
+            dist/tspdf-*.tar.gz.sha256
+          generate_release_notes: true
+          body: |
+            See [CHANGELOG.md](https://github.com/be-lang/tspdf/blob/main/CHANGELOG.md) for details.

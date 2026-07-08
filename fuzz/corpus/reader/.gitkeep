@@ -1,0 +1,4 @@
+# Reader seed corpus is populated at run time by `make fuzz-corpus`, which copies
+# the synthetic fixtures from tests/data/*.pdf here. Those *.pdf files are
+# gitignored (regenerated on demand), so this placeholder keeps the directory
+# present in the repository.

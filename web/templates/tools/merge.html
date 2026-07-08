@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}Merge PDFs{% endblock %}
+{% block content %}
+<div class="tool-page">
+  <a href="/" class="back-link">&larr; All Tools</a>
+  <div class="tool-header">
+    <span class="icon">&#x1F517;</span>
+    <div><h1>Merge PDFs</h1><p>Combine multiple PDF files into one</p></div>
+  </div>
+  <div class="form-section">
+    <div class="drop-zone">
+      <input type="file" id="pdf_files" accept=".pdf" multiple>
+      <div class="dz-icon">&#x1F4C4;</div>
+      <p>Drop PDF files here or click to browse</p>
+      <div class="dz-hint">Select 2 or more files</div>
+    </div>
+    <div id="file-list" style="margin-top:8px; color:var(--text-muted); font-size:11px;"></div>
+  </div>
+  <div class="actions">
+    <button class="btn btn-primary" id="btn-generate"><span class="spinner"></span>Merge PDFs</button>
+  </div>
+  <div class="result-area" id="result-area">
+    <span class="result-icon">&#x2713;</span>
+    <div class="result-text"><h3>Ready</h3><p>Your merged PDF is ready.</p></div>
+    <a class="btn-download" id="btn-download">&darr; Download</a>
+  </div>
+  <div class="error-area" id="error-area"></div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+document.getElementById('pdf_files').addEventListener('change', function() {
+  const list = document.getElementById('file-list');
+  if (this.files.length) {
+    list.textContent = Array.from(this.files).map(f => f.name).join(', ');
+  } else {
+    list.textContent = '';
+  }
+});
+
+setupTool('merge', () => ({
+  config: {},
+  files: (() => {
+    const files = {};
+    const input = document.getElementById('pdf_files');
+    for (let i = 0; i < input.files.length; i++) {
+      files[`pdf_file_${i}`] = input.files[i];
+    }
+    return Object.keys(files).length >= 2 ? files : null;
+  })()
+}));
+</script>
+{% endblock %}
