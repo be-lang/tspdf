@@ -92,6 +92,7 @@ CLI_SOURCES = \
 	cli/cmd_img2pdf.c \
 	cli/cmd_qrcode.c \
 	cli/cmd_md2pdf.c \
+	cli/cmd_pagenum.c \
 	cli/server.c
 
 CLI_TARGET = $(BUILDDIR)/tspdf

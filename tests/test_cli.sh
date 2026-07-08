@@ -1105,6 +1105,55 @@ run_test "split rejects --burst combined with --pages" bash -c "
 
 run_test "split help mentions --burst" bash -c "$TSPDF split --help | grep -q -- '--burst'"
 
+# pagenum: stamp page numbers via the overlay API.
+run_test "pagenum stamps default numbers" bash -c "
+  set -e
+  $TSPDF pagenum $INPUT -o $TMPDIR/pn.pdf > /dev/null
+  $TSPDF info $TMPDIR/pn.pdf | grep -q 'Pages:[[:space:]]*3'"
+
+if command -v qpdf > /dev/null 2>&1; then
+  run_test "pagenum content streams carry the numbers" bash -c "
+    set -e
+    qpdf --qdf --object-streams=disable $TMPDIR/pn.pdf $TMPDIR/pn.qdf
+    grep -q '(1)' $TMPDIR/pn.qdf
+    grep -q '(2)' $TMPDIR/pn.qdf
+    grep -q '(3)' $TMPDIR/pn.qdf"
+
+  run_test "pagenum honors --format with page and total" bash -c "
+    set -e
+    $TSPDF pagenum $INPUT -o $TMPDIR/pnfmt.pdf --format 'Page %d of %d' > /dev/null
+    qpdf --qdf --object-streams=disable $TMPDIR/pnfmt.pdf $TMPDIR/pnfmt.qdf
+    grep -q '(Page 2 of 3)' $TMPDIR/pnfmt.qdf"
+
+  run_test "pagenum --start offsets numbers and total" bash -c "
+    set -e
+    $TSPDF pagenum $INPUT -o $TMPDIR/pnstart.pdf --format '%d/%d' --start 10 > /dev/null
+    qpdf --qdf --object-streams=disable $TMPDIR/pnstart.pdf $TMPDIR/pnstart.qdf
+    grep -q '(10/12)' $TMPDIR/pnstart.qdf
+    grep -q '(12/12)' $TMPDIR/pnstart.qdf"
+
+  run_test "pagenum output passes qpdf --check" qpdf --check $TMPDIR/pn.pdf
+else
+  echo "  SKIP  pagenum content assertions (qpdf not found)"
+fi
+
+# Format string is printf-adjacent: only plain %d (max two) and %% may appear.
+run_test "pagenum rejects %s in --format" bash -c "
+  ! $TSPDF pagenum $INPUT -o $TMPDIR/pnbad.pdf --format '%s' 2>/dev/null"
+
+run_test "pagenum rejects three %d in --format" bash -c "
+  ! $TSPDF pagenum $INPUT -o $TMPDIR/pnbad.pdf --format '%d %d %d' 2>/dev/null"
+
+run_test "pagenum rejects width-flagged %5d in --format" bash -c "
+  ! $TSPDF pagenum $INPUT -o $TMPDIR/pnbad.pdf --format '%5d' 2>/dev/null"
+
+run_test "pagenum rejects invalid --position" bash -c "
+  ! $TSPDF pagenum $INPUT -o $TMPDIR/pnbad.pdf --position middle 2>/dev/null"
+
+run_test "pagenum accepts top-right position and custom size" $TSPDF pagenum $INPUT -o $TMPDIR/pntr.pdf --position top-right --font-size 8
+
+run_test "help pagenum shows command-specific usage" bash -c "$TSPDF help pagenum 2>/dev/null | grep -q 'Usage: tspdf pagenum'"
+
 echo ""
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ] || exit 1

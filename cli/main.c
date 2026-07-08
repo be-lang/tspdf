@@ -25,6 +25,7 @@ static void print_usage(void) {
     printf("  qrcode     Generate a QR code PDF\n");
     printf("  md2pdf     Convert Markdown to a styled PDF\n");
     printf("  serve      Start a local web server for PDF tools\n");
+    printf("  pagenum    Stamp page numbers onto a PDF\n");
     printf("\n");
     printf("Options:\n");
     printf("  --help, -h     Show this help message\n");
@@ -179,10 +180,27 @@ static void print_command_help(const char *cmd) {
         printf("  <input.md>       Input Markdown file\n");
         printf("  -o <output.pdf>  Output file path (required)\n");
     } else if (strcmp(cmd, "serve") == 0) {
-        printf("Usage: tspdf serve [--port <port>]\n");
+        printf("Usage: tspdf serve [--port <port>] [--bind <addr>]\n");
         printf("\n");
         printf("Start a local web server for PDF tools.\n");
-        printf("Default port: 8080\n");
+        printf("Default port: 8080, default bind address: 127.0.0.1\n");
+        printf("Binding a non-loopback address exposes the unauthenticated UI\n");
+        printf("to the network; a warning is printed.\n");
+    } else if (strcmp(cmd, "pagenum") == 0) {
+        printf("Usage: tspdf pagenum <input.pdf> -o <output.pdf> [--format \"%%d / %%d\"]\n");
+        printf("                     [--position <pos>] [--start N] [--font-size N]\n");
+        printf("\n");
+        printf("Stamp a page number on every page of a PDF.\n");
+        printf("\n");
+        printf("Arguments:\n");
+        printf("  <input.pdf>        Input PDF file\n");
+        printf("  --format <fmt>     Label format; up to two %%d (page number, total).\n");
+        printf("                     Default: \"%%d\"\n");
+        printf("  --position <pos>   bottom-center (default), bottom-left, bottom-right,\n");
+        printf("                     top-center, top-left, top-right\n");
+        printf("  --start N          Number of the first page (default: 1)\n");
+        printf("  --font-size N      Font size in points (default: 10)\n");
+        printf("  -o <output.pdf>    Output file path (required)\n");
     } else {
         /* Unknown command — fall back to general help */
         print_usage();
@@ -237,6 +255,7 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "qrcode") == 0)   return cmd_qrcode(sub_argc, sub_argv);
     if (strcmp(cmd, "md2pdf") == 0)   return cmd_md2pdf(sub_argc, sub_argv);
     if (strcmp(cmd, "serve") == 0)   return cmd_serve(sub_argc, sub_argv);
+    if (strcmp(cmd, "pagenum") == 0)  return cmd_pagenum(sub_argc, sub_argv);
 
     fprintf(stderr, "tspdf: unknown command '%s'\n\n", cmd);
     print_usage();
