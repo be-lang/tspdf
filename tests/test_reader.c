@@ -6742,6 +6742,385 @@ TEST(test_save_preserve_ids_producer_is_tspdf_with_version) {
     tspdf_reader_destroy(doc);
 }
 
+// --- Text extraction (tspdf_reader_page_text) ---
+
+#include "../src/reader/tspr_text.h"
+
+// One-page PDF for text-extraction tests. `resources` is the page /Resources
+// dict body; obj 4 is the /F1 font dict (`font_body`); obj 5 is an optional
+// auxiliary object: a stream when aux_data != NULL (dict body `aux_dict`,
+// /Length computed here), else a plain object with body `aux_dict`, else
+// null. Obj 6 is the page content stream built from `content`.
+static char *make_text_pdf_full(const char *resources, const char *font_body,
+                                const char *aux_dict, const char *aux_data,
+                                const char *content, size_t *out_len) {
+    size_t cap = 8192 + strlen(content) + (aux_data ? strlen(aux_data) : 0);
+    char *pdf = (char *)malloc(cap);
+    if (!pdf) return NULL;
+    size_t pos = 0;
+    if (!appendf(pdf, cap, &pos, "%%PDF-1.4\n")) goto fail;
+    size_t obj1 = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")) goto fail;
+    size_t obj2 = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")) goto fail;
+    size_t obj3 = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                 "/Resources %s /Contents 6 0 R >>\nendobj\n", resources)) goto fail;
+    size_t obj4 = pos;
+    if (!appendf(pdf, cap, &pos, "4 0 obj\n%s\nendobj\n",
+                 font_body ? font_body : "null")) goto fail;
+    size_t obj5 = pos;
+    if (aux_data) {
+        if (!appendf(pdf, cap, &pos,
+                     "5 0 obj\n<< %s /Length %zu >>\nstream\n%s\nendstream\nendobj\n",
+                     aux_dict ? aux_dict : "", strlen(aux_data), aux_data)) goto fail;
+    } else {
+        if (!appendf(pdf, cap, &pos, "5 0 obj\n%s\nendobj\n",
+                     aux_dict ? aux_dict : "null")) goto fail;
+    }
+    size_t obj6 = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "6 0 obj\n<< /Length %zu >>\nstream\n%s\nendstream\nendobj\n",
+                 strlen(content), content)) goto fail;
+    size_t xref = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "xref\n"
+                 "0 7\n"
+                 "0000000000 65535 f \n"
+                 "%010zu 00000 n \n"
+                 "%010zu 00000 n \n"
+                 "%010zu 00000 n \n"
+                 "%010zu 00000 n \n"
+                 "%010zu 00000 n \n"
+                 "%010zu 00000 n \n"
+                 "trailer\n<< /Size 7 /Root 1 0 R >>\n"
+                 "startxref\n%zu\n%%%%EOF",
+                 obj1, obj2, obj3, obj4, obj5, obj6, xref)) goto fail;
+    *out_len = pos;
+    return pdf;
+fail:
+    free(pdf);
+    return NULL;
+}
+
+#define TEXT_HELV_FONT \
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+#define TEXT_HELV_RES "<< /Font << /F1 4 0 R >> >>"
+
+static char *make_text_pdf(const char *font_body, const char *content, size_t *out_len) {
+    return make_text_pdf_full(TEXT_HELV_RES, font_body, NULL, NULL, content, out_len);
+}
+
+TEST(test_text_simple_lines_writer_fixture) {
+    // Writer-generated ground truth: two lines with WinAnsi umlauts/dash.
+    TspdfWriter *w = tspdf_writer_create();
+    const char *font = tspdf_writer_add_builtin_font(w, "Helvetica");
+    TspdfStream *page = tspdf_writer_add_page(w);
+    tspdf_stream_begin_text(page);
+    tspdf_stream_set_font(page, font, 12.0);
+    tspdf_stream_text_position(page, 72, 720);
+    tspdf_stream_show_text(page, "Hello World");
+    tspdf_stream_text_position(page, 0, -14);
+    tspdf_stream_show_text(page, "Gr\xfc\xdf" "e \x96 Umlaute");  // cp1252 bytes
+    tspdf_stream_end_text(page);
+    uint8_t *pdf = NULL;
+    size_t len = 0;
+    ASSERT_EQ_INT(tspdf_writer_save_to_memory(w, &pdf, &len), TSPDF_OK);
+    tspdf_writer_destroy(w);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open(pdf, len, &err);
+    ASSERT(doc != NULL);
+    const char *text = tspdf_reader_page_text(doc, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT_EQ_STR(text, "Hello World\nGr\xc3\xbc\xc3\x9f" "e \xe2\x80\x93 Umlaute\n");
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_text_tj_kerning_spacing) {
+    // Kerning tweaks (-30) must not create spaces; word gaps (-300) must.
+    size_t len = 0;
+    char *pdf = make_text_pdf(TEXT_HELV_FONT,
+        "BT /F1 12 Tf 72 700 Td [(Hel) -30 (lo) -300 (world)] TJ ET", &len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    const char *text = tspdf_reader_page_text(doc, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT_EQ_STR(text, "Hello world\n");
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_text_multiline_td_tstar) {
+    size_t len = 0;
+    char *pdf = make_text_pdf(TEXT_HELV_FONT,
+        "BT /F1 12 Tf 14 TL 72 700 Td (Line one) Tj T* (Line two) Tj "
+        "0 -20 Td (Line three) Tj ET", &len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    const char *text = tspdf_reader_page_text(doc, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT_EQ_STR(text, "Line one\nLine two\nLine three\n");
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_text_xgap_emits_space) {
+    // Two runs on one baseline with a large x-gap: joined by a space,
+    // not a newline.
+    size_t len = 0;
+    char *pdf = make_text_pdf(TEXT_HELV_FONT,
+        "BT /F1 12 Tf 72 700 Td (Left) Tj ET "
+        "BT /F1 12 Tf 200 700 Td (Right) Tj ET", &len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    const char *text = tspdf_reader_page_text(doc, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT_EQ_STR(text, "Left Right\n");
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_text_tounicode_bfchar_bfrange) {
+    // ToUnicode beats /Encoding: bfchar (incl. multi-unit ligature target),
+    // offset-form bfrange, and array-form bfrange.
+    size_t len = 0;
+    char *pdf = make_text_pdf_full(TEXT_HELV_RES,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
+        "/Encoding /WinAnsiEncoding /ToUnicode 5 0 R >>",
+        "",
+        "/CIDInit /ProcSet findresource begin\n"
+        "12 dict begin\n"
+        "begincmap\n"
+        "1 begincodespacerange\n<00> <FF>\nendcodespacerange\n"
+        "2 beginbfchar\n"
+        "<44> <00660069>\n"
+        "<45> <20AC>\n"
+        "endbfchar\n"
+        "2 beginbfrange\n"
+        "<41> <43> <0391>\n"
+        "<50> <51> [<0058> <0059>]\n"
+        "endbfrange\n"
+        "endcmap\nend\nend",
+        "BT /F1 12 Tf 72 700 Td (ABCDE) Tj (PQ) Tj ET", &len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    const char *text = tspdf_reader_page_text(doc, 0, &err);
+    ASSERT(text != NULL);
+    // A->Α B->Β C->Γ D->fi E->€ P->X Q->Y
+    ASSERT_EQ_STR(text, "\xce\x91\xce\x92\xce\x93" "fi" "\xe2\x82\xac" "XY\n");
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_text_differences_encoding) {
+    // /Differences over WinAnsi, glyph names resolved via the AGL subset.
+    size_t len = 0;
+    char *pdf = make_text_pdf(
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
+        "/Encoding << /BaseEncoding /WinAnsiEncoding "
+        "/Differences [65 /adieresis /germandbls 97 /Euro] >> >>",
+        "BT /F1 12 Tf 72 700 Td (ABa) Tj ET", &len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    const char *text = tspdf_reader_page_text(doc, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT_EQ_STR(text, "\xc3\xa4\xc3\x9f\xe2\x82\xac\n");
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_text_form_xobject_recursion) {
+    size_t len = 0;
+    char *pdf = make_text_pdf_full(
+        "<< /Font << /F1 4 0 R >> /XObject << /Fx 5 0 R >> >>",
+        TEXT_HELV_FONT,
+        "/Type /XObject /Subtype /Form /BBox [0 0 200 200] "
+        "/Resources << /Font << /F1 4 0 R >> >>",
+        "BT /F1 12 Tf 10 100 Td (Inside form) Tj ET",
+        "BT /F1 12 Tf 72 700 Td (Before) Tj ET "
+        "q 1 0 0 1 50 50 cm /Fx Do Q "
+        "BT /F1 12 Tf 72 600 Td (After) Tj ET", &len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    const char *text = tspdf_reader_page_text(doc, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT_EQ_STR(text, "Before\nInside form\nAfter\n");
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_text_form_xobject_self_cycle_guarded) {
+    // A form that draws itself must terminate via the cycle guard/depth cap.
+    size_t len = 0;
+    char *pdf = make_text_pdf_full(
+        "<< /Font << /F1 4 0 R >> /XObject << /Fx 5 0 R >> >>",
+        TEXT_HELV_FONT,
+        "/Type /XObject /Subtype /Form /BBox [0 0 200 200] "
+        "/Resources << /Font << /F1 4 0 R >> /XObject << /Fx 5 0 R >> >>",
+        "BT /F1 12 Tf 10 100 Td (Loop) Tj ET /Fx Do",
+        "/Fx Do", &len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    const char *text = tspdf_reader_page_text(doc, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT(strstr(text, "Loop") != NULL);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_text_identity_h_ttf_tounicode) {
+    // The writer's own TTF path (CIDFontType2 + Identity-H + ToUnicode) must
+    // round-trip UTF-8 text through 2-byte glyph codes.
+    TspdfWriter *w = tspdf_writer_create();
+    const char *fname = tspdf_writer_add_ttf_font(w,
+        "/usr/share/fonts/liberation/LiberationSans-Regular.ttf");
+    if (!fname) {
+        tspdf_writer_destroy(w);
+        SKIP("LiberationSans-Regular.ttf not installed");
+    }
+    TTF_Font *ttf = tspdf_writer_get_ttf(w, fname);
+    TspdfFont *pdf_font = tspdf_writer_get_font(w, fname);
+    ASSERT(ttf != NULL);
+    TspdfStream *page = tspdf_writer_add_page(w);
+    tspdf_stream_begin_text(page);
+    tspdf_stream_set_font(page, fname, 14.0);
+    tspdf_stream_text_position(page, 72, 700);
+    tspdf_stream_show_text_utf8(page, "Gr\xc3\xbc\xc3\x9f" "e \xe2\x80\x93 done",
+                                ttf, pdf_font);
+    tspdf_stream_end_text(page);
+    uint8_t *pdf = NULL;
+    size_t len = 0;
+    ASSERT_EQ_INT(tspdf_writer_save_to_memory(w, &pdf, &len), TSPDF_OK);
+    tspdf_writer_destroy(w);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open(pdf, len, &err);
+    ASSERT(doc != NULL);
+    const char *text = tspdf_reader_page_text(doc, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT_EQ_STR(text, "Gr\xc3\xbc\xc3\x9f" "e \xe2\x80\x93 done\n");
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_text_cid_no_tounicode_replacement) {
+    // Identity-H without /ToUnicode: one U+FFFD per 2-byte code, counted.
+    size_t len = 0;
+    char *pdf = make_text_pdf_full(TEXT_HELV_RES,
+        "<< /Type /Font /Subtype /Type0 /BaseFont /NoMap "
+        "/Encoding /Identity-H /DescendantFonts [5 0 R] >>",
+        "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /NoMap "
+        "/CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) "
+        "/Supplement 0 >> /DW 1000 >>",
+        NULL,
+        "BT /F1 12 Tf 72 700 Td <00410042> Tj ET", &len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    TspdfTextStats stats;
+    const char *text = tspdf_reader_page_text_stats(doc, 0, &stats, &err);
+    ASSERT(text != NULL);
+    ASSERT_EQ_STR(text, "\xef\xbf\xbd\xef\xbf\xbd\n");
+    ASSERT_EQ_SIZE(stats.glyphs, 2);
+    ASSERT_EQ_SIZE(stats.replacements, 2);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_text_encrypted_pdf) {
+    TspdfWriter *w = tspdf_writer_create();
+    const char *font = tspdf_writer_add_builtin_font(w, "Helvetica");
+    TspdfStream *page = tspdf_writer_add_page(w);
+    tspdf_stream_begin_text(page);
+    tspdf_stream_set_font(page, font, 12.0);
+    tspdf_stream_text_position(page, 72, 700);
+    tspdf_stream_show_text(page, "Secret text");
+    tspdf_stream_end_text(page);
+    uint8_t *pdf = NULL;
+    size_t len = 0;
+    ASSERT_EQ_INT(tspdf_writer_save_to_memory(w, &pdf, &len), TSPDF_OK);
+    tspdf_writer_destroy(w);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open(pdf, len, &err);
+    ASSERT(doc != NULL);
+    uint8_t *enc = NULL;
+    size_t enc_len = 0;
+    err = tspdf_reader_save_to_memory_encrypted(doc, &enc, &enc_len,
+                                                "pw", "owner", 0xFFFFFFFC, 128);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+
+    TspdfReader *doc2 = tspdf_reader_open_with_password(enc, enc_len, "pw", &err);
+    ASSERT(doc2 != NULL);
+    const char *text = tspdf_reader_page_text(doc2, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT_EQ_STR(text, "Secret text\n");
+    tspdf_reader_destroy(doc2);
+    free(enc);
+}
+
+TEST(test_text_page_out_of_range) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/one_page.pdf", &err);
+    ASSERT(doc != NULL);
+    const char *text = tspdf_reader_page_text(doc, 5, &err);
+    ASSERT(text == NULL);
+    ASSERT_EQ_INT(err, TSPDF_ERR_PAGE_RANGE);
+    tspdf_reader_destroy(doc);
+}
+
+TEST(test_text_no_bt_writer_style_content) {
+    // The writer's own fixtures emit Tf/Tj without BT..ET; extraction must
+    // still see the text (lenient like real viewers).
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/one_page.pdf", &err);
+    ASSERT(doc != NULL);
+    const char *text = tspdf_reader_page_text(doc, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT_EQ_STR(text, "Page 1\n");
+    tspdf_reader_destroy(doc);
+}
+
+TEST(test_text_malformed_content_no_crash) {
+    // Garbage operators, unbalanced constructs, truncated hex: no crash,
+    // best-effort text.
+    size_t len = 0;
+    char *pdf = make_text_pdf(TEXT_HELV_FONT,
+        "BT /F1 12 Tf 72 700 Td (ok) Tj zz 3 qq [ (unterminated TJ "
+        "\x01\x02\xff garbage ) ] TJ <4 broken ET", &len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    const char *text = tspdf_reader_page_text(doc, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT(strstr(text, "ok") != NULL);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
 int main(void) {
     printf("tspr reader tests:\n");
 
@@ -6964,6 +7343,21 @@ int main(void) {
     RUN(test_save_producer_is_tspdf_with_version);
     RUN(test_save_preserve_ids_producer_is_tspdf_with_version);
 
+    printf("\n  Text extraction:\n");
+    RUN(test_text_simple_lines_writer_fixture);
+    RUN(test_text_tj_kerning_spacing);
+    RUN(test_text_multiline_td_tstar);
+    RUN(test_text_xgap_emits_space);
+    RUN(test_text_tounicode_bfchar_bfrange);
+    RUN(test_text_differences_encoding);
+    RUN(test_text_form_xobject_recursion);
+    RUN(test_text_form_xobject_self_cycle_guarded);
+    RUN(test_text_identity_h_ttf_tounicode);
+    RUN(test_text_cid_no_tounicode_replacement);
+    RUN(test_text_encrypted_pdf);
+    RUN(test_text_page_out_of_range);
+    RUN(test_text_no_bt_writer_style_content);
+    RUN(test_text_malformed_content_no_crash);
 
     printf("\n%d tests, %d passed, %d failed\n",
            tests_run, tests_passed, tests_failed);
