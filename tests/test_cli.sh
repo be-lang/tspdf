@@ -1069,6 +1069,59 @@ else
   echo "  SKIP  staged headers compile as C++ (c++ not found)"
 fi
 
+# --- Distribution: versioned shared library + single-file amalgamation ---
+
+# `make shared` must produce a versioned ELF shared object with a SONAME so
+# distro packagers can ship it. Linux-only: Mach-O uses -install_name instead
+# and there is no macOS box in this environment to validate the layout.
+if [ "$(uname -s)" = "Linux" ] && command -v readelf > /dev/null 2>&1; then
+  VMAJ=$(sed -n 's/^#define TSPDF_VERSION_MAJOR *//p' include/tspdf/version.h)
+  VMIN=$(sed -n 's/^#define TSPDF_VERSION_MINOR *//p' include/tspdf/version.h)
+
+  run_test "make shared produces versioned .so with SONAME" bash -c '
+    set -e
+    make shared BUILDDIR="'"$TMPDIR"'/shbuild" > /dev/null 2>&1
+    test -f "'"$TMPDIR"'/shbuild/libtspdf.so.'"$VMAJ.$VMIN"'"
+    test -L "'"$TMPDIR"'/shbuild/libtspdf.so.'"$VMAJ"'"
+    test -L "'"$TMPDIR"'/shbuild/libtspdf.so"
+    readelf -d "'"$TMPDIR"'/shbuild/libtspdf.so.'"$VMAJ.$VMIN"'" \
+      | grep -q "SONAME.*\[libtspdf.so.'"$VMAJ"'\]"'
+
+  run_test "install-lib installs the versioned shared library" bash -c '
+    set -e
+    make install-lib DESTDIR="'"$TMPDIR"'/shstage" PREFIX=/usr \
+      BUILDDIR="'"$TMPDIR"'/shbuild" > /dev/null 2>&1
+    test -f "'"$TMPDIR"'/shstage/usr/lib/libtspdf.a"
+    test -f "'"$TMPDIR"'/shstage/usr/lib/libtspdf.so.'"$VMAJ.$VMIN"'"
+    test -L "'"$TMPDIR"'/shstage/usr/lib/libtspdf.so.'"$VMAJ"'"
+    test -L "'"$TMPDIR"'/shstage/usr/lib/libtspdf.so"'
+
+  run_test "uninstall removes the shared library" bash -c '
+    set -e
+    make uninstall DESTDIR="'"$TMPDIR"'/shstage" PREFIX=/usr > /dev/null 2>&1
+    test ! -e "'"$TMPDIR"'/shstage/usr/lib/libtspdf.so.'"$VMAJ.$VMIN"'"
+    test ! -e "'"$TMPDIR"'/shstage/usr/lib/libtspdf.so.'"$VMAJ"'"
+    test ! -e "'"$TMPDIR"'/shstage/usr/lib/libtspdf.so"
+    test ! -e "'"$TMPDIR"'/shstage/usr/lib/libtspdf.a"'
+else
+  echo "  SKIP  versioned shared library tests (Linux + readelf only)"
+fi
+
+# `make amalgamation` generates build/amalgamation/tspdf.{c,h} and proves them:
+# standalone -Werror compile, link + run examples/minimal.c against them, and
+# qpdf --check on the produced PDF (inside the make target, when qpdf exists).
+if [ -f scripts/amalgamate.sh ]; then
+  run_test "amalgamation compiles, links minimal example, output checks" bash -c '
+    set -e
+    make amalgamation > /dev/null 2>&1
+    test -f build/amalgamation/tspdf.c
+    test -f build/amalgamation/tspdf.h
+    test -s build/amalgamation/minimal.pdf
+    head -c 5 build/amalgamation/minimal.pdf | grep -q "%PDF-"'
+else
+  echo "  SKIP  amalgamation (scripts/amalgamate.sh not present)"
+fi
+
 echo ""
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ] || exit 1

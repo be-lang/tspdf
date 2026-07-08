@@ -21,6 +21,24 @@ VERSION_MINOR := $(shell sed -n 's/^\#define TSPDF_VERSION_MINOR *//p' include/t
 VERSION_PATCH := $(shell sed -n 's/^\#define TSPDF_VERSION_PATCH *//p' include/tspdf/version.h)
 VERSION := $(VERSION_MAJOR).$(VERSION_MINOR).$(VERSION_PATCH)
 
+# Shared-library naming. Pre-1.0 the ABI may break on minor releases, so the
+# real file carries MAJOR.MINOR and the SONAME only MAJOR (bump MAJOR on any
+# post-1.0 ABI break). ELF and Mach-O spell versioning differently, hence the
+# uname guard. The Darwin branch follows platform conventions but has only
+# been verified on Linux (no macOS machine here); CI exercises it on tag builds.
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+SHLIB_FILE   = libtspdf.$(VERSION_MAJOR).$(VERSION_MINOR).dylib
+SHLIB_SONAME = libtspdf.$(VERSION_MAJOR).dylib
+SHLIB_LINK   = libtspdf.dylib
+SHLIB_LDFLAGS = -dynamiclib -install_name @rpath/$(SHLIB_SONAME)
+else
+SHLIB_FILE   = libtspdf.so.$(VERSION_MAJOR).$(VERSION_MINOR)
+SHLIB_SONAME = libtspdf.so.$(VERSION_MAJOR)
+SHLIB_LINK   = libtspdf.so
+SHLIB_LDFLAGS = -shared -Wl,-soname,$(SHLIB_SONAME)
+endif
+
 # Sanitizer build flags for `make test-asan`. Compiler-builtin instrumentation
 # only (AddressSanitizer + UndefinedBehaviorSanitizer + LeakSanitizer), so the
 # zero-dependency promise holds. -O1 keeps frames/inlining sane for readable
@@ -177,10 +195,13 @@ install: install-lib $(CLI_TARGET)
 	  *) echo "note: $(PREFIX)/bin is not on your PATH; add it to run tspdf" ;; \
 	esac
 
-# Install the static library, public headers, and pkg-config file.
-install-lib: $(BUILDDIR)/libtspdf.a tspdf.pc.in include/tspdf/version.h
+# Install the static + shared libraries, public headers, and pkg-config file.
+install-lib: $(BUILDDIR)/libtspdf.a shared tspdf.pc.in include/tspdf/version.h
 	install -d $(DESTLIB)
 	install -m 644 $(BUILDDIR)/libtspdf.a $(DESTLIB)/libtspdf.a
+	install -m 755 $(BUILDDIR)/$(SHLIB_FILE) $(DESTLIB)/$(SHLIB_FILE)
+	ln -sf $(SHLIB_FILE) $(DESTLIB)/$(SHLIB_SONAME)
+	ln -sf $(SHLIB_SONAME) $(DESTLIB)/$(SHLIB_LINK)
 	install -d $(DESTINC) $(DESTINC)/pdf $(DESTINC)/font \
 	          $(DESTINC)/image $(DESTINC)/util $(DESTINC)/reader $(DESTINC)/layout
 	install -m 644 include/tspdf.h $(DESTINC)/tspdf.h
@@ -202,6 +223,7 @@ uninstall:
 	rm -f $(DESTBIN)/tspdf
 	rm -f $(DESTMAN1)/tspdf.1
 	rm -f $(DESTLIB)/libtspdf.a
+	rm -f $(DESTLIB)/$(SHLIB_FILE) $(DESTLIB)/$(SHLIB_SONAME) $(DESTLIB)/$(SHLIB_LINK)
 	rm -f $(DESTPKGCFG)/tspdf.pc
 	rm -rf $(DESTINC)
 
@@ -366,15 +388,19 @@ $(BUILDDIR)/libtspdf.a: $(ALL_SOURCES)
 	for f in $(ALL_SOURCES); do $(CC) $(CPPFLAGS) $(ALL_CFLAGS) -c $$f -o $(BUILDDIR)/obj/$$(basename $$f .c).o; done
 	ar rcs $@ $(BUILDDIR)/obj/*.o
 
-# Optional shared library. Not built by the default `lib`/`install` targets so
-# the portable static-only path stays the default (soname/-install_name handling
-# differs across ELF vs. Mach-O); build explicitly with `make shared` when wanted.
-shared: $(BUILDDIR)/libtspdf.so
+# Shared library, properly versioned (see SHLIB_* above): the real file is
+# libtspdf.so.MAJOR.MINOR with SONAME libtspdf.so.MAJOR, plus the usual
+# libtspdf.so.MAJOR and libtspdf.so symlinks (dylib naming on Darwin).
+# Known pre-1.0 limitation: no symbol-visibility annotations yet, so the .so
+# exports internal symbols too — see docs/library.md.
+shared: $(BUILDDIR)/$(SHLIB_FILE)
+	ln -sf $(SHLIB_FILE) $(BUILDDIR)/$(SHLIB_SONAME)
+	ln -sf $(SHLIB_SONAME) $(BUILDDIR)/$(SHLIB_LINK)
 
-$(BUILDDIR)/libtspdf.so: $(ALL_SOURCES)
+$(BUILDDIR)/$(SHLIB_FILE): $(ALL_SOURCES)
 	@mkdir -p $(BUILDDIR)/shobj
 	for f in $(ALL_SOURCES); do $(CC) $(CPPFLAGS) $(ALL_CFLAGS) -fPIC -c $$f -o $(BUILDDIR)/shobj/$$(basename $$f .c).o; done
-	$(CC) $(LDFLAGS) -shared -o $@ $(BUILDDIR)/shobj/*.o -lm
+	$(CC) $(LDFLAGS) $(SHLIB_LDFLAGS) -o $@ $(BUILDDIR)/shobj/*.o -lm
 
 # --- Examples & benchmarks ---
 
