@@ -44,13 +44,16 @@ static void print_command_help(const char *cmd) {
         printf("  <file1.pdf> <file2.pdf> [...]  Two or more input PDF files\n");
         printf("  -o <output.pdf>               Output file path (required)\n");
     } else if (strcmp(cmd, "split") == 0) {
-        printf("Usage: tspdf split <input.pdf> --pages <range> -o <output.pdf>\n");
+        printf("Usage: tspdf split <input.pdf> [--pages <range> | --burst] -o <output.pdf>\n");
         printf("\n");
-        printf("Extract specific pages from a PDF into a new file.\n");
+        printf("Extract specific pages from a PDF, or split it into one file per page.\n");
+        printf("Without --pages, every page is written to its own file (burst mode):\n");
+        printf("out.pdf becomes out-001.pdf, out-002.pdf, ...\n");
         printf("\n");
         printf("Arguments:\n");
         printf("  <input.pdf>       Input PDF file\n");
         printf("  --pages <range>   Page range to extract, e.g. 1-3 or 1,3,5 or 2-4,7\n");
+        printf("  --burst           One output file per page (default without --pages)\n");
         printf("  -o <output.pdf>   Output file path (required)\n");
     } else if (strcmp(cmd, "rotate") == 0) {
         printf("Usage: tspdf rotate <input.pdf> --angle <deg> [-o <output.pdf>] [--pages <range>]\n");

@@ -1069,6 +1069,42 @@ else
   echo "  SKIP  staged headers compile as C++ (c++ not found)"
 fi
 
+# --- md2pdf tables/images, burst split, page numbers, serve --bind ---
+
+# Burst split: no --pages splits every page into its own zero-padded file.
+run_test "split --burst produces one file per page" bash -c "
+  set -e
+  $TSPDF split $INPUT --burst -o $TMPDIR/burst.pdf > /dev/null
+  test -f $TMPDIR/burst-001.pdf
+  test -f $TMPDIR/burst-002.pdf
+  test -f $TMPDIR/burst-003.pdf
+  test ! -e $TMPDIR/burst-004.pdf"
+
+run_test "split without --pages defaults to burst" bash -c "
+  set -e
+  $TSPDF split $INPUT -o $TMPDIR/burstdef.pdf > /dev/null
+  test -f $TMPDIR/burstdef-001.pdf
+  test -f $TMPDIR/burstdef-003.pdf"
+
+run_test "split burst files each have one page" bash -c "
+  set -e
+  for i in 1 2 3; do
+    $TSPDF info $TMPDIR/burst-00\$i.pdf | grep -q 'Pages:[[:space:]]*1'
+  done"
+
+if command -v qpdf > /dev/null 2>&1; then
+  run_test "split burst files pass qpdf --check" bash -c "
+    set -e
+    for i in 1 2 3; do qpdf --check $TMPDIR/burst-00\$i.pdf > /dev/null; done"
+else
+  echo "  SKIP  split burst files pass qpdf --check (qpdf not found)"
+fi
+
+run_test "split rejects --burst combined with --pages" bash -c "
+  ! $TSPDF split $INPUT --burst --pages 1 -o $TMPDIR/burstconflict.pdf 2>/dev/null"
+
+run_test "split help mentions --burst" bash -c "$TSPDF split --help | grep -q -- '--burst'"
+
 echo ""
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ] || exit 1
