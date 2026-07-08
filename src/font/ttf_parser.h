@@ -5,6 +5,10 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define TSPDF_TTF_MAX_GLYPHS 65536
 
 // Kerning pair
@@ -123,5 +127,9 @@ double ttf_get_line_height(const TTF_Font *font, double font_size);
 static inline uint32_t make_tag(const char *s) {
     return ((uint32_t)s[0] << 24) | ((uint32_t)s[1] << 16) | ((uint32_t)s[2] << 8) | (uint32_t)s[3];
 }
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

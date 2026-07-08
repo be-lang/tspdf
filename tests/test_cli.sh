@@ -1004,6 +1004,71 @@ fi
 run_test "encrypt help mentions --password-file" bash -c "$TSPDF encrypt --help | grep -q -- '--password-file'"
 run_test "decrypt help mentions --password-file" bash -c "$TSPDF decrypt --help | grep -q -- '--password-file'"
 
+# --- Packaging/distribution tests (build flags, install layout, headers) ---
+
+# The Makefile must honor packager-injected CPPFLAGS/LDFLAGS and keep the
+# required flags when CFLAGS is overridden (dpkg-buildflags, makepkg, abuild
+# and nix all inject these and lint when they are dropped). `make -n` keeps
+# the checks cheap: no rebuild, just the commands make would run.
+run_test "make honors CPPFLAGS on compile lines" bash -c '
+  make -n BUILDDIR=/tmp/tspdf-nbuild CPPFLAGS=-DTSPDF_CPPFLAGS_PROBE | grep -q -- -DTSPDF_CPPFLAGS_PROBE'
+
+run_test "make honors LDFLAGS on link lines" bash -c '
+  make -n BUILDDIR=/tmp/tspdf-nbuild LDFLAGS=-Wl,--tspdf-ldflags-probe | grep -q -- --tspdf-ldflags-probe'
+
+run_test "required flags survive a CFLAGS override" bash -c '
+  make -n BUILDDIR=/tmp/tspdf-nbuild CFLAGS=-O3 | grep -q -- -std=c11'
+
+# A fully static Linux build is what the release workflow ships; glibc-only
+# feature, so skip elsewhere (macOS has no static libSystem).
+if [ "$(uname -s)" = "Linux" ]; then
+  run_test "make LDFLAGS=-static links a static binary" bash -c '
+    set -e
+    make BUILDDIR="'"$TMPDIR"'/staticbuild" LDFLAGS=-static > /dev/null 2>&1
+    file "'"$TMPDIR"'/staticbuild/tspdf" | grep -q "statically linked"'
+else
+  echo "  SKIP  make LDFLAGS=-static links a static binary (Linux only)"
+fi
+
+# `make install` must print a PATH hint when $(PREFIX)/bin is not on PATH
+# (README recommends PREFIX=~/.local, which is not on PATH by default on macOS).
+run_test "make install hints when PREFIX/bin not on PATH" bash -c '
+  make install DESTDIR="'"$TMPDIR"'/hintstage" PREFIX=/opt/tspdf-hint-probe 2>/dev/null \
+    | grep -q "/opt/tspdf-hint-probe/bin is not on your PATH"'
+
+run_test "make install stays quiet when PREFIX/bin is on PATH" bash -c '
+  set -e
+  PATH="/opt/tspdf-hint-probe/bin:$PATH" make install DESTDIR="'"$TMPDIR"'/hintstage2" PREFIX=/opt/tspdf-hint-probe \
+    > "'"$TMPDIR"'/hint-quiet-out.txt" 2>/dev/null
+  ! grep -q "not on your PATH" "'"$TMPDIR"'/hint-quiet-out.txt"'
+
+# The man page ships with `make install`.
+run_test "make install places tspdf.1 in man1" bash -c '
+  test -f "'"$TMPDIR"'/hintstage/opt/tspdf-hint-probe/share/man/man1/tspdf.1"'
+
+# Installed-layout acceptance: stage `make install-lib` and compile a C and a
+# C++ translation unit that include BOTH umbrella headers against the staged
+# tree. This proves the overlay header works installed and that every header
+# it pulls in is extern "C" guarded.
+INSTALL_STAGE="$TMPDIR/libstage"
+run_test "install-lib stages overlay header with the reader headers" bash -c '
+  set -e
+  make install-lib DESTDIR="'"$INSTALL_STAGE"'" PREFIX=/usr > /dev/null
+  test -f "'"$INSTALL_STAGE"'/usr/include/tspdf/tspdf_overlay.h"
+  test -f "'"$INSTALL_STAGE"'/usr/include/tspdf/reader/tspr_overlay.h"'
+
+run_test "staged headers compile as C" bash -c '
+  printf "#include <tspdf/tspdf.h>\n#include <tspdf/tspdf_overlay.h>\nint main(void){return 0;}\n" > "'"$TMPDIR"'/hdr_c.c"
+  cc -std=c11 -Wall -Wextra -Werror -fsyntax-only -I "'"$INSTALL_STAGE"'/usr/include" "'"$TMPDIR"'/hdr_c.c"'
+
+if command -v c++ > /dev/null 2>&1; then
+  run_test "staged headers compile as C++" bash -c '
+    printf "#include <tspdf/tspdf.h>\n#include <tspdf/tspdf_overlay.h>\nint main(){return 0;}\n" > "'"$TMPDIR"'/hdr_cpp.cc"
+    c++ -x c++ -Wall -Wextra -Werror -fsyntax-only -I "'"$INSTALL_STAGE"'/usr/include" "'"$TMPDIR"'/hdr_cpp.cc"'
+else
+  echo "  SKIP  staged headers compile as C++ (c++ not found)"
+fi
+
 echo ""
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ] || exit 1

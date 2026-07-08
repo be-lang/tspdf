@@ -7,6 +7,10 @@
 #include <stdio.h>
 #include "../util/buffer.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // Maximum number of indirect objects in a PDF
 #define TSPDF_MAX_OBJECTS 4096
 
@@ -81,5 +85,9 @@ bool tspdf_raw_writer_write_to_file(TspdfRawWriter *w, const char *path);
 // Raw append (for content streams etc.)
 void tspdf_raw_write_raw(TspdfRawWriter *w, const char *str);
 void tspdf_raw_write_raw_data(TspdfRawWriter *w, const uint8_t *data, size_t len);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

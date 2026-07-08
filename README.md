@@ -4,7 +4,7 @@
 
 A local-first PDF toolkit in pure C. Merge, split, encrypt, watermark, compress,
 and more, all on your machine. No uploads, no cloud, no dependencies, not even
-zlib. Just a single binary you build from source.
+zlib. Just a single binary.
 
 ![tspdf web UI](docs/webui-screenshot.png)
 
@@ -18,6 +18,8 @@ cd tspdf
 make
 make install PREFIX=~/.local        # user-local; or `sudo make install` for /usr/local
 ```
+
+Or grab a prebuilt binary from the [releases](https://github.com/be-lang/tspdf/releases) page.
 
 Uninstall with `make uninstall PREFIX=~/.local`.
 

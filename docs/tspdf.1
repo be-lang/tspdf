@@ -1,0 +1,83 @@
+.TH TSPDF 1 "2026" "tspdf" "User Commands"
+.SH NAME
+tspdf \- local-first PDF toolkit
+.SH SYNOPSIS
+.B tspdf
+.I command
+.RI [ options ]
+.SH DESCRIPTION
+.B tspdf
+merges, splits, encrypts, watermarks, compresses and otherwise manipulates
+PDF files, entirely on the local machine. No network access, no dependencies.
+.SH COMMANDS
+.TP
+.B merge
+Merge multiple PDF files into one.
+.TP
+.B split
+Split a PDF into individual pages or ranges.
+.TP
+.B rotate
+Rotate pages in a PDF.
+.TP
+.B delete
+Delete pages from a PDF.
+.TP
+.B reorder
+Reorder pages in a PDF.
+.TP
+.B encrypt
+Encrypt a PDF with a password.
+.TP
+.B decrypt
+Decrypt a password-protected PDF.
+.TP
+.B metadata
+View or edit PDF metadata.
+.TP
+.B info
+Print information about a PDF.
+.TP
+.B watermark
+Add a text watermark to a PDF.
+.TP
+.B compress
+Compress a PDF to reduce file size.
+.TP
+.B img2pdf
+Convert images (JPEG/PNG) to a PDF.
+.TP
+.B qrcode
+Generate a QR code PDF.
+.TP
+.B md2pdf
+Convert Markdown to a styled PDF.
+.TP
+.B serve
+Start a local web server for PDF tools (default port 8080).
+.PP
+Run
+.B tspdf help
+.I command
+for command-specific options.
+.SH OPTIONS
+.TP
+.BR \-\-help ", " \-h
+Show the help message.
+.TP
+.B \-\-version
+Show version information.
+.SH EXAMPLES
+.nf
+tspdf merge a.pdf b.pdf \-o combined.pdf
+tspdf split report.pdf \-\-pages 1\-5 \-o extract.pdf
+tspdf encrypt doc.pdf \-o locked.pdf \-\-password secret
+tspdf watermark doc.pdf \-o draft.pdf \-\-text "DRAFT"
+tspdf serve \-\-port 3000
+.fi
+.SH SEE ALSO
+.BR qpdf (1),
+.BR pdftk (1)
+.PP
+Project page:
+.I https://github.com/be-lang/tspdf

@@ -7,8 +7,8 @@ This matrix reflects what the project currently validates in CI and local regres
 | Platform | Status | Notes |
 |---|---|---|
 | Linux (x86_64) | Primary | Main development and CI target |
-| macOS | Expected | Builds with C11 toolchain + make |
-| Windows | Expected | Builds with a compatible C11 environment |
+| macOS | Tested | CI runs the full suite with gcc and clang |
+| Windows | Untested | Not supported today; the make build does not work natively |
 
 ## Input/Feature Coverage
 

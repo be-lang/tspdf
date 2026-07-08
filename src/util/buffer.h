@@ -5,6 +5,10 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // A growable byte buffer for building PDF output
 typedef struct {
     uint8_t *data;
@@ -23,5 +27,9 @@ void tspdf_buffer_append_double(TspdfBuffer *buf, double val, int decimal_places
 void tspdf_buffer_append_int(TspdfBuffer *buf, int val);
 void tspdf_buffer_append_int64(TspdfBuffer *buf, int64_t val);
 void tspdf_buffer_reset(TspdfBuffer *buf);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

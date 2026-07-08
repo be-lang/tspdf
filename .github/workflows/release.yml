@@ -18,19 +18,35 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Linux binaries are fully static (-static) so they run on any distro
+        # regardless of glibc version; macOS has no static libSystem, so those
+        # stay dynamically linked against the system libraries.
         include:
           - os: ubuntu-latest
             label: linux-x86_64
+            ldflags: -static
+          - os: ubuntu-24.04-arm
+            label: linux-arm64
+            ldflags: -static
           - os: macos-latest
             label: macos-arm64
+            ldflags: ""
+          - os: macos-15-intel
+            label: macos-x86_64
+            ldflags: ""
     steps:
       - uses: actions/checkout@v4
 
       - name: Build (release)
         run: |
           make clean
-          make CFLAGS="-Wall -Wextra -std=c11 -O2"
+          make CFLAGS="-Wall -Wextra -std=c11 -O2" LDFLAGS="${{ matrix.ldflags }}"
+          strip build/tspdf
           ./build/tspdf --version
+
+      - name: Verify static link (Linux)
+        if: runner.os == 'Linux'
+        run: file build/tspdf | grep "statically linked"
 
       - name: Smoke test
         run: |

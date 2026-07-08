@@ -1,5 +1,13 @@
 CC ?= gcc
-CFLAGS = -Wall -Wextra -std=c11 -g -O2
+# CFLAGS/CPPFLAGS/LDFLAGS are overridable so distro packagers (dpkg-buildflags,
+# makepkg, abuild, nix) can inject their flags. The required flags live in
+# REQUIRED_CFLAGS so a user CFLAGS override can never drop the C11/warning
+# baseline; internal rules use ALL_CFLAGS.
+CFLAGS ?= -g -O2
+CPPFLAGS ?=
+LDFLAGS ?=
+REQUIRED_CFLAGS = -Wall -Wextra -std=c11
+ALL_CFLAGS = $(CFLAGS) $(REQUIRED_CFLAGS)
 SRCDIR = src
 BUILDDIR = build
 PREFIX ?= /usr/local
@@ -112,7 +120,7 @@ cli/assets.h: $(WEB_EMBED_INPUTS)
 
 $(CLI_TARGET): cli/assets.h $(CLI_SOURCES) $(ALL_SOURCES)
 	@mkdir -p $(BUILDDIR)
-	$(CC) $(CFLAGS) -o $@ $(CLI_SOURCES) $(ALL_SOURCES) -lm
+	$(CC) $(CPPFLAGS) $(ALL_CFLAGS) $(LDFLAGS) -o $@ $(CLI_SOURCES) $(ALL_SOURCES) -lm
 
 # --- Install / uninstall ---
 #
@@ -134,6 +142,7 @@ DESTBIN     = $(DESTDIR)$(PREFIX)/bin
 DESTLIB     = $(DESTDIR)$(PREFIX)/lib
 DESTINC     = $(DESTDIR)$(PREFIX)/include/tspdf
 DESTPKGCFG  = $(DESTDIR)$(PREFIX)/lib/pkgconfig
+DESTMAN1    = $(DESTDIR)$(PREFIX)/share/man/man1
 
 # Public headers to install, listed WITH the subdirectory they live in so the
 # relative "../foo/bar.h" includes still resolve under $(PREFIX)/include/tspdf/.
@@ -153,13 +162,20 @@ INSTALL_HEADERS_UTIL = \
 	$(SRCDIR)/util/buffer.h \
 	$(SRCDIR)/util/arena.h
 INSTALL_HEADERS_READER = \
-	$(SRCDIR)/reader/tspr.h
+	$(SRCDIR)/reader/tspr.h \
+	$(SRCDIR)/reader/tspr_overlay.h
 INSTALL_HEADERS_LAYOUT = \
 	$(SRCDIR)/layout/layout.h
 
 install: install-lib $(CLI_TARGET)
 	install -d $(DESTBIN)
 	install -m 755 $(CLI_TARGET) $(DESTBIN)/tspdf
+	install -d $(DESTMAN1)
+	install -m 644 docs/tspdf.1 $(DESTMAN1)/tspdf.1
+	@case ":$$PATH:" in \
+	  *":$(PREFIX)/bin:"*) ;; \
+	  *) echo "note: $(PREFIX)/bin is not on your PATH; add it to run tspdf" ;; \
+	esac
 
 # Install the static library, public headers, and pkg-config file.
 install-lib: $(BUILDDIR)/libtspdf.a tspdf.pc.in include/tspdf/version.h
@@ -168,6 +184,7 @@ install-lib: $(BUILDDIR)/libtspdf.a tspdf.pc.in include/tspdf/version.h
 	install -d $(DESTINC) $(DESTINC)/pdf $(DESTINC)/font \
 	          $(DESTINC)/image $(DESTINC)/util $(DESTINC)/reader $(DESTINC)/layout
 	install -m 644 include/tspdf.h $(DESTINC)/tspdf.h
+	install -m 644 include/tspdf_overlay.h $(DESTINC)/tspdf_overlay.h
 	install -m 644 include/tspdf/version.h $(DESTINC)/version.h
 	install -m 644 $(INSTALL_HEADERS_ROOT)   $(DESTINC)/
 	install -m 644 $(INSTALL_HEADERS_PDF)    $(DESTINC)/pdf/
@@ -183,6 +200,7 @@ install-lib: $(BUILDDIR)/libtspdf.a tspdf.pc.in include/tspdf/version.h
 
 uninstall:
 	rm -f $(DESTBIN)/tspdf
+	rm -f $(DESTMAN1)/tspdf.1
 	rm -f $(DESTLIB)/libtspdf.a
 	rm -f $(DESTPKGCFG)/tspdf.pc
 	rm -rf $(DESTINC)
@@ -282,20 +300,20 @@ fuzz: $(FUZZ_TARGETS) fuzz-corpus
 
 $(FUZZ_BIN)/fuzz_reader: fuzz/fuzz_reader.c $(ALL_SOURCES)
 	@mkdir -p $(FUZZ_BIN)
-	$(FUZZ_CC) $(FUZZ_CFLAGS) -o $@ $< $(LIB_SOURCES) $(TSPR_SOURCES) $(CRYPTO_SOURCES) -lm
+	$(FUZZ_CC) $(CPPFLAGS) $(FUZZ_CFLAGS) $(LDFLAGS) -o $@ $< $(LIB_SOURCES) $(TSPR_SOURCES) $(CRYPTO_SOURCES) -lm
 
 $(FUZZ_BIN)/fuzz_inflate: fuzz/fuzz_inflate.c $(SRCDIR)/compress/deflate.c $(SRCDIR)/util/buffer.c
 	@mkdir -p $(FUZZ_BIN)
-	$(FUZZ_CC) $(FUZZ_CFLAGS) -o $@ $^ -lm
+	$(FUZZ_CC) $(CPPFLAGS) $(FUZZ_CFLAGS) $(LDFLAGS) -o $@ $^ -lm
 
 $(FUZZ_BIN)/fuzz_ttf: fuzz/fuzz_ttf.c $(SRCDIR)/font/ttf_parser.c
 	@mkdir -p $(FUZZ_BIN)
-	$(FUZZ_CC) $(FUZZ_CFLAGS) -o $@ $^ -lm
+	$(FUZZ_CC) $(CPPFLAGS) $(FUZZ_CFLAGS) $(LDFLAGS) -o $@ $^ -lm
 
 $(FUZZ_BIN)/fuzz_png: fuzz/fuzz_png.c $(SRCDIR)/image/png_decoder.c \
                       $(SRCDIR)/compress/deflate.c $(SRCDIR)/util/buffer.c
 	@mkdir -p $(FUZZ_BIN)
-	$(FUZZ_CC) $(FUZZ_CFLAGS) -o $@ $^ -lm
+	$(FUZZ_CC) $(CPPFLAGS) $(FUZZ_CFLAGS) $(LDFLAGS) -o $@ $^ -lm
 
 # Seed the reader corpus with the synthetic test PDFs so libFuzzer starts from
 # real, structurally-valid inputs instead of random noise. We copy the existing
@@ -329,15 +347,15 @@ ci: check
 
 $(BUILDDIR)/test_runner: tests/test_main.c $(LIB_SOURCES)
 	@mkdir -p $(BUILDDIR)
-	$(CC) $(CFLAGS) -o $@ $< $(LIB_SOURCES) -lm
+	$(CC) $(CPPFLAGS) $(ALL_CFLAGS) $(LDFLAGS) -o $@ $< $(LIB_SOURCES) -lm
 
 $(BUILDDIR)/test_reader: tests/test_reader.c $(ALL_SOURCES)
 	@mkdir -p $(BUILDDIR)
-	$(CC) $(CFLAGS) -o $@ $< $(TSPR_SOURCES) $(LIB_SOURCES) $(CRYPTO_SOURCES) -lm
+	$(CC) $(CPPFLAGS) $(ALL_CFLAGS) $(LDFLAGS) -o $@ $< $(TSPR_SOURCES) $(LIB_SOURCES) $(CRYPTO_SOURCES) -lm
 
 $(BUILDDIR)/test_crypto: tests/test_crypto.c $(CRYPTO_SOURCES)
 	@mkdir -p $(BUILDDIR)
-	$(CC) $(CFLAGS) -o $@ $< $(CRYPTO_SOURCES) -lm
+	$(CC) $(CPPFLAGS) $(ALL_CFLAGS) $(LDFLAGS) -o $@ $< $(CRYPTO_SOURCES) -lm
 
 # --- Library (for embedding in other projects) ---
 
@@ -345,7 +363,7 @@ lib: $(BUILDDIR)/libtspdf.a
 
 $(BUILDDIR)/libtspdf.a: $(ALL_SOURCES)
 	@mkdir -p $(BUILDDIR)/obj
-	for f in $(ALL_SOURCES); do $(CC) $(CFLAGS) -c $$f -o $(BUILDDIR)/obj/$$(basename $$f .c).o; done
+	for f in $(ALL_SOURCES); do $(CC) $(CPPFLAGS) $(ALL_CFLAGS) -c $$f -o $(BUILDDIR)/obj/$$(basename $$f .c).o; done
 	ar rcs $@ $(BUILDDIR)/obj/*.o
 
 # Optional shared library. Not built by the default `lib`/`install` targets so
@@ -355,8 +373,8 @@ shared: $(BUILDDIR)/libtspdf.so
 
 $(BUILDDIR)/libtspdf.so: $(ALL_SOURCES)
 	@mkdir -p $(BUILDDIR)/shobj
-	for f in $(ALL_SOURCES); do $(CC) $(CFLAGS) -fPIC -c $$f -o $(BUILDDIR)/shobj/$$(basename $$f .c).o; done
-	$(CC) -shared -o $@ $(BUILDDIR)/shobj/*.o -lm
+	for f in $(ALL_SOURCES); do $(CC) $(CPPFLAGS) $(ALL_CFLAGS) -fPIC -c $$f -o $(BUILDDIR)/shobj/$$(basename $$f .c).o; done
+	$(CC) $(LDFLAGS) -shared -o $@ $(BUILDDIR)/shobj/*.o -lm
 
 # --- Examples & benchmarks ---
 
@@ -365,35 +383,35 @@ demo: $(BUILDDIR)/tspdf_demo
 
 $(BUILDDIR)/tspdf_demo: examples/demo.c $(LIB_SOURCES)
 	@mkdir -p $(BUILDDIR)
-	$(CC) $(CFLAGS) -o $@ $< $(LIB_SOURCES) -lm
+	$(CC) $(CPPFLAGS) $(ALL_CFLAGS) $(LDFLAGS) -o $@ $< $(LIB_SOURCES) -lm
 
 minimal: $(BUILDDIR)/minimal
 	./$(BUILDDIR)/minimal
 
 $(BUILDDIR)/minimal: examples/minimal.c $(LIB_SOURCES)
 	@mkdir -p $(BUILDDIR)
-	$(CC) $(CFLAGS) -o $@ $< $(LIB_SOURCES) -lm
+	$(CC) $(CPPFLAGS) $(ALL_CFLAGS) $(LDFLAGS) -o $@ $< $(LIB_SOURCES) -lm
 
 reader-demo: $(BUILDDIR)/reader_demo
 	./$(BUILDDIR)/reader_demo
 
 $(BUILDDIR)/reader_demo: examples/reader_demo.c $(ALL_SOURCES)
 	@mkdir -p $(BUILDDIR)
-	$(CC) $(CFLAGS) -o $@ $< $(LIB_SOURCES) $(TSPR_SOURCES) $(CRYPTO_SOURCES) -lm
+	$(CC) $(CPPFLAGS) $(ALL_CFLAGS) $(LDFLAGS) -o $@ $< $(LIB_SOURCES) $(TSPR_SOURCES) $(CRYPTO_SOURCES) -lm
 
 bench: $(BUILDDIR)/bench
 	./$(BUILDDIR)/bench
 
 $(BUILDDIR)/bench: examples/benchmark.c $(LIB_SOURCES)
 	@mkdir -p $(BUILDDIR)
-	$(CC) $(CFLAGS) -o $@ $< $(LIB_SOURCES) -lm
+	$(CC) $(CPPFLAGS) $(ALL_CFLAGS) $(LDFLAGS) -o $@ $< $(LIB_SOURCES) -lm
 
 bench-reader: $(BUILDDIR)/bench_reader
 	./$(BUILDDIR)/bench_reader
 
 $(BUILDDIR)/bench_reader: examples/bench_reader.c $(ALL_SOURCES)
 	@mkdir -p $(BUILDDIR)
-	$(CC) $(CFLAGS) -o $@ $< $(LIB_SOURCES) $(TSPR_SOURCES) $(CRYPTO_SOURCES) -lm
+	$(CC) $(CPPFLAGS) $(ALL_CFLAGS) $(LDFLAGS) -o $@ $< $(LIB_SOURCES) $(TSPR_SOURCES) $(CRYPTO_SOURCES) -lm
 
 generate-test-pdfs: $(BUILDDIR)/generate_test_pdfs
 	@mkdir -p tests/data
@@ -401,4 +419,4 @@ generate-test-pdfs: $(BUILDDIR)/generate_test_pdfs
 
 $(BUILDDIR)/generate_test_pdfs: tests/generate_test_pdfs.c $(LIB_SOURCES)
 	@mkdir -p $(BUILDDIR)
-	$(CC) $(CFLAGS) -o $@ $< $(LIB_SOURCES) -lm
+	$(CC) $(CPPFLAGS) $(ALL_CFLAGS) $(LDFLAGS) -o $@ $< $(LIB_SOURCES) -lm

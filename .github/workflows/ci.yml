@@ -144,3 +144,25 @@ jobs:
       # /TspdfSize -> /Size trailer fix) and auto-activates once that lands.
       - name: Run external conformance gate
         run: make test-external
+
+  fuzz:
+    name: Fuzz smoke (libFuzzer)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `make fuzz` builds the four libFuzzer harnesses with clang (the
+      # fuzzing runtime ships with the compiler) and seeds the corpora.
+      - name: Build fuzz harnesses
+        run: make fuzz
+
+      # Run each harness over its seed corpus for a fixed 30 seconds.
+      # -seed pins the PRNG so runs are reproducible; finding nothing is
+      # fine, while any crash or sanitizer report makes libFuzzer exit
+      # non-zero and fails the job.
+      - name: Run harnesses over seed corpora
+        run: |
+          for t in reader inflate ttf png; do
+            echo "=== fuzz_$t"
+            ./build/fuzz/fuzz_$t "fuzz/corpus/$t" -seed=1 -max_total_time=30 -print_final_stats=1
+          done

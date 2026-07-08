@@ -5,6 +5,10 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct {
     int width;
     int height;
@@ -15,5 +19,9 @@ typedef struct {
 
 bool jpeg_load(JpegImage *img, const char *path);
 void jpeg_free(JpegImage *img);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

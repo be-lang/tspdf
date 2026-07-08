@@ -2,8 +2,15 @@
 
 This file tracks current, known constraints so users can evaluate fit quickly.
 
+See the [compatibility matrix](compatibility-matrix.md) for what is tested where.
+
 ## Scope
 
+- No text extraction.
+- No rendering of pages to images.
+- Existing AcroForm forms cannot be filled (creating form fields in generated PDFs is supported).
+- md2pdf does not render tables or images.
+- Merge and split currently drop bookmarks and form fields.
 - Watermark support is text-only (no image watermark pipeline yet).
 - Web server mode is intentionally simple and local-first; it is not a general-purpose multi-tenant service.
 

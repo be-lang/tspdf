@@ -3,6 +3,10 @@
 
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // Metrics for the 14 standard PDF fonts (from AFM files).
 // Widths are in units of 1/1000 em, indexed by WinAnsiEncoding code point.
 // Symbol and ZapfDingbats use their own built-in encodings.
@@ -28,5 +32,9 @@ double tspdf_base14_line_height(const TspdfBase14Metrics *metrics, double font_s
 
 // Returns true if the font uses WinAnsiEncoding (all except Symbol, ZapfDingbats).
 int tspdf_base14_is_latin(const char *font_name);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
