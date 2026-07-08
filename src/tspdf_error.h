@@ -24,6 +24,7 @@ typedef enum {
     TSPDF_ERR_UNSUPPORTED,
     TSPDF_ERR_ENCRYPTED,
     TSPDF_ERR_BAD_PASSWORD,
+    TSPDF_ERR_PAGE_RANGE,
 } TspdfError;
 
 const char *tspdf_error_string(TspdfError err);

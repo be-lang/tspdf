@@ -8,6 +8,7 @@ int cmd_compress(int argc, char **argv) {
     if (argc == 0 || has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
         printf("Usage: tspdf compress <input.pdf> -o <output.pdf> [--keep-metadata]\n");
         printf("\nStrip metadata and unused objects, recompress streams to reduce file size.\n");
+        printf("Uncompressed streams shrink a lot; already well-compressed files only a little.\n");
         printf("By default removes all metadata (Info dict, XMP). Use --keep-metadata to preserve it.\n");
         return argc == 0 ? 1 : 0;
     }

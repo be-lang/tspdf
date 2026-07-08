@@ -758,6 +758,52 @@ else
   echo "  SKIP  serve raw HTTP regressions (python3 not found)"
 fi
 
+# --- Audit fixes (fix/reader-core): out-of-range page messages, split
+# --- output stripping, compress of unfiltered streams ---
+
+# Out-of-range page indices must name the offending page and the document's
+# actual page count instead of a generic "PDF parsing failed".
+run_test "split out-of-range page message" bash -c "
+  ! $TSPDF split $INPUT --pages 5 -o $TMPDIR/oor_split.pdf > /dev/null 2>$TMPDIR/oor_split.err &&
+  grep -q 'page 5 is out of range (document has 3 pages)' $TMPDIR/oor_split.err
+"
+run_test "delete out-of-range page message" bash -c "
+  ! $TSPDF delete $INPUT --pages 9 -o $TMPDIR/oor_delete.pdf > /dev/null 2>$TMPDIR/oor_delete.err &&
+  grep -q 'page 9 is out of range (document has 3 pages)' $TMPDIR/oor_delete.err
+"
+run_test "rotate out-of-range page message" bash -c "
+  ! $TSPDF rotate $INPUT --pages 4 --angle 90 -o $TMPDIR/oor_rotate.pdf > /dev/null 2>$TMPDIR/oor_rotate.err &&
+  grep -q 'page 4 is out of range (document has 3 pages)' $TMPDIR/oor_rotate.err
+"
+run_test "reorder out-of-range page message" bash -c "
+  ! $TSPDF reorder $INPUT --order 1,2,7 -o $TMPDIR/oor_reorder.pdf > /dev/null 2>$TMPDIR/oor_reorder.err &&
+  grep -q 'page 7 is out of range (document has 3 pages)' $TMPDIR/oor_reorder.err
+"
+
+# split must not drag unreachable source objects into the output: extracting
+# one page of three must produce a file well under the source size.
+run_test "split output smaller than source" bash -c "
+  $TSPDF split $INPUT --pages 1 -o $TMPDIR/split_small.pdf > /dev/null 2>&1 &&
+  in_sz=\$(wc -c < $INPUT) && out_sz=\$(wc -c < $TMPDIR/split_small.pdf) &&
+  [ \"\$out_sz\" -lt \"\$in_sz\" ]
+"
+
+# compress must FlateDecode-compress streams that are stored with no filter
+# (e.g. qpdf --stream-data=uncompress output) for a large reduction.
+if command -v qpdf > /dev/null 2>&1; then
+  run_test "compress shrinks uncompressed-streams file" bash -c "
+    qpdf --stream-data=uncompress $INPUT $TMPDIR/uncompressed.pdf &&
+    $TSPDF compress $TMPDIR/uncompressed.pdf -o $TMPDIR/recompressed.pdf > /dev/null 2>&1 &&
+    in_sz=\$(wc -c < $TMPDIR/uncompressed.pdf) && out_sz=\$(wc -c < $TMPDIR/recompressed.pdf) &&
+    [ \$((out_sz * 10)) -lt \$((in_sz * 9)) ]
+  "
+  run_test "compress uncompressed-streams output passes qpdf --check" bash -c "
+    qpdf --check $TMPDIR/recompressed.pdf > /dev/null 2>&1
+  "
+else
+  echo "  SKIP  compress uncompressed-streams file (qpdf not found)"
+fi
+
 echo ""
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ] || exit 1

@@ -4,6 +4,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+// First 0-based page index in `pages` that is out of range for `total`.
+static size_t first_out_of_range(const size_t *pages, size_t count, size_t total) {
+    for (size_t i = 0; i < count; i++) {
+        if (pages[i] >= total) return pages[i];
+    }
+    return total;
+}
+
 int cmd_split(int argc, char **argv) {
     if (argc == 0 || has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
         printf("Usage: tspdf split <input.pdf> --pages 1-3,5 -o <output.pdf>\n");
@@ -48,13 +56,24 @@ int cmd_split(int argc, char **argv) {
 
     TspdfReader *result = tspdf_reader_extract(doc, pages, page_count, &err);
     if (!result) {
-        fprintf(stderr, "tspdf split: extract failed: %s\n", tspdf_error_string(err));
+        if (err == TSPDF_ERR_PAGE_RANGE) {
+            size_t total = tspdf_reader_page_count(doc);
+            fprintf(stderr, "tspdf split: page %zu is out of range (document has %zu page%s)\n",
+                    first_out_of_range(pages, page_count, total) + 1, total,
+                    total == 1 ? "" : "s");
+        } else {
+            fprintf(stderr, "tspdf split: extract failed: %s\n", tspdf_error_string(err));
+        }
         tspdf_reader_destroy(doc);
         free(pages);
         return 1;
     }
 
-    err = tspdf_reader_save(result, output);
+    // Only write objects reachable from the extracted pages; without this the
+    // output would carry every object of the source document along.
+    TspdfSaveOptions opts = tspdf_save_options_default();
+    opts.strip_unused_objects = true;
+    err = tspdf_reader_save_with_options(result, output, &opts);
     if (err != TSPDF_OK) {
         fprintf(stderr, "tspdf split: failed to save '%s': %s\n", output, tspdf_error_string(err));
         tspdf_reader_destroy(result);

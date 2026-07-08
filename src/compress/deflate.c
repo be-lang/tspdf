@@ -612,6 +612,11 @@ uint8_t *deflate_decompress(const uint8_t *data, size_t len, size_t *out_len) {
         if (btype == 0) {
             // Stored (uncompressed) block
             br_align(&br);
+            // br_fill pre-buffers whole bytes past the block header: rewind to
+            // the true byte position before reading LEN/NLEN and the payload.
+            br.pos -= (size_t)(br.nbits / 8);
+            br.bits = 0;
+            br.nbits = 0;
             if (br.pos + 4 > br.len) { tspdf_buffer_destroy(&out); return NULL; }
             // Read from underlying byte stream
             uint16_t block_len = br.data[br.pos] | ((uint16_t)br.data[br.pos + 1] << 8);

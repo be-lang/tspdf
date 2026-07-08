@@ -4,6 +4,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+// First 0-based page index in `pages` that is out of range for `total`.
+static size_t first_out_of_range(const size_t *pages, size_t count, size_t total) {
+    for (size_t i = 0; i < count; i++) {
+        if (pages[i] >= total) return pages[i];
+    }
+    return total;
+}
+
 int cmd_delete(int argc, char **argv) {
     if (argc == 0 || has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
         printf("Usage: tspdf delete <input.pdf> --pages 2,4 -o <output.pdf>\n");
@@ -48,7 +56,14 @@ int cmd_delete(int argc, char **argv) {
 
     TspdfReader *result = tspdf_reader_delete(doc, pages, page_count, &err);
     if (!result) {
-        fprintf(stderr, "tspdf delete: delete failed: %s\n", tspdf_error_string(err));
+        if (err == TSPDF_ERR_PAGE_RANGE) {
+            size_t total = tspdf_reader_page_count(doc);
+            fprintf(stderr, "tspdf delete: page %zu is out of range (document has %zu page%s)\n",
+                    first_out_of_range(pages, page_count, total) + 1, total,
+                    total == 1 ? "" : "s");
+        } else {
+            fprintf(stderr, "tspdf delete: delete failed: %s\n", tspdf_error_string(err));
+        }
         tspdf_reader_destroy(doc);
         free(pages);
         return 1;

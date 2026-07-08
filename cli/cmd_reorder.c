@@ -5,6 +5,14 @@
 #include <string.h>
 #include <ctype.h>
 
+// First 0-based page index in `pages` that is out of range for `total`.
+static size_t first_out_of_range(const size_t *pages, size_t count, size_t total) {
+    for (size_t i = 0; i < count; i++) {
+        if (pages[i] >= total) return pages[i];
+    }
+    return total;
+}
+
 int cmd_reorder(int argc, char **argv) {
     if (argc == 0 || has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
         printf("Usage: tspdf reorder <input.pdf> --order 3,1,2 -o <output.pdf>\n");
@@ -98,7 +106,13 @@ int cmd_reorder(int argc, char **argv) {
 
     TspdfReader *result = tspdf_reader_reorder(doc, order, count, &err);
     if (!result) {
-        fprintf(stderr, "tspdf reorder: reorder failed: %s\n", tspdf_error_string(err));
+        if (err == TSPDF_ERR_PAGE_RANGE) {
+            fprintf(stderr, "tspdf reorder: page %zu is out of range (document has %zu page%s)\n",
+                    first_out_of_range(order, count, total) + 1, total,
+                    total == 1 ? "" : "s");
+        } else {
+            fprintf(stderr, "tspdf reorder: reorder failed: %s\n", tspdf_error_string(err));
+        }
         tspdf_reader_destroy(doc);
         free(order);
         return 1;

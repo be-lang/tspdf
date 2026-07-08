@@ -1294,6 +1294,46 @@ TEST(test_ttf_load_from_memory_partial_failure) {
     free(data);
 }
 
+// --- Audit fixes (fix/reader-core): stored-block inflate support ---
+
+// A VALID zlib stream of stored (BTYPE=00) blocks — what zlib emits at
+// compression level 0 — must inflate correctly. The bit reader pre-buffers
+// bytes, so the stored-block path has to rewind to the true byte position
+// before reading LEN/NLEN.
+TEST(test_deflate_decompresses_valid_stored_block) {
+    const char payload[] = "stored block payload 123";
+    size_t payload_len = sizeof(payload) - 1;
+
+    uint8_t zlib[2 + 5 + sizeof(payload) - 1 + 4];
+    size_t pos = 0;
+    zlib[pos++] = 0x78;
+    zlib[pos++] = 0x01;
+    zlib[pos++] = 0x01;  // BFINAL=1, BTYPE=00
+    zlib[pos++] = (uint8_t)(payload_len & 0xFF);
+    zlib[pos++] = (uint8_t)(payload_len >> 8);
+    zlib[pos++] = (uint8_t)(~payload_len & 0xFF);
+    zlib[pos++] = (uint8_t)((~payload_len >> 8) & 0xFF);
+    memcpy(zlib + pos, payload, payload_len);
+    pos += payload_len;
+    uint32_t s1 = 1, s2 = 0;
+    for (size_t i = 0; i < payload_len; i++) {
+        s1 = (s1 + (uint8_t)payload[i]) % 65521;
+        s2 = (s2 + s1) % 65521;
+    }
+    uint32_t adler = (s2 << 16) | s1;
+    zlib[pos++] = (uint8_t)(adler >> 24);
+    zlib[pos++] = (uint8_t)(adler >> 16);
+    zlib[pos++] = (uint8_t)(adler >> 8);
+    zlib[pos++] = (uint8_t)adler;
+
+    size_t out_len = 0;
+    uint8_t *out = deflate_decompress(zlib, pos, &out_len);
+    ASSERT(out != NULL);
+    ASSERT(out_len == payload_len);
+    ASSERT(memcmp(out, payload, payload_len) == 0);
+    free(out);
+}
+
 // ============================================================
 // Main
 // ============================================================
@@ -1404,6 +1444,9 @@ int main(void) {
     printf("\n  Integration:\n");
     RUN(test_pdf_save_builtin_still_works);
     RUN(test_small_stream_not_compressed);
+
+    printf("\n  Audit fixes (reader-core):\n");
+    RUN(test_deflate_decompresses_valid_stored_block);
 
     printf("\n%d tests run, %d passed, %d failed, %d skipped\n",
            tests_run, tests_passed, tests_failed, tests_skipped);

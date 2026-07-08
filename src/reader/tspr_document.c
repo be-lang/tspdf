@@ -605,7 +605,7 @@ static TspdfReader *create_doc_from_pages(TspdfReader *src, const size_t *page_i
     // Validate indices
     for (size_t i = 0; i < count; i++) {
         if (page_indices[i] >= src->pages.count) {
-            if (err) *err = TSPDF_ERR_PARSE;
+            if (err) *err = TSPDF_ERR_PAGE_RANGE;
             return NULL;
         }
     }
@@ -707,18 +707,109 @@ static TspdfReader *create_doc_from_pages(TspdfReader *src, const size_t *page_i
     return doc;
 }
 
+// Catalog entries dropped when extracting pages into a new document. These
+// document-level trees (structure tree, outlines, destination/name trees,
+// page labels, form fields) reference the source's full page set and would
+// keep the entire object graph reachable in the extracted file. qpdf --pages
+// drops them on extraction the same way.
+static bool extract_drops_catalog_key(const char *key) {
+    static const char *const dropped[] = {
+        "StructTreeRoot", "Outlines", "Dests", "Names", "PageLabels",
+        "AcroForm", NULL
+    };
+    for (size_t i = 0; dropped[i] != NULL; i++) {
+        if (strcmp(key, dropped[i]) == 0) return true;
+    }
+    return false;
+}
+
+// Give an extracted document its own catalog: a copy of the source catalog
+// without the document-level trees above. Without this the serializer falls
+// back to the shared source catalog and everything those trees reference is
+// collected into the output.
+static TspdfError set_extract_catalog(TspdfReader *src, TspdfReader *dst) {
+    TspdfObj *src_catalog = src->catalog;
+    if (!src_catalog && src->xref.trailer) {
+        TspdfObj *root = tspdf_dict_get(src->xref.trailer, "Root");
+        if (root && root->type == TSPDF_OBJ_DICT) {
+            src_catalog = root;
+        } else if (root && root->type == TSPDF_OBJ_REF &&
+                   root->ref.num < src->xref.count) {
+            TspdfParser parser;
+            tspdf_parser_init(&parser, src->data, src->data_len, &src->arena);
+            src_catalog = tspdf_xref_resolve(&src->xref, &parser, root->ref.num,
+                                             src->obj_cache, src->crypt);
+        }
+    }
+    if (!src_catalog || src_catalog->type != TSPDF_OBJ_DICT) {
+        return TSPDF_OK;
+    }
+
+    TspdfObj *copy = (TspdfObj *)tspdf_arena_alloc_zero(&dst->arena, sizeof(TspdfObj));
+    if (!copy) return TSPDF_ERR_ALLOC;
+    copy->type = TSPDF_OBJ_DICT;
+    copy->dict.count = 0;
+    copy->dict.entries = NULL;
+
+    size_t kept = 0;
+    for (size_t i = 0; i < src_catalog->dict.count; i++) {
+        if (!extract_drops_catalog_key(src_catalog->dict.entries[i].key)) kept++;
+    }
+    if (kept > 0) {
+        copy->dict.entries = (TspdfDictEntry *)tspdf_arena_alloc(&dst->arena,
+            sizeof(TspdfDictEntry) * kept);
+        if (!copy->dict.entries) return TSPDF_ERR_ALLOC;
+        size_t ci = 0;
+        for (size_t i = 0; i < src_catalog->dict.count; i++) {
+            const char *key = src_catalog->dict.entries[i].key;
+            if (extract_drops_catalog_key(key)) continue;
+            char *key_copy = arena_strdup(&dst->arena, key);
+            if (!key_copy) return TSPDF_ERR_ALLOC;
+            TspdfObj *value_copy = tspdf_obj_deep_copy(src_catalog->dict.entries[i].value,
+                                                       &dst->arena);
+            if (!value_copy) return TSPDF_ERR_ALLOC;
+            copy->dict.entries[ci].key = key_copy;
+            copy->dict.entries[ci].value = value_copy;
+            ci++;
+        }
+        copy->dict.count = ci;
+    }
+
+    dst->catalog = copy;
+    return TSPDF_OK;
+}
+
 TspdfReader *tspdf_reader_extract(TspdfReader *doc, const size_t *pages, size_t count, TspdfError *err) {
     if (!doc || !pages || count == 0) {
         if (err) *err = TSPDF_ERR_PARSE;
         return NULL;
     }
-    return create_doc_from_pages(doc, pages, count, err);
+
+    TspdfReader *result = create_doc_from_pages(doc, pages, count, err);
+    if (!result) return NULL;
+
+    TspdfError cat_err = set_extract_catalog(doc, result);
+    if (cat_err != TSPDF_OK) {
+        tspdf_reader_destroy(result);
+        if (err) *err = cat_err;
+        return NULL;
+    }
+    return result;
 }
 
 TspdfReader *tspdf_reader_delete(TspdfReader *doc, const size_t *pages, size_t count, TspdfError *err) {
     if (!doc || !pages) {
         if (err) *err = TSPDF_ERR_PARSE;
         return NULL;
+    }
+
+    // Reject out-of-range page indices up front (a delete that silently
+    // ignores them would hide caller bugs and mismatch extract/reorder).
+    for (size_t i = 0; i < count; i++) {
+        if (pages[i] >= doc->pages.count) {
+            if (err) *err = TSPDF_ERR_PAGE_RANGE;
+            return NULL;
+        }
     }
 
     // Build list of pages to keep (all except the ones in `pages`)
@@ -811,6 +902,14 @@ TspdfReader *tspdf_reader_rotate(TspdfReader *doc, const size_t *pages, size_t c
     if (angle % 90 != 0) {
         if (err) *err = TSPDF_ERR_PARSE;
         return NULL;
+    }
+
+    // Reject out-of-range page indices before doing any work
+    for (size_t i = 0; i < count; i++) {
+        if (pages[i] >= doc->pages.count) {
+            if (err) *err = TSPDF_ERR_PAGE_RANGE;
+            return NULL;
+        }
     }
 
     // Extract all pages

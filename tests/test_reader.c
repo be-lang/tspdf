@@ -5948,6 +5948,623 @@ TEST(test_large_document_500_pages) {
     tspdf_writer_destroy(doc);
 }
 
+// --- Audit fixes (fix/reader-core): page-range errors, extract catalog
+// --- slimming, real stream recompression ---
+
+TEST(test_error_string_page_range) {
+    ASSERT_EQ_STR(tspdf_error_string(TSPDF_ERR_PAGE_RANGE),
+                  "page index out of range");
+}
+
+TEST(test_extract_out_of_range_sets_page_range_error) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/three_pages.pdf", &err);
+    ASSERT(doc != NULL);
+    size_t pages[] = {0, 7};
+    TspdfReader *result = tspdf_reader_extract(doc, pages, 2, &err);
+    ASSERT(result == NULL);
+    ASSERT_EQ_INT(err, TSPDF_ERR_PAGE_RANGE);
+    tspdf_reader_destroy(doc);
+}
+
+TEST(test_delete_out_of_range_sets_page_range_error) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/three_pages.pdf", &err);
+    ASSERT(doc != NULL);
+    size_t pages[] = {7};
+    TspdfReader *result = tspdf_reader_delete(doc, pages, 1, &err);
+    ASSERT(result == NULL);
+    ASSERT_EQ_INT(err, TSPDF_ERR_PAGE_RANGE);
+    tspdf_reader_destroy(doc);
+}
+
+TEST(test_rotate_out_of_range_sets_page_range_error) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/three_pages.pdf", &err);
+    ASSERT(doc != NULL);
+    size_t pages[] = {7};
+    TspdfReader *result = tspdf_reader_rotate(doc, pages, 1, 90, &err);
+    ASSERT(result == NULL);
+    ASSERT_EQ_INT(err, TSPDF_ERR_PAGE_RANGE);
+    tspdf_reader_destroy(doc);
+}
+
+TEST(test_reorder_out_of_range_sets_page_range_error) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/three_pages.pdf", &err);
+    ASSERT(doc != NULL);
+    size_t order[] = {2, 1, 7};
+    TspdfReader *result = tspdf_reader_reorder(doc, order, 3, &err);
+    ASSERT(result == NULL);
+    ASSERT_EQ_INT(err, TSPDF_ERR_PAGE_RANGE);
+    tspdf_reader_destroy(doc);
+}
+
+// Two-page PDF whose catalog carries every document-level tree that can pin
+// the full object graph (/StructTreeRoot /Outlines /Dests /Names /PageLabels
+// /AcroForm), each referencing a payload object with a recognizable marker.
+static char *make_pinned_trees_pdf(size_t *out_len) {
+    char *pdf = (char *)malloc(8192);
+    if (!pdf) return NULL;
+
+    size_t pos = 0;
+    if (!appendf(pdf, 8192, &pos, "%%PDF-1.4\n")) goto fail;
+
+    size_t obj1 = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "1 0 obj\n"
+                 "<< /Type /Catalog /Pages 2 0 R /Lang (en) "
+                 "/StructTreeRoot 6 0 R /Outlines 7 0 R /Dests 8 0 R "
+                 "/Names 9 0 R /PageLabels 10 0 R /AcroForm 11 0 R >>\n"
+                 "endobj\n")) goto fail;
+
+    size_t obj2 = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n")) goto fail;
+
+    size_t obj3 = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "3 0 obj\n"
+                 "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                 "/Contents 5 0 R >>\n"
+                 "endobj\n")) goto fail;
+
+    size_t obj4 = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n")) goto fail;
+
+    size_t obj5 = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "5 0 obj\n<< /Length 20 >>\nstream\nq 1 0 0 1 0 0 cm Q\n\nendstream\nendobj\n")) goto fail;
+
+    size_t obj6 = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "6 0 obj\n<< /Type /StructTreeRoot /K 12 0 R >>\nendobj\n")) goto fail;
+
+    size_t obj7 = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "7 0 obj\n<< /Type /Outlines /Count 1 /First 12 0 R >>\nendobj\n")) goto fail;
+
+    size_t obj8 = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "8 0 obj\n<< /SomeDest 12 0 R >>\nendobj\n")) goto fail;
+
+    size_t obj9 = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "9 0 obj\n<< /Dests << /Names [(d1) 12 0 R] >> >>\nendobj\n")) goto fail;
+
+    size_t obj10 = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "10 0 obj\n<< /Nums [0 12 0 R] >>\nendobj\n")) goto fail;
+
+    size_t obj11 = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "11 0 obj\n<< /Fields [12 0 R] >>\nendobj\n")) goto fail;
+
+    size_t obj12 = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "12 0 obj\n<< /Marker (PINNEDPAYLOAD) >>\nendobj\n")) goto fail;
+
+    size_t xref = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "xref\n"
+                 "0 13\n"
+                 "0000000000 65535 f \n"
+                 "%010zu 00000 n \n"
+                 "%010zu 00000 n \n"
+                 "%010zu 00000 n \n"
+                 "%010zu 00000 n \n"
+                 "%010zu 00000 n \n"
+                 "%010zu 00000 n \n"
+                 "%010zu 00000 n \n"
+                 "%010zu 00000 n \n"
+                 "%010zu 00000 n \n"
+                 "%010zu 00000 n \n"
+                 "%010zu 00000 n \n"
+                 "%010zu 00000 n \n"
+                 "trailer\n<< /Size 13 /Root 1 0 R >>\n"
+                 "startxref\n%zu\n%%%%EOF",
+                 obj1, obj2, obj3, obj4, obj5, obj6, obj7, obj8, obj9,
+                 obj10, obj11, obj12, xref)) goto fail;
+
+    *out_len = pos;
+    return pdf;
+
+fail:
+    free(pdf);
+    return NULL;
+}
+
+TEST(test_extract_drops_document_level_trees) {
+    size_t len = 0;
+    char *pdf = make_pinned_trees_pdf(&len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(doc), 2);
+
+    size_t pages[] = {0};
+    TspdfReader *result = tspdf_reader_extract(doc, pages, 1, &err);
+    ASSERT(result != NULL);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(result, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    // The document-level trees and everything only they referenced are gone
+    ASSERT(!bytes_contains(out, out_len, "/StructTreeRoot"));
+    ASSERT(!bytes_contains(out, out_len, "/Outlines"));
+    ASSERT(!bytes_contains(out, out_len, "/Dests"));
+    ASSERT(!bytes_contains(out, out_len, "/Names"));
+    ASSERT(!bytes_contains(out, out_len, "/PageLabels"));
+    ASSERT(!bytes_contains(out, out_len, "/AcroForm"));
+    ASSERT(!bytes_contains(out, out_len, "PINNEDPAYLOAD"));
+
+    // Other catalog entries survive
+    ASSERT(bytes_contains(out, out_len, "/Lang"));
+
+    TspdfReader *doc2 = tspdf_reader_open(out, out_len, &err);
+    ASSERT(doc2 != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(doc2), 1);
+    ASSERT(tspdf_dict_get(doc2->catalog, "StructTreeRoot") == NULL);
+    ASSERT(tspdf_dict_get(doc2->catalog, "Outlines") == NULL);
+    ASSERT(tspdf_dict_get(doc2->catalog, "Lang") != NULL);
+
+    tspdf_reader_destroy(doc2);
+    free(out);
+    tspdf_reader_destroy(result);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+// Append raw (possibly binary) bytes to a builder buffer.
+static bool append_raw(char *buf, size_t cap, size_t *pos, const void *data, size_t len) {
+    if (len > cap - *pos) return false;
+    memcpy(buf + *pos, data, len);
+    *pos += len;
+    return true;
+}
+
+static uint32_t test_adler32(const uint8_t *data, size_t len) {
+    uint32_t s1 = 1, s2 = 0;
+    for (size_t i = 0; i < len; i++) {
+        s1 = (s1 + data[i]) % 65521;
+        s2 = (s2 + s1) % 65521;
+    }
+    return (s2 << 16) | s1;
+}
+
+// Large, highly compressible content-stream payload (malloc'd).
+static char *make_compressible_payload(size_t *payload_len) {
+    const char *line = "0.2 0.4 0.6 rg 72 700 468 -650 re f\n";
+    size_t line_len = strlen(line);
+    size_t reps = 300;  // ~10.8KB, well above the old 4KB recompress floor
+    char *payload = (char *)malloc(line_len * reps + 1);
+    if (!payload) return NULL;
+    for (size_t i = 0; i < reps; i++) {
+        memcpy(payload + i * line_len, line, line_len);
+    }
+    payload[line_len * reps] = '\0';
+    *payload_len = line_len * reps;
+    return payload;
+}
+
+// One-page PDF whose content stream carries `payload` verbatim with no /Filter.
+static char *make_unfiltered_stream_pdf(const char *payload, size_t payload_len,
+                                        size_t *out_len) {
+    size_t cap = payload_len + 2048;
+    char *pdf = (char *)malloc(cap);
+    if (!pdf) return NULL;
+
+    size_t pos = 0;
+    if (!appendf(pdf, cap, &pos, "%%PDF-1.4\n")) goto fail;
+
+    size_t obj1 = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")) goto fail;
+
+    size_t obj2 = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")) goto fail;
+
+    size_t obj3 = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "3 0 obj\n"
+                 "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                 "/Contents 4 0 R >>\n"
+                 "endobj\n")) goto fail;
+
+    size_t obj4 = pos;
+    if (!appendf(pdf, cap, &pos, "4 0 obj\n<< /Length %zu >>\nstream\n", payload_len)) goto fail;
+    if (!append_raw(pdf, cap, &pos, payload, payload_len)) goto fail;
+    if (!appendf(pdf, cap, &pos, "\nendstream\nendobj\n")) goto fail;
+
+    size_t xref = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "xref\n"
+                 "0 5\n"
+                 "0000000000 65535 f \n"
+                 "%010zu 00000 n \n"
+                 "%010zu 00000 n \n"
+                 "%010zu 00000 n \n"
+                 "%010zu 00000 n \n"
+                 "trailer\n<< /Size 5 /Root 1 0 R >>\n"
+                 "startxref\n%zu\n%%%%EOF",
+                 obj1, obj2, obj3, obj4, xref)) goto fail;
+
+    *out_len = pos;
+    return pdf;
+
+fail:
+    free(pdf);
+    return NULL;
+}
+
+// One-page PDF whose content stream is `payload` wrapped in a zlib stream of
+// stored (uncompressed) deflate blocks: a valid but poorly compressed
+// FlateDecode stream, like real-world files written with compression level 0.
+static char *make_stored_flate_stream_pdf(const char *payload, size_t payload_len,
+                                          size_t *out_len) {
+    // zlib header + stored blocks (5 bytes overhead per 65535) + adler32
+    size_t flate_cap = 2 + payload_len + 5 * (payload_len / 65535 + 1) + 4;
+    uint8_t *flate = (uint8_t *)malloc(flate_cap);
+    if (!flate) return NULL;
+
+    size_t fpos = 0;
+    flate[fpos++] = 0x78;
+    flate[fpos++] = 0x01;
+    size_t remaining = payload_len;
+    const uint8_t *src = (const uint8_t *)payload;
+    while (remaining > 0) {
+        uint16_t block = remaining > 65535 ? 65535 : (uint16_t)remaining;
+        flate[fpos++] = (remaining == block) ? 1 : 0;  // BFINAL, BTYPE=00
+        flate[fpos++] = (uint8_t)(block & 0xFF);
+        flate[fpos++] = (uint8_t)(block >> 8);
+        flate[fpos++] = (uint8_t)(~block & 0xFF);
+        flate[fpos++] = (uint8_t)((~block >> 8) & 0xFF);
+        memcpy(flate + fpos, src, block);
+        fpos += block;
+        src += block;
+        remaining -= block;
+    }
+    uint32_t adler = test_adler32((const uint8_t *)payload, payload_len);
+    flate[fpos++] = (uint8_t)(adler >> 24);
+    flate[fpos++] = (uint8_t)(adler >> 16);
+    flate[fpos++] = (uint8_t)(adler >> 8);
+    flate[fpos++] = (uint8_t)adler;
+
+    size_t cap = fpos + 2048;
+    char *pdf = (char *)malloc(cap);
+    if (!pdf) { free(flate); return NULL; }
+
+    size_t pos = 0;
+    if (!appendf(pdf, cap, &pos, "%%PDF-1.4\n")) goto fail;
+
+    size_t obj1 = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")) goto fail;
+
+    size_t obj2 = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")) goto fail;
+
+    size_t obj3 = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "3 0 obj\n"
+                 "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                 "/Contents 4 0 R >>\n"
+                 "endobj\n")) goto fail;
+
+    size_t obj4 = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "4 0 obj\n<< /Length %zu /Filter /FlateDecode >>\nstream\n", fpos)) goto fail;
+    if (!append_raw(pdf, cap, &pos, flate, fpos)) goto fail;
+    if (!appendf(pdf, cap, &pos, "\nendstream\nendobj\n")) goto fail;
+
+    size_t xref = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "xref\n"
+                 "0 5\n"
+                 "0000000000 65535 f \n"
+                 "%010zu 00000 n \n"
+                 "%010zu 00000 n \n"
+                 "%010zu 00000 n \n"
+                 "%010zu 00000 n \n"
+                 "trailer\n<< /Size 5 /Root 1 0 R >>\n"
+                 "startxref\n%zu\n%%%%EOF",
+                 obj1, obj2, obj3, obj4, xref)) goto fail;
+
+    free(flate);
+    *out_len = pos;
+    return pdf;
+
+fail:
+    free(flate);
+    free(pdf);
+    return NULL;
+}
+
+// Resolve page 0's /Contents stream in a document.
+static TspdfObj *first_page_contents(TspdfReader *doc) {
+    TspdfReaderPage *page = tspdf_reader_get_page(doc, 0);
+    if (!page) return NULL;
+    return test_resolve_ref(doc, tspdf_dict_get(page->page_dict, "Contents"));
+}
+
+TEST(test_recompress_adds_flate_to_unfiltered_streams) {
+    size_t payload_len = 0;
+    char *payload = make_compressible_payload(&payload_len);
+    ASSERT(payload != NULL);
+    size_t len = 0;
+    char *pdf = make_unfiltered_stream_pdf(payload, payload_len, &len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    TspdfSaveOptions opts = tspdf_save_options_default();
+    opts.recompress_streams = true;
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory_with_options(doc, &out, &out_len, &opts);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(out_len < len);
+
+    TspdfReader *doc2 = tspdf_reader_open(out, out_len, &err);
+    ASSERT(doc2 != NULL);
+    TspdfObj *contents = first_page_contents(doc2);
+    ASSERT(contents != NULL);
+    ASSERT_EQ_INT(contents->type, TSPDF_OBJ_STREAM);
+
+    TspdfObj *filter = tspdf_dict_get(contents->stream.dict, "Filter");
+    ASSERT(filter != NULL);
+    ASSERT_EQ_INT(filter->type, TSPDF_OBJ_NAME);
+    ASSERT_EQ_STR((const char *)filter->string.data, "FlateDecode");
+
+    // The compressed bytes must decode back to the original payload
+    size_t dec_len = 0;
+    uint8_t *dec = deflate_decompress(doc2->data + contents->stream.raw_offset,
+                                      contents->stream.raw_len, &dec_len);
+    ASSERT(dec != NULL);
+    ASSERT_EQ_SIZE(dec_len, payload_len);
+    ASSERT(memcmp(dec, payload, payload_len) == 0);
+
+    free(dec);
+    tspdf_reader_destroy(doc2);
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+    free(payload);
+}
+
+TEST(test_recompress_keeps_incompressible_stream_verbatim) {
+    // Pseudo-random binary payload: deflate cannot shrink it, so the
+    // keep-smaller rule must leave the stream unfiltered and untouched.
+    size_t payload_len = 5000;
+    char *payload = (char *)malloc(payload_len);
+    ASSERT(payload != NULL);
+    uint32_t state = 0x2545F491u;
+    for (size_t i = 0; i < payload_len; i++) {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        payload[i] = (char)(state & 0xFF);
+    }
+
+    size_t len = 0;
+    char *pdf = make_unfiltered_stream_pdf(payload, payload_len, &len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    TspdfSaveOptions opts = tspdf_save_options_default();
+    opts.recompress_streams = true;
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory_with_options(doc, &out, &out_len, &opts);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    TspdfReader *doc2 = tspdf_reader_open(out, out_len, &err);
+    ASSERT(doc2 != NULL);
+    TspdfObj *contents = first_page_contents(doc2);
+    ASSERT(contents != NULL);
+    ASSERT_EQ_INT(contents->type, TSPDF_OBJ_STREAM);
+    ASSERT(tspdf_dict_get(contents->stream.dict, "Filter") == NULL);
+    ASSERT_EQ_SIZE(contents->stream.raw_len, payload_len);
+    ASSERT(memcmp(doc2->data + contents->stream.raw_offset, payload, payload_len) == 0);
+
+    tspdf_reader_destroy(doc2);
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+    free(payload);
+}
+
+TEST(test_recompress_reflates_large_flate_stream) {
+    size_t payload_len = 0;
+    char *payload = make_compressible_payload(&payload_len);
+    ASSERT(payload != NULL);
+    size_t len = 0;
+    char *pdf = make_stored_flate_stream_pdf(payload, payload_len, &len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    TspdfSaveOptions opts = tspdf_save_options_default();
+    opts.recompress_streams = true;
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory_with_options(doc, &out, &out_len, &opts);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    // The stored-block stream is > 10KB and highly compressible: with the old
+    // 4KB skip floor removed the output must shrink substantially.
+    ASSERT(out_len + 4000 < len);
+
+    TspdfReader *doc2 = tspdf_reader_open(out, out_len, &err);
+    ASSERT(doc2 != NULL);
+    TspdfObj *contents = first_page_contents(doc2);
+    ASSERT(contents != NULL);
+    ASSERT_EQ_INT(contents->type, TSPDF_OBJ_STREAM);
+
+    size_t dec_len = 0;
+    uint8_t *dec = deflate_decompress(doc2->data + contents->stream.raw_offset,
+                                      contents->stream.raw_len, &dec_len);
+    ASSERT(dec != NULL);
+    ASSERT_EQ_SIZE(dec_len, payload_len);
+    ASSERT(memcmp(dec, payload, payload_len) == 0);
+
+    free(dec);
+    tspdf_reader_destroy(doc2);
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+    free(payload);
+}
+
+TEST(test_recompress_encrypted_source_roundtrip) {
+    // Streams of an encrypted source are decrypted in memory before
+    // recompression: the recompressed plaintext output must decode cleanly.
+    size_t payload_len = 0;
+    char *payload = make_compressible_payload(&payload_len);
+    ASSERT(payload != NULL);
+    size_t len = 0;
+    char *pdf = make_unfiltered_stream_pdf(payload, payload_len, &len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    uint8_t *enc = NULL;
+    size_t enc_len = 0;
+    err = tspdf_reader_save_to_memory_encrypted(doc, &enc, &enc_len,
+                                                "user123", "owner456", 0xFFFFFFFC, 128);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    TspdfReader *enc_doc = tspdf_reader_open_with_password(enc, enc_len, "user123", &err);
+    ASSERT(enc_doc != NULL);
+
+    TspdfSaveOptions opts = tspdf_save_options_default();
+    opts.recompress_streams = true;
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory_with_options(enc_doc, &out, &out_len, &opts);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    TspdfReader *doc2 = tspdf_reader_open(out, out_len, &err);
+    ASSERT(doc2 != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(doc2), 1);
+    TspdfObj *contents = first_page_contents(doc2);
+    ASSERT(contents != NULL);
+    ASSERT_EQ_INT(contents->type, TSPDF_OBJ_STREAM);
+
+    TspdfObj *filter = tspdf_dict_get(contents->stream.dict, "Filter");
+    ASSERT(filter != NULL);
+    ASSERT_EQ_INT(filter->type, TSPDF_OBJ_NAME);
+    ASSERT_EQ_STR((const char *)filter->string.data, "FlateDecode");
+
+    size_t dec_len = 0;
+    uint8_t *dec = deflate_decompress(doc2->data + contents->stream.raw_offset,
+                                      contents->stream.raw_len, &dec_len);
+    ASSERT(dec != NULL);
+    ASSERT_EQ_SIZE(dec_len, payload_len);
+    ASSERT(memcmp(dec, payload, payload_len) == 0);
+
+    free(dec);
+    tspdf_reader_destroy(doc2);
+    free(out);
+    tspdf_reader_destroy(enc_doc);
+    free(enc);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+    free(payload);
+}
+
+TEST(test_recompress_writes_xref_stream) {
+    // recompress_streams targets minimal output size, so it also writes the
+    // compact xref stream instead of a classic table.
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/three_pages.pdf", &err);
+    ASSERT(doc != NULL);
+
+    TspdfSaveOptions opts = tspdf_save_options_default();
+    opts.recompress_streams = true;
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory_with_options(doc, &out, &out_len, &opts);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(bytes_contains(out, out_len, "/Type /XRef"));
+
+    TspdfReader *doc2 = tspdf_reader_open(out, out_len, &err);
+    ASSERT(doc2 != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(doc2), 3);
+
+    tspdf_reader_destroy(doc2);
+    free(out);
+    tspdf_reader_destroy(doc);
+}
+
+TEST(test_delete_keeps_document_level_trees) {
+    size_t len = 0;
+    char *pdf = make_pinned_trees_pdf(&len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    size_t pages[] = {1};
+    TspdfReader *result = tspdf_reader_delete(doc, pages, 1, &err);
+    ASSERT(result != NULL);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(result, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    // Delete keeps the document-level trees (only extract drops them)
+    ASSERT(bytes_contains(out, out_len, "/StructTreeRoot"));
+    ASSERT(bytes_contains(out, out_len, "/Outlines"));
+
+    TspdfReader *doc2 = tspdf_reader_open(out, out_len, &err);
+    ASSERT(doc2 != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(doc2), 1);
+
+    tspdf_reader_destroy(doc2);
+    free(out);
+    tspdf_reader_destroy(result);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
 int main(void) {
     printf("tspr reader tests:\n");
 
@@ -6145,6 +6762,20 @@ int main(void) {
 
     printf("\n  Large document:\n");
     RUN(test_large_document_500_pages);
+
+    printf("\n  Audit fixes (reader-core):\n");
+    RUN(test_error_string_page_range);
+    RUN(test_extract_out_of_range_sets_page_range_error);
+    RUN(test_delete_out_of_range_sets_page_range_error);
+    RUN(test_rotate_out_of_range_sets_page_range_error);
+    RUN(test_reorder_out_of_range_sets_page_range_error);
+    RUN(test_extract_drops_document_level_trees);
+    RUN(test_delete_keeps_document_level_trees);
+    RUN(test_recompress_adds_flate_to_unfiltered_streams);
+    RUN(test_recompress_keeps_incompressible_stream_verbatim);
+    RUN(test_recompress_reflates_large_flate_stream);
+    RUN(test_recompress_encrypted_source_roundtrip);
+    RUN(test_recompress_writes_xref_stream);
 
     printf("\n%d tests, %d passed, %d failed\n",
            tests_run, tests_passed, tests_failed);

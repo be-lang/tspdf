@@ -10,13 +10,7 @@
 // --- Forward declarations for write helpers (defined later) ---
 static void write_string_escaped(TspdfBuffer *buf, const uint8_t *data, size_t len);
 static void write_name(TspdfBuffer *buf, const uint8_t *data, size_t len);
-
-// Streams already stored as /FlateDecode above this size are kept verbatim
-// instead of being inflated + re-deflated during "compress": the round-trip is
-// dominated by the inflate cost and effectively never shrinks an already
-// well-compressed stream. Small streams (<= floor) are still round-tripped
-// because the work is cheap and can occasionally recover a poorly-stored one.
-#define RECOMPRESS_FLATE_SIZE_FLOOR ((size_t)4096)
+static bool is_xmp_metadata(TspdfObj *obj);
 
 // --- Metadata helpers ---
 
@@ -565,35 +559,50 @@ static TspdfError write_stream_obj_with_options(TspdfBuffer *buf, TspdfObj *obj,
     const uint8_t *stream_data = stream.data;
     size_t stream_len = stream.len;
 
-    // Recompression
+    // Recompression. Both branches keep whichever encoding is smaller, so a
+    // stream never grows: an already-well-compressed stream stays verbatim.
     uint8_t *recompressed = NULL;
     size_t recomp_len = 0;
-    if (opts->recompress_streams) {
+    bool add_flate_filter = false;
+    if (opts->recompress_streams && !stream_dict_type_is(obj, "XRef")) {
         TspdfObj *filter = tspdf_dict_get(dict, "Filter");
         if (filter && filter->type == TSPDF_OBJ_NAME &&
             strcmp((char *)filter->string.data, "FlateDecode") == 0) {
-            // A stream that is already FlateDecode is, by definition, already
-            // compressed. Inflating and re-deflating it wastes the (dominant)
-            // decompress cost and essentially never shrinks a non-trivial stream
-            // — it usually grows it slightly. Only bother round-tripping small
-            // streams, where the work is cheap and a poorly-stored stream might
-            // still shrink; keep large already-compressed streams verbatim.
-            // This preserves the "keep the smaller of the two" guarantee: the
-            // original compressed bytes are already the smaller candidate.
-            if (stream_len <= RECOMPRESS_FLATE_SIZE_FLOOR) {
-                size_t dec_len = 0;
-                uint8_t *decompressed = deflate_decompress(stream_data, stream_len, &dec_len);
-                if (decompressed) {
-                    recompressed = deflate_compress(decompressed, dec_len, &recomp_len);
-                    free(decompressed);
-                    if (recompressed && recomp_len < stream_len) {
-                        stream_data = recompressed;
-                        stream_len = recomp_len;
-                    } else {
-                        free(recompressed);
-                        recompressed = NULL;
-                    }
+            // Existing Flate stream: inflate + re-deflate and keep the smaller
+            // encoding. This recovers streams stored at a low compression
+            // level (or as raw stored blocks) regardless of their size.
+            size_t dec_len = 0;
+            uint8_t *decompressed = deflate_decompress(stream_data, stream_len, &dec_len);
+            if (decompressed) {
+                recompressed = deflate_compress(decompressed, dec_len, &recomp_len);
+                free(decompressed);
+                if (recompressed && recomp_len < stream_len) {
+                    stream_data = recompressed;
+                    stream_len = recomp_len;
+                } else {
+                    free(recompressed);
+                    recompressed = NULL;
                 }
+            }
+        } else if (!filter && stream_len > 0 &&
+                   !tspdf_dict_get(dict, "FFilter") &&
+                   !tspdf_dict_get(dict, "DecodeParms") &&
+                   !tspdf_dict_get(dict, "DP") &&
+                   !is_xmp_metadata(obj)) {
+            // Stream stored with no filter at all: deflate it and add the
+            // /Filter entry if that shrinks it. Streams with a non-Flate
+            // filter (DCTDecode etc.) are already compressed and stay
+            // untouched, as do XMP metadata streams (kept uncompressed for
+            // PDF/A-style scanning) and anything with external-file or
+            // decode-parameter entries.
+            recompressed = deflate_compress(stream_data, stream_len, &recomp_len);
+            if (recompressed && recomp_len < stream_len) {
+                stream_data = recompressed;
+                stream_len = recomp_len;
+                add_flate_filter = true;
+            } else {
+                free(recompressed);
+                recompressed = NULL;
             }
         }
     }
@@ -620,6 +629,9 @@ static TspdfError write_stream_obj_with_options(TspdfBuffer *buf, TspdfObj *obj,
     }
     if (!wrote_length) {
         tspdf_buffer_printf(buf, "/Length %zu ", stream_len);
+    }
+    if (add_flate_filter) {
+        tspdf_buffer_append_str(buf, "/Filter /FlateDecode ");
     }
     tspdf_buffer_append_str(buf, ">>");
 
@@ -714,6 +726,11 @@ static TspdfError write_xref_stream(TspdfBuffer *buf, size_t *offsets, uint32_t 
 TspdfError tspdf_serialize_with_options(TspdfReader *doc, uint8_t **out_buf, size_t *out_len,
                                       const TspdfSaveOptions *opts) {
     if (!doc || !out_buf || !out_len || !opts) return TSPDF_ERR_PARSE;
+
+    // recompress_streams targets minimal output size, so it also implies the
+    // compact compressed xref stream over the classic table (whose 20 bytes
+    // per object dominate the achievable savings on object-heavy files).
+    bool use_xref_stream = opts->use_xref_stream || opts->recompress_streams;
 
     // --- Preserve object IDs fast path ---
     // When preserve_object_ids is set and document is unmodified, copy raw bytes
@@ -817,7 +834,7 @@ TspdfError tspdf_serialize_with_options(TspdfReader *doc, uint8_t **out_buf, siz
         // Determine PDF version
         char version[8];
         memcpy(version, doc->pdf_version, sizeof(version));
-        if (opts->use_xref_stream) {
+        if (use_xref_stream) {
             // Ensure at least 1.5
             if (strcmp(version, "1.0") == 0 || strcmp(version, "1.1") == 0 ||
                 strcmp(version, "1.2") == 0 || strcmp(version, "1.3") == 0 ||
@@ -898,7 +915,7 @@ TspdfError tspdf_serialize_with_options(TspdfReader *doc, uint8_t **out_buf, siz
         }
 
         // Write xref / trailer
-        if (opts->use_xref_stream) {
+        if (use_xref_stream) {
             uint32_t root_for_trailer = orig_root_num;
             uint32_t info_for_trailer = (!opts->strip_metadata && need_producer_info) ? producer_info_num : 0;
             TspdfError xref_err = write_xref_stream(&buf, offsets, max_obj, root_for_trailer,
@@ -1024,7 +1041,7 @@ TspdfError tspdf_serialize_with_options(TspdfReader *doc, uint8_t **out_buf, siz
     // Determine PDF version
     char version[8];
     memcpy(version, doc->pdf_version, sizeof(version));
-    if (opts->use_xref_stream) {
+    if (use_xref_stream) {
         if (strcmp(version, "1.0") == 0 || strcmp(version, "1.1") == 0 ||
             strcmp(version, "1.2") == 0 || strcmp(version, "1.3") == 0 ||
             strcmp(version, "1.4") == 0) {
@@ -1149,7 +1166,7 @@ TspdfError tspdf_serialize_with_options(TspdfReader *doc, uint8_t **out_buf, siz
     }
 
     // Xref table or xref stream
-    if (opts->use_xref_stream) {
+    if (use_xref_stream) {
         TspdfError xref_err = write_xref_stream(&buf, offsets, total_objects, 1,
                                                  info_obj_num, write_info, opts);
         if (xref_err != TSPDF_OK) {

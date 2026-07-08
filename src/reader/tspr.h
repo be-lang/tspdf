@@ -131,7 +131,9 @@ typedef struct {
     bool preserve_object_ids;   // Keep original object numbers (enables raw byte copy, faster)
     bool strip_unused_objects;  // Only include objects reachable from page tree
     bool use_xref_stream;      // Use compact xref stream (PDF 1.5+) instead of classic table
-    bool recompress_streams;   // Decompress + recompress all FlateDecode streams
+    bool recompress_streams;   // Minimize stream storage: deflate unfiltered streams,
+                               // re-deflate FlateDecode ones (keeping whichever encoding
+                               // is smaller), and write the xref as a compressed stream
     bool strip_metadata;       // Remove Info dict and XMP metadata
     bool update_producer;      // Set /Producer to "tspdf" (default true)
 } TspdfSaveOptions;

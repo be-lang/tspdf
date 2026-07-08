@@ -19,6 +19,7 @@ const char *tspdf_error_string(TspdfError err) {
         case TSPDF_ERR_UNSUPPORTED: return "unsupported PDF feature";
         case TSPDF_ERR_ENCRYPTED:   return "PDF is encrypted, password required";
         case TSPDF_ERR_BAD_PASSWORD: return "wrong password";
+        case TSPDF_ERR_PAGE_RANGE:  return "page index out of range";
     }
     return "unknown error";
 }
