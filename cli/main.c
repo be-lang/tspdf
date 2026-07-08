@@ -25,6 +25,7 @@ static void print_usage(void) {
     printf("  qrcode     Generate a QR code PDF\n");
     printf("  md2pdf     Convert Markdown to a styled PDF\n");
     printf("  serve      Start a local web server for PDF tools\n");
+    printf("  text       Extract text from a PDF\n");
     printf("\n");
     printf("Options:\n");
     printf("  --help, -h     Show this help message\n");
@@ -180,6 +181,17 @@ static void print_command_help(const char *cmd) {
         printf("\n");
         printf("Start a local web server for PDF tools.\n");
         printf("Default port: 8080\n");
+    } else if (strcmp(cmd, "text") == 0) {
+        printf("Usage: tspdf text <input.pdf> [--pages <range>] [-o <output.txt>]\n");
+        printf("\n");
+        printf("Extract text from a PDF, in content-stream order.\n");
+        printf("All pages go to stdout by default, separated by form-feed (\\f).\n");
+        printf("\n");
+        printf("Arguments:\n");
+        printf("  <input.pdf>        Input PDF file\n");
+        printf("  --pages <range>    Pages to extract, e.g. 1-3 or 1,3,5 (default: all)\n");
+        printf("  -o <output.txt>    Write to a file instead of stdout\n");
+        printf("  --password <pass>  Password for encrypted PDFs (optional)\n");
     } else {
         /* Unknown command — fall back to general help */
         print_usage();
@@ -234,6 +246,7 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "qrcode") == 0)   return cmd_qrcode(sub_argc, sub_argv);
     if (strcmp(cmd, "md2pdf") == 0)   return cmd_md2pdf(sub_argc, sub_argv);
     if (strcmp(cmd, "serve") == 0)   return cmd_serve(sub_argc, sub_argv);
+    if (strcmp(cmd, "text") == 0)    return cmd_text(sub_argc, sub_argv);
 
     fprintf(stderr, "tspdf: unknown command '%s'\n\n", cmd);
     print_usage();
