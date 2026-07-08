@@ -1269,6 +1269,76 @@ else
   echo "  SKIP  md2pdf images (qpdf not found)"
 fi
 
+# serve --bind: default stays loopback; non-loopback binds warn and keep a
+# same-origin gate for browser POSTs.
+BIND_PORT_LOOP=$((CLI_TEST_PORT_BASE + 50))
+BIND_PORT_ANY=$((CLI_TEST_PORT_BASE + 51))
+BIND_PORT_CSRF=$((CLI_TEST_PORT_BASE + 52))
+
+run_test "serve rejects an invalid --bind address" bash -c "
+  ! $TSPDF serve --bind 999.1.2.3 --port $BIND_PORT_LOOP 2>/dev/null"
+
+run_test "serve help mentions --bind" bash -c "$TSPDF serve --help | grep -q -- '--bind'"
+
+if command -v curl > /dev/null 2>&1; then
+  run_test "serve --bind 127.0.0.1 answers GET /" bash -c "
+    $TSPDF serve --bind 127.0.0.1 --port $BIND_PORT_LOOP > /dev/null 2>&1 & sp=\$!
+    sleep 2
+    curl -sf --retry 3 --retry-delay 1 --max-time 5 http://127.0.0.1:${BIND_PORT_LOOP}/ -o /dev/null
+    rc=\$?
+    kill \$sp 2>/dev/null; wait \$sp 2>/dev/null
+    exit \$rc"
+
+  run_test "serve --bind 0.0.0.0 warns and answers via 127.0.0.1" bash -c "
+    $TSPDF serve --bind 0.0.0.0 --port $BIND_PORT_ANY > $TMPDIR/bind_any.log 2>&1 & sp=\$!
+    sleep 2
+    curl -sf --retry 3 --retry-delay 1 --max-time 5 http://127.0.0.1:${BIND_PORT_ANY}/ -o /dev/null
+    rc=\$?
+    kill \$sp 2>/dev/null; wait \$sp 2>/dev/null
+    [ \$rc -eq 0 ] && grep -qi 'warning' $TMPDIR/bind_any.log && grep -qi 'no authentication' $TMPDIR/bind_any.log"
+else
+  echo "  SKIP  serve --bind e2e (curl not found)"
+fi
+
+# With a non-loopback bind the Host header can name any address the server is
+# reachable at, but a browser POST carrying a foreign Origin must still be
+# rejected (same-origin gate), and a matching Origin must pass.
+if command -v python3 > /dev/null 2>&1; then
+  run_test "serve --bind 0.0.0.0 keeps same-origin gate on POST /api" bash -c "
+    set -e
+    \"$TSPDF\" serve --bind 0.0.0.0 --port $BIND_PORT_CSRF > /dev/null 2>&1 & sp=\$!
+    sleep 2
+    python3 -c \"
+import socket, sys
+def post(host_hdr, origin):
+    bnd = '----tspdf'
+    body = ('--%s\\\\r\\\\nContent-Disposition: form-data; name=\\\"config\\\"\\\\r\\\\n\\\\r\\\\n'
+            '{\\\"url\\\":\\\"https://example.com\\\"}\\\\r\\\\n--%s--\\\\r\\\\n' % (bnd, bnd)).encode('ascii')
+    hdr = ('POST /api/qrcode HTTP/1.1\\\\r\\\\nHost: %s\\\\r\\\\n'
+           'Origin: %s\\\\r\\\\n'
+           'Content-Type: multipart/form-data; boundary=%s\\\\r\\\\n'
+           'Content-Length: %d\\\\r\\\\n\\\\r\\\\n' % (host_hdr, origin, bnd, len(body))).encode('ascii')
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(5)
+    s.connect(('127.0.0.1', $BIND_PORT_CSRF))
+    s.sendall(hdr + body)
+    data = s.recv(8192)
+    s.close()
+    return data.split(b' ')[1]
+# foreign Origin on a network Host: rejected
+if post('192.168.7.7:$BIND_PORT_CSRF', 'https://evil.example.com') != b'403':
+    sys.exit(1)
+# same-origin POST from the served UI on a network address: accepted
+if post('192.168.7.7:$BIND_PORT_CSRF', 'http://192.168.7.7:$BIND_PORT_CSRF') != b'200':
+    sys.exit(2)
+\"
+    kill \$sp 2>/dev/null || true
+    wait \$sp 2>/dev/null || true
+  "
+else
+  echo "  SKIP  serve --bind same-origin gate (python3 not found)"
+fi
+
 echo ""
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ] || exit 1

@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <fcntl.h>
@@ -227,15 +228,32 @@ static int parse_request(const char *raw, size_t raw_len, HttpRequest *req)
 
 /* ── Local-origin enforcement (DNS-rebinding / cross-site mitigation) ──
  *
- * The server binds 127.0.0.1, but binding the loopback interface alone does
- * not stop a remote web page from pointing an attacker-controlled hostname at
- * 127.0.0.1 (DNS rebinding) and then POSTing to our /api endpoints — the
- * browser would happily send the request and hand the generated PDF back to
- * the attacker's page. The standard, dependency-free defence for a local tool
- * is to (1) require the Host header to name loopback (so a rebound attacker
- * hostname is rejected) and (2) when an Origin/Referer is present, require it
- * to point at our own loopback origin too. Both checks use already-parsed
- * req->headers, so this is purely additive. */
+ * The server binds 127.0.0.1 by default, and binding the loopback interface
+ * alone does not stop a remote web page from pointing an attacker-controlled
+ * hostname at 127.0.0.1 (DNS rebinding) and then POSTing to our /api
+ * endpoints — the browser would happily send the request and hand the
+ * generated PDF back to the attacker's page. The standard, dependency-free
+ * defence for a local tool is to (1) require the Host header to name loopback
+ * (so a rebound attacker hostname is rejected) and (2) when an Origin/Referer
+ * is present, require it to point at our own loopback origin too. Both checks
+ * use already-parsed req->headers, so this is purely additive.
+ *
+ * --bind relaxes this by tiers. A specific non-loopback address (e.g. a LAN
+ * IP) additionally accepts that address in Host/Origin. Binding 0.0.0.0
+ * (the Docker case) means the server is reachable under any name we cannot
+ * enumerate, so the Host check is reduced to presence and the Origin check
+ * becomes same-origin: a present Origin/Referer must match the request's own
+ * Host (or loopback). That still blocks the cross-site browser POST, but a
+ * non-loopback bind fundamentally trusts the network — there is no
+ * authentication, and cmd_serve prints a warning saying so. */
+
+/* Bind configuration (set once in cmd_serve before start_server). */
+static struct {
+    struct in_addr addr;
+    int loopback;                       /* 127.0.0.0/8 (the default) */
+    int any;                            /* INADDR_ANY */
+    char addr_str[INET_ADDRSTRLEN];
+} g_bind = { { 0 }, 1, 0, "127.0.0.1" };
 
 static const char *find_request_header(const HttpRequest *req, const char *name)
 {
@@ -247,11 +265,11 @@ static const char *find_request_header(const HttpRequest *req, const char *name)
     return NULL;
 }
 
-/* True if host (no scheme, may carry ":port") names a loopback address.
- * Accepts "localhost", "127.0.0.1", "127.x.y.z", "[::1]" and "::1". The port,
- * if present, must equal expect_port — a browser always sends the port it
- * connected to, so a mismatch means the value was forged or rebound. */
-static int host_is_loopback(const char *host, int expect_port)
+/* Extract the bare host from a Host-style value (no scheme, may carry
+ * ":port") into out. The port, if present, must equal expect_port — a
+ * browser always sends the port it connected to, so a mismatch means the
+ * value was forged or rebound. Returns 1 on success. */
+static int host_authority(const char *host, int expect_port, char *out, size_t out_sz)
 {
     if (!host) return 0;
     while (*host == ' ' || *host == '\t') host++;
@@ -298,6 +316,19 @@ static int host_is_loopback(const char *host, int expect_port)
         h = hostbuf + 1;
     }
 
+    size_t out_len = strlen(h);
+    if (out_len >= out_sz) return 0;
+    memcpy(out, h, out_len + 1);
+    return 1;
+}
+
+/* True if host (no scheme, may carry ":port") names a loopback address.
+ * Accepts "localhost", "127.0.0.1", "127.x.y.z", "[::1]" and "::1". */
+static int host_is_loopback(const char *host, int expect_port)
+{
+    char h[256];
+    if (!host_authority(host, expect_port, h, sizeof(h))) return 0;
+
     if (!strcasecmp(h, "localhost")) return 1;
     if (!strcmp(h, "::1")) return 1;
     /* Any 127.0.0.0/8 address is loopback. Match the leading octet strictly. */
@@ -305,10 +336,27 @@ static int host_is_loopback(const char *host, int expect_port)
     return 0;
 }
 
+/* Host-header gate, per the bind tiers described above. */
+static int host_is_allowed(const char *host, int expect_port)
+{
+    if (host_is_loopback(host, expect_port)) return 1;
+    if (g_bind.loopback) return 0;
+    if (g_bind.any) {
+        /* Reachable under any name; require presence only. The Origin
+         * same-origin check below still blocks cross-site POSTs. */
+        return host != NULL && *host != '\0';
+    }
+    /* Specific non-loopback bind: also accept the bound address. */
+    char h[256];
+    return host_authority(host, expect_port, h, sizeof(h)) &&
+           strcmp(h, g_bind.addr_str) == 0;
+}
+
 /* Validate an Origin/Referer value (e.g. "http://127.0.0.1:8080" or
- * "http://localhost:8080/tool") by extracting the authority and checking it
- * with host_is_loopback. */
-static int origin_is_loopback(const char *origin, int expect_port)
+ * "http://192.168.1.5:8080/tool") by extracting the authority and applying
+ * the bind tiers; for a 0.0.0.0 bind the authority must equal the request's
+ * own Host value (same-origin). */
+static int origin_is_allowed(const char *origin, const char *request_host, int expect_port)
 {
     if (!origin) return 0;
     while (*origin == ' ' || *origin == '\t') origin++;
@@ -328,27 +376,42 @@ static int origin_is_loopback(const char *origin, int expect_port)
         authbuf[i++] = *p;
     }
     authbuf[i] = '\0';
-    return host_is_loopback(authbuf, expect_port);
+
+    if (host_is_loopback(authbuf, expect_port)) return 1;
+    if (g_bind.loopback) return 0;
+    if (!g_bind.any) {
+        char h[256];
+        return host_authority(authbuf, expect_port, h, sizeof(h)) &&
+               strcmp(h, g_bind.addr_str) == 0;
+    }
+    /* 0.0.0.0: same-origin — the Origin authority must equal the Host the
+     * request was addressed to (both carry the same host:port text). */
+    if (!request_host) return 0;
+    while (*request_host == ' ' || *request_host == '\t') request_host++;
+    size_t hl = strlen(request_host);
+    while (hl > 0 && (request_host[hl - 1] == ' ' || request_host[hl - 1] == '\t')) hl--;
+    return strlen(authbuf) == hl && strncasecmp(authbuf, request_host, hl) == 0;
 }
 
-/* Gate for /api requests: the Host must be loopback, and if the browser
- * supplied an Origin (always present on cross-origin/CORS-relevant fetches) or
- * a Referer, that too must be our local origin. Returns 1 to allow. */
+/* Gate for /api requests: the Host must pass the bind tier, and if the
+ * browser supplied an Origin (always present on cross-origin/CORS-relevant
+ * fetches) or a Referer, that too must be an allowed origin. Returns 1 to
+ * allow. */
 static int request_is_local(const HttpRequest *req, int port)
 {
     const char *host = find_request_header(req, "Host");
-    if (!host_is_loopback(host, port))
+    if (!host_is_allowed(host, port))
         return 0;
 
     const char *origin = find_request_header(req, "Origin");
-    if (origin && !origin_is_loopback(origin, port))
+    if (origin && !origin_is_allowed(origin, host, port))
         return 0;
 
     /* Fall back to Referer only when Origin is absent (older browsers / some
      * fetch modes omit Origin). A present Referer must still match. */
     if (!origin) {
         const char *referer = find_request_header(req, "Referer");
-        if (referer && !origin_is_loopback(referer, port))
+        if (referer && !origin_is_allowed(referer, host, port))
             return 0;
     }
     return 1;
@@ -1987,7 +2050,7 @@ static int start_server(int port)
 
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_addr = g_bind.addr;
     addr.sin_port = htons((uint16_t)port);
 
     if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
@@ -2002,7 +2065,13 @@ static int start_server(int port)
         return 1;
     }
 
-    printf("tspdf server running at http://localhost:%d\n", port);
+    if (!g_bind.loopback) {
+        fprintf(stderr, "WARNING: --bind %s exposes the web UI to the network; "
+                        "it has no authentication and trusts every client that "
+                        "can reach it.\n", g_bind.addr_str);
+    }
+    printf("tspdf server running at http://%s:%d\n",
+           g_bind.loopback ? "localhost" : g_bind.addr_str, port);
     printf("Press Ctrl+C to stop.\n");
 
     while (server_running) {
@@ -2220,9 +2289,11 @@ static int start_server(int port)
 int cmd_serve(int argc, char **argv)
 {
     if (has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
-        printf("Usage: tspdf serve [--port <port>]\n");
+        printf("Usage: tspdf serve [--port <port>] [--bind <addr>]\n");
         printf("\nStart a local web server for PDF tools.\n");
-        printf("Default port: 8080\n");
+        printf("Default port: 8080, default bind address: 127.0.0.1\n");
+        printf("Binding a non-loopback address (e.g. 0.0.0.0) exposes the\n");
+        printf("unauthenticated UI to the network; a warning is printed.\n");
         return 0;
     }
 
@@ -2240,6 +2311,26 @@ int cmd_serve(int argc, char **argv)
             return 1;
         }
         port = (int)val;
+    }
+
+    const char *bind_str = find_flag(argc, argv, "--bind");
+    if (bind_str) {
+        struct in_addr a;
+        if (inet_pton(AF_INET, bind_str, &a) != 1) {
+            fprintf(stderr,
+                "error: invalid --bind '%s' (must be an IPv4 address, e.g. 127.0.0.1 or 0.0.0.0)\n",
+                bind_str);
+            return 1;
+        }
+        g_bind.addr = a;
+        g_bind.loopback = (ntohl(a.s_addr) >> 24) == 127;
+        g_bind.any = a.s_addr == htonl(INADDR_ANY);
+        if (!inet_ntop(AF_INET, &a, g_bind.addr_str, sizeof(g_bind.addr_str))) {
+            fprintf(stderr, "error: cannot format --bind address\n");
+            return 1;
+        }
+    } else {
+        g_bind.addr.s_addr = htonl(INADDR_LOOPBACK);
     }
 
     return start_server(port);
