@@ -29,19 +29,8 @@ static double lh_cb(const char *f, double s, void *u) {
  * actually contain inline markup; plain lines keep the wrapping text node so
  * long paragraphs still word-wrap. */
 
-/* True if the line contains any supported inline construct:
- * **bold** / __bold__, `code`, or [label](url). */
-static int line_has_inline(const char *s) {
-    for (const char *p = s; *p; p++) {
-        if ((p[0] == '*' && p[1] == '*') || (p[0] == '_' && p[1] == '_')) return 1;
-        if (p[0] == '`') return 1;
-        if (p[0] == '[' && strchr(p, ']') && strstr(p, "](")) return 1;
-    }
-    return 0;
-}
-
 /* A run of text with one inline style, produced by scanning a line. */
-typedef enum { SEG_PLAIN, SEG_BOLD, SEG_MONO, SEG_LINK } SegKind;
+typedef enum { SEG_PLAIN, SEG_BOLD, SEG_ITALIC, SEG_MONO, SEG_LINK } SegKind;
 typedef struct {
     const char *start;   /* points into the (mutable) source line */
     size_t      len;
@@ -50,11 +39,23 @@ typedef struct {
 
 #define MD_MAX_SEGS 64
 
+/* Word character for emphasis flanking rules (cp1252 high bytes count as
+ * letters so accented words do not open/close `_` emphasis mid-word). */
+static int md_word_char(char c) {
+    unsigned char u = (unsigned char)c;
+    return (u >= '0' && u <= '9') || (u >= 'A' && u <= 'Z') ||
+           (u >= 'a' && u <= 'z') || u >= 0x80;
+}
+
 /* Split `line` into styled segments. `**x**`/`__x__` -> SEG_BOLD,
- * `` `x` `` -> SEG_MONO, `[label](url)` -> SEG_LINK (label text only; the URL
- * is dropped from the visible run). Everything else is SEG_PLAIN. Returns the
- * number of segments (capped at MD_MAX_SEGS; on overflow the tail is folded
- * into the last plain segment so no text is lost). */
+ * `*x*`/`_x_` -> SEG_ITALIC (with flanking rules: the opener must not be
+ * followed by a space, the closer not preceded by one, and `_` only opens or
+ * closes at a word boundary so snake_case stays literal), `` `x` `` ->
+ * SEG_MONO, `[label](url)` -> SEG_LINK (label text only; the URL is dropped
+ * from the visible run), `![alt](url)` -> SEG_ITALIC alt text (inline images
+ * are not embedded). Everything else is SEG_PLAIN. Returns the number of
+ * segments (capped at MD_MAX_SEGS; on overflow the tail is folded into the
+ * last plain segment so no text is lost). */
 static int split_inline_segments(const char *line, InlineSeg *segs, int max_segs) {
     int n = 0;
     const char *p = line;
@@ -75,6 +76,30 @@ static int split_inline_segments(const char *line, InlineSeg *segs, int max_segs
             if (close && close > p + 2) {
                 seg = p + 2; seg_len = (size_t)(close - seg);
                 resume = close + 2; kind = SEG_BOLD;
+            }
+        } else if ((p[0] == '*' && p[1] != '*') ||
+                   (p[0] == '_' && p[1] != '_' &&
+                    (p == line || !md_word_char(p[-1])))) {
+            char d = p[0];
+            if (p[1] != ' ' && p[1] != '\0') {
+                const char *close = NULL;
+                for (const char *q = p + 2; *q; q++) {
+                    if (q[0] == d && q[-1] != ' ' &&
+                        (d == '*' || !md_word_char(q[1]))) { close = q; break; }
+                }
+                if (close) {
+                    seg = p + 1; seg_len = (size_t)(close - seg);
+                    resume = close + 1; kind = SEG_ITALIC;
+                }
+            }
+        } else if (p[0] == '!' && p[1] == '[') {
+            const char *rb = strchr(p + 1, ']');
+            if (rb && rb[1] == '(') {
+                const char *rp = strchr(rb + 2, ')');
+                if (rp) {
+                    seg = p + 2; seg_len = (size_t)(rb - seg);  /* alt only */
+                    resume = rp + 1; kind = SEG_ITALIC;
+                }
             }
         } else if (p[0] == '`') {
             const char *close = strchr(p + 1, '`');
@@ -123,43 +148,67 @@ static int split_inline_segments(const char *line, InlineSeg *segs, int max_segs
     return n;
 }
 
-/* Render `line` with inline styling onto `node`. fonts: regular / bold / mono.
+/* True if the line contains any inline construct the segment scanner would
+ * style (exact: runs the scanner, so flanking rules match the renderer). */
+static int line_has_inline(const char *s) {
+    InlineSeg segs[MD_MAX_SEGS];
+    int n = split_inline_segments(s, segs, MD_MAX_SEGS);
+    if (n > 1) return 1;
+    return n == 1 && segs[0].kind != SEG_PLAIN;
+}
+
+/* Render `line` with inline styling onto `node`.
+ * fonts: regular / bold / italic / mono.
  *
  * Rich-text spans (src/layout/layout.h) render on a single non-wrapping line
- * and are capped at TSPDF_LAYOUT_MAX_SPANS, so we only use them when the line
- * fits. Otherwise we fall back to plain (still word-wrapping) text built from
- * the segments with the markup stripped — styling is lost but every character
- * is preserved and no literal `**`/backtick/`](` markers leak into the PDF.
- * Either way `node->text.text` was pre-seeded with the raw line by the caller;
- * when spans are added they override it, and on fallback we overwrite it. */
+ * and are capped at TSPDF_LAYOUT_MAX_SPANS, so we only use them when the
+ * styled line fits within avail_width and the span cap. Otherwise we fall
+ * back to plain (still word-wrapping) text built from the segments with the
+ * markup stripped — styling is lost but every character is preserved and no
+ * literal `*`/backtick/`](` markers leak into the PDF. Either way
+ * `node->text.text` was pre-seeded with the raw line by the caller; when
+ * spans are added they override it, and on fallback we overwrite it. */
 static void parse_inline_spans(TspdfLayout *ctx, TspdfNode *node, const char *line,
-                               const char *regular, const char *bold, const char *mono,
-                               double size, TspdfColor color) {
+                               const char *regular, const char *bold,
+                               const char *italic, const char *mono,
+                               double size, TspdfColor color, double avail_width) {
     InlineSeg segs[MD_MAX_SEGS];
     int n = split_inline_segments(line, segs, MD_MAX_SEGS);
     if (n == 0) return;
 
-    if (n <= TSPDF_LAYOUT_MAX_SPANS) {
-        for (int i = 0; i < n; i++) {
-            if (segs[i].len == 0) continue;
-            char *buf = (char *)tspdf_arena_alloc(ctx->arena, segs[i].len + 1);
-            if (!buf) { node->text.span_count = 0; goto fallback; }
-            memcpy(buf, segs[i].start, segs[i].len);
-            buf[segs[i].len] = '\0';
-            const char *font = regular;
-            int decoration = 0;
-            switch (segs[i].kind) {
-                case SEG_BOLD: font = bold; break;
-                case SEG_MONO: font = mono; break;
-                case SEG_LINK: decoration = TSPDF_TEXT_DECOR_UNDERLINE; break;
-                case SEG_PLAIN: break;
-            }
-            if (!tspdf_layout_text_add_span(node, buf, font, size, color, decoration)) {
-                node->text.span_count = 0;  /* should not happen: n <= cap */
-                goto fallback;
-            }
+    /* Arena copies of every segment; also reused by the plain fallback. */
+    char *texts[MD_MAX_SEGS];
+    const char *fonts[MD_MAX_SEGS];
+    for (int i = 0; i < n; i++) {
+        texts[i] = (char *)tspdf_arena_alloc(ctx->arena, segs[i].len + 1);
+        if (!texts[i]) return;  /* keep node's raw text (still no crash) */
+        memcpy(texts[i], segs[i].start, segs[i].len);
+        texts[i][segs[i].len] = '\0';
+        switch (segs[i].kind) {
+            case SEG_BOLD:   fonts[i] = bold;    break;
+            case SEG_ITALIC: fonts[i] = italic;  break;
+            case SEG_MONO:   fonts[i] = mono;    break;
+            default:         fonts[i] = regular; break;
         }
-        return;
+    }
+
+    if (n <= TSPDF_LAYOUT_MAX_SPANS) {
+        double total = 0;
+        for (int i = 0; i < n; i++) {
+            if (ctx->measure_text)
+                total += ctx->measure_text(fonts[i], size, texts[i], ctx->measure_userdata);
+        }
+        if (total <= avail_width) {
+            for (int i = 0; i < n; i++) {
+                if (segs[i].len == 0) continue;
+                int decoration = segs[i].kind == SEG_LINK ? TSPDF_TEXT_DECOR_UNDERLINE : 0;
+                if (!tspdf_layout_text_add_span(node, texts[i], fonts[i], size, color, decoration)) {
+                    node->text.span_count = 0;  /* should not happen: n <= cap */
+                    goto fallback;
+                }
+            }
+            return;
+        }
     }
 
 fallback:
@@ -171,7 +220,7 @@ fallback:
         if (!buf) return;  /* keep node's raw text (still no crash) */
         size_t off = 0;
         for (int i = 0; i < n; i++) {
-            memcpy(buf + off, segs[i].start, segs[i].len);
+            memcpy(buf + off, texts[i], segs[i].len);
             off += segs[i].len;
         }
         buf[off] = '\0';
@@ -256,6 +305,8 @@ int cmd_md2pdf(int argc, char **argv) {
 
     const char *sans = tspdf_writer_add_builtin_font(doc, "Helvetica");
     const char *bold = tspdf_writer_add_builtin_font(doc, "Helvetica-Bold");
+    const char *italic = tspdf_writer_add_builtin_font(doc, "Helvetica-Oblique");
+    const char *bolditalic = tspdf_writer_add_builtin_font(doc, "Helvetica-BoldOblique");
     const char *mono = tspdf_writer_add_builtin_font(doc, "Courier");
 
     TspdfArena arena = tspdf_arena_create(8 * 1024 * 1024);
@@ -265,6 +316,10 @@ int cmd_md2pdf(int argc, char **argv) {
     ctx.doc = doc;
 
     double W = TSPDF_PAGE_A4_WIDTH, H = TSPDF_PAGE_A4_HEIGHT;
+    /* Width available to content inside the root padding; inline spans only
+     * render single-line, so parse_inline_spans falls back to wrapped plain
+     * text when the styled line would exceed this. */
+    double content_w = W - 2 * 52;
 
     TspdfNode *root = tspdf_layout_box(&ctx);
     root->width = tspdf_size_fixed(W);
@@ -370,7 +425,8 @@ int cmd_md2pdf(int argc, char **argv) {
             node->width = tspdf_size_grow();
             if (line_has_inline(text)) {
                 /* Headings default to bold; inline `code`/links still styled. */
-                parse_inline_spans(&ctx, node, text, bold, bold, mono, sz, heading_color);
+                parse_inline_spans(&ctx, node, text, bold, bold, bolditalic, mono,
+                                   sz, heading_color, content_w);
             }
             tspdf_layout_add_child(root, node);
         } else if ((line[0] == '-' || line[0] == '*') && line[1] == ' ') {
@@ -390,7 +446,8 @@ int cmd_md2pdf(int argc, char **argv) {
             txt->width = tspdf_size_grow();
             txt->text.color = item_color;
             if (line_has_inline(line + 2)) {
-                parse_inline_spans(&ctx, txt, line + 2, sans, bold, mono, 11, item_color);
+                parse_inline_spans(&ctx, txt, line + 2, sans, bold, italic, mono,
+                                   11, item_color, content_w - 20);
             }
             tspdf_layout_add_child(row, txt);
 
@@ -414,7 +471,8 @@ int cmd_md2pdf(int argc, char **argv) {
             txt->width = tspdf_size_grow();
             txt->text.color = quote_color;
             if (line_has_inline(line + 2)) {
-                parse_inline_spans(&ctx, txt, line + 2, sans, bold, mono, 11, quote_color);
+                parse_inline_spans(&ctx, txt, line + 2, sans, bold, italic, mono,
+                                   11, quote_color, content_w - 16);
             }
             tspdf_layout_add_child(bq, txt);
 
@@ -438,7 +496,8 @@ int cmd_md2pdf(int argc, char **argv) {
             txt->width = tspdf_size_grow();
             txt->text.color = item_color;
             if (line_has_inline(ord_content)) {
-                parse_inline_spans(&ctx, txt, ord_content, sans, bold, mono, 11, item_color);
+                parse_inline_spans(&ctx, txt, ord_content, sans, bold, italic, mono,
+                                   11, item_color, content_w - 30);
             }
             tspdf_layout_add_child(row, txt);
 
@@ -460,7 +519,8 @@ int cmd_md2pdf(int argc, char **argv) {
             node->text.color = para_color;
             node->width = tspdf_size_grow();
             if (line_has_inline(line)) {
-                parse_inline_spans(&ctx, node, line, sans, bold, mono, 11, para_color);
+                parse_inline_spans(&ctx, node, line, sans, bold, italic, mono,
+                                   11, para_color, content_w);
             }
             tspdf_layout_add_child(root, node);
         }

@@ -1154,6 +1154,35 @@ run_test "pagenum accepts top-right position and custom size" $TSPDF pagenum $IN
 
 run_test "help pagenum shows command-specific usage" bash -c "$TSPDF help pagenum 2>/dev/null | grep -q 'Usage: tspdf pagenum'"
 
+# md2pdf emphasis: *x*/_x_ italic, **x** bold; literal markers must not leak.
+if command -v qpdf > /dev/null 2>&1; then
+  run_test "md2pdf emphasis styles text without literal markers" bash -c "
+    set -e
+    cat > $TMPDIR/emph.md <<'EOF'
+# Emphasis
+
+Plain ITALWORD is *ITALWORD* and BOLDWORD is **BOLDWORD** and _UNDERITAL_ ends.
+
+A snake_case_word stays literal and 2 * 3 = 6 stays literal too.
+
+This is a deliberately long wrapping paragraph that keeps going and going and going far past one line so the styled segments cannot fit on a single rendered line and *WRAPITALWORD* must fall back to plain de-marked text while still wrapping across lines without leaking markers.
+EOF
+    $TSPDF md2pdf $TMPDIR/emph.md -o $TMPDIR/emph.pdf > /dev/null 2>&1
+    qpdf --qdf --object-streams=disable $TMPDIR/emph.pdf $TMPDIR/emph.qdf
+    grep -q 'Helvetica-Oblique' $TMPDIR/emph.qdf
+    grep -q 'ITALWORD' $TMPDIR/emph.qdf
+    grep -q 'UNDERITAL' $TMPDIR/emph.qdf
+    grep -q 'WRAPITALWORD' $TMPDIR/emph.qdf
+    ! grep -q -- '\*ITALWORD\*' $TMPDIR/emph.qdf
+    ! grep -q -- '\*\*BOLDWORD\*\*' $TMPDIR/emph.qdf
+    ! grep -q -- '_UNDERITAL_' $TMPDIR/emph.qdf
+    ! grep -q -- '\*WRAPITALWORD\*' $TMPDIR/emph.qdf
+    grep -q 'snake_case_word' $TMPDIR/emph.qdf
+    grep -q '2 \* 3 = 6' $TMPDIR/emph.qdf"
+else
+  echo "  SKIP  md2pdf emphasis (qpdf not found)"
+fi
+
 echo ""
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ] || exit 1

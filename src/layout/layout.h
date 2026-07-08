@@ -94,8 +94,9 @@ typedef enum {
     TSPDF_TEXT_DECOR_OVERLINE    = 4,
 } TspdfTextDecoration;
 
-// Rich text span (for inline formatting within a text node)
-#define TSPDF_LAYOUT_MAX_SPANS 4
+// Rich text span (for inline formatting within a text node). The spans array
+// is realloc'd on demand; this only clamps its growth.
+#define TSPDF_LAYOUT_MAX_SPANS 16
 
 typedef struct {
     const char *text;       // arena-allocated
