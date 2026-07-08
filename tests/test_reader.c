@@ -6565,6 +6565,183 @@ TEST(test_delete_keeps_document_level_trees) {
     free(pdf);
 }
 
+// ============================================================
+// Encoding / i18n (fix/encoding track)
+// ============================================================
+
+#include "../include/tspdf/version.h"
+#include "../src/util/pdftext.h"
+
+TEST(test_pdftext_cp1252_from_codepoint) {
+    // ASCII and Latin-1 map to themselves.
+    ASSERT_EQ_INT(tspdf_cp1252_from_codepoint('A'), 'A');
+    ASSERT_EQ_INT(tspdf_cp1252_from_codepoint(0xFC), 0xFC);  // ü
+    ASSERT_EQ_INT(tspdf_cp1252_from_codepoint(0xC4), 0xC4);  // Ä
+    // cp1252 specials in the 0x80-0x9F window (not plain Latin-1).
+    ASSERT_EQ_INT(tspdf_cp1252_from_codepoint(0x20AC), 0x80); // €
+    ASSERT_EQ_INT(tspdf_cp1252_from_codepoint(0x2013), 0x96); // en-dash
+    ASSERT_EQ_INT(tspdf_cp1252_from_codepoint(0x2014), 0x97); // em-dash
+    ASSERT_EQ_INT(tspdf_cp1252_from_codepoint(0x2022), 0x95); // bullet
+    ASSERT_EQ_INT(tspdf_cp1252_from_codepoint(0x201C), 0x93); // left curly quote
+    ASSERT_EQ_INT(tspdf_cp1252_from_codepoint(0x0178), 0x9F); // Ÿ
+    // No mapping: C1 controls, unassigned cp1252 slots, non-Latin scripts.
+    ASSERT_EQ_INT(tspdf_cp1252_from_codepoint(0x0081), -1);
+    ASSERT_EQ_INT(tspdf_cp1252_from_codepoint(0x0416), -1);  // Cyrillic Ж
+    ASSERT_EQ_INT(tspdf_cp1252_from_codepoint(0x6A5F), -1);  // CJK 機
+}
+
+TEST(test_pdftext_utf8_to_cp1252_strict) {
+    char out[64];
+    uint32_t bad = 0;
+    // Umlauts and en-dash convert to the cp1252 bytes.
+    ASSERT_EQ_INT(tspdf_utf8_to_cp1252("Vertraulich \xe2\x80\x93 gepr\xc3\xbc"
+                                       "ft", out, &bad),
+                  TSPDF_PDFTEXT_OK);
+    ASSERT_EQ_STR(out, "Vertraulich \x96 gepr\xfc" "ft");
+    // Characters outside WinAnsi fail and name the offending code point.
+    ASSERT_EQ_INT(tspdf_utf8_to_cp1252("ok \xe6\xa9\x9f", out, &bad),
+                  TSPDF_PDFTEXT_UNMAPPED);
+    ASSERT_EQ_INT((int)bad, 0x6A5F);
+    // Malformed UTF-8 is reported as such, not silently emitted.
+    ASSERT_EQ_INT(tspdf_utf8_to_cp1252("bad \xc3", out, &bad),
+                  TSPDF_PDFTEXT_BAD_UTF8);
+}
+
+TEST(test_pdftext_utf8_to_cp1252_lossy) {
+    char out[64];
+    uint32_t bad = 0;
+    // In-place conversion is allowed (output is never longer than input).
+    char line[] = "na\xc3\xafve caf\xc3\xa9 \xe2\x80\x94 \xf0\x9f\x98\x80!";
+    size_t subs = tspdf_utf8_to_cp1252_lossy(line, line, &bad);
+    ASSERT_EQ_SIZE(subs, 1);
+    ASSERT_EQ_INT((int)bad, 0x1F600);  // the emoji became '?'
+    ASSERT_EQ_STR(line, "na\xefve caf\xe9 \x97 ?!");
+    // Pure WinAnsi text passes through with zero substitutions.
+    ASSERT_EQ_SIZE(tspdf_utf8_to_cp1252_lossy("plain", out, &bad), 0);
+    ASSERT_EQ_STR(out, "plain");
+}
+
+TEST(test_pdftext_utf16be_roundtrip) {
+    // Encoder: non-ASCII Info strings become a BOM-prefixed UTF-16BE hex string.
+    TspdfBuffer buf = tspdf_buffer_create(64);
+    tspdf_pdftext_write_info_string(&buf, "Pr\xc3\xbc \xe2\x80\x93 \xf0\x9f\x98\x80");
+    tspdf_buffer_append_byte(&buf, '\0');
+    ASSERT_EQ_STR((const char *)buf.data, "<FEFF0050007200FC002020130020D83DDE00>");
+    tspdf_buffer_destroy(&buf);
+
+    // ASCII strings stay readable literal strings (with the usual escapes).
+    TspdfBuffer buf2 = tspdf_buffer_create(64);
+    tspdf_pdftext_write_info_string(&buf2, "Plain (Report)");
+    tspdf_buffer_append_byte(&buf2, '\0');
+    ASSERT_EQ_STR((const char *)buf2.data, "(Plain \\(Report\\))");
+    tspdf_buffer_destroy(&buf2);
+
+    // Decoder: BOM + UTF-16BE (incl. a surrogate pair) back to UTF-8.
+    TspdfArena arena = tspdf_arena_create(1024);
+    const uint8_t utf16[] = {0xFE, 0xFF, 0x00, 0x50, 0x00, 0xFC,
+                             0x20, 0x13, 0xD8, 0x3D, 0xDE, 0x00};
+    char *utf8 = tspdf_utf16be_to_utf8(utf16, sizeof(utf16), &arena);
+    ASSERT(utf8 != NULL);
+    ASSERT_EQ_STR(utf8, "P\xc3\xbc\xe2\x80\x93\xf0\x9f\x98\x80");
+    // Strings without the BOM are not touched.
+    ASSERT(tspdf_utf16be_to_utf8((const uint8_t *)"plain", 5, &arena) == NULL);
+    tspdf_arena_destroy(&arena);
+}
+
+TEST(test_metadata_non_ascii_utf16_roundtrip) {
+    // Non-ASCII metadata must be written as UTF-16BE with BOM (ISO 32000
+    // text string), not raw UTF-8 bytes in a PDFDocEncoded literal.
+    const char *title = "Pr\xc3\xbc" "fbericht \xe2\x80\x93 \xc3\x84nderungen";
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/one_page.pdf", &err);
+    ASSERT(doc != NULL);
+
+    tspdf_reader_set_title(doc, title);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    // Raw bytes: a BOM-prefixed hex string, and no octal-escaped UTF-8 tail.
+    ASSERT(bytes_contains(out, out_len, "<FEFF"));
+    ASSERT(!bytes_contains(out, out_len, "\\303\\274"));
+
+    // Reader display path decodes the UTF-16BE string back to UTF-8.
+    TspdfReader *doc2 = tspdf_reader_open(out, out_len, &err);
+    ASSERT(doc2 != NULL);
+    const char *got = tspdf_reader_get_title(doc2);
+    ASSERT(got != NULL);
+    ASSERT_EQ_STR(got, title);
+
+    tspdf_reader_destroy(doc2);
+    free(out);
+    tspdf_reader_destroy(doc);
+}
+
+TEST(test_metadata_ascii_stays_literal) {
+    // Pure-ASCII values keep the compact literal-string form.
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/one_page.pdf", &err);
+    ASSERT(doc != NULL);
+
+    tspdf_reader_set_title(doc, "Plain Report");
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(bytes_contains(out, out_len, "(Plain Report)"));
+
+    TspdfReader *doc2 = tspdf_reader_open(out, out_len, &err);
+    ASSERT(doc2 != NULL);
+    ASSERT_EQ_STR(tspdf_reader_get_title(doc2), "Plain Report");
+
+    tspdf_reader_destroy(doc2);
+    free(out);
+    tspdf_reader_destroy(doc);
+}
+
+TEST(test_save_producer_is_tspdf_with_version) {
+    // Default save options set update_producer; the stamp must be the real
+    // project name + version, not the leftover codename "(tspr)".
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/one_page.pdf", &err);
+    ASSERT(doc != NULL);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    ASSERT(!bytes_contains(out, out_len, "(tspr)"));
+    ASSERT(bytes_contains(out, out_len, "/Producer (tspdf " TSPDF_VERSION_STRING ")"));
+
+    free(out);
+    tspdf_reader_destroy(doc);
+}
+
+TEST(test_save_preserve_ids_producer_is_tspdf_with_version) {
+    // The preserve-object-ids raw-copy path builds its own Info dict too.
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/one_page.pdf", &err);
+    ASSERT(doc != NULL);
+
+    TspdfSaveOptions opts = tspdf_save_options_default();
+    opts.preserve_object_ids = true;
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory_with_options(doc, &out, &out_len, &opts);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    ASSERT(!bytes_contains(out, out_len, "(tspr)"));
+    ASSERT(bytes_contains(out, out_len, "/Producer (tspdf " TSPDF_VERSION_STRING ")"));
+
+    free(out);
+    tspdf_reader_destroy(doc);
+}
+
 int main(void) {
     printf("tspr reader tests:\n");
 
@@ -6776,6 +6953,17 @@ int main(void) {
     RUN(test_recompress_reflates_large_flate_stream);
     RUN(test_recompress_encrypted_source_roundtrip);
     RUN(test_recompress_writes_xref_stream);
+
+    printf("\n  Encoding/i18n:\n");
+    RUN(test_pdftext_cp1252_from_codepoint);
+    RUN(test_pdftext_utf8_to_cp1252_strict);
+    RUN(test_pdftext_utf8_to_cp1252_lossy);
+    RUN(test_pdftext_utf16be_roundtrip);
+    RUN(test_metadata_non_ascii_utf16_roundtrip);
+    RUN(test_metadata_ascii_stays_literal);
+    RUN(test_save_producer_is_tspdf_with_version);
+    RUN(test_save_preserve_ids_producer_is_tspdf_with_version);
+
 
     printf("\n%d tests, %d passed, %d failed\n",
            tests_run, tests_passed, tests_failed);

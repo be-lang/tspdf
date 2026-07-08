@@ -803,6 +803,78 @@ if command -v qpdf > /dev/null 2>&1; then
 else
   echo "  SKIP  compress uncompressed-streams file (qpdf not found)"
 fi
+# ---------------------------------------------------------------
+# encoding/i18n regressions (fix/encoding)
+# ---------------------------------------------------------------
+
+# metadata: non-ASCII values must round-trip through the CLI display path and
+# be stored as a BOM-prefixed UTF-16BE text string (not raw UTF-8 bytes).
+run_test "metadata non-ASCII round-trip (UTF-16BE with BOM)" bash -c "
+  set -e
+  \"$TSPDF\" metadata \"$INPUT\" --set title='Prüfbericht – Änderungen' -o \"$TMPDIR/enc_meta.pdf\"
+  \"$TSPDF\" metadata \"$TMPDIR/enc_meta.pdf\" | grep -qF 'Prüfbericht – Änderungen'
+  LC_ALL=C grep -aq '<FEFF' \"$TMPDIR/enc_meta.pdf\"
+"
+
+# Output PDFs must be stamped with the real project name + version.
+run_test "producer stamp is tspdf + version" bash -c "
+  set -e
+  \"$TSPDF\" rotate \"$INPUT\" -o \"$TMPDIR/enc_prod.pdf\" --angle 90
+  if LC_ALL=C grep -aqF '(tspr)' \"$TMPDIR/enc_prod.pdf\"; then exit 1; fi
+  LC_ALL=C grep -aqE '/Producer \(tspdf [0-9]+\.[0-9]+\.[0-9]+\)' \"$TMPDIR/enc_prod.pdf\"
+"
+
+# watermark: cp1252-representable text must succeed and the content stream
+# must carry WinAnsi bytes (0x96 en-dash, 0xFC u-umlaut), not UTF-8 sequences.
+run_test "watermark emits cp1252 bytes in content stream" bash -c "
+  set -e
+  \"$TSPDF\" watermark \"$INPUT\" -o \"$TMPDIR/enc_wm.pdf\" --text 'Vertraulich – geprüft'
+  LC_ALL=C grep -aqF \"\$(printf 'Vertraulich \\226 gepr\\374ft')\" \"$TMPDIR/enc_wm.pdf\"
+  if LC_ALL=C grep -aqF \"\$(printf 'gepr\\303\\274ft')\" \"$TMPDIR/enc_wm.pdf\"; then exit 1; fi
+  if command -v qpdf > /dev/null 2>&1; then
+    qpdf --check \"$TMPDIR/enc_wm.pdf\"
+  fi
+"
+
+# watermark: text outside WinAnsi must fail with an error naming the character.
+run_test "watermark rejects non-WinAnsi text with clear error" bash -c "
+  set -e
+  if \"$TSPDF\" watermark \"$INPUT\" -o \"$TMPDIR/enc_wm_cjk.pdf\" --text '機密' 2> \"$TMPDIR/enc_wm_err.txt\"; then
+    exit 1
+  fi
+  grep -q 'U+6A5F' \"$TMPDIR/enc_wm_err.txt\"
+"
+
+# md2pdf: Latin-script UTF-8 must be drawn as cp1252 bytes (small content
+# streams are stored uncompressed, so the raw output is grep-able), with no
+# warnings for cp1252-clean input.
+run_test "md2pdf renders Latin-1 punctuation via WinAnsi" bash -c "
+  set -e
+  printf '# Prüfbericht\n\nnaïve café — dash\n' > \"$TMPDIR/enc_doc.md\"
+  \"$TSPDF\" md2pdf \"$TMPDIR/enc_doc.md\" -o \"$TMPDIR/enc_doc.pdf\" 2> \"$TMPDIR/enc_doc_err.txt\"
+  test ! -s \"$TMPDIR/enc_doc_err.txt\"
+  LC_ALL=C grep -aqF \"\$(printf 'na\\357ve caf\\351 \\227 dash')\" \"$TMPDIR/enc_doc.pdf\"
+  if LC_ALL=C grep -aqF \"\$(printf 'caf\\303\\251')\" \"$TMPDIR/enc_doc.pdf\"; then exit 1; fi
+  if command -v qpdf > /dev/null 2>&1; then
+    qpdf --check \"$TMPDIR/enc_doc.pdf\"
+  fi
+"
+
+# md2pdf: characters outside WinAnsi become '?' with a per-line warning, and
+# the document still converts (one emoji must not fail a whole README).
+run_test "md2pdf substitutes non-WinAnsi chars with warning" bash -c "
+  set -e
+  printf 'ok line\nemoji \\360\\237\\230\\200 here\n' > \"$TMPDIR/enc_emoji.md\"
+  \"$TSPDF\" md2pdf \"$TMPDIR/enc_emoji.md\" -o \"$TMPDIR/enc_emoji.pdf\" 2> \"$TMPDIR/enc_emoji_err.txt\"
+  grep -q 'line 2' \"$TMPDIR/enc_emoji_err.txt\"
+  grep -q 'U+1F600' \"$TMPDIR/enc_emoji_err.txt\"
+  LC_ALL=C grep -aqF 'emoji ? here' \"$TMPDIR/enc_emoji.pdf\"
+"
+
+# md2pdf: the help text mentions the WinAnsi limitation.
+run_test "md2pdf help mentions WinAnsi limitation" bash -c "
+  \"$TSPDF\" md2pdf --help | grep -qi 'WinAnsi'
+"
 
 echo ""
 echo "$pass passed, $fail failed"

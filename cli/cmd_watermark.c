@@ -1,5 +1,6 @@
 #include "commands.h"
 #include "../include/tspdf_overlay.h"
+#include "../src/util/pdftext.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,6 +38,30 @@ int cmd_watermark(int argc, char **argv) {
         return 1;
     }
 
+    // The watermark is drawn with the built-in Helvetica font, which uses
+    // WinAnsiEncoding (cp1252): re-encode the UTF-8 input up front so the
+    // content stream carries cp1252 bytes instead of raw UTF-8 mojibake.
+    char *wa_text = malloc(strlen(text) + 1);
+    if (!wa_text) {
+        fprintf(stderr, "tspdf watermark: out of memory\n");
+        return 1;
+    }
+    uint32_t bad_cp = 0;
+    int conv = tspdf_utf8_to_cp1252(text, wa_text, &bad_cp);
+    if (conv != TSPDF_PDFTEXT_OK) {
+        if (conv == TSPDF_PDFTEXT_UNMAPPED) {
+            char ch[5];
+            ch[tspdf_utf8_encode(bad_cp, ch)] = '\0';
+            fprintf(stderr, "tspdf watermark: character '%s' (U+%04X) cannot be shown with the "
+                            "built-in fonts (WinAnsi/cp1252); use Latin-script text\n",
+                    ch, (unsigned)bad_cp);
+        } else {
+            fprintf(stderr, "tspdf watermark: --text is not valid UTF-8\n");
+        }
+        free(wa_text);
+        return 1;
+    }
+
     double opacity = 0.3;
     const char *opacity_str = find_flag(argc, argv, "--opacity");
     if (opacity_str) {
@@ -51,6 +76,7 @@ int cmd_watermark(int argc, char **argv) {
     TspdfReader *doc = tspdf_reader_open_file(input, &err);
     if (!doc) {
         fprintf(stderr, "tspdf watermark: failed to open '%s': %s\n", input, tspdf_error_string(err));
+        free(wa_text);
         return 1;
     }
 
@@ -102,12 +128,12 @@ int cmd_watermark(int argc, char **argv) {
         tspdf_stream_concat_matrix(stream, cos_a, sin_a, -sin_a, cos_a, cx, cy);
 
         // Estimate text width to center it (rough: ~0.5 * font_size per char for Helvetica)
-        double text_width = (double)strlen(text) * font_size * 0.5;
+        double text_width = (double)strlen(wa_text) * font_size * 0.5;
 
         tspdf_stream_begin_text(stream);
         tspdf_stream_set_font(stream, font_name, font_size);
         tspdf_stream_text_position(stream, -text_width / 2.0, -font_size / 3.0);
-        tspdf_stream_show_text(stream, text);
+        tspdf_stream_show_text(stream, wa_text);
         tspdf_stream_end_text(stream);
 
         tspdf_stream_restore(stream);
@@ -118,6 +144,7 @@ int cmd_watermark(int argc, char **argv) {
             fprintf(stderr, "tspdf watermark: overlay failed on page %zu: %s\n",
                     i + 1, tspdf_error_string(err));
             tspdf_reader_destroy(doc);
+            free(wa_text);
             return 1;
         }
     }
@@ -126,11 +153,13 @@ int cmd_watermark(int argc, char **argv) {
     if (err != TSPDF_OK) {
         fprintf(stderr, "tspdf watermark: failed to save '%s': %s\n", output, tspdf_error_string(err));
         tspdf_reader_destroy(doc);
+        free(wa_text);
         return 1;
     }
 
     printf("Watermarked %zu page(s) → %s\n", page_count, output);
 
     tspdf_reader_destroy(doc);
+    free(wa_text);
     return 0;
 }

@@ -1335,6 +1335,39 @@ TEST(test_deflate_decompresses_valid_stored_block) {
 }
 
 // ============================================================
+// Encoding / i18n (fix/encoding track)
+// ============================================================
+
+#include "../include/tspdf/version.h"
+
+// Binary-safe substring search (writer output contains compressed streams).
+static bool enc_bytes_contains(const uint8_t *haystack, size_t haystack_len, const char *needle) {
+    size_t needle_len = strlen(needle);
+    if (!haystack || needle_len == 0 || needle_len > haystack_len) return false;
+    for (size_t i = 0; i <= haystack_len - needle_len; i++) {
+        if (memcmp(haystack + i, needle, needle_len) == 0) return true;
+    }
+    return false;
+}
+
+TEST(test_writer_producer_is_tspdf_with_version) {
+    // The Info dict /Producer stamp must carry the project name + version.
+    TspdfWriter *doc = tspdf_writer_create();
+    ASSERT(doc != NULL);
+    tspdf_writer_add_page(doc);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    TspdfError err = tspdf_writer_save_to_memory(doc, &out, &out_len);
+    ASSERT(err == TSPDF_OK);
+
+    ASSERT(enc_bytes_contains(out, out_len, "/Producer (tspdf " TSPDF_VERSION_STRING ")"));
+
+    free(out);
+    tspdf_writer_destroy(doc);
+}
+
+// ============================================================
 // Main
 // ============================================================
 
@@ -1447,6 +1480,8 @@ int main(void) {
 
     printf("\n  Audit fixes (reader-core):\n");
     RUN(test_deflate_decompresses_valid_stored_block);
+    printf("\n  Encoding/i18n:\n");
+    RUN(test_writer_producer_is_tspdf_with_version);
 
     printf("\n%d tests run, %d passed, %d failed, %d skipped\n",
            tests_run, tests_passed, tests_failed, tests_skipped);

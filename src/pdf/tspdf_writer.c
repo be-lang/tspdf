@@ -1,6 +1,7 @@
 #include "tspdf_writer.h"
 #include "../image/png_decoder.h"
 #include "../compress/deflate.h"
+#include "../../include/tspdf/version.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1306,7 +1307,7 @@ TspdfError tspdf_writer_save(TspdfWriter *doc, const char *path) {
     TspdfRef info_ref = tspdf_raw_writer_alloc_object(w);
     tspdf_raw_writer_begin_object(w, info_ref);
     tspdf_raw_write_dict_begin(w);
-    tspdf_raw_write_dict_name_string(w, "Producer", "tspdf");
+    tspdf_raw_write_dict_name_string(w, "Producer", "tspdf " TSPDF_VERSION_STRING);
     if (doc->metadata.title[0])
         tspdf_raw_write_dict_name_string(w, "Title", doc->metadata.title);
     if (doc->metadata.author[0])

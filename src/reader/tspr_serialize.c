@@ -1,6 +1,8 @@
 #include "tspr_internal.h"
 #include "../util/buffer.h"
+#include "../util/pdftext.h"
 #include "../compress/deflate.h"
+#include "../../include/tspdf/version.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -92,7 +94,7 @@ static void write_info_dict_obj(TspdfBuffer *buf, TspdfReader *doc, TspdfParser 
                 if (override_val != NULL) {
                     write_name(buf, (const uint8_t *)key, strlen(key));
                     tspdf_buffer_append_byte(buf, ' ');
-                    write_string_escaped(buf, (const uint8_t *)override_val, strlen(override_val));
+                    tspdf_pdftext_write_info_string(buf, override_val);
                     tspdf_buffer_append_byte(buf, ' ');
                 }
             } else {
@@ -146,7 +148,7 @@ static void write_info_dict_obj(TspdfBuffer *buf, TspdfReader *doc, TspdfParser 
 
             write_name(buf, (const uint8_t *)fname, strlen(fname));
             tspdf_buffer_append_byte(buf, ' ');
-            write_string_escaped(buf, (const uint8_t *)new_val, strlen(new_val));
+            tspdf_pdftext_write_info_string(buf, new_val);
             tspdf_buffer_append_byte(buf, ' ');
         }
     }
@@ -911,7 +913,7 @@ TspdfError tspdf_serialize_with_options(TspdfReader *doc, uint8_t **out_buf, siz
                     }
                 }
             }
-            tspdf_buffer_append_str(&buf, "/Producer (tspr) >>\nendobj\n");
+            tspdf_buffer_append_str(&buf, "/Producer (tspdf " TSPDF_VERSION_STRING ") >>\nendobj\n");
         }
 
         // Write xref / trailer
@@ -1161,7 +1163,7 @@ TspdfError tspdf_serialize_with_options(TspdfReader *doc, uint8_t **out_buf, siz
             write_info_dict_obj(&buf, doc, &parser, info_obj_num);
         } else if (opts->update_producer) {
             // Just write a simple Info dict with /Producer
-            tspdf_buffer_printf(&buf, "%u 0 obj\n<< /Producer (tspr) >>\nendobj\n", info_obj_num);
+            tspdf_buffer_printf(&buf, "%u 0 obj\n<< /Producer (tspdf " TSPDF_VERSION_STRING ") >>\nendobj\n", info_obj_num);
         }
     }
 

@@ -1,5 +1,6 @@
 #include "commands.h"
 #include "../include/tspdf.h"
+#include "../src/util/pdftext.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -202,6 +203,8 @@ int cmd_md2pdf(int argc, char **argv) {
     if (argc == 0 || has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
         printf("Usage: tspdf md2pdf <input.md> -o <output.pdf>\n");
         printf("\nConvert a Markdown document to a styled PDF.\n");
+        printf("Text uses the built-in WinAnsi (cp1252) fonts; characters outside that\n");
+        printf("range (emoji, CJK, ...) are replaced with '?' and warned about.\n");
         return argc == 0 ? 1 : 0;
     }
 
@@ -277,11 +280,13 @@ int cmd_md2pdf(int argc, char **argv) {
     int in_code_block = 0;
     char code_buf[8192];
     int code_len = 0;
+    int lineno = 0;
 
     char *line = md;
     while (line && *line) {
         char *eol = strchr(line, '\n');
         size_t line_len = eol ? (size_t)(eol - line) : strlen(line);
+        lineno++;
 
         /* Temporary null-terminate the line */
         char saved = line[line_len];
@@ -291,6 +296,22 @@ int cmd_md2pdf(int argc, char **argv) {
         if (line_len > 0 && line[line_len - 1] == '\r') {
             line[line_len - 1] = '\0';
         }
+
+        /* The built-in (base14) fonts draw text as WinAnsiEncoding (cp1252),
+         * so re-encode the UTF-8 line in place (cp1252 output is never longer
+         * than the input). Characters outside cp1252 become '?' with a
+         * warning instead of aborting the whole document; see --help. */
+        uint32_t bad_cp = 0;
+        if (tspdf_utf8_to_cp1252_lossy(line, line, &bad_cp) > 0) {
+            char ch[5];
+            ch[tspdf_utf8_encode(bad_cp, ch)] = '\0';
+            fprintf(stderr, "tspdf md2pdf: warning: line %d: character '%s' (U+%04X) is "
+                            "outside WinAnsi (cp1252); substituted '?'\n",
+                    lineno, ch, (unsigned)bad_cp);
+        }
+        /* Length of the re-encoded line (line_len stays the raw length so the
+         * saved byte is restored at the right offset below). */
+        size_t text_len = strlen(line);
 
         /* Detect ordered-list marker ("1." / "1)") up front so the if-chain
          * below can branch on it. Only meaningful outside code blocks. */
@@ -328,7 +349,7 @@ int cmd_md2pdf(int argc, char **argv) {
             }
             int remaining = (int)sizeof(code_buf) - code_len - 1;
             if (remaining > 0) {
-                int copy = (int)line_len < remaining ? (int)line_len : remaining;
+                int copy = (int)text_len < remaining ? (int)text_len : remaining;
                 memcpy(code_buf + code_len, line, copy);
                 code_len += copy;
                 code_buf[code_len] = '\0';
@@ -359,7 +380,7 @@ int cmd_md2pdf(int argc, char **argv) {
             row->width = tspdf_size_grow();
             row->gap = 8;
 
-            TspdfNode *bullet = tspdf_layout_text(&ctx, "\xe2\x80\xa2", sans, 11);
+            TspdfNode *bullet = tspdf_layout_text(&ctx, "\x95", sans, 11);  /* bullet (U+2022) in cp1252 */
             bullet->text.color = tspdf_color_from_u8(79, 110, 247);
             tspdf_layout_add_child(row, bullet);
 
@@ -422,7 +443,7 @@ int cmd_md2pdf(int argc, char **argv) {
             tspdf_layout_add_child(row, txt);
 
             tspdf_layout_add_child(root, row);
-        } else if ((strncmp(line, "---", 3) == 0 || strncmp(line, "***", 3) == 0) && line_len <= 5) {
+        } else if ((strncmp(line, "---", 3) == 0 || strncmp(line, "***", 3) == 0) && text_len <= 5) {
             /* Horizontal rule — render as a thin box */
             TspdfNode *hr = tspdf_layout_box(&ctx);
             hr->width = tspdf_size_grow();
@@ -431,7 +452,7 @@ int cmd_md2pdf(int argc, char **argv) {
             hs->has_background = true;
             hs->background = tspdf_color_from_u8(200, 205, 220);
             tspdf_layout_add_child(root, hr);
-        } else if (line_len > 0) {
+        } else if (text_len > 0) {
             /* Paragraph */
             TspdfColor para_color = tspdf_color_from_u8(40, 50, 80);
             TspdfNode *node = tspdf_layout_text(&ctx, line, sans, 11);
