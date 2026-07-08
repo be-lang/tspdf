@@ -519,6 +519,8 @@ int cmd_md2pdf(int argc, char **argv) {
     if (argc == 0 || has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
         printf("Usage: tspdf md2pdf <input.md> -o <output.pdf>\n");
         printf("\nConvert a Markdown document to a styled PDF.\n");
+        printf("Supports headings, lists, code blocks, blockquotes, rules, pipe tables,\n");
+        printf("and block-level ![alt](path) images (JPEG/PNG, path relative to the .md).\n");
         printf("Text uses the built-in WinAnsi (cp1252) fonts; characters outside that\n");
         printf("range (emoji, CJK, ...) are replaced with '?' and warned about.\n");
         return argc == 0 ? 1 : 0;

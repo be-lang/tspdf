@@ -14,6 +14,22 @@ tspdf merge a.pdf b.pdf c.pdf -o merged.pdf
 tspdf split report.pdf --pages 1-5,9 -o extracted.pdf
 ```
 
+## Split every page into its own file
+
+```bash
+# writes page-001.pdf, page-002.pdf, ...
+tspdf split report.pdf -o page.pdf
+```
+
+## Stamp page numbers
+
+```bash
+tspdf pagenum report.pdf -o numbered.pdf
+
+# "Page 1 of 12" at the top right, numbering starting at 10
+tspdf pagenum report.pdf --format "Page %d of %d" --position top-right --start 10 -o numbered.pdf
+```
+
 ## Delete pages
 
 ```bash
@@ -85,6 +101,7 @@ tspdf qrcode "https://example.com" --title "Scan me" -o qr.pdf
 ## Convert Markdown to PDF
 
 ```bash
+# supports headings, lists, code blocks, pipe tables and ![alt](img.png) images
 tspdf md2pdf notes.md -o notes.pdf
 ```
 
@@ -99,6 +116,12 @@ Use a custom port:
 
 ```bash
 tspdf serve --port 3000
+```
+
+Run it in Docker (binds 0.0.0.0 inside the container; the UI has no authentication):
+
+```bash
+docker build -t tspdf . && docker run -p 127.0.0.1:8080:8080 tspdf
 ```
 
 ## Troubleshooting quick checks

@@ -174,7 +174,8 @@ static void print_command_help(const char *cmd) {
         printf("Usage: tspdf md2pdf <input.md> -o <output.pdf>\n");
         printf("\n");
         printf("Convert a Markdown document into a styled PDF.\n");
-        printf("Supports headings, paragraphs, lists, code blocks, blockquotes, and rules.\n");
+        printf("Supports headings, paragraphs, lists, code blocks, blockquotes, rules,\n");
+        printf("pipe tables, and block-level ![alt](path) images (JPEG/PNG).\n");
         printf("\n");
         printf("Arguments:\n");
         printf("  <input.md>       Input Markdown file\n");
