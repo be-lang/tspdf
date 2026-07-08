@@ -399,6 +399,103 @@ static void md_emit_table(TspdfLayout *ctx, TspdfNode *root,
     } while (r0 < nrows);
 }
 
+/* --- Block-level images --------------------------------------------------- */
+
+static int md_path_is_png(const char *path, size_t len) {
+    if (len < 4) return 0;
+    const char *ext = path + len - 4;
+    return ext[0] == '.' &&
+           (ext[1] == 'p' || ext[1] == 'P') &&
+           (ext[2] == 'n' || ext[2] == 'N') &&
+           (ext[3] == 'g' || ext[3] == 'G');
+}
+
+/* A whole line of the form ![alt](path): embed the image scaled to fit the
+ * content box (aspect preserved, centered, never upscaled). `raw` must be the
+ * raw UTF-8 line — paths keep their original bytes for fopen(); only the alt
+ * text is re-encoded for rendering. A missing/unloadable image warns once on
+ * stderr and renders the alt text in italics instead. Returns 1 if the line
+ * was a block image (even when the fallback was used), 0 otherwise. */
+static int md_try_image(TspdfLayout *ctx, TspdfNode *root, TspdfWriter *doc,
+                        const char *raw, const char *md_path,
+                        const char *italic_font, double content_w,
+                        double content_h, int lineno) {
+    if (raw[0] != '!' || raw[1] != '[') return 0;
+    const char *alt_start = raw + 2;
+    const char *rb = strchr(alt_start, ']');
+    if (!rb || rb[1] != '(') return 0;
+    const char *path_start = rb + 2;
+    const char *rp = strchr(path_start, ')');
+    if (!rp) return 0;
+    for (const char *t = rp + 1; *t; t++)
+        if (*t != ' ' && *t != '\t') return 0;  /* trailing junk: not block image */
+
+    size_t alt_len = (size_t)(rb - alt_start);
+    while (*path_start == ' ') path_start++;
+    size_t path_len = (size_t)(rp - path_start);
+    /* Cut an optional "title" part: ![alt](path "title") */
+    for (size_t i = 0; i < path_len; i++) {
+        if (path_start[i] == ' ') { path_len = i; break; }
+    }
+
+    /* Resolve relative to the directory of the .md file. */
+    size_t dir_len = 0;
+    if (path_len == 0 || path_start[0] != '/') {
+        const char *slash = strrchr(md_path, '/');
+        if (slash) dir_len = (size_t)(slash - md_path) + 1;
+    }
+    char *full = (char *)tspdf_arena_alloc(ctx->arena, dir_len + path_len + 1);
+    if (!full) return 0;
+    memcpy(full, md_path, dir_len);
+    memcpy(full + dir_len, path_start, path_len);
+    full[dir_len + path_len] = '\0';
+
+    const char *img_name = NULL;
+    if (path_len > 0) {
+        img_name = md_path_is_png(full, dir_len + path_len)
+                       ? tspdf_writer_add_png_image(doc, full)
+                       : tspdf_writer_add_jpeg_image(doc, full);
+    }
+
+    if (!img_name) {
+        fprintf(stderr, "tspdf md2pdf: warning: line %d: cannot load image '%s'; "
+                        "showing alt text\n", lineno, full);
+        char *alt = (char *)tspdf_arena_alloc(ctx->arena, alt_len + 1);
+        if (!alt) return 1;
+        memcpy(alt, alt_start, alt_len);
+        alt[alt_len] = '\0';
+        tspdf_utf8_to_cp1252_lossy(alt, alt, NULL);
+        TspdfNode *node = tspdf_layout_text(ctx, alt[0] ? alt : "[image]",
+                                            italic_font, 11);
+        node->text.color = tspdf_color_from_u8(110, 115, 130);
+        node->text.wrap = TSPDF_WRAP_WORD;
+        node->width = tspdf_size_grow();
+        tspdf_layout_add_child(root, node);
+        return 1;
+    }
+
+    /* Scale to fit the content width (and one page height), keep aspect. */
+    const TspdfImage *img = &doc->images[doc->image_count - 1];
+    double dw = (double)img->width, dh = (double)img->height;
+    if (dw <= 0 || dh <= 0) { dw = 1; dh = 1; }
+    if (dw > content_w) { dh *= content_w / dw; dw = content_w; }
+    if (dh > content_h) { dw *= content_h / dh; dh = content_h; }
+
+    TspdfNode *wrap = tspdf_layout_box(ctx);
+    wrap->width = tspdf_size_grow();
+    wrap->direction = TSPDF_DIR_ROW;
+    wrap->align_x = TSPDF_ALIGN_CENTER;
+
+    TspdfNode *imgbox = tspdf_layout_box(ctx);
+    imgbox->width = tspdf_size_fixed(dw);
+    imgbox->height = tspdf_size_fixed(dh);
+    TspdfBoxStyle *st = tspdf_layout_node_style(ctx, imgbox);
+    st->bg_image = img_name;  /* writer-owned name, outlives rendering */
+    tspdf_layout_add_child(wrap, imgbox);
+    tspdf_layout_add_child(root, wrap);
+    return 1;
+}
+
 /* Detect a leading ordered-list marker "N." or "N)" followed by a space.
  * Returns the parsed number (>=0) and sets *content to the text after the
  * marker+space; returns -1 if the line is not an ordered-list item. */
@@ -531,6 +628,19 @@ int cmd_md2pdf(int argc, char **argv) {
         /* Strip trailing \r */
         if (line_len > 0 && line[line_len - 1] == '\r') {
             line[line_len - 1] = '\0';
+        }
+
+        /* Preserve the raw UTF-8 bytes of a potential block-image line: the
+         * cp1252 re-encode below would corrupt non-ASCII image paths, which
+         * must keep their original bytes for fopen(). */
+        const char *raw_image_line = NULL;
+        if (!in_code_block && line[0] == '!' && line[1] == '[') {
+            size_t raw_len = strlen(line);
+            char *copy = (char *)tspdf_arena_alloc(ctx.arena, raw_len + 1);
+            if (copy) {
+                memcpy(copy, line, raw_len + 1);
+                raw_image_line = copy;
+            }
         }
 
         /* The built-in (base14) fonts draw text as WinAnsiEncoding (cp1252),
@@ -748,6 +858,10 @@ int cmd_md2pdf(int argc, char **argv) {
             tspdf_layout_add_child(row, txt);
 
             tspdf_layout_add_child(root, row);
+        } else if (raw_image_line &&
+                   md_try_image(&ctx, root, doc, raw_image_line, input, italic,
+                                content_w, H - 2 * 52, lineno)) {
+            /* Block image (or its alt-text fallback) was emitted. */
         } else if ((strncmp(line, "---", 3) == 0 || strncmp(line, "***", 3) == 0) && text_len <= 5) {
             /* Horizontal rule — render as a thin box */
             TspdfNode *hr = tspdf_layout_box(&ctx);

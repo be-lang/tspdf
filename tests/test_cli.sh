@@ -1242,6 +1242,33 @@ else
   echo "  SKIP  md2pdf pipe tables (qpdf not found)"
 fi
 
+# md2pdf images: block-level ![alt](path) embeds the image as an XObject,
+# path resolved relative to the .md file; missing files warn + alt fallback.
+if command -v qpdf > /dev/null 2>&1; then
+  run_test "md2pdf embeds PNG and JPEG images" bash -c "
+    set -e
+    mkdir -p $TMPDIR/mdimg
+    cp examples/test.png examples/test.jpg $TMPDIR/mdimg/
+    printf '# Images\n\n![png alt](test.png)\n\ntext between\n\n![jpg alt](test.jpg)\n' > $TMPDIR/mdimg/img.md
+    $TSPDF md2pdf $TMPDIR/mdimg/img.md -o $TMPDIR/img.pdf > /dev/null 2>&1
+    qpdf --qdf --object-streams=disable $TMPDIR/img.pdf $TMPDIR/img.qdf
+    [ \$(grep -c '/Subtype /Image' $TMPDIR/img.qdf) -eq 2 ]
+    grep -q 'text between' $TMPDIR/img.qdf"
+
+  run_test "md2pdf image output passes qpdf --check" qpdf --check $TMPDIR/img.pdf
+
+  run_test "md2pdf missing image warns and falls back to alt text" bash -c "
+    set -e
+    printf '![MISSINGALT](no/such/file.png)\n' > $TMPDIR/miss.md
+    $TSPDF md2pdf $TMPDIR/miss.md -o $TMPDIR/miss.pdf 2> $TMPDIR/miss.err
+    grep -qi 'warning' $TMPDIR/miss.err
+    qpdf --qdf --object-streams=disable $TMPDIR/miss.pdf $TMPDIR/miss.qdf
+    grep -q 'MISSINGALT' $TMPDIR/miss.qdf
+    ! grep -q '/Subtype /Image' $TMPDIR/miss.qdf"
+else
+  echo "  SKIP  md2pdf images (qpdf not found)"
+fi
+
 echo ""
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ] || exit 1
