@@ -20,3 +20,7 @@ output.pdf
 /dist/
 /tmp/
 
+
+# wasm build + demo outputs (make wasm / make wasm-demo)
+wasm/dist/
+wasm/demo/dist/
