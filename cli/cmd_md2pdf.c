@@ -229,6 +229,176 @@ fallback:
     }
 }
 
+/* Emit a paragraph node (also used to flush a stashed pipe-table candidate
+ * that turned out not to be a table header). */
+static void md_add_paragraph(TspdfLayout *ctx, TspdfNode *root, const char *text,
+                             const char *sans, const char *bold, const char *italic,
+                             const char *mono, double avail_width) {
+    TspdfColor para_color = tspdf_color_from_u8(40, 50, 80);
+    TspdfNode *node = tspdf_layout_text(ctx, text, sans, 11);
+    node->text.wrap = TSPDF_WRAP_WORD;
+    node->text.color = para_color;
+    node->width = tspdf_size_grow();
+    if (line_has_inline(text)) {
+        parse_inline_spans(ctx, node, text, sans, bold, italic, mono,
+                           11, para_color, avail_width);
+    }
+    tspdf_layout_add_child(root, node);
+}
+
+/* --- Pipe tables --------------------------------------------------------- *
+ * GitHub-style: a header row, a |---|:---:| separator (colons set column
+ * alignment), then body rows. Rows must start with '|'; "\|" inside a cell
+ * is a literal pipe. Inline markup in cells is stripped to plain text. */
+
+#define MD_TABLE_MAX_COLS TSPDF_LAYOUT_MAX_CHILDREN
+
+static int md_is_table_row(const char *line) {
+    return line[0] == '|';
+}
+
+/* Concatenate the de-marked segment texts: cell content renders plain. */
+static char *md_strip_inline_markers(TspdfLayout *ctx, const char *s) {
+    InlineSeg segs[MD_MAX_SEGS];
+    int n = split_inline_segments(s, segs, MD_MAX_SEGS);
+    size_t total = 0;
+    for (int i = 0; i < n; i++) total += segs[i].len;
+    char *buf = (char *)tspdf_arena_alloc(ctx->arena, total + 1);
+    if (!buf) return NULL;
+    size_t off = 0;
+    for (int i = 0; i < n; i++) {
+        memcpy(buf + off, segs[i].start, segs[i].len);
+        off += segs[i].len;
+    }
+    buf[off] = '\0';
+    return buf;
+}
+
+/* Split a table row into trimmed arena cell strings. The leading '|' and a
+ * trailing '|' delimit cells; interior empty cells are kept. Returns the
+ * cell count, or -1 on allocation failure. */
+static int md_parse_table_cells(TspdfLayout *ctx, const char *line,
+                                const char **cells, int max_cells) {
+    const char *p = line;
+    if (*p == '|') p++;
+    int n = 0;
+    while (n < max_cells) {
+        /* Cell extends to the next unescaped '|' or end of line. */
+        const char *q = p;
+        while (*q && !(*q == '|' && (q == p || q[-1] != '\\'))) q++;
+
+        /* Copy, unescaping "\|" and trimming surrounding spaces. */
+        size_t raw_len = (size_t)(q - p);
+        char *buf = (char *)tspdf_arena_alloc(ctx->arena, raw_len + 1);
+        if (!buf) return -1;
+        size_t out = 0;
+        for (size_t i = 0; i < raw_len; i++) {
+            if (p[i] == '\\' && i + 1 < raw_len && p[i + 1] == '|') {
+                buf[out++] = '|';
+                i++;
+            } else {
+                buf[out++] = p[i];
+            }
+        }
+        while (out > 0 && buf[out - 1] == ' ') out--;
+        buf[out] = '\0';
+        char *start = buf;
+        while (*start == ' ') start++;
+
+        cells[n] = md_strip_inline_markers(ctx, start);
+        if (!cells[n]) return -1;
+        n++;
+
+        if (*q == '\0') break;
+        p = q + 1;
+        if (*p == '\0') break;  /* trailing '|': no empty tail cell */
+    }
+    return n;
+}
+
+/* True if `line` is a separator row: every cell matches ^:?-+:?$ (spaces
+ * allowed around it). Writes per-column alignment and the column count. */
+static int md_is_table_separator(const char *line, TspdfTextAlignment *aligns,
+                                 int max_cols, int *ncols_out) {
+    if (line[0] != '|') return 0;
+    const char *p = line + 1;
+    int n = 0;
+    while (*p) {
+        while (*p == ' ') p++;
+        int left = 0, right = 0, dashes = 0;
+        if (*p == ':') { left = 1; p++; }
+        while (*p == '-') { dashes++; p++; }
+        if (*p == ':') { right = 1; p++; }
+        while (*p == ' ') p++;
+        if (dashes == 0) return 0;
+        if (n < max_cols) {
+            aligns[n] = (left && right) ? TSPDF_TEXT_ALIGN_CENTER
+                      : right           ? TSPDF_TEXT_ALIGN_RIGHT
+                                        : TSPDF_TEXT_ALIGN_LEFT;
+        }
+        n++;
+        if (*p == '|') { p++; continue; }
+        if (*p == '\0') break;
+        return 0;
+    }
+    if (n == 0 || n > max_cols) return 0;
+    *ncols_out = n;
+    return 1;
+}
+
+/* Build the collected table and add it to the layout tree. */
+static void md_emit_table(TspdfLayout *ctx, TspdfNode *root,
+                          const char **headers, int ncols,
+                          const TspdfTextAlignment *aligns,
+                          const char **rows_flat, int nrows,
+                          const char *sans) {
+    TspdfTableStyle style = {
+        .font_name = sans,
+        .font_size = 10,
+        .text_color = tspdf_color_from_u8(40, 50, 80),
+        .header_bg = tspdf_color_from_u8(10, 15, 50),
+        .header_text_color = tspdf_color_rgb(1, 1, 1),
+        .row_bg_even = tspdf_color_from_u8(245, 246, 252),
+        .row_bg_odd = tspdf_color_rgb(1, 1, 1),
+        .border_color = tspdf_color_from_u8(200, 205, 220),
+        .border_width = 1,
+        .row_height = 0,  /* rows fit their content, cells word-wrap */
+        .header_height = 24,
+        .padding = 6,
+    };
+
+    /* One column-width pass over all rows so every chunk lines up. */
+    double col_widths[MD_TABLE_MAX_COLS];
+    tspdf_layout_table_compute_widths(ctx, headers, rows_flat, nrows, ncols,
+                                      style, col_widths);
+
+    /* A table node cannot split across pages, so long tables are emitted as
+     * stacked chunks (header repeated); pagination breaks between chunks. */
+    const int rows_per_chunk = 28;
+    int r0 = 0;
+    do {
+        int chunk = nrows - r0 < rows_per_chunk ? nrows - r0 : rows_per_chunk;
+        TspdfNode *tbl = tspdf_layout_table(ctx, headers, col_widths, ncols, style);
+        if (!tbl) return;
+        for (int r = 0; r < chunk; r++)
+            tspdf_layout_table_add_row(ctx, tbl, &rows_flat[(r0 + r) * ncols],
+                                       col_widths, ncols, style);
+
+        /* Column alignment from the separator row. children[0] is the header
+         * row (kept centered); each data-row cell box holds one text node. */
+        for (int r = 1; r < tbl->child_count; r++) {
+            TspdfNode *row = tbl->children[r];
+            for (int c = 0; c < row->child_count && c < ncols; c++) {
+                TspdfNode *cell = row->children[c];
+                if (cell->child_count > 0 && cell->children[0]->type == TSPDF_NODE_TEXT)
+                    cell->children[0]->text.alignment = aligns[c];
+            }
+        }
+        tspdf_layout_add_child(root, tbl);
+        r0 += chunk;
+    } while (r0 < nrows);
+}
+
 /* Detect a leading ordered-list marker "N." or "N)" followed by a space.
  * Returns the parsed number (>=0) and sets *content to the text after the
  * marker+space; returns -1 if the line is not an ordered-list item. */
@@ -337,6 +507,17 @@ int cmd_md2pdf(int argc, char **argv) {
     int code_len = 0;
     int lineno = 0;
 
+    /* Pipe-table collector: a '|' line is stashed until the next line shows
+     * whether it is a table header (separator row follows) or just text. */
+    const char *tbl_header_line = NULL;   /* arena copy of the stashed line */
+    int tbl_active = 0;
+    const char *tbl_headers[MD_TABLE_MAX_COLS];
+    TspdfTextAlignment tbl_aligns[MD_TABLE_MAX_COLS];
+    int tbl_cols = 0;
+    const char **tbl_rows = NULL;         /* flat malloc'd cells, row-major */
+    int tbl_nrows = 0;
+    int tbl_rows_cap = 0;                 /* capacity in cells */
+
     char *line = md;
     while (line && *line) {
         char *eol = strchr(line, '\n');
@@ -377,7 +558,72 @@ int cmd_md2pdf(int argc, char **argv) {
             if (ord_number < 0) ord_content = NULL;
         }
 
-        if (!in_code_block && strncmp(line, "```", 3) == 0) {
+        /* Pipe-table collector. Runs before the block chain: it may consume
+         * the line (header stash / separator / body row) or flush the table
+         * and let the current line fall through to normal handling. */
+        int consumed = 0;
+        if (!in_code_block) {
+            if (tbl_active) {
+                if (md_is_table_row(line)) {
+                    const char *cells[MD_TABLE_MAX_COLS];
+                    int ncells = md_parse_table_cells(&ctx, line, cells, MD_TABLE_MAX_COLS);
+                    if (ncells >= 0) {
+                        if ((tbl_nrows + 1) * tbl_cols > tbl_rows_cap) {
+                            int new_cap = tbl_rows_cap ? tbl_rows_cap * 2 : 16 * tbl_cols;
+                            const char **grown = realloc(tbl_rows,
+                                (size_t)new_cap * sizeof(*tbl_rows));
+                            if (grown) { tbl_rows = grown; tbl_rows_cap = new_cap; }
+                        }
+                        if ((tbl_nrows + 1) * tbl_cols <= tbl_rows_cap) {
+                            /* Pad short rows with ""; drop extra cells. */
+                            for (int c = 0; c < tbl_cols; c++)
+                                tbl_rows[tbl_nrows * tbl_cols + c] = c < ncells ? cells[c] : "";
+                            tbl_nrows++;
+                        }
+                    }
+                    consumed = 1;
+                } else {
+                    md_emit_table(&ctx, root, tbl_headers, tbl_cols, tbl_aligns,
+                                  tbl_rows, tbl_nrows, sans);
+                    free(tbl_rows);
+                    tbl_rows = NULL;
+                    tbl_nrows = tbl_rows_cap = 0;
+                    tbl_active = 0;
+                    /* current line falls through to normal handling */
+                }
+            } else if (tbl_header_line) {
+                const char *hdr = tbl_header_line;
+                tbl_header_line = NULL;
+                if (md_is_table_separator(line, tbl_aligns, MD_TABLE_MAX_COLS, &tbl_cols)) {
+                    int n = md_parse_table_cells(&ctx, hdr, tbl_headers, MD_TABLE_MAX_COLS);
+                    if (n > 0) {
+                        /* Header defines the column count; pad alignment for
+                         * columns the separator did not declare. */
+                        for (int c = tbl_cols; c < n; c++)
+                            tbl_aligns[c] = TSPDF_TEXT_ALIGN_LEFT;
+                        tbl_cols = n;
+                        tbl_active = 1;
+                        consumed = 1;
+                    }
+                }
+                if (!consumed) {
+                    /* Not a table after all: flush the stashed line as a
+                     * paragraph; the current line falls through. */
+                    md_add_paragraph(&ctx, root, hdr, sans, bold, italic, mono, content_w);
+                }
+            } else if (md_is_table_row(line)) {
+                char *copy = (char *)tspdf_arena_alloc(ctx.arena, text_len + 1);
+                if (copy) {
+                    memcpy(copy, line, text_len + 1);
+                    tbl_header_line = copy;
+                    consumed = 1;
+                }
+            }
+        }
+
+        if (consumed) {
+            /* line was taken by the table collector */
+        } else if (!in_code_block && strncmp(line, "```", 3) == 0) {
             in_code_block = 1;
             code_len = 0;
             code_buf[0] = '\0';
@@ -529,6 +775,16 @@ int cmd_md2pdf(int argc, char **argv) {
         line[line_len] = saved;
         line = eol ? eol + 1 : NULL;
     }
+
+    /* Flush table state left open at end of input. */
+    if (tbl_header_line) {
+        md_add_paragraph(&ctx, root, tbl_header_line, sans, bold, italic, mono, content_w);
+    }
+    if (tbl_active) {
+        md_emit_table(&ctx, root, tbl_headers, tbl_cols, tbl_aligns,
+                      tbl_rows, tbl_nrows, sans);
+    }
+    free(tbl_rows);
 
     free(md);
 

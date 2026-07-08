@@ -1183,6 +1183,65 @@ else
   echo "  SKIP  md2pdf emphasis (qpdf not found)"
 fi
 
+# md2pdf pipe tables: header + separator + body become a real layout table.
+if command -v qpdf > /dev/null 2>&1; then
+  run_test "md2pdf renders pipe tables without literal pipes" bash -c "
+    set -e
+    cat > $TMPDIR/tbl.md <<'EOF'
+# Table
+
+| HDRALPHA | HDRBETA | HDRGAMMA |
+|:---------|:-------:|---------:|
+| CELLA1   | CELLB1  | CELLC1   |
+| CELLA2   | **BOLDCELL** | pipe \| stays |
+
+After the table.
+EOF
+    $TSPDF md2pdf $TMPDIR/tbl.md -o $TMPDIR/tbl.pdf > /dev/null 2>&1
+    qpdf --qdf --object-streams=disable $TMPDIR/tbl.pdf $TMPDIR/tbl.qdf
+    grep -q 'HDRALPHA' $TMPDIR/tbl.qdf
+    grep -q 'HDRGAMMA' $TMPDIR/tbl.qdf
+    grep -q 'CELLA1' $TMPDIR/tbl.qdf
+    grep -q 'CELLC1' $TMPDIR/tbl.qdf
+    grep -q 'BOLDCELL' $TMPDIR/tbl.qdf
+    grep -q 'pipe | stays' $TMPDIR/tbl.qdf
+    grep -q 'After the table.' $TMPDIR/tbl.qdf
+    ! grep -q '| HDRALPHA' $TMPDIR/tbl.qdf
+    ! grep -q 'CELLA1   |' $TMPDIR/tbl.qdf
+    ! grep -q -- ':---' $TMPDIR/tbl.qdf
+    ! grep -q -- '\*\*BOLDCELL\*\*' $TMPDIR/tbl.qdf"
+
+  run_test "md2pdf pipe-lookalike without separator stays a paragraph" bash -c "
+    set -e
+    printf '| not a table, just text\n\nnext paragraph\n' > $TMPDIR/nottbl.md
+    $TSPDF md2pdf $TMPDIR/nottbl.md -o $TMPDIR/nottbl.pdf > /dev/null 2>&1
+    qpdf --qdf --object-streams=disable $TMPDIR/nottbl.pdf $TMPDIR/nottbl.qdf
+    grep -q 'not a table, just text' $TMPDIR/nottbl.qdf"
+
+  run_test "md2pdf table output passes qpdf --check" qpdf --check $TMPDIR/tbl.pdf
+
+  # Regression: at TSPDF_LAYOUT_MAX_CHILDREN=32 every block after the 32nd
+  # was silently dropped (and tables were capped at 31 rows).
+  run_test "md2pdf keeps documents longer than 32 blocks" bash -c "
+    set -e
+    for i in \$(seq 1 60); do printf 'Paragraph PARA%d here.\n\n' \$i; done > $TMPDIR/long.md
+    $TSPDF md2pdf $TMPDIR/long.md -o $TMPDIR/long.pdf > /dev/null 2>&1
+    qpdf --qdf --object-streams=disable $TMPDIR/long.pdf $TMPDIR/long.qdf
+    grep -q 'PARA33' $TMPDIR/long.qdf
+    grep -q 'PARA60' $TMPDIR/long.qdf"
+
+  run_test "md2pdf renders tables longer than 31 rows" bash -c "
+    set -e
+    { printf '| N | NAME |\n|---|---|\n'
+      for i in \$(seq 1 40); do printf '| %d | ROWCELL%d |\n' \$i \$i; done
+    } > $TMPDIR/bigtbl.md
+    $TSPDF md2pdf $TMPDIR/bigtbl.md -o $TMPDIR/bigtbl.pdf > /dev/null 2>&1
+    qpdf --qdf --object-streams=disable $TMPDIR/bigtbl.pdf $TMPDIR/bigtbl.qdf
+    grep -q 'ROWCELL40' $TMPDIR/bigtbl.qdf"
+else
+  echo "  SKIP  md2pdf pipe tables (qpdf not found)"
+fi
+
 echo ""
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ] || exit 1

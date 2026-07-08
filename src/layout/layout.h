@@ -11,7 +11,9 @@
 extern "C" {
 #endif
 
-#define TSPDF_LAYOUT_MAX_CHILDREN 32
+/* Children arrays are realloc'd on demand; this only clamps their growth.
+ * (At 32 an md2pdf document silently lost every block after the 32nd.) */
+#define TSPDF_LAYOUT_MAX_CHILDREN 1024
 #define TSPDF_LAYOUT_MAX_TEXT     1024
 #define TSPDF_TSPDF_LAYOUT_MAX_TEXT_LINES 64
 
