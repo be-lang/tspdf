@@ -1368,6 +1368,276 @@ TEST(test_writer_producer_is_tspdf_with_version) {
 }
 
 // ============================================================
+// PNG palette support (cli-media track)
+// ============================================================
+
+// Write a palette PNG (color type 3) to `path`. `palette` is palette_entries
+// RGB triplets; `trns` (may be NULL) is trns_entries palette-alpha bytes;
+// `indices` is width*height palette indices (one byte each, values must fit in
+// bit_depth). Scanlines are packed MSB-first per the PNG spec, each prefixed
+// with filter byte 0, and deflate-compressed into a single IDAT. Reuses
+// test_png_write_chunk (the decoder does not verify chunk CRCs).
+static bool test_png_write_palette_file(const char *path, int width, int height,
+                                        int bit_depth,
+                                        const uint8_t *palette, int palette_entries,
+                                        const uint8_t *trns, int trns_entries,
+                                        const uint8_t *indices) {
+    size_t stride = ((size_t)width * (size_t)bit_depth + 7u) / 8u;
+    size_t raw_len = (stride + 1u) * (size_t)height;
+    uint8_t *rawbuf = (uint8_t *)calloc(raw_len, 1);
+    if (!rawbuf) return false;
+    for (int y = 0; y < height; y++) {
+        uint8_t *row = rawbuf + (size_t)y * (stride + 1u) + 1;  // row[−1] is filter 0
+        for (int x = 0; x < width; x++) {
+            uint8_t idx = indices[y * width + x];
+            size_t bit = (size_t)x * (size_t)bit_depth;
+            unsigned shift = 8u - (unsigned)bit_depth - (unsigned)(bit % 8u);
+            row[bit / 8u] |= (uint8_t)(idx << shift);
+        }
+    }
+    size_t comp_len = 0;
+    uint8_t *comp = deflate_compress(rawbuf, raw_len, &comp_len);
+    free(rawbuf);
+    if (!comp) return false;
+
+    FILE *f = fopen(path, "wb");
+    if (!f) { free(comp); return false; }
+    static const uint8_t sig[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+    fwrite(sig, 1, 8, f);
+    uint8_t ihdr[13] = {
+        (uint8_t)((width >> 24) & 0xff), (uint8_t)((width >> 16) & 0xff),
+        (uint8_t)((width >> 8) & 0xff), (uint8_t)(width & 0xff),
+        (uint8_t)((height >> 24) & 0xff), (uint8_t)((height >> 16) & 0xff),
+        (uint8_t)((height >> 8) & 0xff), (uint8_t)(height & 0xff),
+        (uint8_t)bit_depth, 3, 0, 0, 0,  // color type 3 = palette
+    };
+    test_png_write_chunk(f, "IHDR", ihdr, 13);
+    test_png_write_chunk(f, "PLTE", palette, (size_t)palette_entries * 3);
+    if (trns) {
+        test_png_write_chunk(f, "tRNS", trns, (size_t)trns_entries);
+    }
+    test_png_write_chunk(f, "IDAT", comp, comp_len);
+    test_png_write_chunk(f, "IEND", NULL, 0);
+    fclose(f);
+    free(comp);
+    return true;
+}
+
+// 8-bit palette indices expand to the palette's RGB triplets.
+TEST(test_png_palette_8bit_decodes) {
+    const char *path = "/tmp/tspdf_test_png_pal8.png";
+    static const uint8_t palette[] = {
+        255, 0, 0,   0, 255, 0,   0, 0, 255,   255, 255, 0,
+    };
+    static const uint8_t indices[] = { 0, 1, 2, 3 };  // 2x2
+    ASSERT(test_png_write_palette_file(path, 2, 2, 8, palette, 4, NULL, 0, indices));
+
+    PngImage img;
+    bool ok = png_image_load(path, &img);
+    remove(path);
+    ASSERT(ok);
+    ASSERT_EQ_INT(img.width, 2);
+    ASSERT_EQ_INT(img.height, 2);
+    ASSERT_EQ_INT(img.channels, 3);  // no tRNS -> opaque RGB
+    static const uint8_t expected[] = {
+        255, 0, 0,   0, 255, 0,
+        0, 0, 255,   255, 255, 0,
+    };
+    ASSERT(memcmp(img.pixels, expected, sizeof(expected)) == 0);
+    png_image_free(&img);
+}
+
+// tRNS palette alpha: covered entries use their alpha, uncovered default to 255.
+TEST(test_png_palette_trns_decodes_rgba) {
+    const char *path = "/tmp/tspdf_test_png_pal_trns.png";
+    static const uint8_t palette[] = {
+        10, 20, 30,   40, 50, 60,   70, 80, 90,
+    };
+    static const uint8_t trns[] = { 0, 128 };  // entry 2 uncovered -> 255
+    static const uint8_t indices[] = { 0, 1, 2 };  // 3x1
+    ASSERT(test_png_write_palette_file(path, 3, 1, 8, palette, 3, trns, 2, indices));
+
+    PngImage img;
+    bool ok = png_image_load(path, &img);
+    remove(path);
+    ASSERT(ok);
+    ASSERT_EQ_INT(img.channels, 4);  // tRNS present -> RGBA
+    static const uint8_t expected[] = {
+        10, 20, 30, 0,   40, 50, 60, 128,   70, 80, 90, 255,
+    };
+    ASSERT(memcmp(img.pixels, expected, sizeof(expected)) == 0);
+    png_image_free(&img);
+}
+
+// 1-bit indices: 9 pixels/row spans 2 bytes, exercising row padding bits.
+TEST(test_png_palette_1bit_decodes) {
+    const char *path = "/tmp/tspdf_test_png_pal1.png";
+    static const uint8_t palette[] = { 0, 0, 0,   255, 255, 255 };
+    static const uint8_t indices[] = { 1, 0, 1, 0, 1, 0, 1, 0, 1 };  // 9x1
+    ASSERT(test_png_write_palette_file(path, 9, 1, 1, palette, 2, NULL, 0, indices));
+
+    PngImage img;
+    bool ok = png_image_load(path, &img);
+    remove(path);
+    ASSERT(ok);
+    ASSERT_EQ_INT(img.width, 9);
+    ASSERT_EQ_INT(img.channels, 3);
+    for (int x = 0; x < 9; x++) {
+        uint8_t want = (x % 2 == 0) ? 255 : 0;
+        ASSERT(img.pixels[x * 3 + 0] == want);
+        ASSERT(img.pixels[x * 3 + 1] == want);
+        ASSERT(img.pixels[x * 3 + 2] == want);
+    }
+    png_image_free(&img);
+}
+
+// 2-bit indices: 5 pixels/row = 10 bits spanning 2 bytes.
+TEST(test_png_palette_2bit_decodes) {
+    const char *path = "/tmp/tspdf_test_png_pal2.png";
+    static const uint8_t palette[] = {
+        1, 2, 3,   4, 5, 6,   7, 8, 9,   10, 11, 12,
+    };
+    static const uint8_t indices[] = { 0, 1, 2, 3, 0 };  // 5x1
+    ASSERT(test_png_write_palette_file(path, 5, 1, 2, palette, 4, NULL, 0, indices));
+
+    PngImage img;
+    bool ok = png_image_load(path, &img);
+    remove(path);
+    ASSERT(ok);
+    for (int x = 0; x < 5; x++) {
+        int idx = indices[x];
+        ASSERT(img.pixels[x * 3 + 0] == palette[idx * 3 + 0]);
+        ASSERT(img.pixels[x * 3 + 1] == palette[idx * 3 + 1]);
+        ASSERT(img.pixels[x * 3 + 2] == palette[idx * 3 + 2]);
+    }
+    png_image_free(&img);
+}
+
+// 4-bit indices across two rows: 3 pixels/row = 12 bits spanning 2 bytes.
+TEST(test_png_palette_4bit_decodes) {
+    const char *path = "/tmp/tspdf_test_png_pal4.png";
+    static const uint8_t palette[] = {
+        100, 0, 0,   0, 100, 0,   0, 0, 100,
+    };
+    static const uint8_t indices[] = { 0, 1, 2,  2, 1, 0 };  // 3x2
+    ASSERT(test_png_write_palette_file(path, 3, 2, 4, palette, 3, NULL, 0, indices));
+
+    PngImage img;
+    bool ok = png_image_load(path, &img);
+    remove(path);
+    ASSERT(ok);
+    for (int i = 0; i < 6; i++) {
+        int idx = indices[i];
+        ASSERT(img.pixels[i * 3 + 0] == palette[idx * 3 + 0]);
+        ASSERT(img.pixels[i * 3 + 1] == palette[idx * 3 + 1]);
+        ASSERT(img.pixels[i * 3 + 2] == palette[idx * 3 + 2]);
+    }
+    png_image_free(&img);
+}
+
+// A palette index past the PLTE entry count is malformed and must be rejected.
+TEST(test_png_palette_index_out_of_range_rejected) {
+    const char *path = "/tmp/tspdf_test_png_pal_oob.png";
+    static const uint8_t palette[] = { 255, 0, 0,   0, 255, 0 };  // 2 entries
+    static const uint8_t indices[] = { 0, 5 };  // 5 >= 2 -> invalid
+    ASSERT(test_png_write_palette_file(path, 2, 1, 8, palette, 2, NULL, 0, indices));
+
+    PngImage img;
+    bool ok = png_image_load(path, &img);
+    remove(path);
+    ASSERT(ok == false);
+    ASSERT(img.pixels == NULL);
+}
+
+// A palette PNG with no PLTE chunk at all is malformed and must be rejected.
+TEST(test_png_palette_missing_plte_rejected) {
+    const char *path = "/tmp/tspdf_test_png_pal_noplte.png";
+    FILE *f = fopen(path, "wb");
+    ASSERT(f != NULL);
+    static const uint8_t sig[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+    fwrite(sig, 1, 8, f);
+    uint8_t ihdr[13] = {
+        0, 0, 0, 1, 0, 0, 0, 1,
+        8, 3, 0, 0, 0,  // 8-bit palette, but no PLTE follows
+    };
+    test_png_write_chunk(f, "IHDR", ihdr, 13);
+    uint8_t scanline[2] = { 0, 0 };  // filter 0 + one index byte
+    size_t comp_len = 0;
+    uint8_t *comp = deflate_compress(scanline, 2, &comp_len);
+    ASSERT(comp != NULL);
+    test_png_write_chunk(f, "IDAT", comp, comp_len);
+    free(comp);
+    test_png_write_chunk(f, "IEND", NULL, 0);
+    fclose(f);
+
+    PngImage img;
+    bool ok = png_image_load(path, &img);
+    remove(path);
+    ASSERT(ok == false);
+    ASSERT(img.pixels == NULL);
+}
+
+// Interlaced (Adam7) PNGs stay rejected: no de-interlacing pass exists.
+TEST(test_png_interlaced_still_rejected) {
+    const char *path = "/tmp/tspdf_test_png_interlaced.png";
+    FILE *f = fopen(path, "wb");
+    ASSERT(f != NULL);
+    static const uint8_t sig[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+    fwrite(sig, 1, 8, f);
+    uint8_t ihdr[13] = {
+        0, 0, 0, 1, 0, 0, 0, 1,
+        8, 2, 0, 0, 1,  // 8-bit RGB, interlace = 1 (Adam7)
+    };
+    test_png_write_chunk(f, "IHDR", ihdr, 13);
+    uint8_t scanline[4] = { 0, 255, 0, 0 };  // filter 0 + one RGB pixel
+    size_t comp_len = 0;
+    uint8_t *comp = deflate_compress(scanline, 4, &comp_len);
+    ASSERT(comp != NULL);
+    test_png_write_chunk(f, "IDAT", comp, comp_len);
+    free(comp);
+    test_png_write_chunk(f, "IEND", NULL, 0);
+    fclose(f);
+
+    PngImage img;
+    bool ok = png_image_load(path, &img);
+    remove(path);
+    ASSERT(ok == false);
+    ASSERT(img.pixels == NULL);
+}
+
+// Round-trip: a palette+tRNS PNG embeds through the writer (RGB + soft mask)
+// and the document saves cleanly.
+TEST(test_png_palette_embeds_in_writer) {
+    const char *png_path = "/tmp/tspdf_test_png_pal_embed.png";
+    static const uint8_t palette[] = {
+        255, 0, 0,   0, 255, 0,   0, 0, 255,
+    };
+    static const uint8_t trns[] = { 200 };
+    static const uint8_t indices[] = { 0, 1, 2, 0 };  // 2x2
+    ASSERT(test_png_write_palette_file(png_path, 2, 2, 8, palette, 3, trns, 1, indices));
+
+    TspdfWriter *doc = tspdf_writer_create();
+    ASSERT(doc != NULL);
+    const char *name = tspdf_writer_add_png_image(doc, png_path);
+    remove(png_path);
+    ASSERT(name != NULL);
+    ASSERT_EQ_INT(doc->image_count, 1);
+    ASSERT_EQ_INT(doc->images[0].width, 2);
+    ASSERT_EQ_INT(doc->images[0].height, 2);
+    // The pixel buffers are freed once embedded, but the soft-mask object ref
+    // survives — non-zero only when the decoder reported an alpha channel.
+    ASSERT(doc->images[0].smask_ref.id != 0);  // tRNS -> soft mask
+
+    TspdfStream *page = tspdf_writer_add_page(doc);
+    ASSERT(page != NULL);
+    tspdf_stream_draw_image(page, name, 36, 36, 100, 100);
+    TspdfError err = tspdf_writer_save(doc, "/tmp/tspdf_test_png_pal_embed.pdf");
+    ASSERT(err == TSPDF_OK);
+    tspdf_writer_destroy(doc);
+    remove("/tmp/tspdf_test_png_pal_embed.pdf");
+}
+
+// ============================================================
 // Main
 // ============================================================
 
@@ -1482,6 +1752,16 @@ int main(void) {
     RUN(test_deflate_decompresses_valid_stored_block);
     printf("\n  Encoding/i18n:\n");
     RUN(test_writer_producer_is_tspdf_with_version);
+    printf("\n  PNG palette support:\n");
+    RUN(test_png_palette_8bit_decodes);
+    RUN(test_png_palette_trns_decodes_rgba);
+    RUN(test_png_palette_1bit_decodes);
+    RUN(test_png_palette_2bit_decodes);
+    RUN(test_png_palette_4bit_decodes);
+    RUN(test_png_palette_index_out_of_range_rejected);
+    RUN(test_png_palette_missing_plte_rejected);
+    RUN(test_png_interlaced_still_rejected);
+    RUN(test_png_palette_embeds_in_writer);
 
     printf("\n%d tests run, %d passed, %d failed, %d skipped\n",
            tests_run, tests_passed, tests_failed, tests_skipped);

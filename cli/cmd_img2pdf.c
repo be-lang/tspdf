@@ -19,6 +19,7 @@ int cmd_img2pdf(int argc, char **argv) {
     if (argc == 0 || has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
         printf("Usage: tspdf img2pdf <image1> <image2> [...] -o <output.pdf> [--best-effort]\n");
         printf("\nConvert JPEG/PNG images into a multi-page PDF (one image per page).\n");
+        printf("Each image is scaled to fit the page, keeping its aspect ratio, and centered.\n");
         printf("Exits non-zero if any input fails to load (the pages that loaded are still\n");
         printf("written). Pass --best-effort to skip unsupported inputs and exit 0.\n");
         return argc == 0 ? 1 : 0;
@@ -67,7 +68,18 @@ int cmd_img2pdf(int argc, char **argv) {
         double aw = pw - 2 * margin;
         double ah = ph - 2 * margin;
 
-        tspdf_stream_draw_image(page, img_name, margin, margin, aw, ah);
+        // Scale to fit the content box preserving aspect ratio, centered.
+        // The image just added is the last entry in the writer's image table.
+        const TspdfImage *img = &doc->images[doc->image_count - 1];
+        double sx = aw / img->width;
+        double sy = ah / img->height;
+        double scale = sx < sy ? sx : sy;
+        double dw = img->width * scale;
+        double dh = img->height * scale;
+        double dx = margin + (aw - dw) / 2;
+        double dy = margin + (ah - dh) / 2;
+
+        tspdf_stream_draw_image(page, img_name, dx, dy, dw, dh);
         pages_added++;
     }
 

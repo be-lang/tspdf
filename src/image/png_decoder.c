@@ -101,34 +101,50 @@ bool png_image_load_mem(const uint8_t *file_data, size_t data_len, PngImage *img
     img->width = (int)width_u;
     img->height = (int)height_u;
     img->bit_depth = ihdr[8];
+    int bit_depth = img->bit_depth;
     int color_type = ihdr[9];
     int compression = ihdr[10];
     int filter_method = ihdr[11];
     int interlace = ihdr[12];
 
-    if (compression != 0 || filter_method != 0 || interlace != 0) {
-        // Only support standard non-interlaced PNG
+    if (interlace != 0) {
+        // Adam7 would need a full de-interlacing pass we do not implement.
+        fprintf(stderr, "tspdf: interlaced PNG not supported\n");
+        return false;
+    }
+    if (compression != 0 || filter_method != 0) {
+        // 0 is the only compression/filter method the spec defines
         return false;
     }
 
-    // Determine bytes per pixel
+    // Determine bytes per pixel (the filter delta; min 1 byte for palette)
     int bpp;
     switch (color_type) {
         case 0: bpp = 1; img->channels = 1; break;  // grayscale
         case 2: bpp = 3; img->channels = 3; break;  // RGB
+        case 3: bpp = 1; img->channels = 1; break;  // palette indices
         case 4: bpp = 2; img->channels = 2; break;  // grayscale + alpha
         case 6: bpp = 4; img->channels = 4; break;  // RGBA
         default:
-            return false;  // indexed/palette not supported yet
+            return false;
     }
 
-    // Only support 8-bit depth for now
-    if (img->bit_depth != 8) {
+    // Palette images pack 1/2/4/8-bit indices; everything else is 8-bit only
+    if (color_type == 3) {
+        if (bit_depth != 1 && bit_depth != 2 && bit_depth != 4 && bit_depth != 8) {
+            return false;
+        }
+    } else if (bit_depth != 8) {
         return false;
     }
 
-    // Collect all IDAT chunks (only count bytes from chunks that fully fit in the file)
+    // Collect all IDAT chunks (only count bytes from chunks that fully fit in
+    // the file), and locate PLTE / tRNS for palette expansion on the same pass.
     size_t idat_total = 0;
+    const uint8_t *plte = NULL;
+    size_t plte_len = 0;
+    const uint8_t *trns = NULL;
+    size_t trns_len = 0;
     pos = 8;
     while (pos + 12 <= file_size) {
         uint32_t chunk_len = read_u32_be(file_data + pos);
@@ -139,8 +155,27 @@ bool png_image_load_mem(const uint8_t *file_data, size_t data_len, PngImage *img
                 return false;
             }
             idat_total += add;
+        } else if (memcmp(file_data + pos + 4, "PLTE", 4) == 0 && !plte) {
+            plte = file_data + pos + 8;
+            plte_len = chunk_len;
+        } else if (memcmp(file_data + pos + 4, "tRNS", 4) == 0 && !trns) {
+            trns = file_data + pos + 8;
+            trns_len = chunk_len;
         }
         pos += 12 + chunk_len;
+    }
+
+    // Validate the palette: PLTE is mandatory for color type 3, holds up to 256
+    // RGB triplets, and a tRNS alpha table may cover at most every entry.
+    int plte_count = 0;
+    if (color_type == 3) {
+        if (!plte || plte_len == 0 || plte_len % 3 != 0 || plte_len > 256 * 3) {
+            return false;
+        }
+        plte_count = (int)(plte_len / 3);
+        if (trns && trns_len > (size_t)plte_count) {
+            return false;
+        }
     }
 
     uint8_t *idat_data = (uint8_t *)malloc(idat_total);
@@ -167,13 +202,26 @@ bool png_image_load_mem(const uint8_t *file_data, size_t data_len, PngImage *img
 
     if (!raw) return false;
 
-    // Expected raw size: (1 + width*bpp) * height (1 filter byte per row)
+    // Expected raw size: (1 + stride) * height (1 filter byte per row).
+    // Palette rows pack width*bit_depth bits (rounded up to whole bytes);
+    // the other color types are 8-bit so their stride is width*bpp bytes.
     size_t bpp_sz = (size_t)bpp;
-    if ((uint32_t)img->width > SIZE_MAX / bpp_sz) {
-        free(raw);
-        return false;
+    size_t stride;
+    if (color_type == 3) {
+        // width <= TSPDF_PNG_MAX_DIMENSION and bit_depth <= 8, so this cannot
+        // overflow, but keep the explicit guard style of the branch below.
+        if ((size_t)img->width > (SIZE_MAX - 7u) / (size_t)bit_depth) {
+            free(raw);
+            return false;
+        }
+        stride = ((size_t)img->width * (size_t)bit_depth + 7u) / 8u;
+    } else {
+        if ((uint32_t)img->width > SIZE_MAX / bpp_sz) {
+            free(raw);
+            return false;
+        }
+        stride = (size_t)img->width * bpp_sz;
     }
-    size_t stride = (size_t)img->width * bpp_sz;
     if ((size_t)img->height > SIZE_MAX / (stride + 1u)) {
         free(raw);
         return false;
@@ -184,8 +232,10 @@ bool png_image_load_mem(const uint8_t *file_data, size_t data_len, PngImage *img
         return false;
     }
 
-    // Allocate output pixels (always RGB or RGBA, 3 or 4 channels)
-    int out_channels = (color_type == 4 || color_type == 6) ? 4 : 3;
+    // Allocate output pixels (always RGB or RGBA, 3 or 4 channels).
+    // A palette image becomes RGBA only when a tRNS alpha table is present.
+    int out_channels = (color_type == 4 || color_type == 6 ||
+                        (color_type == 3 && trns)) ? 4 : 3;
     img->channels = out_channels;
     size_t oc = (size_t)out_channels;
     size_t w = (size_t)img->width;
@@ -251,6 +301,31 @@ bool png_image_load_mem(const uint8_t *file_data, size_t data_len, PngImage *img
                     out[x * 3 + 1] = cur_row[x * 3 + 1];
                     out[x * 3 + 2] = cur_row[x * 3 + 2];
                     break;
+                case 3: {  // palette index → RGB(A)
+                    // Sub-byte depths pack indices MSB-first within each byte.
+                    unsigned idx;
+                    if (bit_depth == 8) {
+                        idx = cur_row[x];
+                    } else {
+                        size_t bit = (size_t)x * (size_t)bit_depth;
+                        unsigned shift = 8u - (unsigned)bit_depth - (unsigned)(bit % 8u);
+                        idx = (cur_row[bit / 8u] >> shift) & ((1u << bit_depth) - 1u);
+                    }
+                    if ((int)idx >= plte_count) {
+                        // Index past the PLTE entry count: malformed image
+                        free(raw); free(prev_row); free(cur_row); free(img->pixels);
+                        img->pixels = NULL;
+                        return false;
+                    }
+                    out[x * out_channels + 0] = plte[idx * 3 + 0];
+                    out[x * out_channels + 1] = plte[idx * 3 + 1];
+                    out[x * out_channels + 2] = plte[idx * 3 + 2];
+                    if (out_channels == 4) {
+                        // tRNS covers the first trns_len entries; the rest are opaque
+                        out[x * 4 + 3] = ((size_t)idx < trns_len) ? trns[idx] : 255;
+                    }
+                    break;
+                }
                 case 4:  // gray+alpha → RGBA
                     out[x * 4 + 0] = cur_row[x * 2 + 0];
                     out[x * 4 + 1] = cur_row[x * 2 + 0];

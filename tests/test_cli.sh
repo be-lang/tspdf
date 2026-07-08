@@ -195,23 +195,22 @@ sys.stdout.buffer.write(sig + chunk(b'IHDR',ihdr) + chunk(b'IDAT',raw) + chunk(b
   run_test "img2pdf flag-first ordering (input before -o)" $TSPDF img2pdf $TMPDIR/test.png -o $TMPDIR/img2pdf_ff.pdf
   run_test "img2pdf flag-first (-o before input)" $TSPDF img2pdf -o $TMPDIR/img2pdf_ff2.pdf $TMPDIR/test.png
 
-  # An unsupported image (palette/color-type-3 PNG) that the decoder rejects.
+  # An unsupported image (interlaced/Adam7 PNG) that the decoder rejects.
   python3 -c "
 import struct, zlib, sys
 sig = b'\x89PNG\r\n\x1a\n'
 def chunk(t, d): return struct.pack('>I',len(d)) + t + d + struct.pack('>I', zlib.crc32(t+d) & 0xffffffff)
-ihdr = struct.pack('>IIBBBBB', 1, 1, 8, 3, 0, 0, 0)  # color_type 3 = palette (unsupported)
-plte = b'\xff\x00\x00'
-raw = zlib.compress(b'\x00\x00')
-sys.stdout.buffer.write(sig + chunk(b'IHDR',ihdr) + chunk(b'PLTE',plte) + chunk(b'IDAT',raw) + chunk(b'IEND',b''))
-" > $TMPDIR/palette.png
+ihdr = struct.pack('>IIBBBBB', 1, 1, 8, 2, 0, 0, 1)  # interlace 1 = Adam7 (unsupported)
+raw = zlib.compress(b'\x00\xff\x00\x00')
+sys.stdout.buffer.write(sig + chunk(b'IHDR',ihdr) + chunk(b'IDAT',raw) + chunk(b'IEND',b''))
+" > $TMPDIR/interlaced.png
 
   # A partial failure (one good image + one unsupported) must exit non-zero
   # while still writing the pages that loaded.
-  run_test "img2pdf partial failure exits non-zero" bash -c "! $TSPDF img2pdf $TMPDIR/test.png $TMPDIR/palette.png -o $TMPDIR/img2pdf_partial.pdf > /dev/null 2>&1"
+  run_test "img2pdf partial failure exits non-zero" bash -c "! $TSPDF img2pdf $TMPDIR/test.png $TMPDIR/interlaced.png -o $TMPDIR/img2pdf_partial.pdf > /dev/null 2>&1"
   run_test "img2pdf partial failure still writes the good page" bash -c "$TSPDF info $TMPDIR/img2pdf_partial.pdf | grep -qE '^Pages:[[:space:]]*1$'"
   # --best-effort restores skip-and-exit-0 behaviour
-  run_test "img2pdf --best-effort tolerates unsupported input (exit 0)" $TSPDF img2pdf $TMPDIR/test.png $TMPDIR/palette.png --best-effort -o $TMPDIR/img2pdf_be.pdf
+  run_test "img2pdf --best-effort tolerates unsupported input (exit 0)" $TSPDF img2pdf $TMPDIR/test.png $TMPDIR/interlaced.png --best-effort -o $TMPDIR/img2pdf_be.pdf
   # All-good inputs still exit 0
   run_test "img2pdf all-good inputs exit 0" $TSPDF img2pdf $TMPDIR/test.png examples/test.jpg -o $TMPDIR/img2pdf_good.pdf
 else
@@ -875,6 +874,135 @@ run_test "md2pdf substitutes non-WinAnsi chars with warning" bash -c "
 run_test "md2pdf help mentions WinAnsi limitation" bash -c "
   \"$TSPDF\" md2pdf --help | grep -qi 'WinAnsi'
 "
+# ============================================================
+# cli-media track: img2pdf aspect ratio, palette PNGs, passwords
+# ============================================================
+
+# img2pdf must scale images to fit the A4 content box preserving aspect ratio,
+# centered. Verified by parsing /MediaBox and the image XObject cm matrix out
+# of the output ("w 0 0 h x y cm").
+if command -v python3 > /dev/null 2>&1; then
+  gen_rgb_png() {  # gen_rgb_png <width> <height> <path>
+    python3 -c "
+import struct, zlib, sys
+w, h = int(sys.argv[1]), int(sys.argv[2])
+sig = b'\x89PNG\r\n\x1a\n'
+def chunk(t, d): return struct.pack('>I',len(d)) + t + d + struct.pack('>I', zlib.crc32(t+d) & 0xffffffff)
+ihdr = struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)
+raw = zlib.compress(b''.join(b'\x00' + b'\x40\x80\xc0' * w for _ in range(h)))
+open(sys.argv[3], 'wb').write(sig + chunk(b'IHDR',ihdr) + chunk(b'IDAT',raw) + chunk(b'IEND',b''))
+" "$1" "$2" "$3"
+  }
+  check_img2pdf_aspect() {  # check_img2pdf_aspect <pdf> <img_width> <img_height>
+    python3 - "$1" "$2" "$3" << 'PYEOF'
+import re, sys, zlib
+pdf = open(sys.argv[1], 'rb').read()
+iw, ih = float(sys.argv[2]), float(sys.argv[3])
+m = re.search(rb'/MediaBox \[([\d. ]+)\]', pdf)
+assert m, 'no /MediaBox found'
+mb = [float(v) for v in m.group(1).split()]
+pw, ph = mb[2] - mb[0], mb[3] - mb[1]
+streams = []
+for s in re.finditer(rb'stream\r?\n(.*?)\r?\nendstream', pdf, re.DOTALL):
+    raw = s.group(1)
+    try: streams.append(zlib.decompress(raw))
+    except Exception: streams.append(raw)
+text = b'\n'.join(streams).decode('latin-1')
+cm = re.search(r'([\d.]+) 0 0 ([\d.]+) ([\d.]+) ([\d.]+) cm', text)
+assert cm, 'no image cm matrix found'
+w, h, x, y = (float(v) for v in cm.groups())
+margin = 36.0
+aw, ah = pw - 2 * margin, ph - 2 * margin
+# aspect ratio preserved (within the 4-decimal print rounding)
+assert abs(w / h - iw / ih) < 0.01 * (iw / ih), (w, h, iw, ih)
+# fits inside the content box and fills the constraining axis
+assert w <= aw + 0.01 and h <= ah + 0.01, (w, h, aw, ah)
+assert abs(w - aw) < 0.01 or abs(h - ah) < 0.01, (w, h, aw, ah)
+# centered in the content box
+assert abs((x - margin) - (aw - w) / 2) < 0.01, (x, w, aw)
+assert abs((y - margin) - (ah - h) / 2) < 0.01, (y, h, ah)
+PYEOF
+  }
+  gen_rgb_png 320 200 "$TMPDIR/wide.png"
+  gen_rgb_png 100 400 "$TMPDIR/tall.png"
+  run_test "img2pdf converts wide image" $TSPDF img2pdf $TMPDIR/wide.png -o $TMPDIR/wide.pdf
+  run_test "img2pdf preserves wide aspect ratio, centered" check_img2pdf_aspect $TMPDIR/wide.pdf 320 200
+  run_test "img2pdf converts tall image" $TSPDF img2pdf $TMPDIR/tall.png -o $TMPDIR/tall.pdf
+  run_test "img2pdf preserves tall aspect ratio, centered" check_img2pdf_aspect $TMPDIR/tall.pdf 100 400
+
+  # Palette (color type 3) PNGs are now decoded, including sub-byte depths.
+  python3 -c "
+import struct, zlib, sys
+sig = b'\x89PNG\r\n\x1a\n'
+def chunk(t, d): return struct.pack('>I',len(d)) + t + d + struct.pack('>I', zlib.crc32(t+d) & 0xffffffff)
+ihdr = struct.pack('>IIBBBBB', 2, 2, 8, 3, 0, 0, 0)  # 2x2, 8-bit palette
+plte = b'\xff\x00\x00\x00\xff\x00\x00\x00\xff'
+raw = zlib.compress(b'\x00\x00\x01\x00\x02\x01')  # rows: [0,1] [2,1]
+open(sys.argv[1], 'wb').write(sig + chunk(b'IHDR',ihdr) + chunk(b'PLTE',plte) + chunk(b'IDAT',raw) + chunk(b'IEND',b''))
+" "$TMPDIR/pal8.png"
+  python3 -c "
+import struct, zlib, sys
+sig = b'\x89PNG\r\n\x1a\n'
+def chunk(t, d): return struct.pack('>I',len(d)) + t + d + struct.pack('>I', zlib.crc32(t+d) & 0xffffffff)
+ihdr = struct.pack('>IIBBBBB', 9, 1, 1, 3, 0, 0, 0)  # 9x1, 1-bit palette
+plte = b'\x00\x00\x00\xff\xff\xff'
+raw = zlib.compress(b'\x00\xaa\x80')  # 101010101 packed MSB-first
+open(sys.argv[1], 'wb').write(sig + chunk(b'IHDR',ihdr) + chunk(b'PLTE',plte) + chunk(b'IDAT',raw) + chunk(b'IEND',b''))
+" "$TMPDIR/pal1.png"
+  run_test "img2pdf accepts 8-bit palette PNG" $TSPDF img2pdf $TMPDIR/pal8.png -o $TMPDIR/pal8.pdf
+  run_test "img2pdf accepts 1-bit palette PNG" $TSPDF img2pdf $TMPDIR/pal1.png -o $TMPDIR/pal1.pdf
+  if command -v qpdf > /dev/null 2>&1; then
+    run_test "img2pdf palette PNG output passes qpdf --check" qpdf --check $TMPDIR/pal8.pdf
+    run_test "img2pdf aspect-fit output passes qpdf --check" qpdf --check $TMPDIR/wide.pdf
+  else
+    echo "  SKIP  img2pdf qpdf --check (qpdf not found)"
+  fi
+
+  # Interlaced PNGs stay rejected, with an error message that says so.
+  python3 -c "
+import struct, zlib, sys
+sig = b'\x89PNG\r\n\x1a\n'
+def chunk(t, d): return struct.pack('>I',len(d)) + t + d + struct.pack('>I', zlib.crc32(t+d) & 0xffffffff)
+ihdr = struct.pack('>IIBBBBB', 1, 1, 8, 2, 0, 0, 1)  # interlace 1 = Adam7
+raw = zlib.compress(b'\x00\xff\x00\x00')
+open(sys.argv[1], 'wb').write(sig + chunk(b'IHDR',ihdr) + chunk(b'IDAT',raw) + chunk(b'IEND',b''))
+" "$TMPDIR/adam7.png"
+  run_test "img2pdf reports interlaced PNG clearly" bash -c "$TSPDF img2pdf $TMPDIR/adam7.png -o $TMPDIR/adam7.pdf 2>&1 | grep -q 'interlaced PNG not supported'"
+else
+  echo "  SKIP  img2pdf aspect/palette tests (python3 not found)"
+fi
+
+# encrypt/decrypt --password-file: first line of the file (trailing newline
+# stripped), or stdin when the path is '-'. Passwords must never be required
+# on argv.
+printf 'filesecret\n' > $TMPDIR/pw.txt
+run_test "encrypt --password-file" $TSPDF encrypt $INPUT -o $TMPDIR/encpf.pdf --password-file $TMPDIR/pw.txt
+run_test "decrypt --password-file (newline stripped)" $TSPDF decrypt $TMPDIR/encpf.pdf -o $TMPDIR/decpf.pdf --password-file $TMPDIR/pw.txt
+run_test "encrypt --password-file matches plain --password" $TSPDF decrypt $TMPDIR/encpf.pdf -o $TMPDIR/decpf2.pdf --password filesecret
+run_test "encrypt --password-file - (stdin)" bash -c "echo stdinsecret | $TSPDF encrypt $INPUT -o $TMPDIR/encstdin.pdf --password-file -"
+run_test "decrypt --password-file - (stdin)" bash -c "echo stdinsecret | $TSPDF decrypt $TMPDIR/encstdin.pdf -o $TMPDIR/decstdin.pdf --password-file -"
+run_test "encrypt missing --password-file path fails" bash -c "! $TSPDF encrypt $INPUT -o $TMPDIR/encnopf.pdf --password-file $TMPDIR/no_such_pw.txt > /dev/null 2>&1"
+
+# Omitted password with non-TTY stdin: no prompt possible, so the commands
+# must fail with an error pointing at --password / --password-file.
+run_test "encrypt no password non-TTY fails" bash -c "! $TSPDF encrypt $INPUT -o $TMPDIR/encnopw.pdf < /dev/null > /dev/null 2>&1"
+run_test "encrypt no password non-TTY mentions --password-file" bash -c "$TSPDF encrypt $INPUT -o $TMPDIR/encnopw.pdf < /dev/null 2>&1 | grep -q -- '--password-file'"
+run_test "decrypt no password non-TTY fails" bash -c "! $TSPDF decrypt $TMPDIR/encpf.pdf -o $TMPDIR/decnopw.pdf < /dev/null > /dev/null 2>&1"
+run_test "decrypt no password non-TTY mentions --password-file" bash -c "$TSPDF decrypt $TMPDIR/encpf.pdf -o $TMPDIR/decnopw.pdf < /dev/null 2>&1 | grep -q -- '--password-file'"
+
+# --owner-password-file: owner password read from a file. Validate with qpdf,
+# which can open the file with the owner password.
+if command -v qpdf > /dev/null 2>&1; then
+  printf 'ownersecret\n' > $TMPDIR/opw.txt
+  run_test "encrypt --owner-password-file" $TSPDF encrypt $INPUT -o $TMPDIR/encopf.pdf --password usersecret --owner-password-file $TMPDIR/opw.txt
+  run_test "owner password from file opens the PDF (qpdf)" qpdf --password=ownersecret --check $TMPDIR/encopf.pdf
+else
+  echo "  SKIP  encrypt --owner-password-file (qpdf not found)"
+fi
+
+# Help text documents the new password options.
+run_test "encrypt help mentions --password-file" bash -c "$TSPDF encrypt --help | grep -q -- '--password-file'"
+run_test "decrypt help mentions --password-file" bash -c "$TSPDF decrypt --help | grep -q -- '--password-file'"
 
 echo ""
 echo "$pass passed, $fail failed"

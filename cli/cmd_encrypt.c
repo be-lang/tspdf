@@ -1,4 +1,5 @@
 #include "commands.h"
+#include "password_input.h"
 #include "../include/tspdf.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -6,9 +7,13 @@
 
 int cmd_encrypt(int argc, char **argv) {
     if (argc == 0 || has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
-        printf("Usage: tspdf encrypt <input.pdf> -o <output.pdf> --password <pass>\n");
-        printf("                     [--owner-password <pass>] [--bits 128|256]\n");
+        printf("Usage: tspdf encrypt <input.pdf> -o <output.pdf> [--password <pass>]\n");
+        printf("                     [--password-file <path>] [--owner-password <pass>]\n");
+        printf("                     [--owner-password-file <path>] [--bits 128|256]\n");
         printf("\nEncrypt a PDF with a password.\n");
+        printf("The password can be passed with --password, read from the first line of a\n");
+        printf("file with --password-file ('-' reads stdin), or typed at a hidden prompt\n");
+        printf("when neither is given. The owner password defaults to the user password.\n");
         return argc == 0 ? 1 : 0;
     }
 
@@ -26,14 +31,25 @@ int cmd_encrypt(int argc, char **argv) {
         return 1;
     }
 
-    const char *password = find_flag(argc, argv, "--password");
-    if (!password) {
-        fprintf(stderr, "tspdf encrypt: missing --password <pass>\n");
-        return 1;
-    }
+    char pass_buf[TSPDF_PASSWORD_MAX];
+    const char *password = tspdf_resolve_password(argc, argv,
+                                                  "--password", "--password-file",
+                                                  "encrypt", "Password: ",
+                                                  true, pass_buf, sizeof(pass_buf));
+    if (!password) return 1;
 
-    const char *owner_pass = find_flag(argc, argv, "--owner-password");
-    if (!owner_pass) owner_pass = password;
+    // Owner password is optional: no prompt, default to the user password.
+    char owner_buf[TSPDF_PASSWORD_MAX];
+    bool owner_given = find_flag(argc, argv, "--owner-password") != NULL ||
+                       find_flag(argc, argv, "--owner-password-file") != NULL;
+    const char *owner_pass = tspdf_resolve_password(argc, argv,
+                                                    "--owner-password", "--owner-password-file",
+                                                    "encrypt", "Owner password: ",
+                                                    false, owner_buf, sizeof(owner_buf));
+    if (!owner_pass) {
+        if (owner_given) return 1;  // flag given but the file was unreadable
+        owner_pass = password;
+    }
 
     const char *bits_str = find_flag(argc, argv, "--bits");
     int bits = 128;
