@@ -20,4 +20,28 @@ QrCode *qr_encode(const char *text);
 /* Free a QR code returned by qr_encode(). */
 void qr_free(QrCode *qr);
 
+/*
+ * Introspection hooks for the unit tests. Not part of the public library
+ * surface; they expose internal encoder state so the tests can check the
+ * ECC block table, Reed-Solomon output, and version-information bits
+ * against ISO/IEC 18004 reference data.
+ */
+
+/*
+ * ECC block structure for `version` at level M. Returns 0 on success,
+ * -1 if the version is out of range. Any output pointer may be NULL.
+ */
+int qr_ecc_block_info(int version, int *total_cw, int *ecc_per_block,
+                      int *blocks_g1, int *data_g1,
+                      int *blocks_g2, int *data_g2);
+
+/* Reed-Solomon EC codewords over GF(256) with polynomial 0x11D. */
+void qr_rs_ecc(const uint8_t *data, int data_len, uint8_t *ecc, int num_ecc);
+
+/* 18-bit BCH(18,6) version information value; 0 for versions < 7. */
+uint32_t qr_version_info_bits(int version);
+
+/* Highest supported version (capacity ceiling for qr_encode). */
+int qr_max_version(void);
+
 #endif /* QR_ENCODE_H */

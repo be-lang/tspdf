@@ -1393,6 +1393,45 @@ else
   echo "  SKIP  md2pdf images (qpdf not found)"
 fi
 
+# qrcode: payload lengths spanning versions 1-11 (10..250 chars) must encode
+# and produce a well-formed page. The encoder output itself is pinned by the
+# decode-verified golden grids in tests/test_main.c.
+run_test "qrcode encodes payloads from 10 to 250 chars" bash -c "
+  set -e
+  base='https://example.org/p/'
+  for len in 10 40 116 213 250; do
+    p=\$(printf '%s%s' \"\$base\" \"\$(printf 'a%.0s' \$(seq 1 250))\" | cut -c1-\$len)
+    $TSPDF qrcode \"\$p\" -o $TMPDIR/qr\$len.pdf > /dev/null
+    $TSPDF info $TMPDIR/qr\$len.pdf > /dev/null
+  done"
+
+run_test "qrcode rejects payloads beyond capacity" bash -c "
+  p=\$(printf 'a%.0s' \$(seq 1 300))
+  ! $TSPDF qrcode \"\$p\" -o $TMPDIR/qrtoolong.pdf 2> $TMPDIR/qrtoolong.err
+  grep -q 'too long' $TMPDIR/qrtoolong.err"
+
+# The default title documented in the help ("QR Code") must actually render,
+# and an explicit --title must replace it. Both are checked through the
+# repo's own text extractor.
+run_test "qrcode renders default title, link, and explicit title" bash -c "
+  set -e
+  $TSPDF qrcode 'https://example.org/scan' -o $TMPDIR/qrdef.pdf > /dev/null
+  $TSPDF text $TMPDIR/qrdef.pdf | grep -q 'QR Code'
+  $TSPDF text $TMPDIR/qrdef.pdf | grep -q 'https://example.org/scan'
+  $TSPDF qrcode 'https://example.org/scan' --title 'CUSTOMTITLE' --subtitle 'SUBTXT' \
+      -o $TMPDIR/qrcust.pdf > /dev/null
+  $TSPDF text $TMPDIR/qrcust.pdf | grep -q 'CUSTOMTITLE'
+  $TSPDF text $TMPDIR/qrcust.pdf | grep -q 'SUBTXT'
+  ! $TSPDF text $TMPDIR/qrcust.pdf | grep -q 'QR Code'"
+
+if command -v qpdf > /dev/null 2>&1; then
+  run_test "qrcode output passes qpdf --check" bash -c "
+    set -e
+    for len in 10 116 250; do qpdf --check $TMPDIR/qr\$len.pdf > /dev/null; done"
+else
+  echo "  SKIP  qrcode qpdf --check (qpdf not found)"
+fi
+
 # serve --bind: default stays loopback; non-loopback binds warn and keep a
 # same-origin gate for browser POSTs.
 BIND_PORT_LOOP=$((CLI_TEST_PORT_BASE + 50))
