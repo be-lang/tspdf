@@ -6,5 +6,6 @@ includedir=${prefix}/include
 Name: tspdf
 Description: Zero-dependency C11 PDF toolkit (reader, writer, layout)
 Version: @VERSION@
-Libs: -L${libdir} -ltspdf -lm
+Libs: -L${libdir} -ltspdf
+Libs.private: -lm
 Cflags: -I${includedir}

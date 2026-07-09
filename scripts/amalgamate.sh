@@ -91,18 +91,25 @@ src/crypto/rc4.c
 src/crypto/aes.c
 "
 
-# A new file under src/ that this script does not know about must fail loudly,
-# not ship a silently incomplete amalgamation.
+# A new file under src/ or include/ that this script does not know about must
+# fail loudly, not ship a silently incomplete amalgamation. The umbrella
+# headers are known-but-not-amalgamated: they only #include the closures
+# listed above (this file replaces them), so they are exempt from the scan
+# without being emitted.
+UMBRELLA_HEADERS="
+include/tspdf.h
+include/tspdf_overlay.h
+"
 KNOWN="$PUBLIC_HEADERS $INTERNAL_HEADERS $SOURCES"
 missing=""
-for f in $(find src -name '*.c' -o -name '*.h' | sort); do
-    case " $(echo $KNOWN) " in
+for f in $(find src include -name '*.c' -o -name '*.h' | sort); do
+    case " $(echo $KNOWN $UMBRELLA_HEADERS) " in
         *" $f "*) ;;
         *) missing="$missing $f" ;;
     esac
 done
 if [ -n "$missing" ]; then
-    echo "amalgamate.sh: unknown src file(s):$missing" >&2
+    echo "amalgamate.sh: unknown src/include file(s):$missing" >&2
     echo "add them to the file lists in scripts/amalgamate.sh" >&2
     exit 1
 fi
