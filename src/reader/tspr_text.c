@@ -830,12 +830,14 @@ static void tx_emit_cp(TextCtx *ctx, uint32_t cp) {
     // hiding all following page text. Also reachable via bfrange arithmetic
     // wrapping a uint16 unit to 0.
     if (cp == 0) return;
-    // Fold Latin ligature code points to their letter sequences (poppler
-    // does the same): searching extracted text for "file" should match a
-    // PDF that shows the ﬁ ligature.
+    // Fold Latin ligature code points (U+FB00-FB06) to their ASCII letter
+    // sequences so searching extracted text for "file" matches a PDF that
+    // shows the ﬁ ligature. Sequences follow Unicode NFKC (and poppler's
+    // Latin1 fold tables); note default pdftotext (UTF-8) keeps the raw
+    // code points. U+FB05 is the long-s-t ligature: NFKC folds it to "st".
     if (cp >= 0xFB00 && cp <= 0xFB06) {
         static const char *const lig[7] = {"ff", "fi", "fl", "ffi", "ffl",
-                                           "ft", "st"};
+                                           "st", "st"};
         const char *s = lig[cp - 0xFB00];
         tspdf_buffer_append(&ctx->out, s, strlen(s));
         return;

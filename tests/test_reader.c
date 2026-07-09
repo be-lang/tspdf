@@ -7261,7 +7261,8 @@ TEST(test_text_malformed_content_no_crash) {
 
 TEST(test_text_ligatures_folded_to_ascii) {
     // Unicode ligature code points (U+FB00-FB06) fold to their ASCII letter
-    // sequences at emit time, matching poppler's pdftotext behavior.
+    // sequences at emit time (matching poppler's Latin1 fold tables and
+    // Unicode NFKC).
     size_t len = 0;
     char *pdf = make_text_pdf_full(TEXT_HELV_RES,
         "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
@@ -7271,25 +7272,27 @@ TEST(test_text_ligatures_folded_to_ascii) {
         "12 dict begin\n"
         "begincmap\n"
         "1 begincodespacerange\n<00> <FF>\nendcodespacerange\n"
-        "3 beginbfchar\n"
+        "4 beginbfchar\n"
         "<41> <FB01>\n"
         "<42> <FB04>\n"
         "<43> <FB06>\n"
+        "<44> <FB05>\n"
         "endbfchar\n"
         "1 beginbfrange\n"
         "<50> <52> <FB00>\n"
         "endbfrange\n"
         "endcmap\nend\nend",
-        "BT /F1 12 Tf 72 700 Td (AnBC) Tj 0 -20 Td (PQR) Tj ET", &len);
+        "BT /F1 12 Tf 72 700 Td (AnBC.D) Tj 0 -20 Td (PQR) Tj ET", &len);
     ASSERT(pdf != NULL);
     TspdfError err;
     TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
     ASSERT(doc != NULL);
     const char *text = tspdf_reader_page_text(doc, 0, &err);
     ASSERT(text != NULL);
-    // A->U+FB01 "fi", B->U+FB04 "ffl", C->U+FB06 "st";
+    // A->U+FB01 "fi", B->U+FB04 "ffl", C->U+FB06 "st", D->U+FB05 "st"
+    // (long s t, NFKC folds it to "st" just like FB06);
     // bfrange P,Q,R -> U+FB00 "ff", U+FB01 "fi", U+FB02 "fl".
-    ASSERT_EQ_STR(text, "finfflst\nfffifl\n");
+    ASSERT_EQ_STR(text, "finfflst.st\nfffifl\n");
     tspdf_reader_destroy(doc);
     free(pdf);
 }
