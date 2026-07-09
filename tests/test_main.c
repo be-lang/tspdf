@@ -1792,6 +1792,126 @@ TEST(test_png_passthrough_rejects_damaged_idat) {
     remove(path);
 }
 
+// Like test_png_write_raw_file, but overrides the two zlib header bytes of
+// the IDAT stream — for crafting FDICT / CINFO>7 headers our own inflater
+// tolerates (it skips the header) but external PDF readers reject.
+static bool test_png_write_zhdr_file(const char *path, int width, int height,
+                                     uint8_t z0, uint8_t z1,
+                                     const uint8_t *raw, size_t raw_len) {
+    size_t comp_len = 0;
+    uint8_t *comp = deflate_compress(raw, raw_len, &comp_len);
+    if (!comp || comp_len < 2) { free(comp); return false; }
+    comp[0] = z0;
+    comp[1] = z1;
+    FILE *f = fopen(path, "wb");
+    if (!f) { free(comp); return false; }
+    static const uint8_t sig[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+    fwrite(sig, 1, 8, f);
+    uint8_t ihdr[13] = {
+        (uint8_t)((width >> 24) & 0xff), (uint8_t)((width >> 16) & 0xff),
+        (uint8_t)((width >> 8) & 0xff), (uint8_t)(width & 0xff),
+        (uint8_t)((height >> 24) & 0xff), (uint8_t)((height >> 16) & 0xff),
+        (uint8_t)((height >> 8) & 0xff), (uint8_t)(height & 0xff),
+        (uint8_t)8, (uint8_t)2, 0, 0, 0,
+    };
+    test_png_write_chunk(f, "IHDR", ihdr, 13);
+    test_png_write_chunk(f, "IDAT", comp, comp_len);
+    test_png_write_chunk(f, "IEND", NULL, 0);
+    fclose(f);
+    free(comp);
+    return true;
+}
+
+// Passthrough must only vouch for plain zlib streams external readers can
+// decode: CM=8, CINFO<=7 (32K window), no preset dictionary. Our inflater
+// skips the 2-byte header, so a crafted FDICT or CINFO=15 stream inflates
+// fine locally but breaks qpdf/MuPDF once embedded verbatim.
+TEST(test_png_passthrough_rejects_nonstandard_zlib_header) {
+    const char *path = "/tmp/tspdf_test_png_pt_zhdr.png";
+    static const uint8_t raw[] = { 0, 255, 0, 0 };  // 1x1 RGB, filter 0
+
+    // FDICT set: CMF=0x78, FLG=0x20 (bit 5 = FDICT; (0x7800+0x20) % 31 == 0)
+    ASSERT(test_png_write_zhdr_file(path, 1, 1, 0x78, 0x20, raw, sizeof(raw)));
+    PngPassthrough pt;
+    ASSERT(!png_read_passthrough(path, &pt));
+
+    // CINFO=15: CMF=0xF8, FLG=0x00 (0xF800 % 31 == 0) — window > 32K
+    ASSERT(test_png_write_zhdr_file(path, 1, 1, 0xF8, 0x00, raw, sizeof(raw)));
+    ASSERT(!png_read_passthrough(path, &pt));
+    remove(path);
+}
+
+// The chunk scan must stop at IEND: data after IEND is not part of the image
+// stream (PNG spec), so a stray IDAT there must not be picked up.
+TEST(test_png_passthrough_stops_at_iend) {
+    const char *path = "/tmp/tspdf_test_png_pt_iend.png";
+    static const uint8_t raw[] = { 0, 255, 0, 0 };  // 1x1 RGB, filter 0
+    size_t comp_len = 0;
+    uint8_t *comp = deflate_compress(raw, sizeof(raw), &comp_len);
+    ASSERT(comp != NULL);
+    static const uint8_t sig[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+    static const uint8_t ihdr[13] = { 0, 0, 0, 1,  0, 0, 0, 1,  8, 2, 0, 0, 0 };
+
+    // Only IDAT is after IEND: no image data before IEND -> reject.
+    FILE *f = fopen(path, "wb");
+    ASSERT(f != NULL);
+    fwrite(sig, 1, 8, f);
+    test_png_write_chunk(f, "IHDR", ihdr, 13);
+    test_png_write_chunk(f, "IEND", NULL, 0);
+    test_png_write_chunk(f, "IDAT", comp, comp_len);
+    fclose(f);
+    PngPassthrough pt;
+    ASSERT(!png_read_passthrough(path, &pt));
+
+    // Valid IDAT before IEND plus junk IDAT after: accepted, and only the
+    // real stream is extracted (the junk must not be concatenated).
+    f = fopen(path, "wb");
+    ASSERT(f != NULL);
+    fwrite(sig, 1, 8, f);
+    test_png_write_chunk(f, "IHDR", ihdr, 13);
+    test_png_write_chunk(f, "IDAT", comp, comp_len);
+    test_png_write_chunk(f, "IEND", NULL, 0);
+    static const uint8_t junk[] = { 0xde, 0xad, 0xbe, 0xef };
+    test_png_write_chunk(f, "IDAT", junk, sizeof(junk));
+    fclose(f);
+    ASSERT(png_read_passthrough(path, &pt));
+    remove(path);
+    ASSERT_EQ_SIZE(pt.idat_len, comp_len);
+    ASSERT(memcmp(pt.idat, comp, comp_len) == 0);
+    png_passthrough_free(&pt);
+    free(comp);
+}
+
+// An FDICT-flagged PNG is refused by passthrough but must still convert via
+// the decode+recompress fallback — our inflater tolerates the header, so the
+// image decodes and gets re-embedded with a clean zlib stream.
+TEST(test_png_fdict_converts_via_decode_fallback) {
+    const char *path = "/tmp/tspdf_test_png_fdict_fb.png";
+    static const uint8_t raw[] = { 0, 200, 100, 50 };  // 1x1 RGB, filter 0
+    ASSERT(test_png_write_zhdr_file(path, 1, 1, 0x78, 0x20, raw, sizeof(raw)));
+
+    TspdfWriter *doc = tspdf_writer_create();
+    ASSERT(doc != NULL);
+    const char *name = tspdf_writer_add_png_image(doc, path);
+    remove(path);
+    ASSERT(name != NULL);
+    ASSERT_EQ_INT(doc->image_count, 1);
+    ASSERT_EQ_INT(doc->images[0].width, 1);
+    ASSERT_EQ_INT(doc->images[0].height, 1);
+
+    TspdfStream *page = tspdf_writer_add_page(doc);
+    ASSERT(page != NULL);
+    tspdf_stream_draw_image(page, name, 36, 36, 100, 100);
+    uint8_t *pdf = NULL;
+    size_t pdf_len = 0;
+    ASSERT(tspdf_writer_save_to_memory(doc, &pdf, &pdf_len) == TSPDF_OK);
+    ASSERT(pdf_len > 0);
+    // The crafted FDICT header bytes must NOT appear as an embedded stream
+    // start: the fallback recompresses with a standard header.
+    free(pdf);
+    tspdf_writer_destroy(doc);
+}
+
 // End-to-end guarantee: the writer embeds a passthrough-eligible PNG's IDAT
 // bytes verbatim (found unchanged inside the saved PDF).
 TEST(test_png_passthrough_embeds_idat_verbatim) {
@@ -2028,6 +2148,9 @@ int main(void) {
     RUN(test_png_passthrough_palette_4bit);
     RUN(test_png_passthrough_rejects_interlaced_and_alpha);
     RUN(test_png_passthrough_rejects_damaged_idat);
+    RUN(test_png_passthrough_rejects_nonstandard_zlib_header);
+    RUN(test_png_passthrough_stops_at_iend);
+    RUN(test_png_fdict_converts_via_decode_fallback);
     RUN(test_png_passthrough_embeds_idat_verbatim);
 
     printf("\n  Save-to-memory byte identity (wasm):\n");

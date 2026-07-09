@@ -427,6 +427,7 @@ bool png_read_passthrough(const char *path, PngPassthrough *out) {
     while (pos + 12 <= file_size) {
         uint32_t chunk_len = read_u32_be(data + pos);
         if (chunk_len > file_size - pos - 12) break;
+        if (memcmp(data + pos + 4, "IEND", 4) == 0) break;
         if (memcmp(data + pos + 4, "IDAT", 4) == 0) {
             if (idat_total > SIZE_MAX - chunk_len) goto done;
             idat_total += chunk_len;
@@ -455,6 +456,7 @@ bool png_read_passthrough(const char *path, PngPassthrough *out) {
     while (pos + 12 <= file_size) {
         uint32_t chunk_len = read_u32_be(data + pos);
         if (chunk_len > file_size - pos - 12) break;
+        if (memcmp(data + pos + 4, "IEND", 4) == 0) break;
         if (memcmp(data + pos + 4, "IDAT", 4) == 0) {
             memcpy(out->idat + out->idat_len, data + pos + 8, chunk_len);
             out->idat_len += chunk_len;
@@ -462,6 +464,15 @@ bool png_read_passthrough(const char *path, PngPassthrough *out) {
         pos += 12 + chunk_len;
     }
     if (out->idat_len != idat_total) goto done;
+
+    // These bytes are embedded verbatim, so the zlib header must be one any
+    // PDF reader accepts: CM=8, CINFO<=7 (32K window), no preset dictionary.
+    // Our own inflater skips the header, so it can't be trusted to catch
+    // FDICT / CINFO>7 streams that qpdf/MuPDF would refuse to decode.
+    if (out->idat_len < 2 ||
+        (out->idat[0] & 0x0f) != 8 ||
+        (out->idat[0] >> 4) > 7 ||
+        (out->idat[1] & 0x20) != 0) goto done;
 
     // Validate before vouching for the bytes: the stream must inflate to
     // exactly (stride + 1) * height with every row filter byte in 0..4.
