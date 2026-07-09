@@ -41,11 +41,23 @@ Print information about a PDF.
 .B watermark
 Add a text watermark to a PDF.
 .TP
+.B pagenum
+Stamp page numbers on a PDF.
+.B \-\-pages
+limits which pages are stamped.
+.TP
 .B compress
 Compress a PDF to reduce file size.
 .TP
+.B text
+Extract text from a PDF to stdout or a file.
+.B \-\-pages
+selects pages.
+.TP
 .B img2pdf
 Convert images (JPEG/PNG) to a PDF.
+.B \-\-page\-size
+chooses a4, letter, or a page sized to each image.
 .TP
 .B qrcode
 Generate a QR code PDF.
@@ -54,7 +66,11 @@ Generate a QR code PDF.
 Convert Markdown to a styled PDF.
 .TP
 .B serve
-Start a local web server for PDF tools (default port 8080).
+Start a local web server for PDF tools (default port 8080, bound to
+127.0.0.1; change with
+.B \-\-port
+and
+.BR \-\-bind ).
 .PP
 Run
 .B tspdf help
