@@ -868,6 +868,15 @@ static void render_node(TspdfLayout *ctx, TspdfNode *node, TspdfStream *stream, 
                     tspdf_stream_stroke(stream);
                 }
             }
+
+            // Report the span's rect for link annotations (PDF coords):
+            // from just under the underline to just above the ascent.
+            if (span->link_url && ctx->on_link_rect) {
+                double link_y = text_pdf_y - span->font_size * 0.25;
+                double link_h = span->font_size * 1.1;
+                ctx->on_link_rect(cursor_x, link_y, span_w, link_h,
+                                  span->link_url, ctx->link_userdata);
+            }
             cursor_x += span_w;
         }
     } else if (node->type == TSPDF_NODE_TEXT && node->computed_text.line_count > 0) {

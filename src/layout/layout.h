@@ -106,6 +106,8 @@ typedef struct {
     double font_size;
     TspdfColor color;
     int decoration;   // bitmask of TspdfTextDecoration
+    const char *link_url;   // optional URI (arena-allocated); reported to the
+                            // layout's on_link_rect callback during rendering
 } TspdfTextSpan;
 
 // Text config
@@ -258,12 +260,22 @@ static inline TspdfPadding tspdf_padding_each(double t, double r, double b, doub
 typedef double (*TspdfMeasureTextFn)(const char *font_name, double font_size, const char *text, void *userdata);
 typedef double (*TspdfFontLineHeightFn)(const char *font_name, double font_size, void *userdata);
 
+// Link-rect callback: called during rendering for every text span whose
+// link_url is set. The rect is in PDF coordinates (bottom-left origin) of the
+// page being rendered; the caller decides which page that is (e.g. by setting
+// state in userdata before each tspdf_layout_render_page* call) and typically
+// forwards to tspdf_writer_add_link().
+typedef void (*TspdfLinkRectFn)(double x, double y, double w, double h,
+                                const char *url, void *userdata);
+
 typedef struct {
     TspdfArena *arena;
     TspdfMeasureTextFn measure_text;
     void *measure_userdata;
     TspdfFontLineHeightFn font_line_height;
     void *line_height_userdata;
+    TspdfLinkRectFn on_link_rect;   // optional; see TspdfLinkRectFn
+    void *link_userdata;
     void *doc;  // TspdfWriter pointer for font lookup during rendering (optional)
 } TspdfLayout;
 

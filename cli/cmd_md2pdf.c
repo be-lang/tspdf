@@ -51,14 +51,32 @@ static void md_add_block(TspdfNode *root, TspdfNode *node) {
  * long paragraphs still word-wrap. */
 
 /* A run of text with one inline style, produced by scanning a line. */
-typedef enum { SEG_PLAIN, SEG_BOLD, SEG_ITALIC, SEG_MONO, SEG_LINK } SegKind;
+typedef enum { SEG_PLAIN, SEG_BOLD, SEG_ITALIC, SEG_BOLDITALIC, SEG_MONO,
+               SEG_LINK } SegKind;
 typedef struct {
     const char *start;   /* points into the (mutable) source line */
     size_t      len;
     SegKind     kind;
+    const char *url_start;  /* SEG_LINK only: URL inside the (...) part */
+    size_t      url_len;
 } InlineSeg;
 
 #define MD_MAX_SEGS 64
+
+/* Find the ')' that closes a Markdown link/image destination beginning right
+ * after "](", allowing balanced parens inside the URL (CommonMark), e.g.
+ * [x](https://e.com/a(b)?q=1). Returns NULL when unbalanced/unterminated. */
+static const char *md_find_url_close(const char *start) {
+    int depth = 0;
+    for (const char *q = start; *q; q++) {
+        if (*q == '(') depth++;
+        else if (*q == ')') {
+            if (depth == 0) return q;
+            depth--;
+        }
+    }
+    return NULL;
+}
 
 /* Word character for emphasis flanking rules (cp1252 high bytes count as
  * letters so accented words do not open/close `_` emphasis mid-word). */
@@ -68,15 +86,16 @@ static int md_word_char(char c) {
            (u >= 'a' && u <= 'z') || u >= 0x80;
 }
 
-/* Split `line` into styled segments. `**x**`/`__x__` -> SEG_BOLD,
- * `*x*`/`_x_` -> SEG_ITALIC (with flanking rules: the opener must not be
- * followed by a space, the closer not preceded by one, and `_` only opens or
- * closes at a word boundary so snake_case stays literal), `` `x` `` ->
- * SEG_MONO, `[label](url)` -> SEG_LINK (label text only; the URL is dropped
- * from the visible run), `![alt](url)` -> SEG_ITALIC alt text (inline images
- * are not embedded). Everything else is SEG_PLAIN. Returns the number of
- * segments (capped at MD_MAX_SEGS; on overflow the tail is folded into the
- * last plain segment so no text is lost). */
+/* Split `line` into styled segments. `***x***`/`___x___` -> SEG_BOLDITALIC,
+ * `**x**`/`__x__` -> SEG_BOLD, `*x*`/`_x_` -> SEG_ITALIC (with flanking
+ * rules: the opener must not be followed by a space, the closer not preceded
+ * by one, and `_` only opens or closes at a word boundary so snake_case stays
+ * literal), `` `x` `` -> SEG_MONO, `[label](url)` -> SEG_LINK (label text
+ * only; the URL is recorded in url_start/url_len for link annotations),
+ * `![alt](url)` -> SEG_ITALIC alt text (inline images are not embedded).
+ * Everything else is SEG_PLAIN. Returns the number of segments (capped at
+ * MD_MAX_SEGS; on overflow the tail is folded into the last plain segment so
+ * no text is lost). */
 static int split_inline_segments(const char *line, InlineSeg *segs, int max_segs) {
     int n = 0;
     const char *p = line;
@@ -87,8 +106,23 @@ static int split_inline_segments(const char *line, InlineSeg *segs, int max_segs
         size_t seg_len = 0;
         const char *resume = NULL;
         SegKind kind = SEG_PLAIN;
+        const char *url_start = NULL;
+        size_t url_len = 0;
 
-        if ((p[0] == '*' && p[1] == '*') || (p[0] == '_' && p[1] == '_')) {
+        if ((p[0] == '*' && p[1] == '*' && p[2] == '*') ||
+            (p[0] == '_' && p[1] == '_' && p[2] == '_')) {
+            char d = p[0];
+            const char *close = NULL;
+            for (const char *q = p + 3; *q; q++) {
+                if (q[0] == d && q[1] == d && q[2] == d) { close = q; break; }
+            }
+            if (close && close > p + 3) {
+                seg = p + 3; seg_len = (size_t)(close - seg);
+                resume = close + 3; kind = SEG_BOLDITALIC;
+            }
+            /* No triple closer: fall through via p++ below; the next
+             * iteration sees the remaining ** / __ pair as bold. */
+        } else if ((p[0] == '*' && p[1] == '*') || (p[0] == '_' && p[1] == '_')) {
             char d = p[0];
             const char *close = NULL;
             for (const char *q = p + 2; *q; q++) {
@@ -116,7 +150,7 @@ static int split_inline_segments(const char *line, InlineSeg *segs, int max_segs
         } else if (p[0] == '!' && p[1] == '[') {
             const char *rb = strchr(p + 1, ']');
             if (rb && rb[1] == '(') {
-                const char *rp = strchr(rb + 2, ')');
+                const char *rp = md_find_url_close(rb + 2);
                 if (rp) {
                     seg = p + 2; seg_len = (size_t)(rb - seg);  /* alt only */
                     resume = rp + 1; kind = SEG_ITALIC;
@@ -131,10 +165,11 @@ static int split_inline_segments(const char *line, InlineSeg *segs, int max_segs
         } else if (p[0] == '[') {
             const char *rb = strchr(p, ']');
             if (rb && rb[1] == '(') {
-                const char *rp = strchr(rb + 2, ')');
+                const char *rp = md_find_url_close(rb + 2);
                 if (rp) {
                     seg = p + 1; seg_len = (size_t)(rb - seg);  /* label only */
                     resume = rp + 1; kind = SEG_LINK;
+                    url_start = rb + 2; url_len = (size_t)(rp - url_start);
                 }
             }
         }
@@ -145,12 +180,16 @@ static int split_inline_segments(const char *line, InlineSeg *segs, int max_segs
                 segs[n].start = plain_start;
                 segs[n].len = (size_t)(p - plain_start);
                 segs[n].kind = SEG_PLAIN;
+                segs[n].url_start = NULL;
+                segs[n].url_len = 0;
                 n++;
             }
             if (n < max_segs) {
                 segs[n].start = seg;
                 segs[n].len = seg_len;
                 segs[n].kind = kind;
+                segs[n].url_start = url_start;
+                segs[n].url_len = url_len;
                 n++;
             }
             p = resume;
@@ -164,6 +203,8 @@ static int split_inline_segments(const char *line, InlineSeg *segs, int max_segs
         segs[n].start = plain_start;
         segs[n].len = (size_t)(p - plain_start);
         segs[n].kind = SEG_PLAIN;
+        segs[n].url_start = NULL;
+        segs[n].url_len = 0;
         n++;
     }
     return n;
@@ -179,7 +220,7 @@ static int line_has_inline(const char *s) {
 }
 
 /* Render `line` with inline styling onto `node`.
- * fonts: regular / bold / italic / mono.
+ * fonts: regular / bold / italic / bold-italic / mono.
  *
  * Rich-text spans (src/layout/layout.h) render on a single non-wrapping line
  * and are capped at TSPDF_LAYOUT_MAX_SPANS, so we only use them when the
@@ -191,7 +232,8 @@ static int line_has_inline(const char *s) {
  * spans are added they override it, and on fallback we overwrite it. */
 static void parse_inline_spans(TspdfLayout *ctx, TspdfNode *node, const char *line,
                                const char *regular, const char *bold,
-                               const char *italic, const char *mono,
+                               const char *italic, const char *bolditalic,
+                               const char *mono,
                                double size, TspdfColor color, double avail_width) {
     InlineSeg segs[MD_MAX_SEGS];
     int n = split_inline_segments(line, segs, MD_MAX_SEGS);
@@ -206,10 +248,11 @@ static void parse_inline_spans(TspdfLayout *ctx, TspdfNode *node, const char *li
         memcpy(texts[i], segs[i].start, segs[i].len);
         texts[i][segs[i].len] = '\0';
         switch (segs[i].kind) {
-            case SEG_BOLD:   fonts[i] = bold;    break;
-            case SEG_ITALIC: fonts[i] = italic;  break;
-            case SEG_MONO:   fonts[i] = mono;    break;
-            default:         fonts[i] = regular; break;
+            case SEG_BOLD:       fonts[i] = bold;       break;
+            case SEG_ITALIC:     fonts[i] = italic;     break;
+            case SEG_BOLDITALIC: fonts[i] = bolditalic; break;
+            case SEG_MONO:       fonts[i] = mono;       break;
+            default:             fonts[i] = regular;    break;
         }
     }
 
@@ -226,6 +269,15 @@ static void parse_inline_spans(TspdfLayout *ctx, TspdfNode *node, const char *li
                 if (!tspdf_layout_text_add_span(node, texts[i], fonts[i], size, color, decoration)) {
                     node->text.span_count = 0;  /* should not happen: n <= cap */
                     goto fallback;
+                }
+                /* Carry the URL so rendering can emit a link annotation. */
+                if (segs[i].kind == SEG_LINK && segs[i].url_len > 0) {
+                    char *url = (char *)tspdf_arena_alloc(ctx->arena, segs[i].url_len + 1);
+                    if (url) {
+                        memcpy(url, segs[i].url_start, segs[i].url_len);
+                        url[segs[i].url_len] = '\0';
+                        node->text.spans[node->text.span_count - 1].link_url = url;
+                    }
                 }
             }
             return;
@@ -254,14 +306,15 @@ fallback:
  * that turned out not to be a table header). */
 static void md_add_paragraph(TspdfLayout *ctx, TspdfNode *root, const char *text,
                              const char *sans, const char *bold, const char *italic,
-                             const char *mono, double avail_width) {
+                             const char *bolditalic, const char *mono,
+                             double avail_width) {
     TspdfColor para_color = tspdf_color_from_u8(40, 50, 80);
     TspdfNode *node = tspdf_layout_text(ctx, text, sans, 11);
     node->text.wrap = TSPDF_WRAP_WORD;
     node->text.color = para_color;
     node->width = tspdf_size_grow();
     if (line_has_inline(text)) {
-        parse_inline_spans(ctx, node, text, sans, bold, italic, mono,
+        parse_inline_spans(ctx, node, text, sans, bold, italic, bolditalic, mono,
                            11, para_color, avail_width);
     }
     md_add_block(root, node);
@@ -517,6 +570,23 @@ static int md_try_image(TspdfLayout *ctx, TspdfNode *root, TspdfWriter *doc,
     return 1;
 }
 
+/* --- Link annotations ----------------------------------------------------- *
+ * The layout engine reports the rect of every span with a link_url while a
+ * page renders (see TspdfLinkRectFn in layout.h); we forward it to the writer
+ * for the page currently being rendered. Only styled single-line runs carry
+ * spans, so links on lines that fall back to wrapped plain text render
+ * underlined-less and get no annotation (documented limitation). */
+typedef struct {
+    TspdfWriter *doc;
+    int page;   /* 0-based index of the page currently rendering */
+} MdLinkCtx;
+
+static void md_link_rect_cb(double x, double y, double w, double h,
+                            const char *url, void *userdata) {
+    MdLinkCtx *lc = (MdLinkCtx *)userdata;
+    tspdf_writer_add_link(lc->doc, lc->page, x, y, w, h, url);
+}
+
 /* Detect a leading ordered-list marker "N." or "N)" followed by a space.
  * Returns the parsed number (>=0) and sets *content to the text after the
  * marker+space; returns -1 if the line is not an ordered-list item. */
@@ -604,6 +674,9 @@ int cmd_md2pdf(int argc, char **argv) {
     ctx.measure_text = measure_cb;
     ctx.font_line_height = lh_cb;
     ctx.doc = doc;
+    MdLinkCtx link_ctx = { doc, 0 };
+    ctx.on_link_rect = md_link_rect_cb;
+    ctx.link_userdata = &link_ctx;
 
     double W = TSPDF_PAGE_A4_WIDTH, H = TSPDF_PAGE_A4_HEIGHT;
     /* Width available to content inside the root padding; inline spans only
@@ -742,7 +815,7 @@ int cmd_md2pdf(int argc, char **argv) {
                 if (!consumed) {
                     /* Not a table after all: flush the stashed line as a
                      * paragraph; the current line falls through. */
-                    md_add_paragraph(&ctx, root, hdr, sans, bold, italic, mono, content_w);
+                    md_add_paragraph(&ctx, root, hdr, sans, bold, italic, bolditalic, mono, content_w);
                 }
             } else if (md_is_table_row(line)) {
                 char *copy = (char *)tspdf_arena_alloc(ctx.arena, text_len + 1);
@@ -804,7 +877,7 @@ int cmd_md2pdf(int argc, char **argv) {
             node->width = tspdf_size_grow();
             if (line_has_inline(text)) {
                 /* Headings default to bold; inline `code`/links still styled. */
-                parse_inline_spans(&ctx, node, text, bold, bold, bolditalic, mono,
+                parse_inline_spans(&ctx, node, text, bold, bold, bolditalic, bolditalic, mono,
                                    sz, heading_color, content_w);
             }
             md_add_block(root, node);
@@ -825,7 +898,7 @@ int cmd_md2pdf(int argc, char **argv) {
             txt->width = tspdf_size_grow();
             txt->text.color = item_color;
             if (line_has_inline(line + 2)) {
-                parse_inline_spans(&ctx, txt, line + 2, sans, bold, italic, mono,
+                parse_inline_spans(&ctx, txt, line + 2, sans, bold, italic, bolditalic, mono,
                                    11, item_color, content_w - 20);
             }
             tspdf_layout_add_child(row, txt);
@@ -850,7 +923,7 @@ int cmd_md2pdf(int argc, char **argv) {
             txt->width = tspdf_size_grow();
             txt->text.color = quote_color;
             if (line_has_inline(line + 2)) {
-                parse_inline_spans(&ctx, txt, line + 2, sans, bold, italic, mono,
+                parse_inline_spans(&ctx, txt, line + 2, sans, bold, italic, bolditalic, mono,
                                    11, quote_color, content_w - 16);
             }
             tspdf_layout_add_child(bq, txt);
@@ -875,7 +948,7 @@ int cmd_md2pdf(int argc, char **argv) {
             txt->width = tspdf_size_grow();
             txt->text.color = item_color;
             if (line_has_inline(ord_content)) {
-                parse_inline_spans(&ctx, txt, ord_content, sans, bold, italic, mono,
+                parse_inline_spans(&ctx, txt, ord_content, sans, bold, italic, bolditalic, mono,
                                    11, item_color, content_w - 30);
             }
             tspdf_layout_add_child(row, txt);
@@ -902,7 +975,7 @@ int cmd_md2pdf(int argc, char **argv) {
             node->text.color = para_color;
             node->width = tspdf_size_grow();
             if (line_has_inline(line)) {
-                parse_inline_spans(&ctx, node, line, sans, bold, italic, mono,
+                parse_inline_spans(&ctx, node, line, sans, bold, italic, bolditalic, mono,
                                    11, para_color, content_w);
             }
             md_add_block(root, node);
@@ -915,7 +988,7 @@ int cmd_md2pdf(int argc, char **argv) {
 
     /* Flush table state left open at end of input. */
     if (tbl_header_line) {
-        md_add_paragraph(&ctx, root, tbl_header_line, sans, bold, italic, mono, content_w);
+        md_add_paragraph(&ctx, root, tbl_header_line, sans, bold, italic, bolditalic, mono, content_w);
     }
     if (tbl_active) {
         md_emit_table(&ctx, root, tbl_headers, tbl_cols, tbl_aligns,
@@ -929,6 +1002,7 @@ int cmd_md2pdf(int argc, char **argv) {
     int num_pages = tspdf_layout_compute_paginated(&ctx, root, W, H, &pagination);
     for (int pg = 0; pg < num_pages; pg++) {
         TspdfStream *page = tspdf_writer_add_page(doc);
+        link_ctx.page = pg;  /* link rects reported during render land here */
         tspdf_layout_render_page_recompute(&ctx, root, &pagination, pg, page);
     }
 

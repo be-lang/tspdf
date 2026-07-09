@@ -1474,6 +1474,32 @@ else
   echo "  SKIP  versioned shared library tests (Linux + readelf only)"
 fi
 
+# md2pdf: [text](url) becomes a clickable /Link annotation. Annotation and
+# outline objects are written uncompressed, so the raw PDF bytes are
+# greppable; URL parens must arrive backslash-escaped in the PDF string.
+run_test "md2pdf link annotation" bash -c '
+  set -e
+  printf "Visit [the site](https://example.com/a(b)?q=1) today.\n" \
+    > "'"$TMPDIR"'/links.md"
+  "'"$TSPDF"'" md2pdf "'"$TMPDIR"'/links.md" -o "'"$TMPDIR"'/links.pdf"
+  grep -qa "/Subtype /Link" "'"$TMPDIR"'/links.pdf"
+  grep -qaF "/URI (https://example.com/a\\(b\\)?q=1)" "'"$TMPDIR"'/links.pdf"
+'
+
+# With qpdf available (always true in CI), also validate the file structurally.
+if command -v qpdf > /dev/null 2>&1; then
+  run_test "md2pdf links pass qpdf --check" bash -c '
+    set -e
+    printf "[x](https://example.com/x) plus text\n" > "'"$TMPDIR"'/lb.md"
+    "'"$TSPDF"'" md2pdf "'"$TMPDIR"'/lb.md" -o "'"$TMPDIR"'/lb.pdf"
+    qpdf --check "'"$TMPDIR"'/lb.pdf" > /dev/null
+    qpdf --qdf "'"$TMPDIR"'/lb.pdf" "'"$TMPDIR"'/lb.qdf.pdf"
+    grep -qa "/URI (https://example.com/x)" "'"$TMPDIR"'/lb.qdf.pdf"
+  '
+else
+  echo "  SKIP  md2pdf qpdf structural checks (qpdf not installed)"
+fi
+
 # `make amalgamation` generates build/amalgamation/tspdf.{c,h} and proves them:
 # standalone -Werror compile, link + run examples/minimal.c against them, and
 # qpdf --check on the produced PDF (inside the make target, when qpdf exists).
