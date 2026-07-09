@@ -86,18 +86,24 @@ int cmd_watermark(int argc, char **argv) {
 
     size_t page_count = tspdf_reader_page_count(doc);
     double font_size = 48.0;
-    double angle_rad = 45.0 * M_PI / 180.0;
-    double cos_a = cos(angle_rad);
-    double sin_a = sin(angle_rad);
 
     for (size_t i = 0; i < page_count; i++) {
         TspdfReaderPage *page = tspdf_reader_get_page(doc, i);
         if (!page) continue;
 
-        double w = page->media_box[2] - page->media_box[0];
-        double h = page->media_box[3] - page->media_box[1];
-        double cx = w / 2.0;
-        double cy = h / 2.0;
+        // Center of the VISIBLE page: the MediaBox origin is not always
+        // (0,0), so the center is ((x0+x1)/2, (y0+y1)/2), not (w/2, h/2).
+        double cx = (page->media_box[0] + page->media_box[2]) / 2.0;
+        double cy = (page->media_box[1] + page->media_box[3]) / 2.0;
+
+        // Compensate a page-level /Rotate: the viewer turns the page
+        // clockwise by that many degrees, so pre-rotate the stamp the other
+        // way (45 + rotate CCW) to keep the diagonal upright as viewed.
+        // Rotation is about the page center, so the stamp stays centered.
+        int rot = ((page->rotate % 360) + 360) % 360;
+        double angle_rad = (45.0 + (double)rot) * M_PI / 180.0;
+        double cos_a = cos(angle_rad);
+        double sin_a = sin(angle_rad);
 
         TspdfWriter *writer = tspdf_writer_create();
         if (!writer) continue;

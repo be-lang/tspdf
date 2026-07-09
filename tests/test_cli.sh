@@ -143,6 +143,53 @@ run_test "watermark" $TSPDF watermark $INPUT -o $TMPDIR/watermark.pdf --text "DR
 # flag-first ordering: -o output and --text value must not be swallowed as input
 run_test "watermark flag-first ordering (-o/--text before input)" $TSPDF watermark -o $TMPDIR/watermark_ff.pdf --text "DRAFT" $INPUT
 
+# watermark placement: the stamp must sit at the VISUAL center of the page —
+# a MediaBox with a nonzero origin offsets the center ((x0+x1)/2, (y0+y1)/2),
+# and a page-level /Rotate must not tip the diagonal over in the viewed
+# orientation. Assert on the overlay's cm matrix in the content stream.
+if command -v python3 > /dev/null 2>&1 && command -v qpdf > /dev/null 2>&1; then
+  python3 - "$TMPDIR/wm_box.pdf" "$TMPDIR/wm_box_rot90.pdf" << 'PYEOF'
+import sys
+def make(path, rotate):
+    rot = b' /Rotate %d' % rotate if rotate else b''
+    content = b'q Q\n'
+    objs = [
+        b'<< /Type /Catalog /Pages 2 0 R >>',
+        b'<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+        b'<< /Type /Page /Parent 2 0 R /MediaBox [100 50 600 750]%s /Contents 4 0 R >>' % rot,
+        b'<< /Length %d >>\nstream\n%sendstream' % (len(content), content),
+    ]
+    out = bytearray(b'%PDF-1.4\n')
+    offs = []
+    for i, body in enumerate(objs, 1):
+        offs.append(len(out))
+        out += (b'%d 0 obj\n' % i) + body + b'\nendobj\n'
+    xref = len(out)
+    out += b'xref\n0 %d\n' % (len(objs) + 1)
+    out += b'0000000000 65535 f \n'
+    for o in offs:
+        out += b'%010d 00000 n \n' % o
+    out += b'trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n' % (len(objs) + 1, xref)
+    open(path, 'wb').write(out)
+make(sys.argv[1], 0)
+make(sys.argv[2], 90)
+PYEOF
+  # center of [100 50 600 750] is (350, 400); 45° gives cos=sin=0.7071
+  run_test "watermark centers on offset-origin MediaBox" bash -c "
+    set -e
+    $TSPDF watermark $TMPDIR/wm_box.pdf -o $TMPDIR/wm_box_out.pdf --text DRAFT > /dev/null
+    qpdf --qdf --object-streams=disable $TMPDIR/wm_box_out.pdf $TMPDIR/wm_box_out.qdf
+    grep -q -- '0.7071 0.7071 -0.7071 0.7071 350 400 cm' $TMPDIR/wm_box_out.qdf"
+  # /Rotate 90 is compensated by rotating the stamp to 45+90=135 degrees
+  run_test "watermark reads upright on a /Rotate 90 page" bash -c "
+    set -e
+    $TSPDF watermark $TMPDIR/wm_box_rot90.pdf -o $TMPDIR/wm_rot_out.pdf --text DRAFT > /dev/null
+    qpdf --qdf --object-streams=disable $TMPDIR/wm_rot_out.pdf $TMPDIR/wm_rot_out.qdf
+    grep -q -- '-0.7071 0.7071 -0.7071 -0.7071 350 400 cm' $TMPDIR/wm_rot_out.qdf"
+else
+  echo "  SKIP  watermark placement assertions (python3/qpdf not found)"
+fi
+
 # compress
 run_test "compress" $TSPDF compress $INPUT -o $TMPDIR/compressed.pdf
 # flag-first ordering: -o output must not be swallowed as input
@@ -470,6 +517,18 @@ assert found == need, (sorted(found), sorted(need))
       "http://localhost:${SERVE_PORT}/api/watermark-existing" -o "${TMPDIR}/serve_wm.pdf" &&
     "$TSPDF" text "${TMPDIR}/serve_wm.pdf" | grep -q WMCUSTOM
   '
+
+  # server-side copy of the stamping code must also center on the visual page
+  # (MediaBox origin offset), same as the CLI watermark command
+  if command -v qpdf > /dev/null 2>&1 && [ -f "$TMPDIR/wm_box.pdf" ]; then
+    run_serve_test "serve watermark centers on offset-origin MediaBox" env TMPDIR="$TMPDIR" SERVE_PORT="$SERVE_PORT" bash -c '
+      curl -sf --retry 3 --retry-delay 1 --max-time 10 \
+        -F "pdf_file=@${TMPDIR}/wm_box.pdf" -F "config={}" \
+        "http://localhost:${SERVE_PORT}/api/watermark-existing" -o "${TMPDIR}/serve_wm_box.pdf" &&
+      qpdf --qdf --object-streams=disable "${TMPDIR}/serve_wm_box.pdf" "${TMPDIR}/serve_wm_box.qdf" &&
+      grep -q -- "0.7071 0.7071 -0.7071 0.7071 350 400 cm" "${TMPDIR}/serve_wm_box.qdf"
+    '
+  fi
 
   run_serve_test "serve password-protect honors distinct owner password" env TSPDF="$TSPDF" TMPDIR="$TMPDIR" SERVE_PORT="$SERVE_PORT" INPUT="$INPUT" bash -c '
     curl -sf --retry 3 --retry-delay 1 --max-time 10 \

@@ -1548,18 +1548,22 @@ static void api_watermark(int fd, MultipartForm *form)
 
     size_t page_count = tspdf_reader_page_count(doc);
     double font_size = cfg_font_size;
-    double angle_rad = 45.0 * M_PI / 180.0;
-    double cos_a = cos(angle_rad);
-    double sin_a = sin(angle_rad);
 
     for (size_t i = 0; i < page_count; i++) {
         TspdfReaderPage *page = tspdf_reader_get_page(doc, i);
         if (!page) continue;
 
-        double w = page->media_box[2] - page->media_box[0];
-        double h = page->media_box[3] - page->media_box[1];
-        double cx = w / 2.0;
-        double cy = h / 2.0;
+        /* Center of the VISIBLE page: the MediaBox origin is not always
+         * (0,0), so the center is ((x0+x1)/2, (y0+y1)/2), not (w/2, h/2).
+         * A page-level /Rotate is compensated by pre-rotating the stamp the
+         * other way (45 + rotate CCW) so the diagonal reads upright as
+         * viewed. Same math as cmd_watermark.c. */
+        double cx = (page->media_box[0] + page->media_box[2]) / 2.0;
+        double cy = (page->media_box[1] + page->media_box[3]) / 2.0;
+        int rot = ((page->rotate % 360) + 360) % 360;
+        double angle_rad = (45.0 + (double)rot) * M_PI / 180.0;
+        double cos_a = cos(angle_rad);
+        double sin_a = sin(angle_rad);
 
         TspdfWriter *writer = tspdf_writer_create();
         if (!writer) continue;
