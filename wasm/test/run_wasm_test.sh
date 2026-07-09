@@ -17,6 +17,13 @@ printf '# tspdf wasm fixture\n\nParagraph one for the wasm gate.\n\n- item a\n- 
 
 node wasm/test/wasm-test.js "$OUT/fixture_a.pdf" "$OUT/fixture_b.pdf" "$OUT"
 
+# Demo backend gate: lay the browser backend out next to the module the way
+# the demo site ships it (so its relative imports resolve) and drive it under
+# node — covers the /api contract and merge ordering for >= 11 uploads.
+cp wasm/dist/tspdf.js wasm/dist/tspdf.wasm wasm/tspdf-api.js wasm/demo/wasm-backend.js "$OUT"
+printf '{ "type": "module" }\n' > "$OUT/package.json"
+node wasm/test/wasm-backend-test.js "$OUT/fixture_a.pdf" "$OUT/fixture_b.pdf" "$OUT"
+
 # qpdf conformance gate over every wasm-produced output. The encrypted output
 # needs its password to be checkable.
 fail=0

@@ -47,9 +47,12 @@ async function withDoc(t, files, fn, password = null) {
 
 const handlers = {
   async merge(t, config, files) {
+    // merge.html names uploads pdf_file_0..N; sort numerically so the merge
+    // preserves submission order past 10 files (lexicographic would put
+    // pdf_file_10 before pdf_file_2).
     const uploads = Object.keys(files)
       .filter((k) => k.startsWith('pdf_file'))
-      .sort()
+      .sort((a, b) => parseInt(a.slice(9), 10) - parseInt(b.slice(9), 10))
       .map((k) => files[k]);
     if (uploads.length < 2) throw new Error('Need at least 2 PDF files to merge');
     const handles = [];
