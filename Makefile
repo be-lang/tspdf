@@ -21,22 +21,46 @@ VERSION_MINOR := $(shell sed -n 's/^\#define TSPDF_VERSION_MINOR *//p' include/t
 VERSION_PATCH := $(shell sed -n 's/^\#define TSPDF_VERSION_PATCH *//p' include/tspdf/version.h)
 VERSION := $(VERSION_MAJOR).$(VERSION_MINOR).$(VERSION_PATCH)
 
-# Shared-library naming. Pre-1.0 the ABI may break on minor releases, so the
-# real file carries MAJOR.MINOR and the SONAME only MAJOR (bump MAJOR on any
-# post-1.0 ABI break). ELF and Mach-O spell versioning differently, hence the
-# uname guard. The Darwin branch follows platform conventions but has only
-# been verified on Linux (no macOS machine here); CI exercises it on tag builds.
+# Shared-library naming and ABI policy. Pre-1.0 a minor release may break the
+# ABI, so the SONAME carries MAJOR.MINOR (libtspdf.so.0.2 for any 0.2.x) and
+# bumps on every minor — a binary linked against 0.1 never silently loads an
+# incompatible 0.2. From 1.0 on the SONAME is just MAJOR and bumps only on an
+# actual ABI break. Symlink chain: libtspdf.so -> $(SHLIB_SONAME) -> real file.
+ifeq ($(VERSION_MAJOR),0)
+SHLIB_ABI  = $(VERSION_MAJOR).$(VERSION_MINOR)
+SHLIB_TAIL = $(VERSION_PATCH)
+else
+SHLIB_ABI  = $(VERSION_MAJOR)
+SHLIB_TAIL = $(VERSION_MINOR).$(VERSION_PATCH)
+endif
+
+# Only tspdf_* / tspr_* are public API; the export lists below keep every
+# internal helper (aes_*, sha256_*, deflate_*, jpeg_*, png_*, qr_*, ttf_*, ...)
+# out of the dynamic symbol table so a system-wide shared library cannot
+# interpose symbols of other code at runtime.
+SHLIB_EXPORTS_MAP = scripts/libtspdf.map
+SHLIB_EXPORTS_EXP = scripts/libtspdf.exp
+
+# ELF and Mach-O spell versioning and export filtering differently, hence the
+# uname guard. The Darwin branch follows platform conventions but is untested
+# locally (no macOS machine here); the CI macOS job runs a shared-lib smoke
+# build so a broken dylib link fails there, not at a user's desk.
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
-SHLIB_FILE   = libtspdf.$(VERSION_MAJOR).$(VERSION_MINOR).dylib
-SHLIB_SONAME = libtspdf.$(VERSION_MAJOR).dylib
+SHLIB_FILE   = libtspdf.$(SHLIB_ABI).$(SHLIB_TAIL).dylib
+SHLIB_SONAME = libtspdf.$(SHLIB_ABI).dylib
 SHLIB_LINK   = libtspdf.dylib
-SHLIB_LDFLAGS = -dynamiclib -install_name @rpath/$(SHLIB_SONAME)
+SHLIB_LDFLAGS = -dynamiclib -install_name @rpath/$(SHLIB_SONAME) \
+	-compatibility_version $(SHLIB_ABI) -current_version $(VERSION) \
+	-exported_symbols_list $(SHLIB_EXPORTS_EXP)
+SHLIB_EXPORTS = $(SHLIB_EXPORTS_EXP)
 else
-SHLIB_FILE   = libtspdf.so.$(VERSION_MAJOR).$(VERSION_MINOR)
-SHLIB_SONAME = libtspdf.so.$(VERSION_MAJOR)
+SHLIB_FILE   = libtspdf.so.$(SHLIB_ABI).$(SHLIB_TAIL)
+SHLIB_SONAME = libtspdf.so.$(SHLIB_ABI)
 SHLIB_LINK   = libtspdf.so
-SHLIB_LDFLAGS = -shared -Wl,-soname,$(SHLIB_SONAME)
+SHLIB_LDFLAGS = -shared -Wl,-soname,$(SHLIB_SONAME) \
+	-Wl,--version-script=$(SHLIB_EXPORTS_MAP)
+SHLIB_EXPORTS = $(SHLIB_EXPORTS_MAP)
 endif
 
 # Sanitizer build flags for `make test-asan`. Compiler-builtin instrumentation
@@ -389,15 +413,15 @@ $(BUILDDIR)/libtspdf.a: $(ALL_SOURCES)
 	ar rcs $@ $(BUILDDIR)/obj/*.o
 
 # Shared library, properly versioned (see SHLIB_* above): the real file is
-# libtspdf.so.MAJOR.MINOR with SONAME libtspdf.so.MAJOR, plus the usual
-# libtspdf.so.MAJOR and libtspdf.so symlinks (dylib naming on Darwin).
-# Known pre-1.0 limitation: no symbol-visibility annotations yet, so the .so
-# exports internal symbols too — see docs/library.md.
+# $(SHLIB_FILE) with SONAME $(SHLIB_SONAME), plus the SONAME and libtspdf.so
+# symlinks (dylib naming on Darwin). The export list restricts the dynamic
+# symbol table to the public tspdf_*/tspr_* API; tests/test_cli.sh asserts
+# both the SONAME and the symbol filter.
 shared: $(BUILDDIR)/$(SHLIB_FILE)
 	ln -sf $(SHLIB_FILE) $(BUILDDIR)/$(SHLIB_SONAME)
 	ln -sf $(SHLIB_SONAME) $(BUILDDIR)/$(SHLIB_LINK)
 
-$(BUILDDIR)/$(SHLIB_FILE): $(ALL_SOURCES)
+$(BUILDDIR)/$(SHLIB_FILE): $(ALL_SOURCES) $(SHLIB_EXPORTS)
 	@mkdir -p $(BUILDDIR)/shobj
 	for f in $(ALL_SOURCES); do $(CC) $(CPPFLAGS) $(ALL_CFLAGS) -fPIC -c $$f -o $(BUILDDIR)/shobj/$$(basename $$f .c).o; done
 	$(CC) $(LDFLAGS) $(SHLIB_LDFLAGS) -o $@ $(BUILDDIR)/shobj/*.o -lm

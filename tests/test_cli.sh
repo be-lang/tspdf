@@ -1077,30 +1077,56 @@ fi
 if [ "$(uname -s)" = "Linux" ] && command -v readelf > /dev/null 2>&1; then
   VMAJ=$(sed -n 's/^#define TSPDF_VERSION_MAJOR *//p' include/tspdf/version.h)
   VMIN=$(sed -n 's/^#define TSPDF_VERSION_MINOR *//p' include/tspdf/version.h)
+  VPAT=$(sed -n 's/^#define TSPDF_VERSION_PATCH *//p' include/tspdf/version.h)
+  # Mirror the Makefile's ABI policy: pre-1.0 the SONAME carries MAJOR.MINOR
+  # (the ABI may break on minors), from 1.0 on it carries MAJOR only.
+  if [ "$VMAJ" = "0" ]; then
+    SOABI="$VMAJ.$VMIN"; SOTAIL="$VPAT"
+  else
+    SOABI="$VMAJ"; SOTAIL="$VMIN.$VPAT"
+  fi
+  SOREAL="libtspdf.so.$SOABI.$SOTAIL"
+  SONAME="libtspdf.so.$SOABI"
 
   run_test "make shared produces versioned .so with SONAME" bash -c '
     set -e
     make shared BUILDDIR="'"$TMPDIR"'/shbuild" > /dev/null 2>&1
-    test -f "'"$TMPDIR"'/shbuild/libtspdf.so.'"$VMAJ.$VMIN"'"
-    test -L "'"$TMPDIR"'/shbuild/libtspdf.so.'"$VMAJ"'"
+    test -f "'"$TMPDIR"'/shbuild/'"$SOREAL"'"
+    test -L "'"$TMPDIR"'/shbuild/'"$SONAME"'"
     test -L "'"$TMPDIR"'/shbuild/libtspdf.so"
-    readelf -d "'"$TMPDIR"'/shbuild/libtspdf.so.'"$VMAJ.$VMIN"'" \
-      | grep -q "SONAME.*\[libtspdf.so.'"$VMAJ"'\]"'
+    readelf -d "'"$TMPDIR"'/shbuild/'"$SOREAL"'" \
+      | grep -q "SONAME.*\['"$SONAME"'\]"'
+
+  # The version script must keep internal helpers (aes_*, sha256_*, jpeg_*,
+  # ...) out of the dynamic symbol table: every defined dynamic symbol is
+  # tspdf_*, tspr_*, or toolchain-reserved (_init/_fini/__bss_start etc.) —
+  # and the public API must not get hidden along the way.
+  if command -v nm > /dev/null 2>&1; then
+    run_test "shared .so exports only tspdf_/tspr_ symbols" bash -c '
+      set -e
+      nm -D --defined-only "'"$TMPDIR"'/shbuild/'"$SOREAL"'" \
+        | sed "s/.* //" > "'"$TMPDIR"'/dynsyms.txt"
+      grep -qx "tspdf_writer_create" "'"$TMPDIR"'/dynsyms.txt"
+      grep -qx "tspdf_reader_open_file" "'"$TMPDIR"'/dynsyms.txt"
+      ! grep -vE "^(tspdf_|tspr_|_)" "'"$TMPDIR"'/dynsyms.txt" | grep -q .'
+  else
+    echo "  SKIP  shared .so symbol filter (nm not found)"
+  fi
 
   run_test "install-lib installs the versioned shared library" bash -c '
     set -e
     make install-lib DESTDIR="'"$TMPDIR"'/shstage" PREFIX=/usr \
       BUILDDIR="'"$TMPDIR"'/shbuild" > /dev/null 2>&1
     test -f "'"$TMPDIR"'/shstage/usr/lib/libtspdf.a"
-    test -f "'"$TMPDIR"'/shstage/usr/lib/libtspdf.so.'"$VMAJ.$VMIN"'"
-    test -L "'"$TMPDIR"'/shstage/usr/lib/libtspdf.so.'"$VMAJ"'"
+    test -f "'"$TMPDIR"'/shstage/usr/lib/'"$SOREAL"'"
+    test -L "'"$TMPDIR"'/shstage/usr/lib/'"$SONAME"'"
     test -L "'"$TMPDIR"'/shstage/usr/lib/libtspdf.so"'
 
   run_test "uninstall removes the shared library" bash -c '
     set -e
     make uninstall DESTDIR="'"$TMPDIR"'/shstage" PREFIX=/usr > /dev/null 2>&1
-    test ! -e "'"$TMPDIR"'/shstage/usr/lib/libtspdf.so.'"$VMAJ.$VMIN"'"
-    test ! -e "'"$TMPDIR"'/shstage/usr/lib/libtspdf.so.'"$VMAJ"'"
+    test ! -e "'"$TMPDIR"'/shstage/usr/lib/'"$SOREAL"'"
+    test ! -e "'"$TMPDIR"'/shstage/usr/lib/'"$SONAME"'"
     test ! -e "'"$TMPDIR"'/shstage/usr/lib/libtspdf.so"
     test ! -e "'"$TMPDIR"'/shstage/usr/lib/libtspdf.a"'
 else
