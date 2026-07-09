@@ -2615,6 +2615,70 @@ fail:
     return NULL;
 }
 
+// Catalog with /Version given as an indirect reference to a name object.
+// Header says 1.4; the referenced name says 1.6 and must win.
+static char *make_indirect_version_pdf(size_t *out_len) {
+    char *pdf = (char *)malloc(2048);
+    if (!pdf) return NULL;
+
+    size_t pos = 0;
+    if (!appendf(pdf, 2048, &pos, "%%PDF-1.4\n")) goto fail;
+
+    size_t obj1 = pos;
+    if (!appendf(pdf, 2048, &pos,
+                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Version 4 0 R >>\nendobj\n")) goto fail;
+
+    size_t obj2 = pos;
+    if (!appendf(pdf, 2048, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")) goto fail;
+
+    size_t obj3 = pos;
+    if (!appendf(pdf, 2048, &pos,
+                 "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 400] >>\nendobj\n")) goto fail;
+
+    size_t obj4 = pos;
+    if (!appendf(pdf, 2048, &pos, "4 0 obj\n/1.6\nendobj\n")) goto fail;
+
+    size_t xref = pos;
+    if (!appendf(pdf, 2048, &pos,
+                 "xref\n"
+                 "0 5\n"
+                 "0000000000 65535 f \n"
+                 "%010zu 00000 n \n"
+                 "%010zu 00000 n \n"
+                 "%010zu 00000 n \n"
+                 "%010zu 00000 n \n"
+                 "trailer\n<< /Size 5 /Root 1 0 R >>\n"
+                 "startxref\n%zu\n%%%%EOF",
+                 obj1, obj2, obj3, obj4, xref)) goto fail;
+
+    *out_len = pos;
+    return pdf;
+
+fail:
+    free(pdf);
+    return NULL;
+}
+
+TEST(test_pdf_version_catalog_indirect_ref_resolved) {
+    size_t len = 0;
+    char *pdf = make_indirect_version_pdf(&len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err = TSPDF_OK;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    // An indirect /Version must be resolved, not silently ignored in favor
+    // of the header version.
+    ASSERT_EQ_STR(tspdf_reader_pdf_version(doc), "1.6");
+    // Resolution is cached; a second call returns the same answer.
+    ASSERT_EQ_STR(tspdf_reader_pdf_version(doc), "1.6");
+
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
 TEST(test_xref_parse_classic) {
     TspdfArena a = tspdf_arena_create(65536);
     TspdfParser p;
@@ -8698,6 +8762,7 @@ int main(void) {
 
     printf("\n  Xref:\n");
     RUN(test_xref_parse_classic);
+    RUN(test_pdf_version_catalog_indirect_ref_resolved);
     RUN(test_document_open_classic_xref_horizontal_whitespace);
     RUN(test_xref_resolve);
     RUN(test_classic_xref_reject_subsection_range_overflow);
