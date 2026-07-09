@@ -118,7 +118,9 @@ static const char *const VALUE_FLAGS[] = {
     "--order",
     "--angle",
     "--password",
+    "--password-file",
     "--owner-password",
+    "--owner-password-file",
     "--bits",
     "--text",
     "--opacity",
@@ -126,6 +128,10 @@ static const char *const VALUE_FLAGS[] = {
     "--title",
     "--subtitle",
     "--port",
+    "--format",
+    "--position",
+    "--start",
+    "--font-size",
 };
 
 static bool is_value_flag(const char *arg) {
@@ -138,14 +144,15 @@ static bool is_value_flag(const char *arg) {
 
 int collect_positional(int argc, char **argv, const char **out, int out_max) {
     int count = 0;
-    for (int i = 0; i < argc && count < out_max; i++) {
+    for (int i = 0; i < argc; i++) {
         // Skip the value that belongs to a value-taking flag (e.g. `-o out.pdf`),
         // otherwise it gets mistaken for a positional input.
         if (argv[i][0] == '-') {
             if (is_value_flag(argv[i])) i++;  // also skip the following value token
             continue;
         }
-        out[count++] = argv[i];
+        if (count < out_max) out[count] = argv[i];
+        count++;
     }
     return count;
 }

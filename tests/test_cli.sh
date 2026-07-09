@@ -76,6 +76,17 @@ run_test "cli regenerates embedded assets on build" bash -c '
 
 # info
 run_test "info" $TSPDF info $INPUT
+run_test "info shows the PDF version" bash -c "$TSPDF info $INPUT | grep -qE '^Version:[[:space:]]+PDF 1\.7$'"
+run_test "info flags outlines and AcroForm when present" bash -c "
+  set -e
+  out=\$($TSPDF info tests/data/outline_form.pdf)
+  echo \"\$out\" | grep -qE '^Outlines:[[:space:]]+yes$'
+  echo \"\$out\" | grep -qE '^AcroForm:[[:space:]]+yes$'"
+run_test "info flags absent outlines and AcroForm" bash -c "
+  set -e
+  out=\$($TSPDF info $INPUT)
+  echo \"\$out\" | grep -qE '^Outlines:[[:space:]]+no$'
+  echo \"\$out\" | grep -qE '^AcroForm:[[:space:]]+no$'"
 
 # split
 run_test "split pages 1-2" $TSPDF split $INPUT --pages 1-2 -o $TMPDIR/split.pdf
@@ -88,6 +99,24 @@ run_test "split flag-first result is the real input (1 page)" bash -c "$TSPDF in
 run_test "merge two files" $TSPDF merge $INPUT $TMPDIR/split.pdf -o $TMPDIR/merged.pdf
 # flag-first ordering: -o output must not be counted as an input file
 run_test "merge flag-first ordering (-o before inputs)" $TSPDF merge -o $TMPDIR/merged_ff.pdf $INPUT $TMPDIR/split.pdf
+
+# merge must not silently truncate a long input list (was capped at 64 inputs,
+# printing "Merged 64 files" and dropping the rest with exit 0 — data loss).
+MANY_DIR=$TMPDIR/merge_many
+mkdir -p $MANY_DIR
+$TSPDF split $INPUT --pages 1 -o $MANY_DIR/page.pdf > /dev/null 2>&1
+MANY_INPUTS=()
+for i in $(seq 1 70); do
+  cp $MANY_DIR/page.pdf $MANY_DIR/in_$i.pdf
+  MANY_INPUTS+=("$MANY_DIR/in_$i.pdf")
+done
+run_test "merge 70 files exits 0" $TSPDF merge "${MANY_INPUTS[@]}" -o $TMPDIR/merged_many.pdf
+run_test "merge 70 files keeps every page" bash -c "$TSPDF info $TMPDIR/merged_many.pdf | grep -qE '^Pages:[[:space:]]*70$'"
+
+# single-input commands must reject extra positionals instead of silently
+# ignoring them (a user merging/splitting the wrong file must hear about it)
+run_test "split rejects a second input file" bash -c "! $TSPDF split $INPUT $TMPDIR/split.pdf --pages 1 -o $TMPDIR/split_extra.pdf > /dev/null 2>&1"
+run_test "watermark rejects a second input file" bash -c "! $TSPDF watermark $INPUT $TMPDIR/split.pdf --text DRAFT -o $TMPDIR/wm_extra.pdf > /dev/null 2>&1"
 
 # rotate
 run_test "rotate all 90" $TSPDF rotate $INPUT --angle 90 -o $TMPDIR/rotated.pdf
@@ -113,6 +142,12 @@ run_test "encrypt AES-128" $TSPDF encrypt $INPUT -o $TMPDIR/enc128.pdf --passwor
 run_test "encrypt AES-256" $TSPDF encrypt $INPUT -o $TMPDIR/enc256.pdf --password secret --bits 256
 run_test "decrypt" $TSPDF decrypt $TMPDIR/enc128.pdf -o $TMPDIR/decrypted.pdf --password secret
 
+# info must name the encryption scheme when it can open the file
+run_test "info reports AES-128 R4 encryption details" bash -c "
+  $TSPDF info $TMPDIR/enc128.pdf --password secret | grep -qE '^Encrypted:[[:space:]]+yes \(AES-128, R4\)$'"
+run_test "info reports AES-256 R6 encryption details" bash -c "
+  $TSPDF info $TMPDIR/enc256.pdf --password secret | grep -qE '^Encrypted:[[:space:]]+yes \(AES-256, R6\)$'"
+
 # metadata
 run_test "metadata view" $TSPDF metadata $INPUT
 run_test "metadata set" $TSPDF metadata $INPUT --set title="Test Title" --set author="Test Author" -o $TMPDIR/meta.pdf
@@ -124,6 +159,53 @@ run_test "metadata flag-first applied the title" bash -c "$TSPDF metadata $TMPDI
 run_test "watermark" $TSPDF watermark $INPUT -o $TMPDIR/watermark.pdf --text "DRAFT"
 # flag-first ordering: -o output and --text value must not be swallowed as input
 run_test "watermark flag-first ordering (-o/--text before input)" $TSPDF watermark -o $TMPDIR/watermark_ff.pdf --text "DRAFT" $INPUT
+
+# watermark placement: the stamp must sit at the VISUAL center of the page —
+# a MediaBox with a nonzero origin offsets the center ((x0+x1)/2, (y0+y1)/2),
+# and a page-level /Rotate must not tip the diagonal over in the viewed
+# orientation. Assert on the overlay's cm matrix in the content stream.
+if command -v python3 > /dev/null 2>&1 && command -v qpdf > /dev/null 2>&1; then
+  python3 - "$TMPDIR/wm_box.pdf" "$TMPDIR/wm_box_rot90.pdf" << 'PYEOF'
+import sys
+def make(path, rotate):
+    rot = b' /Rotate %d' % rotate if rotate else b''
+    content = b'q Q\n'
+    objs = [
+        b'<< /Type /Catalog /Pages 2 0 R >>',
+        b'<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+        b'<< /Type /Page /Parent 2 0 R /MediaBox [100 50 600 750]%s /Contents 4 0 R >>' % rot,
+        b'<< /Length %d >>\nstream\n%sendstream' % (len(content), content),
+    ]
+    out = bytearray(b'%PDF-1.4\n')
+    offs = []
+    for i, body in enumerate(objs, 1):
+        offs.append(len(out))
+        out += (b'%d 0 obj\n' % i) + body + b'\nendobj\n'
+    xref = len(out)
+    out += b'xref\n0 %d\n' % (len(objs) + 1)
+    out += b'0000000000 65535 f \n'
+    for o in offs:
+        out += b'%010d 00000 n \n' % o
+    out += b'trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n' % (len(objs) + 1, xref)
+    open(path, 'wb').write(out)
+make(sys.argv[1], 0)
+make(sys.argv[2], 90)
+PYEOF
+  # center of [100 50 600 750] is (350, 400); 45° gives cos=sin=0.7071
+  run_test "watermark centers on offset-origin MediaBox" bash -c "
+    set -e
+    $TSPDF watermark $TMPDIR/wm_box.pdf -o $TMPDIR/wm_box_out.pdf --text DRAFT > /dev/null
+    qpdf --qdf --object-streams=disable $TMPDIR/wm_box_out.pdf $TMPDIR/wm_box_out.qdf
+    grep -q -- '0.7071 0.7071 -0.7071 0.7071 350 400 cm' $TMPDIR/wm_box_out.qdf"
+  # /Rotate 90 is compensated by rotating the stamp to 45+90=135 degrees
+  run_test "watermark reads upright on a /Rotate 90 page" bash -c "
+    set -e
+    $TSPDF watermark $TMPDIR/wm_box_rot90.pdf -o $TMPDIR/wm_rot_out.pdf --text DRAFT > /dev/null
+    qpdf --qdf --object-streams=disable $TMPDIR/wm_rot_out.pdf $TMPDIR/wm_rot_out.qdf
+    grep -q -- '-0.7071 0.7071 -0.7071 -0.7071 350 400 cm' $TMPDIR/wm_rot_out.qdf"
+else
+  echo "  SKIP  watermark placement assertions (python3/qpdf not found)"
+fi
 
 # compress
 run_test "compress" $TSPDF compress $INPUT -o $TMPDIR/compressed.pdf
@@ -266,6 +348,20 @@ sys.stdout.buffer.write(sig + chunk(b'IHDR',ihdr) + chunk(b'IDAT',raw) + chunk(b
   run_test "img2pdf --best-effort tolerates unsupported input (exit 0)" $TSPDF img2pdf $TMPDIR/test.png $TMPDIR/interlaced.png --best-effort -o $TMPDIR/img2pdf_be.pdf
   # All-good inputs still exit 0
   run_test "img2pdf all-good inputs exit 0" $TSPDF img2pdf $TMPDIR/test.png examples/test.jpg -o $TMPDIR/img2pdf_good.pdf
+
+  # img2pdf must not silently drop images past the writer's 64-image limit:
+  # exceeding it is a hard error (even with --best-effort), never a quiet
+  # 64-page PDF with the rest of the inputs missing.
+  IMG_MANY_DIR=$TMPDIR/img_many
+  mkdir -p $IMG_MANY_DIR
+  IMG_MANY=()
+  for i in $(seq 1 70); do
+    cp $TMPDIR/test.png $IMG_MANY_DIR/img_$i.png
+    IMG_MANY+=("$IMG_MANY_DIR/img_$i.png")
+  done
+  run_test "img2pdf >64 images fails loudly" bash -c "! $TSPDF img2pdf ${IMG_MANY[*]} -o $TMPDIR/img2pdf_many.pdf > /dev/null 2>&1"
+  run_test "img2pdf >64 images names the image limit" bash -c "$TSPDF img2pdf ${IMG_MANY[*]} -o $TMPDIR/img2pdf_many2.pdf 2>&1 | grep -qi 'too many images'"
+  run_test "img2pdf >64 images fails even with --best-effort" bash -c "! $TSPDF img2pdf ${IMG_MANY[*]} --best-effort -o $TMPDIR/img2pdf_many3.pdf > /dev/null 2>&1"
 else
   echo "  SKIP  img2pdf (python3 not found)"
 fi
@@ -491,6 +587,18 @@ assert found == need, (sorted(found), sorted(need))
       "http://localhost:${SERVE_PORT}/api/watermark-existing" -o "${TMPDIR}/serve_wm.pdf" &&
     "$TSPDF" text "${TMPDIR}/serve_wm.pdf" | grep -q WMCUSTOM
   '
+
+  # server-side copy of the stamping code must also center on the visual page
+  # (MediaBox origin offset), same as the CLI watermark command
+  if command -v qpdf > /dev/null 2>&1 && [ -f "$TMPDIR/wm_box.pdf" ]; then
+    run_serve_test "serve watermark centers on offset-origin MediaBox" env TMPDIR="$TMPDIR" SERVE_PORT="$SERVE_PORT" bash -c '
+      curl -sf --retry 3 --retry-delay 1 --max-time 10 \
+        -F "pdf_file=@${TMPDIR}/wm_box.pdf" -F "config={}" \
+        "http://localhost:${SERVE_PORT}/api/watermark-existing" -o "${TMPDIR}/serve_wm_box.pdf" &&
+      qpdf --qdf --object-streams=disable "${TMPDIR}/serve_wm_box.pdf" "${TMPDIR}/serve_wm_box.qdf" &&
+      grep -q -- "0.7071 0.7071 -0.7071 0.7071 350 400 cm" "${TMPDIR}/serve_wm_box.qdf"
+    '
+  fi
 
   run_serve_test "serve password-protect honors distinct owner password" env TSPDF="$TSPDF" TMPDIR="$TMPDIR" SERVE_PORT="$SERVE_PORT" INPUT="$INPUT" bash -c '
     curl -sf --retry 3 --retry-delay 1 --max-time 10 \
@@ -1266,7 +1374,28 @@ run_test "pagenum rejects invalid --position" bash -c "
 
 run_test "pagenum accepts top-right position and custom size" $TSPDF pagenum $INPUT -o $TMPDIR/pntr.pdf --position top-right --font-size 8
 
+# --pages: stamp only part of the document (e.g. skip cover pages). The
+# number still reflects the true page position and the %d total stays the
+# real page count.
+$TSPDF split $INPUT --pages 1 -o $TMPDIR/pn1.pdf > /dev/null 2>&1
+$TSPDF merge $INPUT $TMPDIR/pn1.pdf -o $TMPDIR/pn4.pdf > /dev/null 2>&1  # 4-page doc
+run_test "pagenum --pages 2-3 stamps pages 2 and 3" bash -c "
+  set -e
+  $TSPDF pagenum $TMPDIR/pn4.pdf -o $TMPDIR/pnrange.pdf --pages 2-3 --format '[%d/%d]' > /dev/null
+  $TSPDF text $TMPDIR/pnrange.pdf --pages 2 | grep -q '\[2/4\]'
+  $TSPDF text $TMPDIR/pnrange.pdf --pages 3 | grep -q '\[3/4\]'"
+run_test "pagenum --pages leaves page 1 unstamped" bash -c "
+  ! $TSPDF text $TMPDIR/pnrange.pdf --pages 1 | grep -q '\[1/4\]'"
+run_test "pagenum --pages leaves page 4 unstamped" bash -c "
+  ! $TSPDF text $TMPDIR/pnrange.pdf --pages 4 | grep -q '\[4/4\]'"
+run_test "pagenum --pages out of range fails with page count" bash -c "
+  ! $TSPDF pagenum $TMPDIR/pn4.pdf -o $TMPDIR/pnbad.pdf --pages 9 > /dev/null 2>&1"
+run_test "pagenum rejects invalid --pages" bash -c "
+  ! $TSPDF pagenum $TMPDIR/pn4.pdf -o $TMPDIR/pnbad.pdf --pages abc 2>/dev/null"
+run_test "pagenum help mentions --pages" bash -c "$TSPDF pagenum --help | grep -q -- '--pages'"
+
 run_test "help pagenum shows command-specific usage" bash -c "$TSPDF help pagenum 2>/dev/null | grep -q 'Usage: tspdf pagenum'"
+run_test "help pagenum documents --pages" bash -c "$TSPDF help pagenum 2>/dev/null | grep -q -- '--pages'"
 
 # md2pdf emphasis: *x*/_x_ italic, **x** bold; literal markers must not leak.
 if command -v qpdf > /dev/null 2>&1; then

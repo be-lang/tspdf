@@ -470,6 +470,48 @@ TspdfReaderPage *tspdf_reader_get_page(const TspdfReader *doc, size_t index) {
     return &doc->pages.pages[index];
 }
 
+const char *tspdf_reader_pdf_version(const TspdfReader *doc) {
+    if (!doc) return "";
+    // The catalog /Version name overrides the header (PDF 32000-1 §7.7.2).
+    // Parsed names are NUL-terminated in the arena, so it can be returned
+    // directly.
+    if (doc->catalog) {
+        TspdfObj *v = tspdf_dict_get(doc->catalog, "Version");
+        if (v && v->type == TSPDF_OBJ_NAME && v->string.data && v->string.len > 0)
+            return (const char *)v->string.data;
+    }
+    return doc->pdf_version;
+}
+
+bool tspdf_reader_encryption_info(const TspdfReader *doc, int *revision,
+                                  const char **algorithm) {
+    if (!doc || !doc->crypt) return false;
+    const TspdfCrypt *c = doc->crypt;
+    if (revision) *revision = c->revision;
+    if (algorithm) {
+        if (c->use_aes)
+            *algorithm = (c->key_len == 32) ? "AES-256" : "AES-128";
+        else
+            *algorithm = (c->key_len == 5) ? "RC4-40"
+                       : (c->key_len == 16) ? "RC4-128" : "RC4";
+    }
+    return true;
+}
+
+static bool catalog_has(const TspdfReader *doc, const char *key) {
+    if (!doc || !doc->catalog) return false;
+    TspdfObj *v = tspdf_dict_get(doc->catalog, key);
+    return v && v->type != TSPDF_OBJ_NULL;
+}
+
+bool tspdf_reader_has_outlines(const TspdfReader *doc) {
+    return catalog_has(doc, "Outlines");
+}
+
+bool tspdf_reader_has_acroform(const TspdfReader *doc) {
+    return catalog_has(doc, "AcroForm");
+}
+
 static bool dict_has_key(TspdfObj *dict, const char *key) {
     return tspdf_dict_get(dict, key) != NULL;
 }

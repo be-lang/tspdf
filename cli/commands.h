@@ -17,7 +17,10 @@ bool has_flag(int argc, char **argv, const char *flag);
 // Returns count. Values stored in out[] (max out_max entries).
 int find_flags(int argc, char **argv, const char *flag, const char **out, int out_max);
 
-// Collect positional args (not flags). Returns count.
+// Collect positional args (not flags). Returns the TOTAL number of
+// positionals found, even when it exceeds out_max; only the first out_max
+// are stored in out[]. Callers must compare the return value against the
+// number of inputs they expect instead of assuming it was capped.
 int collect_positional(int argc, char **argv, const char **out, int out_max);
 
 // First page index in pages[] that is >= total, or total if none is.
