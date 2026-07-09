@@ -5702,7 +5702,10 @@ TEST(test_save_use_xref_stream_roundtrip) {
     ASSERT_EQ_INT(err, TSPDF_OK);
     ASSERT(bytes_contains(out, out_len, "/Type /XRef"));
     ASSERT(bytes_contains(out, out_len, "/Size "));
-    ASSERT(bytes_contains(out, out_len, "/W [ 1 8 2 ]"));
+    // W is right-sized from the actual max offset (2 bytes here) and max
+    // field-3 value (no type-2 entries: 1 byte), not a fixed [1 8 2].
+    ASSERT(bytes_contains(out, out_len, "/W [ 1 2 1 ]"));
+    ASSERT(!bytes_contains(out, out_len, "/W [ 1 8 2 ]"));
     ASSERT(!bytes_contains(out, out_len, "/TspdfSize"));
 
     TspdfReader *doc2 = tspdf_reader_open(out, out_len, &err);
@@ -6530,6 +6533,225 @@ TEST(test_recompress_writes_xref_stream) {
     tspdf_reader_destroy(doc2);
     free(out);
     tspdf_reader_destroy(doc);
+}
+
+// A classic-xref PDF with `count` small ExtGState objects reachable from the
+// single page's resources. Exercises object-stream packing on files where
+// per-object overhead dominates.
+static char *make_many_small_objects_pdf(size_t *out_len, int count) {
+    size_t cap = 65536 + (size_t)count * 128;
+    char *pdf = (char *)malloc(cap);
+    size_t *off = (size_t *)calloc((size_t)count + 8, sizeof(size_t));
+    if (!pdf || !off) {
+        free(pdf);
+        free(off);
+        return NULL;
+    }
+
+    size_t pos = 0;
+    if (!appendf(pdf, cap, &pos, "%%PDF-1.4\n")) goto fail;
+
+    off[1] = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")) goto fail;
+
+    off[2] = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")) goto fail;
+
+    off[3] = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                 "/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> /ExtGState << ")) goto fail;
+    for (int i = 0; i < count; i++) {
+        if (!appendf(pdf, cap, &pos, "/GS%d %d 0 R ", i, 6 + i)) goto fail;
+    }
+    if (!appendf(pdf, cap, &pos, ">> >> >>\nendobj\n")) goto fail;
+
+    const char *content = "BT /F1 12 Tf 72 720 Td (Hello ObjStm) Tj ET";
+    off[4] = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "4 0 obj\n<< /Length %zu >>\nstream\n%s\nendstream\nendobj\n",
+                 strlen(content), content)) goto fail;
+
+    off[5] = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n")) goto fail;
+
+    for (int i = 0; i < count; i++) {
+        off[6 + i] = pos;
+        if (!appendf(pdf, cap, &pos,
+                     "%d 0 obj\n<< /Type /ExtGState /CA 0.%d /LW %d >>\nendobj\n",
+                     6 + i, i % 9 + 1, i % 7 + 1)) goto fail;
+    }
+
+    size_t xref = pos;
+    if (!appendf(pdf, cap, &pos, "xref\n0 %d\n0000000000 65535 f \n", count + 6)) goto fail;
+    for (int i = 1; i < count + 6; i++) {
+        if (!appendf(pdf, cap, &pos, "%010zu 00000 n \n", off[i])) goto fail;
+    }
+    if (!appendf(pdf, cap, &pos,
+                 "trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%zu\n%%%%EOF",
+                 count + 6, xref)) goto fail;
+
+    free(off);
+    *out_len = pos;
+    return pdf;
+
+fail:
+    free(off);
+    free(pdf);
+    return NULL;
+}
+
+TEST(test_recompress_packs_objects_into_object_streams) {
+    size_t len = 0;
+    char *pdf = make_many_small_objects_pdf(&len, 300);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    // Same options the `compress` CLI command uses.
+    TspdfSaveOptions opts = tspdf_save_options_default();
+    opts.strip_unused_objects = true;
+    opts.recompress_streams = true;
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory_with_options(doc, &out, &out_len, &opts);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    ASSERT(bytes_contains(out, out_len, "/Type /ObjStm"));
+    ASSERT(out_len < len);
+
+    // Reopen with our own reader: pages, text, metadata and every object
+    // must survive the round-trip.
+    TspdfReader *doc2 = tspdf_reader_open(out, out_len, &err);
+    ASSERT(doc2 != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(doc2), 1);
+    const char *text = tspdf_reader_page_text(doc2, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT(strstr(text, "Hello ObjStm") != NULL);
+    const char *producer = tspdf_reader_get_producer(doc2);
+    ASSERT(producer != NULL);
+    ASSERT(strstr(producer, "tspdf") != NULL);
+
+    // Every in-use object resolves, and the small objects landed in object
+    // streams (type-2 xref entries).
+    TspdfParser parser;
+    tspdf_parser_init(&parser, doc2->data, doc2->data_len, &doc2->arena);
+    size_t type2_entries = 0;
+    for (uint32_t i = 1; i < (uint32_t)doc2->xref.count; i++) {
+        if (!doc2->xref.entries[i].in_use) continue;
+        TspdfObj *obj = tspdf_xref_resolve(&doc2->xref, &parser, i, doc2->obj_cache, NULL);
+        ASSERT(obj != NULL);
+        if (doc2->xref.entries[i].compressed) type2_entries++;
+    }
+    ASSERT(type2_entries >= 300);
+
+    tspdf_reader_destroy(doc2);
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_recompress_roundtrip_from_objstm_input) {
+    // A document that itself came from object-stream input survives
+    // recompression into fresh object streams.
+    size_t len = 0;
+    char *pdf = make_object_stream_pdf(&len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    TspdfSaveOptions opts = tspdf_save_options_default();
+    opts.strip_unused_objects = true;
+    opts.recompress_streams = true;
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory_with_options(doc, &out, &out_len, &opts);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(bytes_contains(out, out_len, "/Type /ObjStm"));
+
+    TspdfReader *doc2 = tspdf_reader_open(out, out_len, &err);
+    ASSERT(doc2 != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(doc2), 1);
+
+    tspdf_reader_destroy(doc2);
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_recompress_objstm_output_does_not_grow) {
+    // Do-no-harm: recompressing an ObjStm-heavy file (our own compressed
+    // output) must not inflate it.
+    size_t len = 0;
+    char *pdf = make_many_small_objects_pdf(&len, 300);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    TspdfSaveOptions opts = tspdf_save_options_default();
+    opts.strip_unused_objects = true;
+    opts.recompress_streams = true;
+    uint8_t *out1 = NULL;
+    size_t out1_len = 0;
+    err = tspdf_reader_save_to_memory_with_options(doc, &out1, &out1_len, &opts);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(bytes_contains(out1, out1_len, "/Type /ObjStm"));
+
+    TspdfReader *doc1 = tspdf_reader_open(out1, out1_len, &err);
+    ASSERT(doc1 != NULL);
+    uint8_t *out2 = NULL;
+    size_t out2_len = 0;
+    err = tspdf_reader_save_to_memory_with_options(doc1, &out2, &out2_len, &opts);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(out2_len <= out1_len);
+
+    TspdfReader *doc2 = tspdf_reader_open(out2, out2_len, &err);
+    ASSERT(doc2 != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(doc2), 1);
+
+    tspdf_reader_destroy(doc2);
+    free(out2);
+    tspdf_reader_destroy(doc1);
+    free(out1);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_encrypted_save_has_no_objstm) {
+    // Encrypted saves keep plain top-level objects: strings inside an object
+    // stream must not be individually encrypted, so we don't pack them.
+    size_t len = 0;
+    char *pdf = make_many_small_objects_pdf(&len, 50);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory_encrypted(doc, &out, &out_len,
+                                                "user123", "owner456", 0xFFFFFFFC, 128);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(!bytes_contains(out, out_len, "/Type /ObjStm"));
+
+    TspdfReader *doc2 = tspdf_reader_open_with_password(out, out_len, "user123", &err);
+    ASSERT(doc2 != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(doc2), 1);
+
+    tspdf_reader_destroy(doc2);
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
 }
 
 TEST(test_delete_keeps_document_level_trees) {
@@ -8594,6 +8816,10 @@ int main(void) {
     RUN(test_recompress_reflates_large_flate_stream);
     RUN(test_recompress_encrypted_source_roundtrip);
     RUN(test_recompress_writes_xref_stream);
+    RUN(test_recompress_packs_objects_into_object_streams);
+    RUN(test_recompress_roundtrip_from_objstm_input);
+    RUN(test_recompress_objstm_output_does_not_grow);
+    RUN(test_encrypted_save_has_no_objstm);
 
     printf("\n  Encoding/i18n:\n");
     RUN(test_pdftext_cp1252_from_codepoint);
