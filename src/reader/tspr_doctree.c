@@ -84,6 +84,14 @@ static TspdfError dt_dict_put(TspdfObj *dict, const char *key, TspdfObj *value,
     return TSPDF_OK;
 }
 
+// Length-checked name compare: parsed names can carry embedded NULs via
+// #00 escapes, so strcmp against string.data would match too eagerly.
+static bool dt_name_is(const TspdfObj *o, const char *name) {
+    size_t len = strlen(name);
+    return o && o->type == TSPDF_OBJ_NAME && o->string.len == len &&
+           memcmp(o->string.data, name, len) == 0;
+}
+
 // --- resolution ---
 
 // Resolve an object number through `doc`. Merged documents have no backing
@@ -333,9 +341,7 @@ static TspdfError dt_prune_outline_level(DtCtx *ctx, TspdfObj *first_val,
         TspdfObj *action = dt_resolve(ctx->doc, ctx->parser, tspdf_dict_get(item, "A"));
         bool action_is_goto = false;
         if (action && action->type == TSPDF_OBJ_DICT) {
-            TspdfObj *s = tspdf_dict_get(action, "S");
-            action_is_goto = s && s->type == TSPDF_OBJ_NAME &&
-                             strcmp((const char *)s->string.data, "GoTo") == 0;
+            action_is_goto = dt_name_is(tspdf_dict_get(action, "S"), "GoTo");
             if (!dest_val && action_is_goto) {
                 dest_val = tspdf_dict_get(action, "D");
             }
@@ -559,6 +565,8 @@ static bool dt_prune_field(TspdfReader *dst, TspdfParser *parser,
     } else if (annot_page && field_num < dst->xref.count) {
         page_num = annot_page[field_num];
     }
+    // page_num == 0 doubles as the not-found sentinel; that is safe only
+    // because object 0 is the xref free-list head and can never be a page.
     return page_num > 0 && page_num < dst->xref.count && page_kept[page_num];
 }
 
