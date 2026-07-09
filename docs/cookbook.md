@@ -28,6 +28,9 @@ tspdf pagenum report.pdf -o numbered.pdf
 
 # "Page 1 of 12" at the top right, numbering starting at 10
 tspdf pagenum report.pdf --format "Page %d of %d" --position top-right --start 10 -o numbered.pdf
+
+# skip the cover page; page 2 still shows "2"
+tspdf pagenum report.pdf --pages 2-12 -o numbered.pdf
 ```
 
 ## Delete pages
@@ -52,6 +55,16 @@ tspdf rotate report.pdf --pages 1,2 --angle 90 -o rotated.pdf
 
 ```bash
 tspdf watermark report.pdf --text "DRAFT" -o draft.pdf
+```
+
+## Extract text
+
+```bash
+# all pages to stdout, one form-feed between pages
+tspdf text report.pdf
+
+# specific pages, to a file
+tspdf text report.pdf --pages 1-3 -o report.txt
 ```
 
 ## Compress a PDF
@@ -90,6 +103,9 @@ tspdf decrypt locked.pdf --password "secret" -o unlocked.pdf
 
 ```bash
 tspdf img2pdf page1.jpg page2.png -o photos.pdf
+
+# page sized to each image instead of A4
+tspdf img2pdf scan1.png scan2.png --page-size image -o scans.pdf
 ```
 
 ## Generate a QR code PDF
@@ -102,6 +118,7 @@ tspdf qrcode "https://example.com" --title "Scan me" -o qr.pdf
 
 ```bash
 # supports headings, lists, code blocks, pipe tables and ![alt](img.png) images
+# headings become PDF bookmarks; [text](url) links stay clickable
 tspdf md2pdf notes.md -o notes.pdf
 ```
 

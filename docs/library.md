@@ -35,6 +35,7 @@ Writer — build PDFs from scratch (`<tspdf/pdf/tspdf_writer.h>`):
 - `tspdf_writer_add_page` — appends a page and returns its content stream
 - `tspdf_writer_add_builtin_font` / `tspdf_writer_add_ttf_font` — base-14 fonts, or embed + subset a TTF
 - `tspdf_writer_add_png_image` / `tspdf_writer_add_jpeg_image`
+- `tspdf_writer_add_link` / `tspdf_writer_add_bookmark` / `tspdf_writer_add_bookmark_xyz` — URL link annotations and (nested) outline entries
 - `tspdf_writer_save` / `tspdf_writer_save_to_memory`
 
 Content streams — draw on a page (`<tspdf/pdf/pdf_stream.h>`): `tspdf_stream_begin_text`,

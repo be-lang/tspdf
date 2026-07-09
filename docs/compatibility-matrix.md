@@ -18,9 +18,10 @@ This matrix reflects what the project currently validates in CI and local regres
 | Encrypt / Decrypt (AES-128/256) | Stable | `tests/test_reader.c`, `tests/test_crypto.c`, `tests/test_cli.sh` |
 | Metadata view/edit | Stable | `tests/test_reader.c`, `tests/test_cli.sh` |
 | Watermark (text) | Stable | `tests/test_cli.sh` |
+| Text extraction | Stable | `tests/test_reader.c`, `tests/test_cli.sh` |
 | Compress | Stable | `tests/test_main.c`, `tests/test_cli.sh` |
 | Markdown to PDF | Stable | `tests/test_cli.sh` |
-| QR code to PDF | Stable | `tests/test_cli.sh` |
+| QR code to PDF | Stable | `tests/test_main.c`, `tests/test_cli.sh` |
 | PNG decode | Hardened | `tests/test_main.c` |
 | Deflate/inflate | Hardened | `tests/test_main.c` |
 | Embedded web server | Hardened | `tests/test_cli.sh` raw HTTP regressions |

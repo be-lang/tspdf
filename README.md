@@ -32,7 +32,9 @@ tspdf encrypt doc.pdf -o locked.pdf --password secret
 tspdf decrypt locked.pdf -o unlocked.pdf --password secret
 tspdf rotate doc.pdf --angle 90 -o rotated.pdf
 tspdf watermark doc.pdf -o draft.pdf --text "DRAFT"
+tspdf pagenum doc.pdf -o numbered.pdf
 tspdf compress doc.pdf -o smaller.pdf
+tspdf text doc.pdf -o doc.txt
 tspdf metadata doc.pdf
 tspdf md2pdf notes.md -o notes.pdf
 tspdf img2pdf photo.jpg -o photo.pdf
@@ -53,6 +55,9 @@ A local web interface for the same operations. The UI is embedded in the binary,
 so there are no extra files and no network access. Your documents stay on your
 computer.
 
+You can also try it in the browser at <https://be-lang.github.io/tspdf/>. That
+is the same code compiled to WebAssembly, so files never leave the page.
+
 ## PDF compatibility
 
 tspdf aims to open the PDFs you actually have, not just clean ones:
@@ -68,8 +73,10 @@ please [open an issue](../../issues) with the file if you can share it. See
 
 ## Use as a C library
 
-`make install` also installs `libtspdf.a`, headers under `<tspdf/...>`, and a
-pkg-config file. The headers are `extern "C"` guarded for C++.
+`make install` also installs `libtspdf.a`, a versioned `libtspdf.so`, headers
+under `<tspdf/...>`, and a pkg-config file. `make amalgamation` produces a
+single-file `tspdf.c` + `tspdf.h` to drop into a project. The headers are
+`extern "C"` guarded for C++.
 API overview, ownership rules, and examples: [docs/library.md](docs/library.md).
 
 ```bash
@@ -110,11 +117,11 @@ and conformance jobs, on every push.
 
 ## Features
 
-- **Reading**: open PDFs, extract/delete/rotate/reorder/merge pages, watermarks, annotations, page numbers, content overlay, AES-128/256 encryption and decryption.
+- **Reading**: open PDFs, extract/delete/rotate/reorder/merge pages, text extraction, watermarks, annotations, page numbers, content overlay, AES-128/256 encryption and decryption.
 - **Generation**: flexbox-style layout with fixed/grow/fit-content/percentage sizing, automatic page breaks with repeating headers, tables with auto-sized columns and colspan.
 - **Text**: TrueType parsing and embedding with subsetting, Unicode via CIDFont Type2 + Identity-H, wrapping, alignment, inline rich text.
 - **Graphics**: borders, shadows, opacity, clipping, transforms, vector paths, linear and radial gradients.
-- **Media**: JPEG pass-through, PNG decoding (8-bit grayscale/RGB/RGBA, non-interlaced), QR codes, Markdown to PDF.
+- **Media**: JPEG and PNG pass-through, PNG decoding (8-bit grayscale/RGB/RGBA and palette, non-interlaced), QR codes, Markdown to PDF.
 - **From scratch**: deflate/inflate (RFC 1950/1951), AES-128/256, MD5, SHA-256/384/512, RC4.
 
 ## Credits
