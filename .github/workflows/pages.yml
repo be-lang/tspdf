@@ -6,8 +6,10 @@ name: Pages
 # client-side, nothing is uploaded anywhere.
 #
 # emsdk is a build-time tool only (like the compiler); the shipped library and
-# CLI stay zero-dependency. The emsdk version is pinned so demo builds are
-# reproducible.
+# CLI stay zero-dependency. The emsdk version is pinned to the locally-tested
+# release so demo builds are reproducible, and `make wasm-test` gates the
+# deploy: a shim/wrapper regression or a pin/toolchain mismatch fails CI
+# instead of shipping to Pages.
 #
 # Maintainer step (not automated here): enable Pages for the repository under
 # Settings -> Pages -> Source: "GitHub Actions", or the deploy job will fail.
@@ -36,9 +38,15 @@ jobs:
       - name: Install emsdk (pinned)
         uses: mymindstorm/setup-emsdk@v14
         with:
-          version: 3.1.74
+          version: 5.0.7
 
-      - name: Build wasm module and demo site
+      - name: Install qpdf (wasm-test conformance gate)
+        run: sudo apt-get update && sudo apt-get install -y qpdf
+
+      - name: Test wasm module under node + qpdf
+        run: make wasm-test
+
+      - name: Build demo site
         run: make wasm-demo
 
       - name: Upload site artifact
