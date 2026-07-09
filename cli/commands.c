@@ -132,6 +132,8 @@ static const char *const VALUE_FLAGS[] = {
     "--position",
     "--start",
     "--font-size",
+    "--page-size",
+    "--bind",
 };
 
 static bool is_value_flag(const char *arg) {

@@ -599,9 +599,206 @@ const char *tspdf_writer_add_jpeg_image(TspdfWriter *doc, const char *jpeg_path)
     return img->name;
 }
 
+// Write /Filter /FlateDecode plus the PNG-predictor /DecodeParms dict entries
+// for an image stream. Must run before tspdf_raw_write_stream (which emits
+// /Length and closes the dict).
+static void tsw_write_png_decodeparms(TspdfRawWriter *w, int colors, int bpc, int columns) {
+    tspdf_raw_write_dict_name_name(w, "Filter", "FlateDecode");
+    tspdf_raw_write_name(w, "DecodeParms");
+    tspdf_raw_write_dict_begin(w);
+    tspdf_raw_write_dict_name_int(w, "Predictor", 15);
+    tspdf_raw_write_dict_name_int(w, "Colors", colors);
+    tspdf_raw_write_dict_name_int(w, "BitsPerComponent", bpc);
+    tspdf_raw_write_dict_name_int(w, "Columns", columns);
+    tspdf_raw_write_dict_end(w);
+}
+
+// Apply per-row PNG filters to an 8-bit raster (choosing per row the filter
+// with the smallest sum of absolute residuals — the standard heuristic) and
+// deflate the filtered bytes. The result pairs with /Predictor 15 DecodeParms.
+// Returns a malloc'd buffer or NULL (caller falls back to plain compression).
+static uint8_t *tsw_flate_png_predicted(const uint8_t *data, int width, int height,
+                                        int colors, size_t *out_len) {
+    size_t stride = (size_t)width * (size_t)colors;
+    if (stride == 0 || (size_t)height > SIZE_MAX / (stride + 1u)) return NULL;
+    size_t filtered_len = (stride + 1u) * (size_t)height;
+    uint8_t *filtered = (uint8_t *)malloc(filtered_len);
+    uint8_t *trial = (uint8_t *)malloc(stride);
+    uint8_t *best = (uint8_t *)malloc(stride);
+    if (!filtered || !trial || !best) {
+        free(filtered); free(trial); free(best);
+        return NULL;
+    }
+
+    const uint8_t *prev = NULL;  // unfiltered previous row
+    int bpp = colors;
+    for (int y = 0; y < height; y++) {
+        const uint8_t *row = data + (size_t)y * stride;
+        int best_filter = 0;
+        unsigned long best_score = (unsigned long)-1;
+        for (int ft = 0; ft <= 4; ft++) {
+            unsigned long score = 0;
+            for (size_t x = 0; x < stride; x++) {
+                uint8_t a = (x >= (size_t)bpp) ? row[x - bpp] : 0;
+                uint8_t b = prev ? prev[x] : 0;
+                uint8_t c = (prev && x >= (size_t)bpp) ? prev[x - bpp] : 0;
+                uint8_t v = row[x];
+                switch (ft) {
+                    case 1: v = (uint8_t)(v - a); break;
+                    case 2: v = (uint8_t)(v - b); break;
+                    case 3: v = (uint8_t)(v - (uint8_t)((a + b) / 2)); break;
+                    case 4: {
+                        int p = a + b - c;
+                        int pa = p - a; if (pa < 0) pa = -pa;
+                        int pb = p - b; if (pb < 0) pb = -pb;
+                        int pc = p - c; if (pc < 0) pc = -pc;
+                        uint8_t pred = (pa <= pb && pa <= pc) ? a : (pb <= pc ? b : c);
+                        v = (uint8_t)(v - pred);
+                        break;
+                    }
+                    default: break;
+                }
+                trial[x] = v;
+                // treat residuals as signed: 0 and 255 are both "small"
+                score += (v < 128) ? v : 256u - v;
+            }
+            if (score < best_score) {
+                best_score = score;
+                best_filter = ft;
+                uint8_t *tmp = best; best = trial; trial = tmp;
+            }
+        }
+        uint8_t *dst = filtered + (size_t)y * (stride + 1u);
+        dst[0] = (uint8_t)best_filter;
+        memcpy(dst + 1, best, stride);
+        prev = row;
+    }
+    free(trial);
+    free(best);
+
+    uint8_t *comp = deflate_compress(filtered, filtered_len, out_len);
+    free(filtered);
+    return comp;
+}
+
+// Write an image stream: PNG-predictor flate when it wins, otherwise the
+// plain compressed/stored path. Call with the stream dict still open.
+static void tsw_write_image_stream(TspdfRawWriter *w, const uint8_t *data, size_t len,
+                                   int width, int height, int colors) {
+    size_t comp_len = 0;
+    uint8_t *comp = tsw_flate_png_predicted(data, width, height, colors, &comp_len);
+    if (comp && comp_len < len) {
+        tsw_write_png_decodeparms(w, colors, 8, width);
+        tspdf_raw_write_stream(w, comp, comp_len);
+        free(comp);
+        return;
+    }
+    free(comp);
+    tspdf_raw_write_stream_compressed(w, data, len);
+}
+
+// Write the soft-mask XObject (8-bit gray alpha channel).
+static void tsw_write_smask(TspdfRawWriter *w, TspdfRef ref, int width, int height,
+                            const uint8_t *alpha, size_t alpha_len) {
+    tspdf_raw_writer_begin_object(w, ref);
+    tspdf_raw_write_dict_begin(w);
+    tspdf_raw_write_dict_name_name(w, "Type", "XObject");
+    tspdf_raw_write_dict_name_name(w, "Subtype", "Image");
+    tspdf_raw_write_dict_name_int(w, "Width", width);
+    tspdf_raw_write_dict_name_int(w, "Height", height);
+    tspdf_raw_write_dict_name_int(w, "BitsPerComponent", 8);
+    tspdf_raw_write_dict_name_name(w, "ColorSpace", "DeviceGray");
+    tsw_write_image_stream(w, alpha, alpha_len, width, height, 1);
+    tspdf_raw_writer_end_object(w);
+}
+
+// Embed a passthrough-eligible PNG: the concatenated IDAT bytes go into the
+// stream verbatim (they are already a FlateDecode stream under /Predictor 15),
+// mirroring the JPEG DCTDecode passthrough above. Palette PNGs keep their
+// /Indexed colorspace, grayscale stays /DeviceGray — no RGB expansion.
+static const char *tsw_add_png_passthrough(TspdfWriter *doc, const char *png_path,
+                                           const PngPassthrough *pt) {
+    // Palette alpha (tRNS) still needs a decoded soft mask.
+    uint8_t *alpha = NULL;
+    size_t alpha_len = 0;
+    if (pt->has_alpha) {
+        PngImage png;
+        if (!png_image_load(png_path, &png) || png.channels != 4) {
+            doc->last_error = TSPDF_ERR_IMAGE_PARSE;
+            return NULL;
+        }
+        alpha_len = (size_t)png.width * (size_t)png.height;
+        alpha = (uint8_t *)malloc(alpha_len);
+        if (!alpha) {
+            png_image_free(&png);
+            doc->last_error = TSPDF_ERR_ALLOC;
+            return NULL;
+        }
+        for (size_t i = 0; i < alpha_len; i++) {
+            alpha[i] = png.pixels[i * 4 + 3];
+        }
+        png_image_free(&png);
+    }
+
+    TspdfImage *img = &doc->images[doc->image_count++];
+    img->ref = tspdf_raw_writer_alloc_object(&doc->writer);
+    img->width = pt->width;
+    img->height = pt->height;
+    img->is_png = true;
+    img->smask_ref = alpha ? tspdf_raw_writer_alloc_object(&doc->writer) : (TspdfRef){0, 0};
+    snprintf(img->name, sizeof(img->name), "Im%d", doc->image_count);
+
+    TspdfRawWriter *w = &doc->writer;
+    tspdf_raw_writer_begin_object(w, img->ref);
+    tspdf_raw_write_dict_begin(w);
+    tspdf_raw_write_dict_name_name(w, "Type", "XObject");
+    tspdf_raw_write_dict_name_name(w, "Subtype", "Image");
+    tspdf_raw_write_dict_name_int(w, "Width", pt->width);
+    tspdf_raw_write_dict_name_int(w, "Height", pt->height);
+    tspdf_raw_write_dict_name_int(w, "BitsPerComponent", pt->bit_depth);
+    if (pt->color_type == 3) {
+        tspdf_raw_write_name(w, "ColorSpace");
+        tspdf_raw_write_array_begin(w);
+        tspdf_raw_write_name(w, "Indexed");
+        tspdf_raw_write_name(w, "DeviceRGB");
+        tspdf_raw_write_int(w, pt->palette_count - 1);
+        tspdf_raw_write_string_hex(w, pt->palette, (size_t)pt->palette_count * 3);
+        tspdf_raw_write_array_end(w);
+    } else if (pt->color_type == 0) {
+        tspdf_raw_write_dict_name_name(w, "ColorSpace", "DeviceGray");
+    } else {
+        tspdf_raw_write_dict_name_name(w, "ColorSpace", "DeviceRGB");
+    }
+    if (alpha) {
+        tspdf_raw_write_dict_name_ref(w, "SMask", img->smask_ref);
+    }
+    tsw_write_png_decodeparms(w, pt->color_type == 2 ? 3 : 1, pt->bit_depth, pt->width);
+    tspdf_raw_write_stream(w, pt->idat, pt->idat_len);
+    tspdf_raw_writer_end_object(w);
+
+    if (alpha) {
+        tsw_write_smask(w, img->smask_ref, pt->width, pt->height, alpha, alpha_len);
+        free(alpha);
+    }
+
+    doc->last_error = TSPDF_OK;
+    return img->name;
+}
+
 const char *tspdf_writer_add_png_image(TspdfWriter *doc, const char *png_path) {
     if (doc->image_count >= TSPDF_MAX_IMAGES) { doc->last_error = TSPDF_ERR_IMAGE_LIMIT; return NULL; }
 
+    // Common case first: non-interlaced gray/RGB/palette PNGs embed their
+    // IDAT stream verbatim — zero recompression, zero size loss.
+    PngPassthrough pt;
+    if (png_read_passthrough(png_path, &pt)) {
+        const char *name = tsw_add_png_passthrough(doc, png_path, &pt);
+        png_passthrough_free(&pt);
+        return name;
+    }
+
+    // Decode fallback: alpha color types (gray+alpha, RGBA) whose interleaved
+    // alpha PDF cannot represent — split into color channel + soft mask.
     PngImage png;
     if (!png_image_load(png_path, &png)) {
         doc->last_error = TSPDF_ERR_IMAGE_PARSE;
@@ -615,7 +812,6 @@ const char *tspdf_writer_add_png_image(TspdfWriter *doc, const char *png_path) {
     img->is_png = true;
     snprintf(img->name, sizeof(img->name), "Im%d", doc->image_count);
 
-    // Separate RGB and alpha channels
     // Guard against integer overflow: check before multiplication
     if (png.width <= 0 || png.height <= 0 ||
         (size_t)png.height > SIZE_MAX / (size_t)png.width) {
@@ -631,9 +827,19 @@ const char *tspdf_writer_add_png_image(TspdfWriter *doc, const char *png_path) {
         doc->last_error = TSPDF_ERR_IMAGE_PARSE;
         return NULL;
     }
-    img->rgb_data = (uint8_t *)malloc(pixel_count * 3);
+
+    // A grayscale source (gray+alpha, or any decode whose pixels are all
+    // R==G==B) is written as one DeviceGray component — no RGB expansion.
+    bool is_gray = true;
+    for (size_t i = 0; i < pixel_count && is_gray; i++) {
+        const uint8_t *p = png.pixels + i * (size_t)png.channels;
+        is_gray = (p[0] == p[1] && p[1] == p[2]);
+    }
+    int colors = is_gray ? 1 : 3;
+
+    img->rgb_data = (uint8_t *)malloc(pixel_count * (size_t)colors);
     if (!img->rgb_data) { png_image_free(&png); doc->image_count--; doc->last_error = TSPDF_ERR_ALLOC; return NULL; }
-    img->rgb_len = pixel_count * 3;
+    img->rgb_len = pixel_count * (size_t)colors;
 
     bool has_alpha = (png.channels == 4);
     if (has_alpha) {
@@ -648,17 +854,22 @@ const char *tspdf_writer_add_png_image(TspdfWriter *doc, const char *png_path) {
     }
 
     for (size_t i = 0; i < pixel_count; i++) {
-        img->rgb_data[i * 3 + 0] = png.pixels[i * png.channels + 0];
-        img->rgb_data[i * 3 + 1] = png.pixels[i * png.channels + 1];
-        img->rgb_data[i * 3 + 2] = png.pixels[i * png.channels + 2];
+        const uint8_t *p = png.pixels + i * (size_t)png.channels;
+        if (is_gray) {
+            img->rgb_data[i] = p[0];
+        } else {
+            img->rgb_data[i * 3 + 0] = p[0];
+            img->rgb_data[i * 3 + 1] = p[1];
+            img->rgb_data[i * 3 + 2] = p[2];
+        }
         if (has_alpha) {
-            img->alpha_data[i] = png.pixels[i * 4 + 3];
+            img->alpha_data[i] = p[3];
         }
     }
 
     png_image_free(&png);
 
-    // Write image XObject (RGB data, compressed)
+    // Write image XObject (color channel, PNG-predictor compressed)
     TspdfRawWriter *w = &doc->writer;
     tspdf_raw_writer_begin_object(w, img->ref);
     tspdf_raw_write_dict_begin(w);
@@ -667,25 +878,17 @@ const char *tspdf_writer_add_png_image(TspdfWriter *doc, const char *png_path) {
     tspdf_raw_write_dict_name_int(w, "Width", img->width);
     tspdf_raw_write_dict_name_int(w, "Height", img->height);
     tspdf_raw_write_dict_name_int(w, "BitsPerComponent", 8);
-    tspdf_raw_write_dict_name_name(w, "ColorSpace", "DeviceRGB");
+    tspdf_raw_write_dict_name_name(w, "ColorSpace", is_gray ? "DeviceGray" : "DeviceRGB");
     if (has_alpha) {
         tspdf_raw_write_dict_name_ref(w, "SMask", img->smask_ref);
     }
-    tspdf_raw_write_stream_compressed(w, img->rgb_data, img->rgb_len);
+    tsw_write_image_stream(w, img->rgb_data, img->rgb_len, img->width, img->height, colors);
     tspdf_raw_writer_end_object(w);
 
     // Write soft mask (alpha channel) if present
     if (has_alpha) {
-        tspdf_raw_writer_begin_object(w, img->smask_ref);
-        tspdf_raw_write_dict_begin(w);
-        tspdf_raw_write_dict_name_name(w, "Type", "XObject");
-        tspdf_raw_write_dict_name_name(w, "Subtype", "Image");
-        tspdf_raw_write_dict_name_int(w, "Width", img->width);
-        tspdf_raw_write_dict_name_int(w, "Height", img->height);
-        tspdf_raw_write_dict_name_int(w, "BitsPerComponent", 8);
-        tspdf_raw_write_dict_name_name(w, "ColorSpace", "DeviceGray");
-        tspdf_raw_write_stream_compressed(w, img->alpha_data, img->alpha_len);
-        tspdf_raw_writer_end_object(w);
+        tsw_write_smask(w, img->smask_ref, img->width, img->height,
+                        img->alpha_data, img->alpha_len);
     }
 
     // Free pixel data (already written to PDF)

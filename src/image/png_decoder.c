@@ -355,3 +355,148 @@ void png_image_free(PngImage *img) {
     free(img->pixels);
     img->pixels = NULL;
 }
+
+// --- IDAT passthrough -------------------------------------------------------
+
+// Row stride in bytes for the filtered raster (excluding the filter byte).
+static size_t png_row_stride(int width, int bit_depth, int color_type) {
+    size_t bits_per_px = (size_t)bit_depth * (color_type == 2 ? 3u : 1u);
+    return ((size_t)width * bits_per_px + 7u) / 8u;
+}
+
+bool png_read_passthrough(const char *path, PngPassthrough *out) {
+    if (!path || !out) return false;
+    memset(out, 0, sizeof(*out));
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    long file_size_l = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (file_size_l < 33) { fclose(f); return false; }
+    size_t file_size = (size_t)file_size_l;
+
+    uint8_t *data = (uint8_t *)malloc(file_size);
+    if (!data) { fclose(f); return false; }
+    if (fread(data, 1, file_size, f) != file_size) {
+        free(data);
+        fclose(f);
+        return false;
+    }
+    fclose(f);
+
+    bool ok = false;
+    uint8_t *raw = NULL;
+
+    if (memcmp(data, PNG_SIG, 8) != 0) goto done;
+
+    // IHDR — same validation as the decode path (see png_image_load_mem)
+    size_t pos = 8;
+    if (read_u32_be(data + pos) != 13 ||
+        memcmp(data + pos + 4, "IHDR", 4) != 0) goto done;
+    const uint8_t *ihdr = data + pos + 8;
+    uint32_t width_u = read_u32_be(ihdr);
+    uint32_t height_u = read_u32_be(ihdr + 4);
+    if (width_u == 0u || height_u == 0u ||
+        width_u > TSPDF_PNG_MAX_DIMENSION || height_u > TSPDF_PNG_MAX_DIMENSION) {
+        goto done;
+    }
+    int bit_depth = ihdr[8];
+    int color_type = ihdr[9];
+    if (ihdr[10] != 0 || ihdr[11] != 0) goto done;  // compression/filter method
+    if (ihdr[12] != 0) goto done;                    // interlaced: row order differs
+    // Only gray/RGB/palette can passthrough — types 4/6 interleave alpha with
+    // color, which PDF image streams cannot represent.
+    if (color_type != 0 && color_type != 2 && color_type != 3) goto done;
+    if (color_type == 3) {
+        if (bit_depth != 1 && bit_depth != 2 && bit_depth != 4 && bit_depth != 8) goto done;
+    } else if (bit_depth != 8) {
+        goto done;  // sub-8/16-bit gray/RGB: keep the decode fallback behavior
+    }
+    out->width = (int)width_u;
+    out->height = (int)height_u;
+    out->bit_depth = bit_depth;
+    out->color_type = color_type;
+
+    // Chunk scan: total IDAT size plus PLTE/tRNS, mirroring the decode path.
+    size_t idat_total = 0;
+    const uint8_t *plte = NULL;
+    size_t plte_len = 0;
+    bool have_trns = false;
+    pos = 8;
+    while (pos + 12 <= file_size) {
+        uint32_t chunk_len = read_u32_be(data + pos);
+        if (chunk_len > file_size - pos - 12) break;
+        if (memcmp(data + pos + 4, "IEND", 4) == 0) break;
+        if (memcmp(data + pos + 4, "IDAT", 4) == 0) {
+            if (idat_total > SIZE_MAX - chunk_len) goto done;
+            idat_total += chunk_len;
+        } else if (memcmp(data + pos + 4, "PLTE", 4) == 0 && !plte) {
+            plte = data + pos + 8;
+            plte_len = chunk_len;
+        } else if (memcmp(data + pos + 4, "tRNS", 4) == 0) {
+            have_trns = true;
+        }
+        pos += 12 + chunk_len;
+    }
+    if (idat_total == 0) goto done;
+
+    if (color_type == 3) {
+        if (!plte || plte_len == 0 || plte_len % 3 != 0 || plte_len > 256 * 3) goto done;
+        out->palette_count = (int)(plte_len / 3);
+        memcpy(out->palette, plte, plte_len);
+        out->has_alpha = have_trns;
+    }
+    // tRNS on gray/RGB (color-key transparency) is ignored, matching the
+    // decode path, so passthrough loses nothing relative to it.
+
+    out->idat = (uint8_t *)malloc(idat_total);
+    if (!out->idat) goto done;
+    pos = 8;
+    while (pos + 12 <= file_size) {
+        uint32_t chunk_len = read_u32_be(data + pos);
+        if (chunk_len > file_size - pos - 12) break;
+        if (memcmp(data + pos + 4, "IEND", 4) == 0) break;
+        if (memcmp(data + pos + 4, "IDAT", 4) == 0) {
+            memcpy(out->idat + out->idat_len, data + pos + 8, chunk_len);
+            out->idat_len += chunk_len;
+        }
+        pos += 12 + chunk_len;
+    }
+    if (out->idat_len != idat_total) goto done;
+
+    // These bytes are embedded verbatim, so the zlib header must be one any
+    // PDF reader accepts: CM=8, CINFO<=7 (32K window), no preset dictionary.
+    // Our own inflater skips the header, so it can't be trusted to catch
+    // FDICT / CINFO>7 streams that qpdf/MuPDF would refuse to decode.
+    if (out->idat_len < 2 ||
+        (out->idat[0] & 0x0f) != 8 ||
+        (out->idat[0] >> 4) > 7 ||
+        (out->idat[1] & 0x20) != 0) goto done;
+
+    // Validate before vouching for the bytes: the stream must inflate to
+    // exactly (stride + 1) * height with every row filter byte in 0..4.
+    // Anything else would embed a stream PDF readers cannot decode.
+    size_t stride = png_row_stride(out->width, bit_depth, color_type);
+    if ((size_t)out->height > SIZE_MAX / (stride + 1u)) goto done;
+    size_t expected = (stride + 1u) * (size_t)out->height;
+    size_t raw_len = 0;
+    raw = deflate_decompress(out->idat, out->idat_len, &raw_len);
+    if (!raw || raw_len != expected) goto done;
+    for (int y = 0; y < out->height; y++) {
+        if (raw[(size_t)y * (stride + 1u)] > 4) goto done;
+    }
+
+    ok = true;
+done:
+    free(raw);
+    free(data);
+    if (!ok) png_passthrough_free(out);
+    return ok;
+}
+
+void png_passthrough_free(PngPassthrough *pt) {
+    if (!pt) return;
+    free(pt->idat);
+    memset(pt, 0, sizeof(*pt));
+}
