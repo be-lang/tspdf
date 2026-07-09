@@ -5,6 +5,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* NOTE: the web UI's /api/md2pdf (api_md2pdf in cli/server.c) is a separate,
+ * deliberately smaller implementation of this converter: no pipe tables, no
+ * inline bold/italic/code styling, and no images — the web endpoint must not
+ * read server-side files named by a request. When extending the Markdown
+ * dialect here, decide explicitly whether the web path follows, and keep
+ * docs/known-limitations.md in sync. */
+
 static TspdfWriter *g_doc = NULL;
 
 static double measure_cb(const char *f, double s, const char *t, void *u) {

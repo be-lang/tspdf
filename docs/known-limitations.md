@@ -10,6 +10,7 @@ See the [compatibility matrix](compatibility-matrix.md) for what is tested where
 - No rendering of pages to images.
 - Existing AcroForm forms cannot be filled (creating form fields in generated PDFs is supported).
 - md2pdf renders pipe tables and block-level `![alt](path)` images. Inline bold/italic/code only keeps its styling when the line fits unwrapped; longer lines render plain (markers stripped). Images inside a paragraph fall back to their alt text. Tables longer than 28 rows are split into stacked tables with the header repeated. Inline markup inside table cells renders as plain text. A document is capped at 1024 top-level blocks (paragraphs, headings, list items, ...); content past the cap is dropped with a warning.
+- The web UI's Markdown converter (`/api/md2pdf`) supports a smaller dialect than `tspdf md2pdf`: headings, bullet lists, blockquotes, fenced code blocks, and rules. Tables, images, and inline bold/italic/code styling are CLI-only; in the web UI those markers render literally. The web endpoint deliberately embeds no images, since that would mean reading files on the server.
 - Merge and split currently drop bookmarks and form fields.
 - Watermark support is text-only (no image watermark pipeline yet).
 - Web server mode is intentionally simple and local-first; it is not a general-purpose multi-tenant service.

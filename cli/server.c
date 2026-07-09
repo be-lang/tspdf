@@ -1783,7 +1783,17 @@ static void api_qrcode(int fd, MultipartForm *form)
     free(out);
 }
 
-/* ── md2pdf API handler ───────────────────────────────────────────── */
+/* ── md2pdf API handler ───────────────────────────────────────────── *
+ *
+ * NOTE: this is a separate, deliberately smaller Markdown dialect than the
+ * CLI converter in cli/cmd_md2pdf.c. The web path renders headings, bullet
+ * lists, blockquotes, fenced code blocks, rules, and paragraphs — no pipe
+ * tables, no inline bold/italic/code styling (markers render literally),
+ * and no images: embedding ![alt](path) would mean reading server-side
+ * files named by the request, which this endpoint must never do. When the
+ * CLI dialect grows, decide explicitly whether the web path follows, and
+ * keep docs/known-limitations.md and web/templates/tools/md2pdf.html in
+ * sync. */
 
 static double api_md2pdf_measure(const char *f, double s, const char *t, void *u) {
     TspdfWriter *doc = (TspdfWriter *)u;
