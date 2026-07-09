@@ -1,8 +1,22 @@
 #include "aes.h"
+#include <stdbool.h>
 #include <string.h>
 
 /* -------------------------------------------------------------------------
  * AES (FIPS 197) — ECB and CBC modes, 128-bit and 256-bit keys
+ *
+ * The block functions are table-driven ("T-tables"): each round of
+ * SubBytes + ShiftRows + MixColumns collapses into sixteen 32-bit table
+ * lookups XORed with the round key. Decryption runs the equivalent inverse
+ * cipher (FIPS 197 §5.3.5) over the dec_keys schedule, so it has the same
+ * shape as encryption.
+ *
+ * Side-channel note: T-table lookups are indexed by key-dependent state
+ * bytes, so a co-resident attacker who can prime/probe the data cache could
+ * in principle recover key material. The previous byte-oriented code was
+ * not constant-time either (S-box lookups, branchy xtime). tspdf is a local
+ * file tool, not a network service handling attacker-timed traffic, so
+ * cache-timing adversaries are out of its threat model — see SECURITY.md.
  * ------------------------------------------------------------------------- */
 
 /* AES S-box */
@@ -52,20 +66,52 @@ static const uint8_t rcon[11] = {
 };
 
 /* -------------------------------------------------------------------------
- * GF(2^8) multiplication with irreducible poly 0x11b
+ * T-tables
+ *
+ * Te0[x] is the MixColumns column ({02}·S(x), S(x), S(x), {03}·S(x)) as a
+ * big-endian word; Te1..Te3 are byte rotations of it, so a full round is
+ * four lookups per output word. Td0..Td3 are the InvMixColumns equivalents
+ * over the inverse S-box. Generated once from sbox/inv_sbox at the first
+ * aes_init (a few microseconds) instead of 8KB of pasted literals.
+ *
+ * The init is idempotent — every writer stores identical values and
+ * tables_ready flips only after they are in place — so the unsynchronized
+ * check is a benign race in the library's single-threaded posture.
  * ------------------------------------------------------------------------- */
+static uint32_t Te0[256], Te1[256], Te2[256], Te3[256];
+static uint32_t Td0[256], Td1[256], Td2[256], Td3[256];
+static bool tables_ready = false;
+
+/* GF(2^8) doubling with irreducible poly 0x11b; used only for table setup */
 static inline uint8_t xtime(uint8_t a) {
     return (uint8_t)((a << 1) ^ ((a & 0x80) ? 0x1b : 0x00));
 }
 
-static inline uint8_t gmul(uint8_t a, uint8_t b) {
-    uint8_t p = 0;
-    for (int i = 0; i < 8; i++) {
-        if (b & 1) p ^= a;
-        a = xtime(a);
-        b >>= 1;
+static void gen_tables(void) {
+    for (int x = 0; x < 256; x++) {
+        uint8_t s  = sbox[x];
+        uint8_t s2 = xtime(s);
+        uint32_t te = ((uint32_t)s2 << 24) | ((uint32_t)s << 16) |
+                      ((uint32_t)s  <<  8) |  (uint32_t)(s2 ^ s);
+        Te0[x] = te;
+        Te1[x] = (te >>  8) | (te << 24);
+        Te2[x] = (te >> 16) | (te << 16);
+        Te3[x] = (te >> 24) | (te <<  8);
+
+        uint8_t si = inv_sbox[x];
+        uint8_t i2 = xtime(si), i4 = xtime(i2), i8 = xtime(i4);
+        uint8_t i9 = (uint8_t)(i8 ^ si);            /* {09}·si */
+        uint8_t ib = (uint8_t)(i9 ^ i2);            /* {0b}·si */
+        uint8_t id = (uint8_t)(i9 ^ i4);            /* {0d}·si */
+        uint8_t ie = (uint8_t)(i8 ^ i4 ^ i2);       /* {0e}·si */
+        uint32_t td = ((uint32_t)ie << 24) | ((uint32_t)i9 << 16) |
+                      ((uint32_t)id <<  8) |  (uint32_t)ib;
+        Td0[x] = td;
+        Td1[x] = (td >>  8) | (td << 24);
+        Td2[x] = (td >> 16) | (td << 16);
+        Td3[x] = (td >> 24) | (td <<  8);
     }
-    return p;
+    tables_ready = true;
 }
 
 /* -------------------------------------------------------------------------
@@ -82,21 +128,21 @@ static inline uint32_t rotword(uint32_t w) {
     return (w << 8) | (w >> 24);
 }
 
-/* InvMixColumns applied to one round-key word (big-endian column). Used to
- * build the equivalent-inverse-cipher schedule. */
+/* InvMixColumns applied to one round-key word (big-endian column), via the
+ * Td tables: Td0[sbox[b]] is InvMixColumns of ({b},0,0,0). Used to build the
+ * equivalent-inverse-cipher schedule. */
 static inline uint32_t inv_mix_word(uint32_t w) {
-    uint8_t b0 = (uint8_t)(w >> 24), b1 = (uint8_t)(w >> 16),
-            b2 = (uint8_t)(w >>  8), b3 = (uint8_t)(w      );
-    return ((uint32_t)(gmul(0x0e,b0) ^ gmul(0x0b,b1) ^ gmul(0x0d,b2) ^ gmul(0x09,b3)) << 24)
-         | ((uint32_t)(gmul(0x09,b0) ^ gmul(0x0e,b1) ^ gmul(0x0b,b2) ^ gmul(0x0d,b3)) << 16)
-         | ((uint32_t)(gmul(0x0d,b0) ^ gmul(0x09,b1) ^ gmul(0x0e,b2) ^ gmul(0x0b,b3)) <<  8)
-         |  (uint32_t)(gmul(0x0b,b0) ^ gmul(0x0d,b1) ^ gmul(0x09,b2) ^ gmul(0x0e,b3));
+    return Td0[sbox[(w >> 24) & 0xff]] ^ Td1[sbox[(w >> 16) & 0xff]] ^
+           Td2[sbox[(w >>  8) & 0xff]] ^ Td3[sbox[(w      ) & 0xff]];
 }
 
 /* -------------------------------------------------------------------------
  * aes_init — key expansion (FIPS 197 §5.2)
  * ------------------------------------------------------------------------- */
 void aes_init(Aes *ctx, const uint8_t *key, int key_bits) {
+    if (!tables_ready)
+        gen_tables();
+
     int nk = key_bits / 32;          /* words in key: 4 (AES-128) or 8 (AES-256) */
     ctx->nr = nk + 6;                /* rounds: 10 or 14 */
     int total = 4 * (ctx->nr + 1);   /* total words needed */
@@ -132,116 +178,57 @@ void aes_init(Aes *ctx, const uint8_t *key, int key_bits) {
 }
 
 /* -------------------------------------------------------------------------
- * State helpers — state is a 4x4 byte array stored column-major
- * state[col][row], i.e. state[c][r] = byte at row r, column c
+ * Block load/store — the state lives in four big-endian words s0..s3, one
+ * per column
  * ------------------------------------------------------------------------- */
-typedef uint8_t State[4][4];
-
-static inline void bytes_to_state(const uint8_t in[16], State s) {
-    for (int c = 0; c < 4; c++)
-        for (int r = 0; r < 4; r++)
-            s[c][r] = in[c*4 + r];
+static inline uint32_t load_be32(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] <<  8) |  (uint32_t)p[3];
 }
 
-static inline void state_to_bytes(const State s, uint8_t out[16]) {
-    for (int c = 0; c < 4; c++)
-        for (int r = 0; r < 4; r++)
-            out[c*4 + r] = s[c][r];
-}
-
-/* AddRoundKey */
-static inline void add_round_key(State s, const uint32_t *rk) {
-    for (int c = 0; c < 4; c++) {
-        uint32_t w = rk[c];
-        s[c][0] ^= (uint8_t)(w >> 24);
-        s[c][1] ^= (uint8_t)(w >> 16);
-        s[c][2] ^= (uint8_t)(w >>  8);
-        s[c][3] ^= (uint8_t)(w      );
-    }
-}
-
-/* SubBytes */
-static inline void sub_bytes(State s) {
-    for (int c = 0; c < 4; c++)
-        for (int r = 0; r < 4; r++)
-            s[c][r] = sbox[s[c][r]];
-}
-
-/* InvSubBytes */
-static inline void inv_sub_bytes(State s) {
-    for (int c = 0; c < 4; c++)
-        for (int r = 0; r < 4; r++)
-            s[c][r] = inv_sbox[s[c][r]];
-}
-
-/* ShiftRows — shift row r left by r positions */
-static inline void shift_rows(State s) {
-    uint8_t t;
-    /* row 1: shift left 1 */
-    t = s[0][1]; s[0][1] = s[1][1]; s[1][1] = s[2][1]; s[2][1] = s[3][1]; s[3][1] = t;
-    /* row 2: shift left 2 */
-    t = s[0][2]; s[0][2] = s[2][2]; s[2][2] = t;
-    t = s[1][2]; s[1][2] = s[3][2]; s[3][2] = t;
-    /* row 3: shift left 3 (= right 1) */
-    t = s[3][3]; s[3][3] = s[2][3]; s[2][3] = s[1][3]; s[1][3] = s[0][3]; s[0][3] = t;
-}
-
-/* InvShiftRows — shift row r right by r positions */
-static inline void inv_shift_rows(State s) {
-    uint8_t t;
-    /* row 1: shift right 1 */
-    t = s[3][1]; s[3][1] = s[2][1]; s[2][1] = s[1][1]; s[1][1] = s[0][1]; s[0][1] = t;
-    /* row 2: shift right 2 */
-    t = s[0][2]; s[0][2] = s[2][2]; s[2][2] = t;
-    t = s[1][2]; s[1][2] = s[3][2]; s[3][2] = t;
-    /* row 3: shift right 3 (= left 1) */
-    t = s[0][3]; s[0][3] = s[1][3]; s[1][3] = s[2][3]; s[2][3] = s[3][3]; s[3][3] = t;
-}
-
-/* MixColumns */
-static inline void mix_columns(State s) {
-    for (int c = 0; c < 4; c++) {
-        uint8_t s0 = s[c][0], s1 = s[c][1], s2 = s[c][2], s3 = s[c][3];
-        s[c][0] = gmul(0x02, s0) ^ gmul(0x03, s1) ^ s2          ^ s3;
-        s[c][1] = s0             ^ gmul(0x02, s1) ^ gmul(0x03, s2) ^ s3;
-        s[c][2] = s0             ^ s1             ^ gmul(0x02, s2) ^ gmul(0x03, s3);
-        s[c][3] = gmul(0x03, s0) ^ s1             ^ s2             ^ gmul(0x02, s3);
-    }
-}
-
-/* InvMixColumns */
-static inline void inv_mix_columns(State s) {
-    for (int c = 0; c < 4; c++) {
-        uint8_t s0 = s[c][0], s1 = s[c][1], s2 = s[c][2], s3 = s[c][3];
-        s[c][0] = gmul(0x0e, s0) ^ gmul(0x0b, s1) ^ gmul(0x0d, s2) ^ gmul(0x09, s3);
-        s[c][1] = gmul(0x09, s0) ^ gmul(0x0e, s1) ^ gmul(0x0b, s2) ^ gmul(0x0d, s3);
-        s[c][2] = gmul(0x0d, s0) ^ gmul(0x09, s1) ^ gmul(0x0e, s2) ^ gmul(0x0b, s3);
-        s[c][3] = gmul(0x0b, s0) ^ gmul(0x0d, s1) ^ gmul(0x09, s2) ^ gmul(0x0e, s3);
-    }
+static inline void store_be32(uint8_t *p, uint32_t w) {
+    p[0] = (uint8_t)(w >> 24);
+    p[1] = (uint8_t)(w >> 16);
+    p[2] = (uint8_t)(w >>  8);
+    p[3] = (uint8_t)(w      );
 }
 
 /* -------------------------------------------------------------------------
- * aes_encrypt_ecb — single 16-byte block (FIPS 197 §5.1)
+ * aes_encrypt_ecb — single 16-byte block (FIPS 197 §5.1), T-table rounds
  * ------------------------------------------------------------------------- */
 void aes_encrypt_ecb(Aes *ctx, const uint8_t in[16], uint8_t out[16]) {
-    State s;
-    bytes_to_state(in, s);
+    const uint32_t *rk = ctx->round_keys;
+    uint32_t s0 = load_be32(in     ) ^ rk[0];
+    uint32_t s1 = load_be32(in +  4) ^ rk[1];
+    uint32_t s2 = load_be32(in +  8) ^ rk[2];
+    uint32_t s3 = load_be32(in + 12) ^ rk[3];
+    uint32_t t0, t1, t2, t3;
 
-    add_round_key(s, ctx->round_keys);
-
-    for (int round = 1; round < ctx->nr; round++) {
-        sub_bytes(s);
-        shift_rows(s);
-        mix_columns(s);
-        add_round_key(s, ctx->round_keys + round * 4);
+    int r = ctx->nr - 1;
+    rk += 4;
+    for (;;) {
+        t0 = Te0[s0 >> 24] ^ Te1[(s1 >> 16) & 0xff] ^ Te2[(s2 >> 8) & 0xff] ^ Te3[s3 & 0xff] ^ rk[0];
+        t1 = Te0[s1 >> 24] ^ Te1[(s2 >> 16) & 0xff] ^ Te2[(s3 >> 8) & 0xff] ^ Te3[s0 & 0xff] ^ rk[1];
+        t2 = Te0[s2 >> 24] ^ Te1[(s3 >> 16) & 0xff] ^ Te2[(s0 >> 8) & 0xff] ^ Te3[s1 & 0xff] ^ rk[2];
+        t3 = Te0[s3 >> 24] ^ Te1[(s0 >> 16) & 0xff] ^ Te2[(s1 >> 8) & 0xff] ^ Te3[s2 & 0xff] ^ rk[3];
+        rk += 4;
+        if (--r == 0) break;
+        s0 = t0; s1 = t1; s2 = t2; s3 = t3;
     }
 
-    /* final round — no MixColumns */
-    sub_bytes(s);
-    shift_rows(s);
-    add_round_key(s, ctx->round_keys + ctx->nr * 4);
-
-    state_to_bytes(s, out);
+    /* final round — SubBytes + ShiftRows + AddRoundKey, no MixColumns */
+    s0 = ((uint32_t)sbox[t0 >> 24] << 24) | ((uint32_t)sbox[(t1 >> 16) & 0xff] << 16)
+       | ((uint32_t)sbox[(t2 >> 8) & 0xff] << 8) | sbox[t3 & 0xff];
+    s1 = ((uint32_t)sbox[t1 >> 24] << 24) | ((uint32_t)sbox[(t2 >> 16) & 0xff] << 16)
+       | ((uint32_t)sbox[(t3 >> 8) & 0xff] << 8) | sbox[t0 & 0xff];
+    s2 = ((uint32_t)sbox[t2 >> 24] << 24) | ((uint32_t)sbox[(t3 >> 16) & 0xff] << 16)
+       | ((uint32_t)sbox[(t0 >> 8) & 0xff] << 8) | sbox[t1 & 0xff];
+    s3 = ((uint32_t)sbox[t3 >> 24] << 24) | ((uint32_t)sbox[(t0 >> 16) & 0xff] << 16)
+       | ((uint32_t)sbox[(t1 >> 8) & 0xff] << 8) | sbox[t2 & 0xff];
+    store_be32(out     , s0 ^ rk[0]);
+    store_be32(out +  4, s1 ^ rk[1]);
+    store_be32(out +  8, s2 ^ rk[2]);
+    store_be32(out + 12, s3 ^ rk[3]);
 }
 
 /* -------------------------------------------------------------------------
@@ -250,54 +237,66 @@ void aes_encrypt_ecb(Aes *ctx, const uint8_t in[16], uint8_t out[16]) {
  * the dedicated dec_keys schedule front to back.
  * ------------------------------------------------------------------------- */
 void aes_decrypt_ecb(Aes *ctx, const uint8_t in[16], uint8_t out[16]) {
-    State s;
-    bytes_to_state(in, s);
+    const uint32_t *rk = ctx->dec_keys;
+    uint32_t s0 = load_be32(in     ) ^ rk[0];
+    uint32_t s1 = load_be32(in +  4) ^ rk[1];
+    uint32_t s2 = load_be32(in +  8) ^ rk[2];
+    uint32_t s3 = load_be32(in + 12) ^ rk[3];
+    uint32_t t0, t1, t2, t3;
 
-    add_round_key(s, ctx->dec_keys);
-
-    for (int round = 1; round < ctx->nr; round++) {
-        inv_sub_bytes(s);
-        inv_shift_rows(s);
-        inv_mix_columns(s);
-        add_round_key(s, ctx->dec_keys + round * 4);
+    int r = ctx->nr - 1;
+    rk += 4;
+    for (;;) {
+        t0 = Td0[s0 >> 24] ^ Td1[(s3 >> 16) & 0xff] ^ Td2[(s2 >> 8) & 0xff] ^ Td3[s1 & 0xff] ^ rk[0];
+        t1 = Td0[s1 >> 24] ^ Td1[(s0 >> 16) & 0xff] ^ Td2[(s3 >> 8) & 0xff] ^ Td3[s2 & 0xff] ^ rk[1];
+        t2 = Td0[s2 >> 24] ^ Td1[(s1 >> 16) & 0xff] ^ Td2[(s0 >> 8) & 0xff] ^ Td3[s3 & 0xff] ^ rk[2];
+        t3 = Td0[s3 >> 24] ^ Td1[(s2 >> 16) & 0xff] ^ Td2[(s1 >> 8) & 0xff] ^ Td3[s0 & 0xff] ^ rk[3];
+        rk += 4;
+        if (--r == 0) break;
+        s0 = t0; s1 = t1; s2 = t2; s3 = t3;
     }
 
-    /* final round — no InvMixColumns */
-    inv_sub_bytes(s);
-    inv_shift_rows(s);
-    add_round_key(s, ctx->dec_keys + ctx->nr * 4);
-
-    state_to_bytes(s, out);
+    /* final round — InvSubBytes + InvShiftRows + AddRoundKey, no InvMixColumns */
+    s0 = ((uint32_t)inv_sbox[t0 >> 24] << 24) | ((uint32_t)inv_sbox[(t3 >> 16) & 0xff] << 16)
+       | ((uint32_t)inv_sbox[(t2 >> 8) & 0xff] << 8) | inv_sbox[t1 & 0xff];
+    s1 = ((uint32_t)inv_sbox[t1 >> 24] << 24) | ((uint32_t)inv_sbox[(t0 >> 16) & 0xff] << 16)
+       | ((uint32_t)inv_sbox[(t3 >> 8) & 0xff] << 8) | inv_sbox[t2 & 0xff];
+    s2 = ((uint32_t)inv_sbox[t2 >> 24] << 24) | ((uint32_t)inv_sbox[(t1 >> 16) & 0xff] << 16)
+       | ((uint32_t)inv_sbox[(t0 >> 8) & 0xff] << 8) | inv_sbox[t3 & 0xff];
+    s3 = ((uint32_t)inv_sbox[t3 >> 24] << 24) | ((uint32_t)inv_sbox[(t2 >> 16) & 0xff] << 16)
+       | ((uint32_t)inv_sbox[(t1 >> 8) & 0xff] << 8) | inv_sbox[t0 & 0xff];
+    store_be32(out     , s0 ^ rk[0]);
+    store_be32(out +  4, s1 ^ rk[1]);
+    store_be32(out +  8, s2 ^ rk[2]);
+    store_be32(out + 12, s3 ^ rk[3]);
 }
 
 /* -------------------------------------------------------------------------
- * aes_encrypt_cbc — len must be a multiple of 16
+ * aes_encrypt_cbc — len must be a multiple of 16; in and out must not alias
  * ------------------------------------------------------------------------- */
 void aes_encrypt_cbc(Aes *ctx, const uint8_t iv[16], const uint8_t *in, uint8_t *out, size_t len) {
-    uint8_t prev[16];
-    memcpy(prev, iv, 16);
+    const uint8_t *prev = iv;
 
     for (size_t i = 0; i < len; i += 16) {
         uint8_t block[16];
         for (int j = 0; j < 16; j++)
             block[j] = in[i + j] ^ prev[j];
         aes_encrypt_ecb(ctx, block, out + i);
-        memcpy(prev, out + i, 16);
+        prev = out + i;
     }
 }
 
 /* -------------------------------------------------------------------------
- * aes_decrypt_cbc — len must be a multiple of 16
+ * aes_decrypt_cbc — len must be a multiple of 16; in and out must not alias
  * ------------------------------------------------------------------------- */
 void aes_decrypt_cbc(Aes *ctx, const uint8_t iv[16], const uint8_t *in, uint8_t *out, size_t len) {
-    uint8_t prev[16];
-    memcpy(prev, iv, 16);
+    const uint8_t *prev = iv;
 
     for (size_t i = 0; i < len; i += 16) {
         uint8_t block[16];
         aes_decrypt_ecb(ctx, in + i, block);
         for (int j = 0; j < 16; j++)
             out[i + j] = block[j] ^ prev[j];
-        memcpy(prev, in + i, 16);
+        prev = in + i;
     }
 }
