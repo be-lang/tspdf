@@ -335,8 +335,9 @@ test-asan-reader-bin: $(BUILDDIR)/test_reader
 # `make fuzz` builds one binary per untrusted-input parser in $(FUZZ_BIN)/. Each
 # is a libFuzzer target (clang -fsanitize=fuzzer,address,undefined) over the
 # from-scratch parsers that consume attacker-controlled bytes: the PDF reader,
-# the DEFLATE/zlib inflater, the TrueType parser, and the PNG decoder. A seed
-# corpus is dropped alongside (see fuzz-corpus). Run e.g.:
+# the DEFLATE/zlib inflater, the TrueType parser, and the PNG decoder — plus a
+# compressor round-trip target (fuzz_deflate) that asserts compress→inflate is
+# byte-identical. A seed corpus is dropped alongside (see fuzz-corpus). Run e.g.:
 #
 #   make fuzz
 #   ./build/fuzz/fuzz_reader fuzz/corpus/reader
@@ -344,7 +345,7 @@ test-asan-reader-bin: $(BUILDDIR)/test_reader
 #
 # Compiler-only — the fuzzing runtime ships with clang, so zero vendored deps.
 FUZZ_TARGETS = $(FUZZ_BIN)/fuzz_reader $(FUZZ_BIN)/fuzz_inflate \
-               $(FUZZ_BIN)/fuzz_ttf $(FUZZ_BIN)/fuzz_png
+               $(FUZZ_BIN)/fuzz_deflate $(FUZZ_BIN)/fuzz_ttf $(FUZZ_BIN)/fuzz_png
 
 fuzz: $(FUZZ_TARGETS) fuzz-corpus
 
@@ -353,6 +354,10 @@ $(FUZZ_BIN)/fuzz_reader: fuzz/fuzz_reader.c $(ALL_SOURCES)
 	$(FUZZ_CC) $(CPPFLAGS) $(FUZZ_CFLAGS) $(LDFLAGS) -o $@ $< $(LIB_SOURCES) $(TSPR_SOURCES) $(CRYPTO_SOURCES) -lm
 
 $(FUZZ_BIN)/fuzz_inflate: fuzz/fuzz_inflate.c $(SRCDIR)/compress/deflate.c $(SRCDIR)/util/buffer.c
+	@mkdir -p $(FUZZ_BIN)
+	$(FUZZ_CC) $(CPPFLAGS) $(FUZZ_CFLAGS) $(LDFLAGS) -o $@ $^ -lm
+
+$(FUZZ_BIN)/fuzz_deflate: fuzz/fuzz_deflate.c $(SRCDIR)/compress/deflate.c $(SRCDIR)/util/buffer.c
 	@mkdir -p $(FUZZ_BIN)
 	$(FUZZ_CC) $(CPPFLAGS) $(FUZZ_CFLAGS) $(LDFLAGS) -o $@ $^ -lm
 

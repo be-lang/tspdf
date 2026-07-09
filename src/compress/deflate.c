@@ -13,8 +13,13 @@ static bool deflate_out_has_room(const TspdfBuffer *out, size_t extra) {
 }
 
 // ============================================================
-// Minimal deflate compressor with zlib wrapper
-// Uses fixed Huffman codes (block type 01) with LZ77 matching
+// Deflate compressor with zlib wrapper (RFC 1950/1951)
+//
+// LZ77 with hash chains and lazy matching (zlib deflate_slow shape: every
+// position is inserted into the chains, and emitting a match is deferred by
+// one byte when the next position holds a longer one). Symbols are buffered
+// per block; each block is emitted as whichever of stored (BTYPE=00), fixed
+// Huffman (01), or dynamic Huffman (10) costs the fewest bits.
 // ============================================================
 
 // --- Bit writer ---
@@ -83,66 +88,12 @@ static void bw_flush(BitWriter *bw) {
     }
 }
 
-// --- Fixed Huffman code tables (RFC 1951, section 3.2.6) ---
-//
-// Lit/Len 0-143:   8-bit codes  00110000 - 10111111  (0x30 - 0xBF reversed)
-// Lit/Len 144-255: 9-bit codes  110010000 - 111111111
-// Lit/Len 256-279: 7-bit codes  0000000 - 0010111
-// Lit/Len 280-287: 8-bit codes  11000000 - 11000111
-
-// Precomputed fixed Huffman codes (reversed for LSB-first emission)
-typedef struct { uint16_t code; uint8_t len; } HuffCode;
-
-// Note: these statics are initialized once on first call to deflate_compress.
-// WARNING: Not thread-safe — concurrent first calls can race. The library is
-// single-threaded by design. Call deflate_compress() once before spawning
-// threads if you need to use this from multiple threads.
-static HuffCode litlen_table[288];
-static HuffCode dist_table[30];
-static bool huffman_tables_ready = false;
-
-static uint32_t reverse_bits(uint32_t code, int len) {
-    uint32_t reversed = 0;
-    for (int i = 0; i < len; i++) {
-        reversed |= ((code >> i) & 1) << (len - 1 - i);
-    }
-    return reversed;
-}
-
-static void init_huffman_tables(void) {
-    if (huffman_tables_ready) return;
-
-    for (int sym = 0; sym < 288; sym++) {
-        uint32_t code;
-        int len;
-        if (sym <= 143) {
-            code = 0x30 + sym; len = 8;
-        } else if (sym <= 255) {
-            code = 0x190 + (sym - 144); len = 9;
-        } else if (sym <= 279) {
-            code = 0x00 + (sym - 256); len = 7;
-        } else {
-            code = 0xC0 + (sym - 280); len = 8;
-        }
-        litlen_table[sym].code = (uint16_t)reverse_bits(code, len);
-        litlen_table[sym].len = (uint8_t)len;
-    }
-
-    for (int sym = 0; sym < 30; sym++) {
-        dist_table[sym].code = (uint16_t)reverse_bits(sym, 5);
-        dist_table[sym].len = 5;
-    }
-
-    huffman_tables_ready = true;
-}
-
-static void emit_fixed_litlen(BitWriter *bw, int sym) {
-    bw_bits(bw, litlen_table[sym].code, litlen_table[sym].len);
-}
-
-// Distance codes are 5 bits, fixed (0-29)
-static void emit_fixed_dist(BitWriter *bw, int sym) {
-    bw_bits(bw, dist_table[sym].code, dist_table[sym].len);
+// Append n raw bytes (used by stored blocks; caller must be byte-aligned).
+static void bw_write_bytes(BitWriter *bw, const uint8_t *p, size_t n) {
+    bw_ensure(bw, n);
+    if (bw->error) return;
+    memcpy(bw->buf + bw->len, p, n);
+    bw->len += n;
 }
 
 // --- Length encoding (RFC 1951, section 3.2.5) ---
@@ -168,95 +119,510 @@ static const int dist_extra[] = {
     7,7,8,8, 9,9,10,10, 11,11,12,12, 13,13
 };
 
-static int find_len_code(int length) {
-    for (int i = 28; i >= 0; i--) {
-        if (length >= len_base[i]) return i;
+// --- Encoder code tables ---
+//
+// Fixed Huffman codes (RFC 1951, section 3.2.6), precomputed bit-reversed for
+// LSB-first emission, plus O(1) length->code and distance->code lookups.
+//
+// Note: these statics are initialized once on first call to deflate_compress.
+// WARNING: Not thread-safe — concurrent first calls can race. The library is
+// single-threaded by design. Call deflate_compress() once before spawning
+// threads if you need to use this from multiple threads.
+
+typedef struct { uint16_t code; uint8_t len; } HuffCode;
+
+static HuffCode fixed_litlen[288];
+static HuffCode fixed_dist[30];
+static uint8_t length_code_tab[256];  // (match length - 3) -> len code 0..28
+static uint8_t dist_code_tab[512];    // two-part lookup, see dist_code()
+static bool enc_tables_ready = false;
+
+static uint32_t reverse_bits(uint32_t code, int len) {
+    uint32_t reversed = 0;
+    for (int i = 0; i < len; i++) {
+        reversed |= ((code >> i) & 1) << (len - 1 - i);
     }
-    return 0;
+    return reversed;
 }
 
-static int find_dist_code(int distance) {
-    for (int i = 29; i >= 0; i--) {
-        if (distance >= dist_base[i]) return i;
+static void init_enc_tables(void) {
+    if (enc_tables_ready) return;
+
+    // Fixed lit/len:  0-143: 8 bits from 0x30;  144-255: 9 bits from 0x190;
+    //                 256-279: 7 bits from 0;   280-287: 8 bits from 0xC0.
+    for (int sym = 0; sym < 288; sym++) {
+        uint32_t code;
+        int len;
+        if (sym <= 143) {
+            code = 0x30 + sym; len = 8;
+        } else if (sym <= 255) {
+            code = 0x190 + (sym - 144); len = 9;
+        } else if (sym <= 279) {
+            code = 0x00 + (sym - 256); len = 7;
+        } else {
+            code = 0xC0 + (sym - 280); len = 8;
+        }
+        fixed_litlen[sym].code = (uint16_t)reverse_bits(code, len);
+        fixed_litlen[sym].len = (uint8_t)len;
     }
-    return 0;
+    for (int sym = 0; sym < 30; sym++) {
+        fixed_dist[sym].code = (uint16_t)reverse_bits(sym, 5);
+        fixed_dist[sym].len = 5;
+    }
+
+    for (int c = 0; c < 28; c++) {
+        for (int l = len_base[c]; l < len_base[c + 1] && l <= 257; l++) {
+            length_code_tab[l - 3] = (uint8_t)c;
+        }
+    }
+    length_code_tab[258 - 3] = 28;  // length 258 is its own code (285)
+
+    // dist_code_tab: distances 1..256 index directly at (d-1); 257..32768 use
+    // 256 + ((d-1)>>7), which works because all base ranges >= 257 are aligned
+    // to 128-byte boundaries (same layout as zlib's _dist_code).
+    for (int c = 0; c < 30; c++) {
+        int hi = (c == 29) ? 32768 : dist_base[c + 1] - 1;
+        for (int d = dist_base[c]; d <= hi; d++) {
+            int idx = (d - 1) < 256 ? (d - 1) : 256 + ((d - 1) >> 7);
+            dist_code_tab[idx] = (uint8_t)c;
+        }
+    }
+
+    enc_tables_ready = true;
 }
 
-static void emit_match(BitWriter *bw, int length, int distance) {
-    // Emit length
-    int li = find_len_code(length);
-    emit_fixed_litlen(bw, 257 + li);
-    if (len_extra[li] > 0) {
-        bw_bits(bw, length - len_base[li], len_extra[li]);
+static int dist_code(int d) {
+    return (d - 1) < 256 ? dist_code_tab[d - 1] : dist_code_tab[256 + ((d - 1) >> 7)];
+}
+
+// --- Length-limited canonical Huffman construction ---
+
+#define MAX_HUFF_SYMS 286
+
+typedef struct { uint32_t freq; uint16_t sym; } HuffLeaf;
+
+static int huff_leaf_cmp(const void *pa, const void *pb) {
+    const HuffLeaf *a = (const HuffLeaf *)pa;
+    const HuffLeaf *b = (const HuffLeaf *)pb;
+    if (a->freq != b->freq) return a->freq < b->freq ? -1 : 1;
+    return a->sym < b->sym ? -1 : 1;  // deterministic tie-break
+}
+
+// Build code lengths (<= max_bits) for n symbols from their frequencies.
+// Produces a complete code (Kraft sum exactly 2^max_bits) with at least two
+// nonzero-length codes — mirroring zlib — so strict decoders that reject
+// incomplete or over-subscribed tables accept it. lens[i] = 0 for unused syms.
+static void huff_build_lengths(const uint32_t *freq, int n, int max_bits, uint8_t *lens) {
+    HuffLeaf leaves[MAX_HUFF_SYMS];
+    int m = 0;
+    memset(lens, 0, (size_t)n);
+    for (int i = 0; i < n; i++) {
+        if (freq[i] > 0) leaves[m++] = (HuffLeaf){ freq[i], (uint16_t)i };
+    }
+    // Force at least two codes so degenerate blocks still yield a complete code.
+    for (int i = 0; i < n && m < 2; i++) {
+        bool present = false;
+        for (int j = 0; j < m; j++) {
+            if (leaves[j].sym == i) { present = true; break; }
+        }
+        if (!present) leaves[m++] = (HuffLeaf){ 1, (uint16_t)i };
+    }
+    qsort(leaves, (size_t)m, sizeof leaves[0], huff_leaf_cmp);
+
+    // Standard Huffman over the sorted leaves via two-queue merge: internal
+    // nodes are created in nondecreasing weight order, so no heap is needed.
+    uint32_t w[2 * MAX_HUFF_SYMS];
+    int par[2 * MAX_HUFF_SYMS];
+    for (int i = 0; i < m; i++) w[i] = leaves[i].freq;
+    int li = 0, ni = m;
+    int total = 2 * m - 1;
+    for (int next = m; next < total; next++) {
+        int pick[2];
+        for (int k = 0; k < 2; k++) {
+            if (li < m && (ni >= next || w[li] <= w[ni])) pick[k] = li++;
+            else pick[k] = ni++;
+        }
+        w[next] = w[pick[0]] + w[pick[1]];
+        par[pick[0]] = next;
+        par[pick[1]] = next;
+    }
+    int root = total - 1;
+
+    // Leaf depths, clamped to max_bits; track the Kraft sum in units of
+    // 2^-max_bits so the repair loops below can restore exact completeness.
+    uint8_t depth[MAX_HUFF_SYMS];
+    uint64_t kraft = 0;
+    const uint64_t full = 1ull << max_bits;
+    for (int i = 0; i < m; i++) {
+        int d = 0;
+        for (int j = i; j != root; j = par[j]) d++;
+        if (d > max_bits) d = max_bits;
+        depth[i] = (uint8_t)d;
+        kraft += 1ull << (max_bits - d);
     }
 
-    // Emit distance
-    int di = find_dist_code(distance);
-    emit_fixed_dist(bw, di);
-    if (dist_extra[di] > 0) {
-        bw_bits(bw, distance - dist_base[di], dist_extra[di]);
+    // Over-subscribed after clamping: lengthen the least-frequent leaf that is
+    // deepest-but-still-below max_bits (smallest Kraft step, cheapest cost).
+    while (kraft > full) {
+        int pick = -1;
+        for (int i = 0; i < m; i++) {
+            if (depth[i] < max_bits && (pick < 0 || depth[i] > depth[pick])) pick = i;
+        }
+        kraft -= 1ull << (max_bits - depth[pick] - 1);
+        depth[pick]++;
     }
+    // Under-subscribed (the loop above can overshoot): shorten the most-
+    // frequent deepest leaf whose Kraft step fits the remaining gap. A fitting
+    // leaf always exists because both the gap and every step are multiples of
+    // the smallest step present.
+    while (kraft < full) {
+        uint64_t gap = full - kraft;
+        int pick = -1;
+        for (int i = m - 1; i >= 0; i--) {
+            if (depth[i] > 1 && (1ull << (max_bits - depth[i])) <= gap &&
+                (pick < 0 || depth[i] > depth[pick])) pick = i;
+        }
+        kraft += 1ull << (max_bits - depth[pick]);
+        depth[pick]--;
+    }
+
+    for (int i = 0; i < m; i++) lens[leaves[i].sym] = depth[i];
+}
+
+// Canonical code assignment (RFC 1951, section 3.2.2), bit-reversed for
+// LSB-first emission.
+static void lens_to_codes(const uint8_t *lens, int n, HuffCode *codes) {
+    uint16_t bl_count[16] = {0};
+    uint16_t next_code[16] = {0};
+    for (int i = 0; i < n; i++) bl_count[lens[i]]++;
+    bl_count[0] = 0;
+    uint32_t code = 0;
+    for (int bits = 1; bits <= 15; bits++) {
+        code = (code + bl_count[bits - 1]) << 1;
+        next_code[bits] = (uint16_t)code;
+    }
+    for (int i = 0; i < n; i++) {
+        codes[i].len = lens[i];
+        codes[i].code = lens[i] ? (uint16_t)reverse_bits(next_code[lens[i]]++, lens[i]) : 0;
+    }
+}
+
+// --- Block symbol buffer ---
+
+#define SYM_CAP (1u << 16)         // max symbols buffered per block
+#define MAX_BLOCK_SRC (1u << 18)   // max input bytes covered per block
+
+typedef struct { uint16_t len_or_lit; uint16_t dist; } LzSym;  // dist==0: literal
+
+typedef struct {
+    BitWriter *bw;
+    const uint8_t *data;
+    size_t len;
+    LzSym *syms;
+    uint32_t nsyms;
+    uint32_t freq_ll[286];
+    uint32_t freq_d[30];
+    uint64_t extra_bits;    // total len/dist extra bits tallied in this block
+    size_t block_start;     // input offset of the pending block's first byte
+    size_t block_end;       // one past the last tallied input byte
+} Enc;
+
+static void tally_lit(Enc *e, uint8_t lit) {
+    e->syms[e->nsyms].len_or_lit = lit;
+    e->syms[e->nsyms].dist = 0;
+    e->nsyms++;
+    e->freq_ll[lit]++;
+    e->block_end++;
+}
+
+static void tally_match(Enc *e, int length, int distance) {
+    e->syms[e->nsyms].len_or_lit = (uint16_t)length;
+    e->syms[e->nsyms].dist = (uint16_t)distance;
+    e->nsyms++;
+    int li = length_code_tab[length - 3];
+    int di = dist_code(distance);
+    e->freq_ll[257 + li]++;
+    e->freq_d[di]++;
+    e->extra_bits += (uint64_t)(len_extra[li] + dist_extra[di]);
+    e->block_end += (size_t)length;
+}
+
+static bool block_full(const Enc *e) {
+    return e->nsyms >= SYM_CAP || e->block_end - e->block_start >= MAX_BLOCK_SRC;
+}
+
+// --- Dynamic Huffman block header (RFC 1951, section 3.2.7) ---
+
+static const uint8_t cl_order[19] = {
+    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15
+};
+static const uint8_t cl_extra_bits[19] = {
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 3, 7
+};
+
+typedef struct {
+    uint8_t ll_lens[286];
+    uint8_t d_lens[30];
+    uint8_t cl_lens[19];
+    HuffCode ll[286];
+    HuffCode d[30];
+    HuffCode cl[19];
+    uint8_t item_sym[286 + 30];    // RLE'd code-length sequence
+    uint8_t item_extra[286 + 30];  // extra-bits value per item
+    int nitems;
+    int hlit, hdist, hclen;
+} DynPlan;
+
+// RLE-encode the combined lit/len + dist code length sequence with symbols
+// 0-15 (verbatim), 16 (repeat previous 3-6), 17 (3-10 zeros), 18 (11-138 zeros).
+static int rle_lengths(const uint8_t *lens, int total, uint8_t *item_sym, uint8_t *item_extra) {
+    int n = 0, i = 0;
+    while (i < total) {
+        uint8_t v = lens[i];
+        int run = 1;
+        while (i + run < total && lens[i + run] == v) run++;
+        int r = run;
+        if (v == 0) {
+            while (r >= 11) {
+                int t = r > 138 ? 138 : r;
+                item_sym[n] = 18; item_extra[n] = (uint8_t)(t - 11); n++;
+                r -= t;
+            }
+            if (r >= 3) {
+                item_sym[n] = 17; item_extra[n] = (uint8_t)(r - 3); n++;
+                r = 0;
+            }
+        } else {
+            item_sym[n] = v; item_extra[n] = 0; n++;
+            r--;
+            while (r >= 3) {
+                int t = r > 6 ? 6 : r;
+                item_sym[n] = 16; item_extra[n] = (uint8_t)(t - 3); n++;
+                r -= t;
+            }
+        }
+        while (r-- > 0) { item_sym[n] = v; item_extra[n] = 0; n++; }
+        i += run;
+    }
+    return n;
+}
+
+// Build the dynamic-Huffman plan for one block. Returns the bit cost of the
+// header plus the Huffman-coded payload, excluding the 3-bit block preamble
+// and the len/dist extra bits (both common to the fixed alternative).
+static uint64_t build_dyn_plan(DynPlan *p, const uint32_t *freq_ll, const uint32_t *freq_d) {
+    huff_build_lengths(freq_ll, 286, 15, p->ll_lens);
+    huff_build_lengths(freq_d, 30, 15, p->d_lens);
+    lens_to_codes(p->ll_lens, 286, p->ll);
+    lens_to_codes(p->d_lens, 30, p->d);
+
+    p->hlit = 257;
+    for (int i = 285; i >= 257; i--) {
+        if (p->ll_lens[i]) { p->hlit = i + 1; break; }
+    }
+    p->hdist = 1;
+    for (int i = 29; i >= 1; i--) {
+        if (p->d_lens[i]) { p->hdist = i + 1; break; }
+    }
+
+    uint8_t combined[286 + 30];
+    memcpy(combined, p->ll_lens, (size_t)p->hlit);
+    memcpy(combined + p->hlit, p->d_lens, (size_t)p->hdist);
+    p->nitems = rle_lengths(combined, p->hlit + p->hdist, p->item_sym, p->item_extra);
+
+    uint32_t cl_freq[19] = {0};
+    for (int i = 0; i < p->nitems; i++) cl_freq[p->item_sym[i]]++;
+    huff_build_lengths(cl_freq, 19, 7, p->cl_lens);
+    lens_to_codes(p->cl_lens, 19, p->cl);
+
+    p->hclen = 4;
+    for (int i = 18; i >= 4; i--) {
+        if (p->cl_lens[cl_order[i]]) { p->hclen = i + 1; break; }
+    }
+
+    uint64_t bits = 5 + 5 + 4 + (uint64_t)p->hclen * 3;
+    for (int i = 0; i < p->nitems; i++) {
+        bits += (uint64_t)p->cl_lens[p->item_sym[i]] + cl_extra_bits[p->item_sym[i]];
+    }
+    for (int s = 0; s < 286; s++) bits += (uint64_t)freq_ll[s] * p->ll_lens[s];
+    for (int s = 0; s < 30; s++) bits += (uint64_t)freq_d[s] * p->d_lens[s];
+    return bits;
+}
+
+// --- Block emission ---
+
+static void emit_syms(BitWriter *bw, const LzSym *syms, uint32_t n,
+                      const HuffCode *ll, const HuffCode *d) {
+    for (uint32_t i = 0; i < n; i++) {
+        if (syms[i].dist == 0) {
+            const HuffCode *c = &ll[syms[i].len_or_lit];
+            bw_bits(bw, c->code, c->len);
+        } else {
+            int length = syms[i].len_or_lit;
+            int li = length_code_tab[length - 3];
+            const HuffCode *c = &ll[257 + li];
+            bw_bits(bw, c->code, c->len);
+            if (len_extra[li]) bw_bits(bw, (uint32_t)(length - len_base[li]), len_extra[li]);
+            int distance = syms[i].dist;
+            int di = dist_code(distance);
+            c = &d[di];
+            bw_bits(bw, c->code, c->len);
+            if (dist_extra[di]) bw_bits(bw, (uint32_t)(distance - dist_base[di]), dist_extra[di]);
+        }
+    }
+    bw_bits(bw, ll[256].code, ll[256].len);  // end of block
+}
+
+// Emit the block's source bytes as stored (BTYPE=00) blocks, splitting at the
+// 65535-byte stored-block limit. span must be > 0.
+static void emit_stored(BitWriter *bw, const uint8_t *src, size_t span, bool final) {
+    size_t off = 0;
+    do {
+        size_t chunk = span - off;
+        if (chunk > 65535) chunk = 65535;
+        bool last = final && off + chunk == span;
+        bw_bits(bw, last ? 1u : 0u, 1);
+        bw_bits(bw, 0, 2);
+        bw_flush(bw);  // LEN/NLEN are byte-aligned
+        uint16_t l = (uint16_t)chunk;
+        bw_byte(bw, (uint8_t)(l & 0xFF));
+        bw_byte(bw, (uint8_t)(l >> 8));
+        bw_byte(bw, (uint8_t)(~l & 0xFF));
+        bw_byte(bw, (uint8_t)((~l >> 8) & 0xFF));
+        bw_write_bytes(bw, src + off, chunk);
+        off += chunk;
+    } while (off < span);
+}
+
+// Close the pending block: pick the cheapest of stored/fixed/dynamic, emit it,
+// and reset the block state.
+static void flush_block(Enc *e, bool final) {
+    e->freq_ll[256]++;  // end-of-block symbol
+
+    uint64_t fixed_bits = 3 + e->extra_bits;
+    for (int s = 0; s < 286; s++) fixed_bits += (uint64_t)e->freq_ll[s] * fixed_litlen[s].len;
+    for (int s = 0; s < 30; s++) fixed_bits += (uint64_t)e->freq_d[s] * 5;
+
+    DynPlan plan;
+    uint64_t dyn_bits = 3 + build_dyn_plan(&plan, e->freq_ll, e->freq_d) + e->extra_bits;
+
+    size_t span = e->block_end - e->block_start;
+    uint64_t stored_bits = UINT64_MAX;
+    if (span > 0) {
+        uint64_t nchunks = ((uint64_t)span + 65534) / 65535;
+        stored_bits = nchunks * 35 + (uint64_t)span * 8 + 7;  // +7: worst-case alignment
+    }
+
+    if (stored_bits <= fixed_bits && stored_bits <= dyn_bits) {
+        emit_stored(e->bw, e->data + e->block_start, span, final);
+    } else if (dyn_bits < fixed_bits) {
+        bw_bits(e->bw, final ? 1u : 0u, 1);
+        bw_bits(e->bw, 2, 2);
+        bw_bits(e->bw, (uint32_t)(plan.hlit - 257), 5);
+        bw_bits(e->bw, (uint32_t)(plan.hdist - 1), 5);
+        bw_bits(e->bw, (uint32_t)(plan.hclen - 4), 4);
+        for (int i = 0; i < plan.hclen; i++) {
+            bw_bits(e->bw, plan.cl_lens[cl_order[i]], 3);
+        }
+        for (int i = 0; i < plan.nitems; i++) {
+            int s = plan.item_sym[i];
+            bw_bits(e->bw, plan.cl[s].code, plan.cl[s].len);
+            if (cl_extra_bits[s]) bw_bits(e->bw, plan.item_extra[i], cl_extra_bits[s]);
+        }
+        emit_syms(e->bw, e->syms, e->nsyms, plan.ll, plan.d);
+    } else {
+        bw_bits(e->bw, final ? 1u : 0u, 1);
+        bw_bits(e->bw, 1, 2);
+        emit_syms(e->bw, e->syms, e->nsyms, fixed_litlen, fixed_dist);
+    }
+
+    e->nsyms = 0;
+    memset(e->freq_ll, 0, sizeof e->freq_ll);
+    memset(e->freq_d, 0, sizeof e->freq_d);
+    e->extra_bits = 0;
+    e->block_start = e->block_end;
 }
 
 // --- LZ77 hash chain matcher ---
 
 #define HASH_BITS 15
 #define HASH_SIZE (1 << HASH_BITS)
-#define HASH_MASK (HASH_SIZE - 1)
 #define WINDOW_SIZE 32768
 #define MAX_MATCH 258
 #define MIN_MATCH 3
-#define MAX_CHAIN 64   // limit search depth for speed
 
-static uint32_t hash3(const uint8_t *p) {
-    return ((uint32_t)p[0] * 31 * 31 + (uint32_t)p[1] * 31 + (uint32_t)p[2]) & HASH_MASK;
-}
+// Search tuning (roughly zlib level 6-7 territory; see benchmark notes in the
+// commit message). MAX_CHAIN bounds chain walks per position; GOOD_LEN quarters
+// it when the deferred match is already good; NICE_LEN stops a search early;
+// MAX_LAZY skips the deferred search entirely after a long match; TOO_FAR
+// drops 3-byte matches whose distance costs more than three literals.
+#define MAX_CHAIN 256
+#define GOOD_LEN 8
+#define NICE_LEN 128
+#define MAX_LAZY 64
+#define TOO_FAR 4096
 
 typedef struct {
-    int head[HASH_SIZE];   // hash -> most recent position
-    int prev[WINDOW_SIZE]; // chain: position -> previous position with same hash
+    int32_t head[HASH_SIZE];   // hash -> most recent position, -1 if none
+    int32_t prev[WINDOW_SIZE]; // ring: position -> previous position, same hash
 } HashChain;
 
-static int find_match(const uint8_t *data, size_t len, size_t pos,
-                      HashChain *hc, int *best_dist) {
-    if (pos + MIN_MATCH > len) return 0;
-
-    uint32_t h = hash3(data + pos);
-    int best_len = MIN_MATCH - 1;
-    *best_dist = 0;
-
-    int chain_len = MAX_CHAIN;
-    int p = hc->head[h];
-
-    while (p >= 0 && chain_len-- > 0) {
-        int dist = (int)pos - p;
-        if (dist > WINDOW_SIZE || dist <= 0) break;
-
-        // Check match length
-        const uint8_t *a = data + pos;
-        const uint8_t *b = data + p;
-        int max_len = (int)(len - pos);
-        if (max_len > MAX_MATCH) max_len = MAX_MATCH;
-
-        int ml = 0;
-        while (ml < max_len && a[ml] == b[ml]) ml++;
-
-        if (ml > best_len) {
-            best_len = ml;
-            *best_dist = dist;
-            if (ml == MAX_MATCH) break;
-        }
-
-        p = hc->prev[p & (WINDOW_SIZE - 1)];
-    }
-
-    return best_len >= MIN_MATCH ? best_len : 0;
+static uint32_t hash3(const uint8_t *p) {
+    uint32_t v = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
+    return (v * 0x9E3779B1u) >> (32 - HASH_BITS);
 }
 
-static void insert_hash(HashChain *hc, const uint8_t *data, size_t pos) {
+static void hc_insert(HashChain *hc, const uint8_t *data, size_t pos) {
     uint32_t h = hash3(data + pos);
     hc->prev[pos & (WINDOW_SIZE - 1)] = hc->head[h];
-    hc->head[h] = (int)pos;
+    hc->head[h] = (int32_t)pos;
+}
+
+// Walk the hash chain from cand looking for a match at pos longer than
+// floor_len. Returns the best length found (0 if none beat the floor) and
+// sets *out_dist. Distances are capped at WINDOW_SIZE-1 so a prev[] ring slot
+// can never be read after being overwritten by an aliasing newer position.
+static int longest_match(const uint8_t *data, size_t len, size_t pos,
+                         const int32_t *prev, int32_t cand, int floor_len,
+                         int max_chain, int *out_dist) {
+    const uint8_t *scan = data + pos;
+    size_t avail = len - pos;
+    int max_len = avail < MAX_MATCH ? (int)avail : MAX_MATCH;
+    if (floor_len >= max_len) return 0;
+
+    int best_len = floor_len;
+    int best_dist = 0;
+    int nice = NICE_LEN < max_len ? NICE_LEN : max_len;
+    int chain = max_chain;
+
+    while (cand >= 0 && chain-- > 0) {
+        size_t dist = pos - (size_t)cand;
+        if (dist >= WINDOW_SIZE) break;
+        const uint8_t *m = data + cand;
+        // Cheap rejects: last byte a longer match must extend, then first byte.
+        if (m[best_len] == scan[best_len] && m[0] == scan[0]) {
+            int l = 1;
+            while (l + 8 <= max_len) {
+                uint64_t x, y;
+                memcpy(&x, scan + l, 8);
+                memcpy(&y, m + l, 8);
+                if (x != y) break;
+                l += 8;
+            }
+            while (l < max_len && m[l] == scan[l]) l++;
+            if (l > best_len) {
+                best_len = l;
+                best_dist = (int)dist;
+                if (l >= nice) break;
+                if (l >= max_len) break;
+            }
+        }
+        cand = prev[cand & (WINDOW_SIZE - 1)];
+    }
+
+    if (best_dist == 0) return 0;
+    *out_dist = best_dist;
+    return best_len;
 }
 
 // --- Adler-32 checksum (RFC 1950) ---
@@ -285,68 +651,94 @@ static uint32_t adler32(const uint8_t *data, size_t len) {
 // --- Main compress function ---
 
 uint8_t *deflate_compress(const uint8_t *data, size_t len, size_t *out_len) {
-    BitWriter bw;
-    bw_init(&bw, len + 256);  // start with generous allocation
-    init_huffman_tables();
+    // Chain positions are int32; refuse absurd inputs rather than overflow.
+    // Callers treat NULL as "store uncompressed", so this fails safe.
+    if (len > (size_t)INT32_MAX - WINDOW_SIZE) return NULL;
 
-    // Zlib header (RFC 1950)
-    // CMF: CM=8 (deflate), CINFO=7 (32K window)
+    init_enc_tables();
+
+    BitWriter bw;
+    bw_init(&bw, len / 2 + 512);
+
+    // Zlib header (RFC 1950): CMF = 0x78 (CM=8 deflate, CINFO=7 32K window),
+    // FLG = FLEVEL=0 | FDICT=0 | FCHECK such that (CMF*256+FLG) % 31 == 0.
     bw_byte(&bw, 0x78);
-    // FLG: FCHECK so that (CMF*256 + FLG) % 31 == 0, FLEVEL=2 (default)
-    // 0x78 * 256 = 30720; 30720 + FLG must be divisible by 31
-    // 30720 / 31 = 990.967...; 31 * 991 = 30721; FLG = 1
-    // But with FLEVEL=2: FLG = 0b_10_0_00001 = 0x01... wait let me just compute
-    // FLEVEL=1 (fast), FDICT=0, FCHECK=?
-    // 0x78 << 8 = 0x7800; need (0x7800 | FLG) % 31 == 0
-    // 0x7800 % 31 = 30720 % 31 = 30720 - 990*31 = 30720 - 30690 = 30; FCHECK = 31-30=1
-    // FLG = FLEVEL(bits7-6) | FDICT(bit5) | FCHECK(bits4-0)
-    // FLEVEL=01 (fast) = 0x40; FLG = 0x40 | 1 = 0x41? check: (0x7841) % 31
-    // 0x7841 = 30785; 30785/31 = 992.74... nope
-    // Just use FLEVEL=0 (fastest): FLG = 0x00 | FCHECK
-    // (0x7800 + FLG) % 31 == 0 → FLG & 0x1F = 1 → FLG = 0x01
     bw_byte(&bw, 0x01);
 
-    // Emit single fixed Huffman block
-    // BFINAL=1 (last block), BTYPE=01 (fixed Huffman)
-    bw_bits(&bw, 1, 1);  // BFINAL
-    bw_bits(&bw, 1, 2);  // BTYPE = 01
+    Enc e = {0};
+    e.bw = &bw;
+    e.data = data;
+    e.len = len;
+    e.syms = (LzSym *)malloc(SYM_CAP * sizeof(LzSym));
+    HashChain *hc = (HashChain *)malloc(sizeof(HashChain));
+    if (!e.syms || !hc) {
+        free(e.syms);
+        free(hc);
+        free(bw.buf);
+        return NULL;
+    }
+    memset(hc->head, -1, sizeof(hc->head));
+    // hc->prev needs no init: a slot is only ever read via a chain link that
+    // was written when that position was inserted, and the distance cap in
+    // longest_match rejects any link old enough for its slot to have aliased.
 
-    if (len == 0) {
-        // Just emit end-of-block
-        emit_fixed_litlen(&bw, 256);
-    } else {
-        // Initialize hash chains
-        HashChain *hc = (HashChain *)calloc(1, sizeof(HashChain));
-        if (!hc) { free(bw.buf); return NULL; }
-        memset(hc->head, -1, sizeof(hc->head));
+    // Lazy matching (zlib deflate_slow): a match found at pos-1 is held for
+    // one byte; if pos yields a longer match, pos-1 is emitted as a literal.
+    size_t pos = 0;
+    int prev_len = 0, prev_dist = 0;
+    bool match_avail = false;  // true when the byte at pos-1 is still pending
 
-        size_t pos = 0;
-        while (pos < len) {
-            int dist = 0;
-            int match_len = 0;
-
-            if (pos + MIN_MATCH <= len) {
-                match_len = find_match(data, len, pos, hc, &dist);
-            }
-
-            if (match_len >= MIN_MATCH) {
-                emit_match(&bw, match_len, dist);
-                // Lazy insertion: only insert first position, skip the rest
-                insert_hash(hc, data, pos);
-                pos += match_len;
-            } else {
-                emit_fixed_litlen(&bw, data[pos]);
-                if (pos + MIN_MATCH <= len) {
-                    insert_hash(hc, data, pos);
-                }
-                pos++;
-            }
+    while (pos < len) {
+        int32_t cand = -1;
+        if (pos + MIN_MATCH <= len) {
+            uint32_t h = hash3(data + pos);
+            cand = hc->head[h];
+            hc->prev[pos & (WINDOW_SIZE - 1)] = cand;
+            hc->head[h] = (int32_t)pos;
         }
 
-        // End of block
-        emit_fixed_litlen(&bw, 256);
-        free(hc);
+        int cur_len = 0, cur_dist = 0;
+        if (cand >= 0 && prev_len < MAX_LAZY) {
+            int chain = MAX_CHAIN;
+            if (prev_len >= GOOD_LEN) chain >>= 2;
+            int floor_len = prev_len >= MIN_MATCH ? prev_len : MIN_MATCH - 1;
+            cur_len = longest_match(data, len, pos, hc->prev, cand,
+                                    floor_len, chain, &cur_dist);
+            if (cur_len == MIN_MATCH && cur_dist > TOO_FAR) cur_len = 0;
+        }
+
+        if (prev_len >= MIN_MATCH && cur_len <= prev_len) {
+            // The deferred match starting at pos-1 wins.
+            tally_match(&e, prev_len, prev_dist);
+            // Insert the remaining positions covered by the match (pos is
+            // already in; the loop top inserts the byte after the match).
+            size_t match_end = pos - 1 + (size_t)prev_len;
+            for (size_t k = pos + 1; k < match_end && k + MIN_MATCH <= len; k++) {
+                hc_insert(hc, data, k);
+            }
+            pos = match_end;
+            match_avail = false;
+            prev_len = 0;
+            prev_dist = 0;
+            if (block_full(&e)) flush_block(&e, false);
+        } else if (match_avail) {
+            tally_lit(&e, data[pos - 1]);
+            prev_len = cur_len;
+            prev_dist = cur_dist;
+            pos++;
+            if (block_full(&e)) flush_block(&e, false);
+        } else {
+            match_avail = true;
+            prev_len = cur_len;
+            prev_dist = cur_dist;
+            pos++;
+        }
     }
+    if (match_avail) tally_lit(&e, data[len - 1]);
+
+    flush_block(&e, true);
+    free(hc);
+    free(e.syms);
 
     bw_flush(&bw);
 
