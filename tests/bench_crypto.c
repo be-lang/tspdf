@@ -39,7 +39,13 @@ int main(void) {
     for (int i = 0; i < 16; i++) iv[i] = (uint8_t)(200 - i);
 
     double mb = (double)LEN / (1024.0 * 1024.0);
-    printf("AES-CBC throughput, %.0f MB buffer, best of %d runs\n\n", mb, REPS);
+    {
+        Aes probe;
+        aes_init(&probe, key, 128);
+        printf("AES-CBC throughput, %.0f MB buffer, best of %d runs\n", mb, REPS);
+        printf("path: %s (set TSPDF_NO_AESHW=1 to force the portable path)\n\n",
+               probe.use_hw ? "hardware (AES-NI)" : "portable C");
+    }
     printf("%-8s %-4s %10s %12s\n", "cipher", "op", "best s", "MB/s");
 
     for (int bits = 128; bits <= 256; bits += 128) {

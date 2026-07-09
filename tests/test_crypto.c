@@ -1,3 +1,7 @@
+/* For setenv/unsetenv under -std=c11: the AES hw/soft identity tests flip
+ * the TSPDF_NO_AESHW override between aes_init calls. */
+#define _POSIX_C_SOURCE 200112L
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -319,49 +323,53 @@ static const uint8_t sp800_pt[64] = {
     0xf6,0x9f,0x24,0x45,0xdf,0x4f,0x9b,0x17,0xad,0x2b,0x41,0x7b,0xe6,0x6c,0x37,0x10
 };
 
+static const uint8_t sp800_key128[16] = {
+    0x2b,0x7e,0x15,0x16,0x28,0xae,0xd2,0xa6,
+    0xab,0xf7,0x15,0x88,0x09,0xcf,0x4f,0x3c
+};
+
+static const uint8_t sp800_ct128[64] = {
+    0x76,0x49,0xab,0xac,0x81,0x19,0xb2,0x46,0xce,0xe9,0x8e,0x9b,0x12,0xe9,0x19,0x7d,
+    0x50,0x86,0xcb,0x9b,0x50,0x72,0x19,0xee,0x95,0xdb,0x11,0x3a,0x91,0x76,0x78,0xb2,
+    0x73,0xbe,0xd6,0xb8,0xe3,0xc1,0x74,0x3b,0x71,0x16,0xe6,0x9e,0x22,0x22,0x95,0x16,
+    0x3f,0xf1,0xca,0xa1,0x68,0x1f,0xac,0x09,0x12,0x0e,0xca,0x30,0x75,0x86,0xe1,0xa7
+};
+
+static const uint8_t sp800_key256[32] = {
+    0x60,0x3d,0xeb,0x10,0x15,0xca,0x71,0xbe,
+    0x2b,0x73,0xae,0xf0,0x85,0x7d,0x77,0x81,
+    0x1f,0x35,0x2c,0x07,0x3b,0x61,0x08,0xd7,
+    0x2d,0x98,0x10,0xa3,0x09,0x14,0xdf,0xf4
+};
+
+static const uint8_t sp800_ct256[64] = {
+    0xf5,0x8c,0x4c,0x04,0xd6,0xe5,0xf1,0xba,0x77,0x9e,0xab,0xfb,0x5f,0x7b,0xfb,0xd6,
+    0x9c,0xfc,0x4e,0x96,0x7e,0xdb,0x80,0x8d,0x67,0x9f,0x77,0x7b,0xc6,0x70,0x2c,0x7d,
+    0x39,0xf2,0x33,0x69,0xa9,0xd9,0xba,0xcf,0xa5,0x30,0xe2,0x63,0x04,0x23,0x14,0x61,
+    0xb2,0xeb,0x05,0xe2,0xc3,0x9b,0xe9,0xfc,0xda,0x6c,0x19,0x07,0x8c,0x6a,0x9d,0x1b
+};
+
 TEST(test_aes128_cbc_kat) {
-    const uint8_t key[16] = {
-        0x2b,0x7e,0x15,0x16,0x28,0xae,0xd2,0xa6,
-        0xab,0xf7,0x15,0x88,0x09,0xcf,0x4f,0x3c
-    };
-    const uint8_t expected_ct[64] = {
-        0x76,0x49,0xab,0xac,0x81,0x19,0xb2,0x46,0xce,0xe9,0x8e,0x9b,0x12,0xe9,0x19,0x7d,
-        0x50,0x86,0xcb,0x9b,0x50,0x72,0x19,0xee,0x95,0xdb,0x11,0x3a,0x91,0x76,0x78,0xb2,
-        0x73,0xbe,0xd6,0xb8,0xe3,0xc1,0x74,0x3b,0x71,0x16,0xe6,0x9e,0x22,0x22,0x95,0x16,
-        0x3f,0xf1,0xca,0xa1,0x68,0x1f,0xac,0x09,0x12,0x0e,0xca,0x30,0x75,0x86,0xe1,0xa7
-    };
     uint8_t ct[64], pt[64];
     Aes enc;
-    aes_init(&enc, key, 128);
+    aes_init(&enc, sp800_key128, 128);
     aes_encrypt_cbc(&enc, sp800_iv, sp800_pt, ct, 64);
-    ASSERT(memcmp(ct, expected_ct, 64) == 0);
+    ASSERT(memcmp(ct, sp800_ct128, 64) == 0);
     Aes dec;
-    aes_init(&dec, key, 128);
-    aes_decrypt_cbc(&dec, sp800_iv, expected_ct, pt, 64);
+    aes_init(&dec, sp800_key128, 128);
+    aes_decrypt_cbc(&dec, sp800_iv, sp800_ct128, pt, 64);
     ASSERT(memcmp(pt, sp800_pt, 64) == 0);
 }
 
 TEST(test_aes256_cbc_kat) {
-    const uint8_t key[32] = {
-        0x60,0x3d,0xeb,0x10,0x15,0xca,0x71,0xbe,
-        0x2b,0x73,0xae,0xf0,0x85,0x7d,0x77,0x81,
-        0x1f,0x35,0x2c,0x07,0x3b,0x61,0x08,0xd7,
-        0x2d,0x98,0x10,0xa3,0x09,0x14,0xdf,0xf4
-    };
-    const uint8_t expected_ct[64] = {
-        0xf5,0x8c,0x4c,0x04,0xd6,0xe5,0xf1,0xba,0x77,0x9e,0xab,0xfb,0x5f,0x7b,0xfb,0xd6,
-        0x9c,0xfc,0x4e,0x96,0x7e,0xdb,0x80,0x8d,0x67,0x9f,0x77,0x7b,0xc6,0x70,0x2c,0x7d,
-        0x39,0xf2,0x33,0x69,0xa9,0xd9,0xba,0xcf,0xa5,0x30,0xe2,0x63,0x04,0x23,0x14,0x61,
-        0xb2,0xeb,0x05,0xe2,0xc3,0x9b,0xe9,0xfc,0xda,0x6c,0x19,0x07,0x8c,0x6a,0x9d,0x1b
-    };
     uint8_t ct[64], pt[64];
     Aes enc;
-    aes_init(&enc, key, 256);
+    aes_init(&enc, sp800_key256, 256);
     aes_encrypt_cbc(&enc, sp800_iv, sp800_pt, ct, 64);
-    ASSERT(memcmp(ct, expected_ct, 64) == 0);
+    ASSERT(memcmp(ct, sp800_ct256, 64) == 0);
     Aes dec;
-    aes_init(&dec, key, 256);
-    aes_decrypt_cbc(&dec, sp800_iv, expected_ct, pt, 64);
+    aes_init(&dec, sp800_key256, 256);
+    aes_decrypt_cbc(&dec, sp800_iv, sp800_ct256, pt, 64);
     ASSERT(memcmp(pt, sp800_pt, 64) == 0);
 }
 
@@ -441,6 +449,84 @@ TEST(test_aes256_cbc_roundtrip) {
     ASSERT(memcmp(decrypted, plaintext, 32) == 0);
 }
 
+/* aes_init with the TSPDF_NO_AESHW override in force, restoring the caller's
+ * environment afterwards, so one process can build both dispatch targets. */
+static void aes_init_forced_soft(Aes *ctx, const uint8_t *key, int bits) {
+    char saved[32];
+    const char *old = getenv("TSPDF_NO_AESHW");
+    int had = old != NULL;
+    if (had) snprintf(saved, sizeof(saved), "%s", old);
+    setenv("TSPDF_NO_AESHW", "1", 1);
+    aes_init(ctx, key, bits);
+    if (had) setenv("TSPDF_NO_AESHW", saved, 1);
+    else unsetenv("TSPDF_NO_AESHW");
+}
+
+/* TSPDF_NO_AESHW must force the portable path on every build, including ones
+ * where the hardware path is not compiled at all (use_hw is then always 0). */
+TEST(test_aes_hw_env_override) {
+    Aes ctx;
+    aes_init_forced_soft(&ctx, sp800_key128, 128);
+    ASSERT(ctx.use_hw == 0);
+}
+
+/* When the hardware path is live, it must be byte-identical to the soft path:
+ * both must reproduce the SP 800-38A CBC vectors, and both must agree on a
+ * multi-KB pseudo-random buffer sized to hit the 4-block ILP body plus a
+ * non-multiple-of-64 tail. Skips where there is no hardware path to compare
+ * (non-x86 build, CPU without AES-NI, or TSPDF_NO_AESHW set). */
+TEST(test_aes_hw_soft_identity) {
+    Aes probe;
+    aes_init(&probe, sp800_key128, 128);
+    if (!probe.use_hw)
+        SKIP("AES hardware path not active");
+
+    /* pinned vectors through both paths, both key sizes */
+    for (int bits = 128; bits <= 256; bits += 128) {
+        const uint8_t *key = bits == 128 ? sp800_key128 : sp800_key256;
+        const uint8_t *expected_ct = bits == 128 ? sp800_ct128 : sp800_ct256;
+        Aes hw, soft;
+        aes_init(&hw, key, bits);
+        aes_init_forced_soft(&soft, key, bits);
+        ASSERT(hw.use_hw == 1);
+        ASSERT(soft.use_hw == 0);
+
+        uint8_t ct[64], pt[64];
+        aes_encrypt_cbc(&hw, sp800_iv, sp800_pt, ct, 64);
+        ASSERT(memcmp(ct, expected_ct, 64) == 0);
+        aes_encrypt_cbc(&soft, sp800_iv, sp800_pt, ct, 64);
+        ASSERT(memcmp(ct, expected_ct, 64) == 0);
+        aes_decrypt_cbc(&hw, sp800_iv, expected_ct, pt, 64);
+        ASSERT(memcmp(pt, sp800_pt, 64) == 0);
+        aes_decrypt_cbc(&soft, sp800_iv, expected_ct, pt, 64);
+        ASSERT(memcmp(pt, sp800_pt, 64) == 0);
+    }
+
+    /* multi-KB identity: 4096 + 48 bytes = 64 four-block groups + 3 tail
+     * blocks in the hardware decryptor */
+    enum { LEN = 4096 + 48 };
+    static uint8_t pt[LEN], ct_hw[LEN], ct_soft[LEN], out_hw[LEN], out_soft[LEN];
+    uint8_t key[32], iv[16];
+    fill_pseudo_random(pt, LEN, 0xAE5CBCu);
+    fill_pseudo_random(key, 32, 0x8BADF00Du);
+    fill_pseudo_random(iv, 16, 0x1CEB00DAu);
+
+    for (int bits = 128; bits <= 256; bits += 128) {
+        Aes hw, soft;
+        aes_init(&hw, key, bits);
+        aes_init_forced_soft(&soft, key, bits);
+
+        aes_encrypt_cbc(&hw, iv, pt, ct_hw, LEN);
+        aes_encrypt_cbc(&soft, iv, pt, ct_soft, LEN);
+        ASSERT(memcmp(ct_hw, ct_soft, LEN) == 0);
+
+        aes_decrypt_cbc(&hw, iv, ct_hw, out_hw, LEN);
+        aes_decrypt_cbc(&soft, iv, ct_hw, out_soft, LEN);
+        ASSERT(memcmp(out_hw, out_soft, LEN) == 0);
+        ASSERT(memcmp(out_hw, pt, LEN) == 0);
+    }
+}
+
 int main(void) {
     printf("Crypto tests:\n");
     printf("\n  MD5:\n");
@@ -481,6 +567,8 @@ int main(void) {
     RUN(test_aes_cbc_long_roundtrip);
     RUN(test_aes128_cbc_roundtrip);
     RUN(test_aes256_cbc_roundtrip);
+    RUN(test_aes_hw_env_override);
+    RUN(test_aes_hw_soft_identity);
 
     printf("\n%d tests, %d passed, %d failed, %d skipped\n",
            tests_run, tests_passed, tests_failed, tests_skipped);
