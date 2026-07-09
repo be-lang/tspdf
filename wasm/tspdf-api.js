@@ -61,9 +61,12 @@ export function makeTspdf(Module) {
 
     // bytes: Uint8Array; password: string or null. Returns a handle.
     open(bytes, password = null) {
-      const dataPtr = allocBytes(bytes); // ownership transfers to the handle
       const passPtr = allocCString(password);
       try {
+        // The file buffer is allocated last so nothing can throw between its
+        // allocation and the open call, which takes ownership of it (and
+        // frees it on failure).
+        const dataPtr = allocBytes(bytes);
         const h = Module._tspdf_wasm_open(dataPtr, bytes.length, passPtr);
         if (!h) fail();
         return h;

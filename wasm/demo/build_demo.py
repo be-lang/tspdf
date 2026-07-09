@@ -58,9 +58,25 @@ def rewrite_urls(html: str, prefix: str) -> str:
     return html
 
 
+def replace_must(html: str, old: str, new: str, what: str) -> str:
+    """str.replace that fails the build if the target text has drifted away."""
+    out = html.replace(old, new, 1)
+    if out == html:
+        sys.exit(f"build_demo: template drift — {what} not found")
+    return out
+
+
+def sub_must(pattern: str, repl: str, html: str, what: str) -> str:
+    """re.sub that fails the build if the pattern no longer matches."""
+    out, n = re.subn(pattern, repl, html)
+    if n == 0:
+        sys.exit(f"build_demo: template drift — {what} not found")
+    return out
+
+
 def inject_backend(html: str, prefix: str) -> str:
     tag = f'<script type="module" src="{prefix}wasm-backend.js"></script>\n</body>'
-    return html.replace("</body>", tag, 1)
+    return replace_must(html, "</body>", tag, "</body> (backend injection point)")
 
 
 def build():
@@ -77,13 +93,15 @@ def build():
     for tool in UNSUPPORTED_TOOLS:
         index = re.sub(
             r'\s*<a href="/tool/' + re.escape(tool) + r'".*?</a>', "", index, flags=re.S)
-    index = re.sub(r'\s*<button class="filter-tab" data-filter="create">Create</button>',
-                   "", index)
+    index = sub_must(r'\s*<button class="filter-tab" data-filter="create">Create</button>',
+                     "", index, "Create filter tab")
     html = inject_backend(rewrite_urls(render(index), ""), "")
-    html = html.replace(
+    html = replace_must(
+        html,
         "Ready. Files never leave this device.",
         "Ready. Runs fully in your browser via WebAssembly — "
-        "files never leave this device.")
+        "files never leave this device.",
+        "status-line text")
     (DIST / "index.html").write_text(html)
 
     # Tool pages.

@@ -6770,7 +6770,7 @@ TEST(test_reader_save_to_memory_matches_file) {
     // The serializer stamps ModDate with second resolution, so a save pair
     // straddling a second boundary can legitimately differ; retry a few times
     // so the comparison cannot flake on that boundary.
-    const char *tmp_path = "tests/data/wasm_byte_identity.pdf";
+    const char *tmp_path = "/tmp/tspdf_test_wasm_byte_identity.pdf";
     TspdfError err;
     TspdfReader *doc = tspdf_reader_open_file("tests/data/three_pages.pdf", &err);
     ASSERT(doc != NULL);
@@ -6801,7 +6801,7 @@ TEST(test_reader_save_to_memory_matches_file) {
 TEST(test_reader_save_to_memory_with_options_matches_file) {
     // strip_metadata removes the timestamped Info dict, so this pair is fully
     // deterministic and must compare equal on the first try.
-    const char *tmp_path = "tests/data/wasm_byte_identity_opts.pdf";
+    const char *tmp_path = "/tmp/tspdf_test_wasm_byte_identity_opts.pdf";
     TspdfError err;
     TspdfReader *doc = tspdf_reader_open_file("tests/data/three_pages.pdf", &err);
     ASSERT(doc != NULL);

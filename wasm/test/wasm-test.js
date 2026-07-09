@@ -104,8 +104,10 @@ const encrypted = t.encrypt(hm, 'wasmpw', 'wasmpw', 128);
 assertPdf(encrypted, 'encrypt');
 await writeOut('out_encrypted.pdf', encrypted);
 
-assert.throws(() => t.open(encrypted, 'not-the-password'), 'wrong password must fail');
-assert.throws(() => t.open(encrypted), 'missing password must fail');
+assert.throws(() => t.open(encrypted, 'not-the-password'), /wrong password/,
+  'wrong password must fail');
+assert.throws(() => t.open(encrypted), /password required/,
+  'missing password must fail');
 
 const hdec = t.open(encrypted, 'wasmpw');
 assert.equal(t.pageCount(hdec), pagesA + pagesB, 'decrypted page count');
