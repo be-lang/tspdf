@@ -8294,6 +8294,95 @@ TEST(test_extract_breaks_cyclic_outline_siblings) {
     free(pdf);
 }
 
+// ============================================================
+// Save-to-memory byte identity (wasm track)
+// ============================================================
+
+// The wasm build has no filesystem, so the save-to-memory path is the primary
+// API there. These tests pin the invariant that it produces exactly the bytes
+// the file-save path writes.
+
+static uint8_t *wasm_read_whole_file(const char *path, size_t *out_len) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (size < 0) { fclose(f); return NULL; }
+    uint8_t *buf = malloc((size_t)size);
+    if (!buf) { fclose(f); return NULL; }
+    size_t nread = fread(buf, 1, (size_t)size, f);
+    fclose(f);
+    if (nread != (size_t)size) { free(buf); return NULL; }
+    *out_len = nread;
+    return buf;
+}
+
+TEST(test_reader_save_to_memory_matches_file) {
+    // The serializer stamps ModDate with second resolution, so a save pair
+    // straddling a second boundary can legitimately differ; retry a few times
+    // so the comparison cannot flake on that boundary.
+    const char *tmp_path = "/tmp/tspdf_test_wasm_byte_identity.pdf";
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/three_pages.pdf", &err);
+    ASSERT(doc != NULL);
+
+    bool match = false;
+    for (int attempt = 0; attempt < 3 && !match; attempt++) {
+        err = tspdf_reader_save(doc, tmp_path);
+        ASSERT_EQ_INT(err, TSPDF_OK);
+
+        uint8_t *mem = NULL;
+        size_t mem_len = 0;
+        err = tspdf_reader_save_to_memory(doc, &mem, &mem_len);
+        ASSERT_EQ_INT(err, TSPDF_OK);
+
+        size_t file_len = 0;
+        uint8_t *file_buf = wasm_read_whole_file(tmp_path, &file_len);
+        ASSERT(file_buf != NULL);
+
+        match = (file_len == mem_len) && (memcmp(file_buf, mem, mem_len) == 0);
+        free(mem);
+        free(file_buf);
+    }
+    remove(tmp_path);
+    tspdf_reader_destroy(doc);
+    ASSERT(match);
+}
+
+TEST(test_reader_save_to_memory_with_options_matches_file) {
+    // strip_metadata removes the timestamped Info dict, so this pair is fully
+    // deterministic and must compare equal on the first try.
+    const char *tmp_path = "/tmp/tspdf_test_wasm_byte_identity_opts.pdf";
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/three_pages.pdf", &err);
+    ASSERT(doc != NULL);
+
+    TspdfSaveOptions opts = tspdf_save_options_default();
+    opts.strip_metadata = true;
+    opts.use_xref_stream = true;
+
+    err = tspdf_reader_save_with_options(doc, tmp_path, &opts);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *mem = NULL;
+    size_t mem_len = 0;
+    err = tspdf_reader_save_to_memory_with_options(doc, &mem, &mem_len, &opts);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    size_t file_len = 0;
+    uint8_t *file_buf = wasm_read_whole_file(tmp_path, &file_len);
+    ASSERT(file_buf != NULL);
+
+    ASSERT_EQ_SIZE(file_len, mem_len);
+    ASSERT(memcmp(file_buf, mem, mem_len) == 0);
+
+    free(mem);
+    free(file_buf);
+    remove(tmp_path);
+    tspdf_reader_destroy(doc);
+}
+
 int main(void) {
     printf("tspr reader tests:\n");
 
@@ -8549,6 +8638,10 @@ int main(void) {
     RUN(test_extract_and_merge_bounded_on_cyclic_nametree);
     RUN(test_extract_bounded_on_cyclic_field_kids);
     RUN(test_extract_breaks_cyclic_outline_siblings);
+    printf("\n  Save-to-memory byte identity (wasm):\n");
+    RUN(test_reader_save_to_memory_matches_file);
+    RUN(test_reader_save_to_memory_with_options_matches_file);
+
 
     printf("\n%d tests, %d passed, %d failed\n",
            tests_run, tests_passed, tests_failed);

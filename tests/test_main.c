@@ -1638,6 +1638,67 @@ TEST(test_png_palette_embeds_in_writer) {
 }
 
 // ============================================================
+// Save-to-memory byte identity (wasm track)
+// ============================================================
+
+// Build a small deterministic document. The writer stamps no timestamps
+// unless the caller sets them, so two identically-built docs must serialize
+// to identical bytes.
+static TspdfWriter *wasm_ident_make_doc(void) {
+    TspdfWriter *doc = tspdf_writer_create();
+    if (!doc) return NULL;
+    tspdf_writer_add_builtin_font(doc, "Helvetica");
+    TspdfStream *s = tspdf_writer_add_page(doc);
+    if (s) {
+        tspdf_stream_begin_text(s);
+        tspdf_stream_set_font(s, "F1", 12);
+        tspdf_stream_text_position(s, 72, 700);
+        tspdf_stream_show_text(s, "byte identity");
+        tspdf_stream_end_text(s);
+    }
+    return doc;
+}
+
+TEST(test_writer_save_to_memory_matches_file) {
+    // The wasm build has no filesystem, so save-to-memory is the primary API
+    // there; pin it to exactly the bytes the file-save path writes. Two docs
+    // are needed because the writer guards against double-save.
+    const char *tmp_path = "/tmp/tspdf_test_wasm_byte_identity.pdf";
+
+    TspdfWriter *doc_file = wasm_ident_make_doc();
+    ASSERT(doc_file != NULL);
+    TspdfError err = tspdf_writer_save(doc_file, tmp_path);
+    ASSERT(err == TSPDF_OK);
+    tspdf_writer_destroy(doc_file);
+
+    TspdfWriter *doc_mem = wasm_ident_make_doc();
+    ASSERT(doc_mem != NULL);
+    uint8_t *mem = NULL;
+    size_t mem_len = 0;
+    err = tspdf_writer_save_to_memory(doc_mem, &mem, &mem_len);
+    ASSERT(err == TSPDF_OK);
+    tspdf_writer_destroy(doc_mem);
+
+    FILE *f = fopen(tmp_path, "rb");
+    ASSERT(f != NULL);
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint8_t *file_buf = malloc((size_t)size);
+    ASSERT(file_buf != NULL);
+    size_t nread = fread(file_buf, 1, (size_t)size, f);
+    fclose(f);
+    remove(tmp_path);
+    ASSERT(nread == (size_t)size);
+
+    ASSERT(mem_len == (size_t)size);
+    ASSERT(memcmp(file_buf, mem, mem_len) == 0);
+
+    free(file_buf);
+    free(mem);
+}
+
+// ============================================================
 // Main
 // ============================================================
 
@@ -1762,6 +1823,9 @@ int main(void) {
     RUN(test_png_palette_missing_plte_rejected);
     RUN(test_png_interlaced_still_rejected);
     RUN(test_png_palette_embeds_in_writer);
+
+    printf("\n  Save-to-memory byte identity (wasm):\n");
+    RUN(test_writer_save_to_memory_matches_file);
 
     printf("\n%d tests run, %d passed, %d failed, %d skipped\n",
            tests_run, tests_passed, tests_failed, tests_skipped);

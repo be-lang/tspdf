@@ -20,6 +20,24 @@ function buildActionableError(errMessage, statusCode) {
   return msg ? `${msg} ${tip}` : tip;
 }
 
+// Backend seam. The served UI posts to the local tspdf server; the static
+// wasm build (see wasm/demo/) assigns window.TSPDF_BACKEND before any click
+// to run everything in-browser instead. Both paths return a fetch Response.
+async function backendRun(toolId, config, files) {
+  if (window.TSPDF_BACKEND) return window.TSPDF_BACKEND.run(toolId, config, files);
+  const formData = new FormData();
+  formData.append('config', JSON.stringify(config));
+  if (files) {
+    for (const [key, file] of Object.entries(files)) {
+      if (file) formData.append(key, file);
+    }
+  }
+  return fetch(`/api/${toolId}`, {
+    method: 'POST',
+    body: formData
+  });
+}
+
 // Generic PDF tool handler
 // toolId: string matching the API route
 // configFn: function that returns {config: {}, files: {}}
@@ -42,18 +60,7 @@ function setupTool(toolId, configFn) {
     setOperationStatus('Processing locally... Keep this tab open.');
 
     try {
-      const formData = new FormData();
-      formData.append('config', JSON.stringify(config));
-      if (files) {
-        for (const [key, file] of Object.entries(files)) {
-          if (file) formData.append(key, file);
-        }
-      }
-
-      const response = await fetch(`/api/${toolId}`, {
-        method: 'POST',
-        body: formData
-      });
+      const response = await backendRun(toolId, config, files);
 
       if (!response.ok) {
         const text = await response.text();

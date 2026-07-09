@@ -1,0 +1,66 @@
+name: Pages
+
+# Build the in-browser wasm demo (make wasm-demo) and deploy it to GitHub
+# Pages. The site is fully static: the tspdf library compiled to WebAssembly
+# plus the same HTML/CSS/JS the local server embeds — every operation runs
+# client-side, nothing is uploaded anywhere.
+#
+# emsdk is a build-time tool only (like the compiler); the shipped library and
+# CLI stay zero-dependency. The emsdk version is pinned to the locally-tested
+# release so demo builds are reproducible, and `make wasm-test` gates the
+# deploy: a shim/wrapper regression or a pin/toolchain mismatch fails CI
+# instead of shipping to Pages.
+#
+# Maintainer step (not automated here): enable Pages for the repository under
+# Settings -> Pages -> Source: "GitHub Actions", or the deploy job will fail.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One Pages deployment at a time; let an in-flight deploy finish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install emsdk (pinned)
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 5.0.7
+
+      - name: Install qpdf (wasm-test conformance gate)
+        run: sudo apt-get update && sudo apt-get install -y qpdf
+
+      - name: Test wasm module under node + qpdf
+        run: make wasm-test
+
+      - name: Build demo site
+        run: make wasm-demo
+
+      - name: Upload site artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: wasm/demo/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

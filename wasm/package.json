@@ -1,0 +1,6 @@
+{
+  "name": "tspdf-wasm",
+  "private": true,
+  "type": "module",
+  "description": "Marks wasm/ as ES modules so node can import the emcc EXPORT_ES6 output and the test harness without renaming files to .mjs."
+}

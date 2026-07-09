@@ -498,3 +498,41 @@ generate-test-pdfs: $(BUILDDIR)/generate_test_pdfs
 $(BUILDDIR)/generate_test_pdfs: tests/generate_test_pdfs.c $(LIB_SOURCES)
 	@mkdir -p $(BUILDDIR)
 	$(CC) $(CPPFLAGS) $(ALL_CFLAGS) $(LDFLAGS) -o $@ $< $(LIB_SOURCES) -lm
+
+# --- WebAssembly build (optional; requires emcc) ---
+#
+# `make wasm` compiles the whole library plus wasm/shim.c into an ES6 module
+# (wasm/dist/tspdf.js + tspdf.wasm) that runs the reader-side tools entirely
+# in the browser. `make wasm-test` drives merge/extract/rotate/encrypt/decrypt
+# and friends through the module under node and validates every output with
+# qpdf --check. `make wasm-demo` assembles the static in-browser demo site
+# into wasm/demo/dist/ (deployable to GitHub Pages).
+#
+# These targets are intentionally NOT part of `test-all` or `check`: emcc is
+# an optional build-time tool and its absence must not break the offline
+# compiler-and-make-only gate.
+EMCC ?= emcc
+WASM_DIST = wasm/dist
+# EXPORTED_FUNCTIONS only needs malloc/free: the shim's own entry points are
+# kept alive by EMSCRIPTEN_KEEPALIVE. The runtime methods are what the JS
+# wrapper (wasm/tspdf-api.js) touches. STACK_SIZE is raised because the PDF
+# object parser and deep-copy recurse on untrusted structure depth.
+WASM_FLAGS = -O2 -sMODULARIZE=1 -sEXPORT_ES6=1 -sEXPORT_NAME=createTspdf \
+	-sALLOW_MEMORY_GROWTH=1 -sENVIRONMENT=web,worker,node \
+	-sSTACK_SIZE=1048576 \
+	-sEXPORTED_FUNCTIONS=_malloc,_free \
+	-sEXPORTED_RUNTIME_METHODS=HEAPU8,HEAPU32,UTF8ToString,stringToUTF8,lengthBytesUTF8
+
+.PHONY: wasm wasm-test wasm-demo
+
+wasm: $(WASM_DIST)/tspdf.js
+
+$(WASM_DIST)/tspdf.js: wasm/shim.c $(ALL_SOURCES)
+	@mkdir -p $(WASM_DIST)
+	$(EMCC) $(REQUIRED_CFLAGS) $(WASM_FLAGS) -o $@ wasm/shim.c $(ALL_SOURCES) -lm
+
+wasm-test: wasm $(CLI_TARGET)
+	bash wasm/test/run_wasm_test.sh
+
+wasm-demo: wasm
+	python3 wasm/demo/build_demo.py
