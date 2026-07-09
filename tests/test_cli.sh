@@ -1112,6 +1112,286 @@ else
   echo "  SKIP  split keeps only the kept pages' bookmarks and fields (qpdf or fixture missing)"
 fi
 
+# --- md2pdf tables/images, burst split, page numbers, serve --bind ---
+
+# Burst split: no --pages splits every page into its own zero-padded file.
+run_test "split --burst produces one file per page" bash -c "
+  set -e
+  $TSPDF split $INPUT --burst -o $TMPDIR/burst.pdf > /dev/null
+  test -f $TMPDIR/burst-001.pdf
+  test -f $TMPDIR/burst-002.pdf
+  test -f $TMPDIR/burst-003.pdf
+  test ! -e $TMPDIR/burst-004.pdf"
+
+run_test "split without --pages defaults to burst" bash -c "
+  set -e
+  $TSPDF split $INPUT -o $TMPDIR/burstdef.pdf > /dev/null
+  test -f $TMPDIR/burstdef-001.pdf
+  test -f $TMPDIR/burstdef-003.pdf"
+
+run_test "split burst files each have one page" bash -c "
+  set -e
+  for i in 1 2 3; do
+    $TSPDF info $TMPDIR/burst-00\$i.pdf | grep -q 'Pages:[[:space:]]*1'
+  done"
+
+if command -v qpdf > /dev/null 2>&1; then
+  run_test "split burst files pass qpdf --check" bash -c "
+    set -e
+    for i in 1 2 3; do qpdf --check $TMPDIR/burst-00\$i.pdf > /dev/null; done"
+else
+  echo "  SKIP  split burst files pass qpdf --check (qpdf not found)"
+fi
+
+run_test "split rejects --burst combined with --pages" bash -c "
+  ! $TSPDF split $INPUT --burst --pages 1 -o $TMPDIR/burstconflict.pdf 2>/dev/null"
+
+run_test "split help mentions --burst" bash -c "$TSPDF split --help | grep -q -- '--burst'"
+
+# pagenum: stamp page numbers via the overlay API.
+run_test "pagenum stamps default numbers" bash -c "
+  set -e
+  $TSPDF pagenum $INPUT -o $TMPDIR/pn.pdf > /dev/null
+  $TSPDF info $TMPDIR/pn.pdf | grep -q 'Pages:[[:space:]]*3'"
+
+if command -v qpdf > /dev/null 2>&1; then
+  run_test "pagenum content streams carry the numbers" bash -c "
+    set -e
+    qpdf --qdf --object-streams=disable $TMPDIR/pn.pdf $TMPDIR/pn.qdf
+    grep -q '(1)' $TMPDIR/pn.qdf
+    grep -q '(2)' $TMPDIR/pn.qdf
+    grep -q '(3)' $TMPDIR/pn.qdf"
+
+  run_test "pagenum honors --format with page and total" bash -c "
+    set -e
+    $TSPDF pagenum $INPUT -o $TMPDIR/pnfmt.pdf --format 'Page %d of %d' > /dev/null
+    qpdf --qdf --object-streams=disable $TMPDIR/pnfmt.pdf $TMPDIR/pnfmt.qdf
+    grep -q '(Page 2 of 3)' $TMPDIR/pnfmt.qdf"
+
+  run_test "pagenum --start offsets numbers and total" bash -c "
+    set -e
+    $TSPDF pagenum $INPUT -o $TMPDIR/pnstart.pdf --format '%d/%d' --start 10 > /dev/null
+    qpdf --qdf --object-streams=disable $TMPDIR/pnstart.pdf $TMPDIR/pnstart.qdf
+    grep -q '(10/12)' $TMPDIR/pnstart.qdf
+    grep -q '(12/12)' $TMPDIR/pnstart.qdf"
+
+  run_test "pagenum output passes qpdf --check" qpdf --check $TMPDIR/pn.pdf
+else
+  echo "  SKIP  pagenum content assertions (qpdf not found)"
+fi
+
+# Format string is printf-adjacent: only plain %d (max two) and %% may appear.
+run_test "pagenum rejects %s in --format" bash -c "
+  ! $TSPDF pagenum $INPUT -o $TMPDIR/pnbad.pdf --format '%s' 2>/dev/null"
+
+run_test "pagenum rejects three %d in --format" bash -c "
+  ! $TSPDF pagenum $INPUT -o $TMPDIR/pnbad.pdf --format '%d %d %d' 2>/dev/null"
+
+run_test "pagenum rejects width-flagged %5d in --format" bash -c "
+  ! $TSPDF pagenum $INPUT -o $TMPDIR/pnbad.pdf --format '%5d' 2>/dev/null"
+
+run_test "pagenum rejects invalid --position" bash -c "
+  ! $TSPDF pagenum $INPUT -o $TMPDIR/pnbad.pdf --position middle 2>/dev/null"
+
+run_test "pagenum accepts top-right position and custom size" $TSPDF pagenum $INPUT -o $TMPDIR/pntr.pdf --position top-right --font-size 8
+
+run_test "help pagenum shows command-specific usage" bash -c "$TSPDF help pagenum 2>/dev/null | grep -q 'Usage: tspdf pagenum'"
+
+# md2pdf emphasis: *x*/_x_ italic, **x** bold; literal markers must not leak.
+if command -v qpdf > /dev/null 2>&1; then
+  run_test "md2pdf emphasis styles text without literal markers" bash -c "
+    set -e
+    cat > $TMPDIR/emph.md <<'EOF'
+# Emphasis
+
+Plain ITALWORD is *ITALWORD* and BOLDWORD is **BOLDWORD** and _UNDERITAL_ ends.
+
+A snake_case_word stays literal and 2 * 3 = 6 stays literal too.
+
+This is a deliberately long wrapping paragraph that keeps going and going and going far past one line so the styled segments cannot fit on a single rendered line and *WRAPITALWORD* must fall back to plain de-marked text while still wrapping across lines without leaking markers.
+EOF
+    $TSPDF md2pdf $TMPDIR/emph.md -o $TMPDIR/emph.pdf > /dev/null 2>&1
+    qpdf --qdf --object-streams=disable $TMPDIR/emph.pdf $TMPDIR/emph.qdf
+    grep -q 'Helvetica-Oblique' $TMPDIR/emph.qdf
+    grep -q 'ITALWORD' $TMPDIR/emph.qdf
+    grep -q 'UNDERITAL' $TMPDIR/emph.qdf
+    grep -q 'WRAPITALWORD' $TMPDIR/emph.qdf
+    ! grep -q -- '\*ITALWORD\*' $TMPDIR/emph.qdf
+    ! grep -q -- '\*\*BOLDWORD\*\*' $TMPDIR/emph.qdf
+    ! grep -q -- '_UNDERITAL_' $TMPDIR/emph.qdf
+    ! grep -q -- '\*WRAPITALWORD\*' $TMPDIR/emph.qdf
+    grep -q 'snake_case_word' $TMPDIR/emph.qdf
+    grep -q '2 \* 3 = 6' $TMPDIR/emph.qdf"
+else
+  echo "  SKIP  md2pdf emphasis (qpdf not found)"
+fi
+
+# md2pdf pipe tables: header + separator + body become a real layout table.
+if command -v qpdf > /dev/null 2>&1; then
+  run_test "md2pdf renders pipe tables without literal pipes" bash -c "
+    set -e
+    cat > $TMPDIR/tbl.md <<'EOF'
+# Table
+
+| HDRALPHA | HDRBETA | HDRGAMMA |
+|:---------|:-------:|---------:|
+| CELLA1   | CELLB1  | CELLC1   |
+| CELLA2   | **BOLDCELL** | pipe \| stays |
+
+After the table.
+EOF
+    $TSPDF md2pdf $TMPDIR/tbl.md -o $TMPDIR/tbl.pdf > /dev/null 2>&1
+    qpdf --qdf --object-streams=disable $TMPDIR/tbl.pdf $TMPDIR/tbl.qdf
+    grep -q 'HDRALPHA' $TMPDIR/tbl.qdf
+    grep -q 'HDRGAMMA' $TMPDIR/tbl.qdf
+    grep -q 'CELLA1' $TMPDIR/tbl.qdf
+    grep -q 'CELLC1' $TMPDIR/tbl.qdf
+    grep -q 'BOLDCELL' $TMPDIR/tbl.qdf
+    grep -q 'pipe | stays' $TMPDIR/tbl.qdf
+    grep -q 'After the table.' $TMPDIR/tbl.qdf
+    ! grep -q '| HDRALPHA' $TMPDIR/tbl.qdf
+    ! grep -q 'CELLA1   |' $TMPDIR/tbl.qdf
+    ! grep -q -- ':---' $TMPDIR/tbl.qdf
+    ! grep -q -- '\*\*BOLDCELL\*\*' $TMPDIR/tbl.qdf"
+
+  run_test "md2pdf pipe-lookalike without separator stays a paragraph" bash -c "
+    set -e
+    printf '| not a table, just text\n\nnext paragraph\n' > $TMPDIR/nottbl.md
+    $TSPDF md2pdf $TMPDIR/nottbl.md -o $TMPDIR/nottbl.pdf > /dev/null 2>&1
+    qpdf --qdf --object-streams=disable $TMPDIR/nottbl.pdf $TMPDIR/nottbl.qdf
+    grep -q 'not a table, just text' $TMPDIR/nottbl.qdf"
+
+  run_test "md2pdf table output passes qpdf --check" qpdf --check $TMPDIR/tbl.pdf
+
+  # Regression: at TSPDF_LAYOUT_MAX_CHILDREN=32 every block after the 32nd
+  # was silently dropped (and tables were capped at 31 rows).
+  run_test "md2pdf keeps documents longer than 32 blocks" bash -c "
+    set -e
+    for i in \$(seq 1 60); do printf 'Paragraph PARA%d here.\n\n' \$i; done > $TMPDIR/long.md
+    $TSPDF md2pdf $TMPDIR/long.md -o $TMPDIR/long.pdf > /dev/null 2>&1
+    qpdf --qdf --object-streams=disable $TMPDIR/long.pdf $TMPDIR/long.qdf
+    grep -q 'PARA33' $TMPDIR/long.qdf
+    grep -q 'PARA60' $TMPDIR/long.qdf"
+
+  run_test "md2pdf renders tables longer than 31 rows" bash -c "
+    set -e
+    { printf '| N | NAME |\n|---|---|\n'
+      for i in \$(seq 1 40); do printf '| %d | ROWCELL%d |\n' \$i \$i; done
+    } > $TMPDIR/bigtbl.md
+    $TSPDF md2pdf $TMPDIR/bigtbl.md -o $TMPDIR/bigtbl.pdf > /dev/null 2>&1
+    qpdf --qdf --object-streams=disable $TMPDIR/bigtbl.pdf $TMPDIR/bigtbl.qdf
+    grep -q 'ROWCELL40' $TMPDIR/bigtbl.qdf"
+else
+  echo "  SKIP  md2pdf pipe tables (qpdf not found)"
+fi
+
+# The layout tree caps top-level blocks at TSPDF_LAYOUT_MAX_CHILDREN (1024).
+# Content past the cap is dropped, but never silently: exactly one stderr
+# warning, and the (truncated) PDF is still written with exit 0.
+run_test "md2pdf warns once past the 1024-block cap" bash -c "
+  set -e
+  for i in \$(seq 1 1500); do printf 'Paragraph PARA%d here.\n\n' \$i; done > $TMPDIR/huge.md
+  $TSPDF md2pdf $TMPDIR/huge.md -o $TMPDIR/huge.pdf 2> $TMPDIR/huge.err
+  [ \$(grep -c 'exceeds 1024 blocks' $TMPDIR/huge.err) -eq 1 ]
+  $TSPDF info $TMPDIR/huge.pdf > /dev/null"
+
+# md2pdf images: block-level ![alt](path) embeds the image as an XObject,
+# path resolved relative to the .md file; missing files warn + alt fallback.
+if command -v qpdf > /dev/null 2>&1; then
+  run_test "md2pdf embeds PNG and JPEG images" bash -c "
+    set -e
+    mkdir -p $TMPDIR/mdimg
+    cp examples/test.png examples/test.jpg $TMPDIR/mdimg/
+    printf '# Images\n\n![png alt](test.png)\n\ntext between\n\n![jpg alt](test.jpg)\n' > $TMPDIR/mdimg/img.md
+    $TSPDF md2pdf $TMPDIR/mdimg/img.md -o $TMPDIR/img.pdf > /dev/null 2>&1
+    qpdf --qdf --object-streams=disable $TMPDIR/img.pdf $TMPDIR/img.qdf
+    [ \$(grep -c '/Subtype /Image' $TMPDIR/img.qdf) -eq 2 ]
+    grep -q 'text between' $TMPDIR/img.qdf"
+
+  run_test "md2pdf image output passes qpdf --check" qpdf --check $TMPDIR/img.pdf
+
+  run_test "md2pdf missing image warns and falls back to alt text" bash -c "
+    set -e
+    printf '![MISSINGALT](no/such/file.png)\n' > $TMPDIR/miss.md
+    $TSPDF md2pdf $TMPDIR/miss.md -o $TMPDIR/miss.pdf 2> $TMPDIR/miss.err
+    grep -qi 'warning' $TMPDIR/miss.err
+    qpdf --qdf --object-streams=disable $TMPDIR/miss.pdf $TMPDIR/miss.qdf
+    grep -q 'MISSINGALT' $TMPDIR/miss.qdf
+    ! grep -q '/Subtype /Image' $TMPDIR/miss.qdf"
+else
+  echo "  SKIP  md2pdf images (qpdf not found)"
+fi
+
+# serve --bind: default stays loopback; non-loopback binds warn and keep a
+# same-origin gate for browser POSTs.
+BIND_PORT_LOOP=$((CLI_TEST_PORT_BASE + 50))
+BIND_PORT_ANY=$((CLI_TEST_PORT_BASE + 51))
+BIND_PORT_CSRF=$((CLI_TEST_PORT_BASE + 52))
+
+run_test "serve rejects an invalid --bind address" bash -c "
+  ! $TSPDF serve --bind 999.1.2.3 --port $BIND_PORT_LOOP 2>/dev/null"
+
+run_test "serve help mentions --bind" bash -c "$TSPDF serve --help | grep -q -- '--bind'"
+
+if command -v curl > /dev/null 2>&1; then
+  run_test "serve --bind 127.0.0.1 answers GET /" bash -c "
+    $TSPDF serve --bind 127.0.0.1 --port $BIND_PORT_LOOP > /dev/null 2>&1 & sp=\$!
+    sleep 2
+    curl -sf --retry 3 --retry-delay 1 --max-time 5 http://127.0.0.1:${BIND_PORT_LOOP}/ -o /dev/null
+    rc=\$?
+    kill \$sp 2>/dev/null; wait \$sp 2>/dev/null
+    exit \$rc"
+
+  run_test "serve --bind 0.0.0.0 warns and answers via 127.0.0.1" bash -c "
+    $TSPDF serve --bind 0.0.0.0 --port $BIND_PORT_ANY > $TMPDIR/bind_any.log 2>&1 & sp=\$!
+    sleep 2
+    curl -sf --retry 3 --retry-delay 1 --max-time 5 http://127.0.0.1:${BIND_PORT_ANY}/ -o /dev/null
+    rc=\$?
+    kill \$sp 2>/dev/null; wait \$sp 2>/dev/null
+    [ \$rc -eq 0 ] && grep -qi 'warning' $TMPDIR/bind_any.log && grep -qi 'no authentication' $TMPDIR/bind_any.log"
+else
+  echo "  SKIP  serve --bind e2e (curl not found)"
+fi
+
+# With a non-loopback bind the Host header can name any address the server is
+# reachable at, but a browser POST carrying a foreign Origin must still be
+# rejected (same-origin gate), and a matching Origin must pass.
+if command -v python3 > /dev/null 2>&1; then
+  run_test "serve --bind 0.0.0.0 keeps same-origin gate on POST /api" bash -c "
+    set -e
+    \"$TSPDF\" serve --bind 0.0.0.0 --port $BIND_PORT_CSRF > /dev/null 2>&1 & sp=\$!
+    sleep 2
+    python3 -c \"
+import socket, sys
+def post(host_hdr, origin):
+    bnd = '----tspdf'
+    body = ('--%s\\\\r\\\\nContent-Disposition: form-data; name=\\\"config\\\"\\\\r\\\\n\\\\r\\\\n'
+            '{\\\"url\\\":\\\"https://example.com\\\"}\\\\r\\\\n--%s--\\\\r\\\\n' % (bnd, bnd)).encode('ascii')
+    hdr = ('POST /api/qrcode HTTP/1.1\\\\r\\\\nHost: %s\\\\r\\\\n'
+           'Origin: %s\\\\r\\\\n'
+           'Content-Type: multipart/form-data; boundary=%s\\\\r\\\\n'
+           'Content-Length: %d\\\\r\\\\n\\\\r\\\\n' % (host_hdr, origin, bnd, len(body))).encode('ascii')
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(5)
+    s.connect(('127.0.0.1', $BIND_PORT_CSRF))
+    s.sendall(hdr + body)
+    data = s.recv(8192)
+    s.close()
+    return data.split(b' ')[1]
+# foreign Origin on a network Host: rejected
+if post('192.168.7.7:$BIND_PORT_CSRF', 'https://evil.example.com') != b'403':
+    sys.exit(1)
+# same-origin POST from the served UI on a network address: accepted
+if post('192.168.7.7:$BIND_PORT_CSRF', 'http://192.168.7.7:$BIND_PORT_CSRF') != b'200':
+    sys.exit(2)
+\"
+    kill \$sp 2>/dev/null || true
+    wait \$sp 2>/dev/null || true
+  "
+else
+  echo "  SKIP  serve --bind same-origin gate (python3 not found)"
+fi
+
 echo ""
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ] || exit 1

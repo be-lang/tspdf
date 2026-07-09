@@ -11,7 +11,9 @@
 extern "C" {
 #endif
 
-#define TSPDF_LAYOUT_MAX_CHILDREN 32
+/* Children arrays are realloc'd on demand; this only clamps their growth.
+ * (At 32 an md2pdf document silently lost every block after the 32nd.) */
+#define TSPDF_LAYOUT_MAX_CHILDREN 1024
 #define TSPDF_LAYOUT_MAX_TEXT     1024
 #define TSPDF_TSPDF_LAYOUT_MAX_TEXT_LINES 64
 
@@ -94,8 +96,9 @@ typedef enum {
     TSPDF_TEXT_DECOR_OVERLINE    = 4,
 } TspdfTextDecoration;
 
-// Rich text span (for inline formatting within a text node)
-#define TSPDF_LAYOUT_MAX_SPANS 4
+// Rich text span (for inline formatting within a text node). The spans array
+// is realloc'd on demand; this only clamps its growth.
+#define TSPDF_LAYOUT_MAX_SPANS 16
 
 typedef struct {
     const char *text;       // arena-allocated

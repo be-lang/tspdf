@@ -9,7 +9,8 @@ See the [compatibility matrix](compatibility-matrix.md) for what is tested where
 - Text extraction (`tspdf text`) reads text in content-stream order: no column re-ordering, no OCR of scanned pages, and no blank-line preservation. CID fonts without a /ToUnicode map extract as U+FFFD (a stderr warning names the affected pages).
 - No rendering of pages to images.
 - Existing AcroForm forms cannot be filled (creating form fields in generated PDFs is supported).
-- md2pdf does not render tables or images.
+- md2pdf renders pipe tables and block-level `![alt](path)` images. Inline bold/italic/code only keeps its styling when the line fits unwrapped; longer lines render plain (markers stripped). Images inside a paragraph fall back to their alt text. Tables longer than 28 rows are split into stacked tables with the header repeated. Inline markup inside table cells renders as plain text. A document is capped at 1024 top-level blocks (paragraphs, headings, list items, ...); content past the cap is dropped with a warning.
+- The web UI's Markdown converter (`/api/md2pdf`) supports a smaller dialect than `tspdf md2pdf`: headings, bullet lists, blockquotes, fenced code blocks, and rules. Tables, images, and inline bold/italic/code styling are CLI-only; in the web UI those markers render literally. The web endpoint deliberately embeds no images, since that would mean reading files on the server.
 - Merge and split preserve bookmarks and form fields (split keeps only what points at kept pages; named destinations are flattened to explicit ones). Structure trees and page labels are still dropped.
 - Merging files that use the same form field name leaves the duplicate names as-is; viewers will treat them as one shared field.
 - Watermark support is text-only (no image watermark pipeline yet).

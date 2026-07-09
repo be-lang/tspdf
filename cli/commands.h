@@ -40,5 +40,6 @@ int cmd_qrcode(int argc, char **argv);
 int cmd_md2pdf(int argc, char **argv);
 int cmd_serve(int argc, char **argv);
 int cmd_text(int argc, char **argv);
+int cmd_pagenum(int argc, char **argv);
 
 #endif

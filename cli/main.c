@@ -26,6 +26,7 @@ static void print_usage(void) {
     printf("  md2pdf     Convert Markdown to a styled PDF\n");
     printf("  serve      Start a local web server for PDF tools\n");
     printf("  text       Extract text from a PDF\n");
+    printf("  pagenum    Stamp page numbers onto a PDF\n");
     printf("\n");
     printf("Options:\n");
     printf("  --help, -h     Show this help message\n");
@@ -45,13 +46,16 @@ static void print_command_help(const char *cmd) {
         printf("  <file1.pdf> <file2.pdf> [...]  Two or more input PDF files\n");
         printf("  -o <output.pdf>               Output file path (required)\n");
     } else if (strcmp(cmd, "split") == 0) {
-        printf("Usage: tspdf split <input.pdf> --pages <range> -o <output.pdf>\n");
+        printf("Usage: tspdf split <input.pdf> [--pages <range> | --burst] -o <output.pdf>\n");
         printf("\n");
-        printf("Extract specific pages from a PDF into a new file.\n");
+        printf("Extract specific pages from a PDF, or split it into one file per page.\n");
+        printf("Without --pages, every page is written to its own file (burst mode):\n");
+        printf("out.pdf becomes out-001.pdf, out-002.pdf, ...\n");
         printf("\n");
         printf("Arguments:\n");
         printf("  <input.pdf>       Input PDF file\n");
         printf("  --pages <range>   Page range to extract, e.g. 1-3 or 1,3,5 or 2-4,7\n");
+        printf("  --burst           One output file per page (default without --pages)\n");
         printf("  -o <output.pdf>   Output file path (required)\n");
     } else if (strcmp(cmd, "rotate") == 0) {
         printf("Usage: tspdf rotate <input.pdf> --angle <deg> [-o <output.pdf>] [--pages <range>]\n");
@@ -171,16 +175,19 @@ static void print_command_help(const char *cmd) {
         printf("Usage: tspdf md2pdf <input.md> -o <output.pdf>\n");
         printf("\n");
         printf("Convert a Markdown document into a styled PDF.\n");
-        printf("Supports headings, paragraphs, lists, code blocks, blockquotes, and rules.\n");
+        printf("Supports headings, paragraphs, lists, code blocks, blockquotes, rules,\n");
+        printf("pipe tables, and block-level ![alt](path) images (JPEG/PNG).\n");
         printf("\n");
         printf("Arguments:\n");
         printf("  <input.md>       Input Markdown file\n");
         printf("  -o <output.pdf>  Output file path (required)\n");
     } else if (strcmp(cmd, "serve") == 0) {
-        printf("Usage: tspdf serve [--port <port>]\n");
+        printf("Usage: tspdf serve [--port <port>] [--bind <addr>]\n");
         printf("\n");
         printf("Start a local web server for PDF tools.\n");
-        printf("Default port: 8080\n");
+        printf("Default port: 8080, default bind address: 127.0.0.1\n");
+        printf("Binding a non-loopback address exposes the unauthenticated UI\n");
+        printf("to the network; a warning is printed.\n");
     } else if (strcmp(cmd, "text") == 0) {
         printf("Usage: tspdf text <input.pdf> [--pages <range>] [--password <pass>] [-o <output.txt>]\n");
         printf("\n");
@@ -192,6 +199,21 @@ static void print_command_help(const char *cmd) {
         printf("  --pages <range>    Pages to extract, e.g. 1-3 or 1,3,5 (default: all)\n");
         printf("  -o <output.txt>    Write to a file instead of stdout\n");
         printf("  --password <pass>  Password for encrypted PDFs (optional)\n");
+    } else if (strcmp(cmd, "pagenum") == 0) {
+        printf("Usage: tspdf pagenum <input.pdf> -o <output.pdf> [--format \"%%d / %%d\"]\n");
+        printf("                     [--position <pos>] [--start N] [--font-size N]\n");
+        printf("\n");
+        printf("Stamp a page number on every page of a PDF.\n");
+        printf("\n");
+        printf("Arguments:\n");
+        printf("  <input.pdf>        Input PDF file\n");
+        printf("  --format <fmt>     Label format; up to two %%d (page number, total).\n");
+        printf("                     Default: \"%%d\"\n");
+        printf("  --position <pos>   bottom-center (default), bottom-left, bottom-right,\n");
+        printf("                     top-center, top-left, top-right\n");
+        printf("  --start N          Number of the first page (default: 1)\n");
+        printf("  --font-size N      Font size in points (default: 10)\n");
+        printf("  -o <output.pdf>    Output file path (required)\n");
     } else {
         /* Unknown command — fall back to general help */
         print_usage();
@@ -247,6 +269,7 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "md2pdf") == 0)   return cmd_md2pdf(sub_argc, sub_argv);
     if (strcmp(cmd, "serve") == 0)   return cmd_serve(sub_argc, sub_argv);
     if (strcmp(cmd, "text") == 0)    return cmd_text(sub_argc, sub_argv);
+    if (strcmp(cmd, "pagenum") == 0)  return cmd_pagenum(sub_argc, sub_argv);
 
     fprintf(stderr, "tspdf: unknown command '%s'\n\n", cmd);
     print_usage();
