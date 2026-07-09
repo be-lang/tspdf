@@ -1242,6 +1242,16 @@ else
   echo "  SKIP  md2pdf pipe tables (qpdf not found)"
 fi
 
+# The layout tree caps top-level blocks at TSPDF_LAYOUT_MAX_CHILDREN (1024).
+# Content past the cap is dropped, but never silently: exactly one stderr
+# warning, and the (truncated) PDF is still written with exit 0.
+run_test "md2pdf warns once past the 1024-block cap" bash -c "
+  set -e
+  for i in \$(seq 1 1500); do printf 'Paragraph PARA%d here.\n\n' \$i; done > $TMPDIR/huge.md
+  $TSPDF md2pdf $TMPDIR/huge.md -o $TMPDIR/huge.pdf 2> $TMPDIR/huge.err
+  [ \$(grep -c 'exceeds 1024 blocks' $TMPDIR/huge.err) -eq 1 ]
+  $TSPDF info $TMPDIR/huge.pdf > /dev/null"
+
 # md2pdf images: block-level ![alt](path) embeds the image as an XObject,
 # path resolved relative to the .md file; missing files warn + alt fallback.
 if command -v qpdf > /dev/null 2>&1; then

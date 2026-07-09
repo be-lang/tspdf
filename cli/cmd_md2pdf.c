@@ -22,6 +22,20 @@ static double lh_cb(const char *f, double s, void *u) {
     return s * 1.2;
 }
 
+/* Every top-level block lands in root's child array, which is capped at
+ * TSPDF_LAYOUT_MAX_CHILDREN (layout.h). A document past the cap loses its
+ * remaining blocks — warn once instead of dropping them silently. The PDF is
+ * still written (exit 0) with the content that fit. */
+static int g_blocks_warned = 0;
+
+static void md_add_block(TspdfNode *root, TspdfNode *node) {
+    if (tspdf_layout_add_child(root, node) == TSPDF_OK || g_blocks_warned)
+        return;
+    g_blocks_warned = 1;
+    fprintf(stderr, "tspdf md2pdf: warning: document exceeds %d blocks; "
+                    "remaining content dropped\n", TSPDF_LAYOUT_MAX_CHILDREN);
+}
+
 /* --- Inline Markdown parsing -------------------------------------------- *
  * The layout engine exposes rich-text spans (see src/layout/layout.h), but
  * those render on a single non-wrapping line and are capped at
@@ -243,7 +257,7 @@ static void md_add_paragraph(TspdfLayout *ctx, TspdfNode *root, const char *text
         parse_inline_spans(ctx, node, text, sans, bold, italic, mono,
                            11, para_color, avail_width);
     }
-    tspdf_layout_add_child(root, node);
+    md_add_block(root, node);
 }
 
 /* --- Pipe tables --------------------------------------------------------- *
@@ -394,7 +408,7 @@ static void md_emit_table(TspdfLayout *ctx, TspdfNode *root,
                     cell->children[0]->text.alignment = aligns[c];
             }
         }
-        tspdf_layout_add_child(root, tbl);
+        md_add_block(root, tbl);
         r0 += chunk;
     } while (r0 < nrows);
 }
@@ -470,7 +484,7 @@ static int md_try_image(TspdfLayout *ctx, TspdfNode *root, TspdfWriter *doc,
         node->text.color = tspdf_color_from_u8(110, 115, 130);
         node->text.wrap = TSPDF_WRAP_WORD;
         node->width = tspdf_size_grow();
-        tspdf_layout_add_child(root, node);
+        md_add_block(root, node);
         return 1;
     }
 
@@ -492,7 +506,7 @@ static int md_try_image(TspdfLayout *ctx, TspdfNode *root, TspdfWriter *doc,
     TspdfBoxStyle *st = tspdf_layout_node_style(ctx, imgbox);
     st->bg_image = img_name;  /* writer-owned name, outlives rendering */
     tspdf_layout_add_child(wrap, imgbox);
-    tspdf_layout_add_child(root, wrap);
+    md_add_block(root, wrap);
     return 1;
 }
 
@@ -754,7 +768,7 @@ int cmd_md2pdf(int argc, char **argv) {
             code_txt->text.color = tspdf_color_from_u8(60, 40, 120);
             code_txt->width = tspdf_size_grow();
             tspdf_layout_add_child(code_box, code_txt);
-            tspdf_layout_add_child(root, code_box);
+            md_add_block(root, code_box);
         } else if (in_code_block) {
             /* Accumulate code lines */
             if (code_len > 0 && code_len < (int)sizeof(code_buf) - 2) {
@@ -786,7 +800,7 @@ int cmd_md2pdf(int argc, char **argv) {
                 parse_inline_spans(&ctx, node, text, bold, bold, bolditalic, mono,
                                    sz, heading_color, content_w);
             }
-            tspdf_layout_add_child(root, node);
+            md_add_block(root, node);
         } else if ((line[0] == '-' || line[0] == '*') && line[1] == ' ') {
             /* List item */
             TspdfNode *row = tspdf_layout_box(&ctx);
@@ -809,7 +823,7 @@ int cmd_md2pdf(int argc, char **argv) {
             }
             tspdf_layout_add_child(row, txt);
 
-            tspdf_layout_add_child(root, row);
+            md_add_block(root, row);
         } else if (line[0] == '>' && line[1] == ' ') {
             /* Blockquote */
             TspdfNode *bq = tspdf_layout_box(&ctx);
@@ -834,7 +848,7 @@ int cmd_md2pdf(int argc, char **argv) {
             }
             tspdf_layout_add_child(bq, txt);
 
-            tspdf_layout_add_child(root, bq);
+            md_add_block(root, bq);
         } else if (ord_content != NULL) {
             /* Ordered list item: render "N." marker + inline-styled text. */
             TspdfNode *row = tspdf_layout_box(&ctx);
@@ -859,7 +873,7 @@ int cmd_md2pdf(int argc, char **argv) {
             }
             tspdf_layout_add_child(row, txt);
 
-            tspdf_layout_add_child(root, row);
+            md_add_block(root, row);
         } else if (raw_image_line &&
                    md_try_image(&ctx, root, doc, raw_image_line, input, italic,
                                 content_w, H - 2 * 52, lineno)) {
@@ -872,7 +886,7 @@ int cmd_md2pdf(int argc, char **argv) {
             TspdfBoxStyle *hs = tspdf_layout_node_style(&ctx, hr);
             hs->has_background = true;
             hs->background = tspdf_color_from_u8(200, 205, 220);
-            tspdf_layout_add_child(root, hr);
+            md_add_block(root, hr);
         } else if (text_len > 0) {
             /* Paragraph */
             TspdfColor para_color = tspdf_color_from_u8(40, 50, 80);
@@ -884,7 +898,7 @@ int cmd_md2pdf(int argc, char **argv) {
                 parse_inline_spans(&ctx, node, line, sans, bold, italic, mono,
                                    11, para_color, content_w);
             }
-            tspdf_layout_add_child(root, node);
+            md_add_block(root, node);
         }
         /* Skip blank lines (no output) */
 
