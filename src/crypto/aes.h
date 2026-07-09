@@ -4,7 +4,10 @@
 #include <stddef.h>
 
 typedef struct {
-    uint32_t round_keys[60];    // max 14 rounds * 4 + 4 = 60 words
+    uint32_t round_keys[60];    // encrypt schedule; max 14 rounds * 4 + 4 = 60 words
+    uint32_t dec_keys[60];      // decrypt schedule for the equivalent inverse cipher
+                                // (FIPS 197 §5.3.5): round keys in reverse order with
+                                // InvMixColumns applied to the inner rounds
     int nr;                     // number of rounds (10 or 14)
 } Aes;
 

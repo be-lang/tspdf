@@ -82,6 +82,17 @@ static inline uint32_t rotword(uint32_t w) {
     return (w << 8) | (w >> 24);
 }
 
+/* InvMixColumns applied to one round-key word (big-endian column). Used to
+ * build the equivalent-inverse-cipher schedule. */
+static inline uint32_t inv_mix_word(uint32_t w) {
+    uint8_t b0 = (uint8_t)(w >> 24), b1 = (uint8_t)(w >> 16),
+            b2 = (uint8_t)(w >>  8), b3 = (uint8_t)(w      );
+    return ((uint32_t)(gmul(0x0e,b0) ^ gmul(0x0b,b1) ^ gmul(0x0d,b2) ^ gmul(0x09,b3)) << 24)
+         | ((uint32_t)(gmul(0x09,b0) ^ gmul(0x0e,b1) ^ gmul(0x0b,b2) ^ gmul(0x0d,b3)) << 16)
+         | ((uint32_t)(gmul(0x0d,b0) ^ gmul(0x09,b1) ^ gmul(0x0e,b2) ^ gmul(0x0b,b3)) <<  8)
+         |  (uint32_t)(gmul(0x0b,b0) ^ gmul(0x0d,b1) ^ gmul(0x09,b2) ^ gmul(0x0e,b3));
+}
+
 /* -------------------------------------------------------------------------
  * aes_init — key expansion (FIPS 197 §5.2)
  * ------------------------------------------------------------------------- */
@@ -107,6 +118,17 @@ void aes_init(Aes *ctx, const uint8_t *key, int key_bits) {
         }
         ctx->round_keys[i] = ctx->round_keys[i - nk] ^ temp;
     }
+
+    /* Decrypt schedule for the equivalent inverse cipher (FIPS 197 §5.3.5):
+     * encrypt round keys in reverse round order, with InvMixColumns applied
+     * to every inner round key. Stored forward so a decryptor walks it the
+     * same way the encryptor walks round_keys. */
+    for (int i = 0; i <= ctx->nr; i++)
+        for (int j = 0; j < 4; j++)
+            ctx->dec_keys[4*i + j] = ctx->round_keys[4*(ctx->nr - i) + j];
+    for (int i = 1; i < ctx->nr; i++)
+        for (int j = 0; j < 4; j++)
+            ctx->dec_keys[4*i + j] = inv_mix_word(ctx->dec_keys[4*i + j]);
 }
 
 /* -------------------------------------------------------------------------
@@ -223,25 +245,27 @@ void aes_encrypt_ecb(Aes *ctx, const uint8_t in[16], uint8_t out[16]) {
 }
 
 /* -------------------------------------------------------------------------
- * aes_decrypt_ecb — single 16-byte block (FIPS 197 §5.3)
+ * aes_decrypt_ecb — single 16-byte block, equivalent inverse cipher
+ * (FIPS 197 §5.3.5): same round structure as the forward cipher, consuming
+ * the dedicated dec_keys schedule front to back.
  * ------------------------------------------------------------------------- */
 void aes_decrypt_ecb(Aes *ctx, const uint8_t in[16], uint8_t out[16]) {
     State s;
     bytes_to_state(in, s);
 
-    add_round_key(s, ctx->round_keys + ctx->nr * 4);
+    add_round_key(s, ctx->dec_keys);
 
-    for (int round = ctx->nr - 1; round >= 1; round--) {
-        inv_shift_rows(s);
+    for (int round = 1; round < ctx->nr; round++) {
         inv_sub_bytes(s);
-        add_round_key(s, ctx->round_keys + round * 4);
+        inv_shift_rows(s);
         inv_mix_columns(s);
+        add_round_key(s, ctx->dec_keys + round * 4);
     }
 
     /* final round — no InvMixColumns */
-    inv_shift_rows(s);
     inv_sub_bytes(s);
-    add_round_key(s, ctx->round_keys);
+    inv_shift_rows(s);
+    add_round_key(s, ctx->dec_keys + ctx->nr * 4);
 
     state_to_bytes(s, out);
 }
