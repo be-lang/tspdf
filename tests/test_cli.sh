@@ -1084,6 +1084,34 @@ run_test "text help mentions --password" bash -c "$TSPDF text --help | grep -q -
 run_test "text missing input fails" bash -c "! $TSPDF text $TMPDIR/no_such_input.pdf > /dev/null 2>&1"
 run_test "text listed in main help" bash -c "$TSPDF --help | grep -q '^  text'"
 
+# --- Doc trees: bookmarks and form fields across merge/split ---
+# Verified against qpdf's JSON view of the outputs; skipped when qpdf is not
+# installed. tests/data/outline_form.pdf: OF-CH1 -> p1 (child OF-CH1-SUB ->
+# p2), OF-CH2 -> p3; text field of_text on p1, checkbox of_check on p3.
+OUTLINE_INPUT=tests/data/outline_form.pdf
+if command -v qpdf > /dev/null 2>&1 && [ -f "$OUTLINE_INPUT" ]; then
+  run_test "merge preserves bookmarks and form fields" bash -c '
+    set -e
+    "'"$TSPDF"'" merge tests/data/three_pages.pdf "'"$OUTLINE_INPUT"'" -o "'"$TMPDIR"'/dt_merged.pdf"
+    qpdf --check "'"$TMPDIR"'/dt_merged.pdf"
+    qpdf --json --json-key=outlines "'"$TMPDIR"'/dt_merged.pdf" | grep -q "OF-CH1"
+    qpdf --json --json-key=outlines "'"$TMPDIR"'/dt_merged.pdf" | grep -q "OF-CH2"
+    qpdf --json --json-key=acroform "'"$TMPDIR"'/dt_merged.pdf" | grep -q "of_text"
+    qpdf --json --json-key=acroform "'"$TMPDIR"'/dt_merged.pdf" | grep -q "of_check"'
+
+  run_test "split keeps only the kept pages' bookmarks and fields" bash -c '
+    set -e
+    "'"$TSPDF"'" split "'"$OUTLINE_INPUT"'" --pages 1-2 -o "'"$TMPDIR"'/dt_split.pdf"
+    qpdf --check "'"$TMPDIR"'/dt_split.pdf"
+    qpdf --json --json-key=outlines "'"$TMPDIR"'/dt_split.pdf" | grep -q "OF-CH1-SUB"
+    ! qpdf --json --json-key=outlines "'"$TMPDIR"'/dt_split.pdf" | grep -q "OF-CH2"
+    qpdf --json --json-key=acroform "'"$TMPDIR"'/dt_split.pdf" | grep -q "of_text"
+    ! qpdf --json --json-key=acroform "'"$TMPDIR"'/dt_split.pdf" | grep -q "of_check"'
+else
+  echo "  SKIP  merge preserves bookmarks and form fields (qpdf or fixture missing)"
+  echo "  SKIP  split keeps only the kept pages' bookmarks and fields (qpdf or fixture missing)"
+fi
+
 echo ""
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ] || exit 1

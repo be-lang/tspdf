@@ -10,7 +10,8 @@ See the [compatibility matrix](compatibility-matrix.md) for what is tested where
 - No rendering of pages to images.
 - Existing AcroForm forms cannot be filled (creating form fields in generated PDFs is supported).
 - md2pdf does not render tables or images.
-- Merge and split currently drop bookmarks and form fields.
+- Merge and split preserve bookmarks and form fields (split keeps only what points at kept pages; named destinations are flattened to explicit ones). Structure trees and page labels are still dropped.
+- Merging files that use the same form field name leaves the duplicate names as-is; viewers will treat them as one shared field.
 - Watermark support is text-only (no image watermark pipeline yet).
 - Web server mode is intentionally simple and local-first; it is not a general-purpose multi-tenant service.
 

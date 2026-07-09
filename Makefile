@@ -61,6 +61,7 @@ TSPR_SOURCES = \
 	$(SRCDIR)/reader/tspr_serialize.c \
 	$(SRCDIR)/reader/tspr_crypt.c \
 	$(SRCDIR)/reader/tspr_document.c \
+	$(SRCDIR)/reader/tspr_doctree.c \
 	$(SRCDIR)/reader/tspr_metadata.c \
 	$(SRCDIR)/reader/tspr_content.c \
 	$(SRCDIR)/reader/tspr_resources.c \

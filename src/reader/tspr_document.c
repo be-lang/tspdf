@@ -1,4 +1,5 @@
 #include "tspr_internal.h"
+#include "tspr_doctree.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -710,8 +711,9 @@ static TspdfReader *create_doc_from_pages(TspdfReader *src, const size_t *page_i
 // Catalog entries dropped when extracting pages into a new document. These
 // document-level trees (structure tree, outlines, destination/name trees,
 // page labels, form fields) reference the source's full page set and would
-// keep the entire object graph reachable in the extracted file. qpdf --pages
-// drops them on extraction the same way.
+// keep the entire object graph reachable in the extracted file. Outlines and
+// AcroForm are re-attached afterwards, pruned to the kept pages, by
+// tspdf_doctree_extract_attach; the rest stays dropped.
 static bool extract_drops_catalog_key(const char *key) {
     static const char *const dropped[] = {
         "StructTreeRoot", "Outlines", "Dests", "Names", "PageLabels",
@@ -792,6 +794,15 @@ TspdfReader *tspdf_reader_extract(TspdfReader *doc, const size_t *pages, size_t 
     if (cat_err != TSPDF_OK) {
         tspdf_reader_destroy(result);
         if (err) *err = cat_err;
+        return NULL;
+    }
+
+    // Re-attach the outline subtrees and form fields that belong to the
+    // kept pages (set_extract_catalog dropped the document-level trees).
+    TspdfError trees_err = tspdf_doctree_extract_attach(doc, result);
+    if (trees_err != TSPDF_OK) {
+        tspdf_reader_destroy(result);
+        if (err) *err = trees_err;
         return NULL;
     }
     return result;
@@ -947,9 +958,8 @@ TspdfReader *tspdf_reader_reorder(TspdfReader *doc, const size_t *order, size_t 
 
 // Recursively walk an object tree and make source-backed streams self-contained
 // before copying objects into a merged document with no single backing buffer.
-static TspdfError make_streams_self_contained(TspdfObj *obj, const uint8_t *src_data, size_t src_len,
-                                               TspdfObj **cache, TspdfReaderXref *xref, TspdfParser *parser,
-                                               TspdfCrypt *crypt, bool *visited, size_t xref_count);
+// Non-static (declared in tspr_doctree.h): the doctree merge preparation
+// walks outline/AcroForm graphs with the same machinery.
 
 static bool stream_dict_type_is(TspdfObj *obj, const char *type_name) {
     if (!obj || obj->type != TSPDF_OBJ_STREAM || !type_name) {
@@ -997,9 +1007,9 @@ static TspdfError copy_stream_source(TspdfObj *obj, const uint8_t *src_data, siz
     return TSPDF_OK;
 }
 
-static TspdfError make_ref_self_contained(uint32_t obj_num, const uint8_t *src_data, size_t src_len,
-                                           TspdfObj **cache, TspdfReaderXref *xref, TspdfParser *parser,
-                                           TspdfCrypt *crypt, bool *visited, size_t xref_count) {
+TspdfError tspdf_reader_make_ref_self_contained(uint32_t obj_num, const uint8_t *src_data, size_t src_len,
+                                                TspdfObj **cache, TspdfReaderXref *xref, TspdfParser *parser,
+                                                TspdfCrypt *crypt, bool *visited, size_t xref_count) {
     if (obj_num >= xref_count) return TSPDF_OK;
     if (visited[obj_num]) return TSPDF_OK;
     visited[obj_num] = true;
@@ -1011,33 +1021,33 @@ static TspdfError make_ref_self_contained(uint32_t obj_num, const uint8_t *src_d
         uint16_t gen = obj_num < xref->count ? xref->entries[obj_num].gen : 0;
         TspdfError err = copy_stream_source(resolved, src_data, src_len, crypt, obj_num, gen);
         if (err != TSPDF_OK) return err;
-        return make_streams_self_contained(resolved->stream.dict, src_data, src_len,
-                                           cache, xref, parser, crypt, visited, xref_count);
+        return tspdf_reader_make_streams_self_contained(resolved->stream.dict, src_data, src_len,
+                                                        cache, xref, parser, crypt, visited, xref_count);
     }
 
-    return make_streams_self_contained(resolved, src_data, src_len, cache, xref,
-                                       parser, crypt, visited, xref_count);
+    return tspdf_reader_make_streams_self_contained(resolved, src_data, src_len, cache, xref,
+                                                    parser, crypt, visited, xref_count);
 }
 
-static TspdfError make_streams_self_contained(TspdfObj *obj, const uint8_t *src_data, size_t src_len,
-                                               TspdfObj **cache, TspdfReaderXref *xref, TspdfParser *parser,
-                                               TspdfCrypt *crypt, bool *visited, size_t xref_count) {
+TspdfError tspdf_reader_make_streams_self_contained(TspdfObj *obj, const uint8_t *src_data, size_t src_len,
+                                                    TspdfObj **cache, TspdfReaderXref *xref, TspdfParser *parser,
+                                                    TspdfCrypt *crypt, bool *visited, size_t xref_count) {
     if (!obj) return TSPDF_OK;
     switch (obj->type) {
         case TSPDF_OBJ_REF:
-            return make_ref_self_contained(obj->ref.num, src_data, src_len, cache, xref,
-                                           parser, crypt, visited, xref_count);
+            return tspdf_reader_make_ref_self_contained(obj->ref.num, src_data, src_len, cache, xref,
+                                                        parser, crypt, visited, xref_count);
         case TSPDF_OBJ_ARRAY:
             for (size_t i = 0; i < obj->array.count; i++) {
-                TspdfError err = make_streams_self_contained(&obj->array.items[i], src_data, src_len,
-                                                             cache, xref, parser, crypt, visited, xref_count);
+                TspdfError err = tspdf_reader_make_streams_self_contained(&obj->array.items[i], src_data, src_len,
+                                                                          cache, xref, parser, crypt, visited, xref_count);
                 if (err != TSPDF_OK) return err;
             }
             return TSPDF_OK;
         case TSPDF_OBJ_DICT:
             for (size_t i = 0; i < obj->dict.count; i++) {
-                TspdfError err = make_streams_self_contained(obj->dict.entries[i].value, src_data, src_len,
-                                                             cache, xref, parser, crypt, visited, xref_count);
+                TspdfError err = tspdf_reader_make_streams_self_contained(obj->dict.entries[i].value, src_data, src_len,
+                                                                          cache, xref, parser, crypt, visited, xref_count);
                 if (err != TSPDF_OK) return err;
             }
             return TSPDF_OK;
@@ -1045,8 +1055,8 @@ static TspdfError make_streams_self_contained(TspdfObj *obj, const uint8_t *src_
         {
             TspdfError err = copy_stream_source(obj, src_data, src_len, crypt, 0, 0);
             if (err != TSPDF_OK) return err;
-            return make_streams_self_contained(obj->stream.dict, src_data, src_len,
-                                               cache, xref, parser, crypt, visited, xref_count);
+            return tspdf_reader_make_streams_self_contained(obj->stream.dict, src_data, src_len,
+                                                            cache, xref, parser, crypt, visited, xref_count);
         }
         default:
             return TSPDF_OK;
@@ -1154,9 +1164,9 @@ TspdfReader *tspdf_reader_merge(TspdfReader **docs, size_t count, TspdfError *er
         for (size_t p = 0; p < src->pages.count; p++) {
             TspdfReaderPage *page = &src->pages.pages[p];
             if (page->obj_num < src->xref.count) {
-                TspdfError prep_err = make_ref_self_contained(page->obj_num, src->data, src->data_len,
-                                                              src->obj_cache, &src->xref, &parser,
-                                                              src->crypt, visited, src->xref.count);
+                TspdfError prep_err = tspdf_reader_make_ref_self_contained(page->obj_num, src->data, src->data_len,
+                                                                           src->obj_cache, &src->xref, &parser,
+                                                                           src->crypt, visited, src->xref.count);
                 if (prep_err != TSPDF_OK) {
                     free(visited);
                     tspdf_arena_destroy(&doc->arena);
@@ -1166,9 +1176,9 @@ TspdfReader *tspdf_reader_merge(TspdfReader **docs, size_t count, TspdfError *er
                     return NULL;
                 }
             }
-            TspdfError prep_err = make_streams_self_contained(page->page_dict, src->data, src->data_len,
-                                                              src->obj_cache, &src->xref, &parser,
-                                                              src->crypt, visited, src->xref.count);
+            TspdfError prep_err = tspdf_reader_make_streams_self_contained(page->page_dict, src->data, src->data_len,
+                                                                           src->obj_cache, &src->xref, &parser,
+                                                                           src->crypt, visited, src->xref.count);
             if (prep_err != TSPDF_OK) {
                 free(visited);
                 tspdf_arena_destroy(&doc->arena);
@@ -1190,6 +1200,18 @@ TspdfReader *tspdf_reader_merge(TspdfReader **docs, size_t count, TspdfError *er
                 if (err) *err = prep_err;
                 return NULL;
             }
+        }
+
+        // Resolve outline items and the AcroForm graph into the source cache
+        // so the copy loop below picks them up alongside the pages.
+        TspdfError trees_prep_err = tspdf_doctree_merge_prepare(src, &parser, visited);
+        if (trees_prep_err != TSPDF_OK) {
+            free(visited);
+            tspdf_arena_destroy(&doc->arena);
+            free(xref_offsets);
+            free(doc);
+            if (err) *err = trees_prep_err;
+            return NULL;
         }
         free(visited);
 
@@ -1320,6 +1342,17 @@ TspdfReader *tspdf_reader_merge(TspdfReader **docs, size_t count, TspdfError *er
             doc->pages.pages[pi].rotate = src_page->rotate;
             pi++;
         }
+    }
+
+    // Rebuild the sources' outlines and AcroForm on the merged catalog.
+    TspdfError trees_err = tspdf_doctree_merge_attach(doc, docs, count, xref_offsets);
+    if (trees_err != TSPDF_OK) {
+        tspdf_arena_destroy(&doc->arena);
+        free(xref_offsets);
+        free(doc->new_objs.objs);
+        free(doc);
+        if (err) *err = trees_err;
+        return NULL;
     }
 
     // Build a minimal trailer
