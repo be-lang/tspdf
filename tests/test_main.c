@@ -14,6 +14,7 @@
 #include "../src/layout/layout.h"
 #include "../src/pdf/tspdf_writer.h"
 #include "../src/tspdf_error.h"
+#include "../src/qr/qr_encode.h"
 
 // ============================================================
 // TspdfBuffer tests
@@ -1699,6 +1700,227 @@ TEST(test_writer_save_to_memory_matches_file) {
 }
 
 // ============================================================
+// QR encoder
+// ============================================================
+
+// Byte-mode character capacity at level M per ISO/IEC 18004 Table 7,
+// cross-checked against segno at dev time (the smallest version segno
+// picks for a payload of exactly this length is the same version).
+static const int qr_expected_char_capacity[] = {
+    0, 14, 26, 42, 62, 84, 106, 122, 152, 180, 213, 251,
+};
+
+TEST(test_qr_ecc_table_consistent) {
+    // Every row of the level-M block table must satisfy
+    // blocks x (data + ec) == total codewords for the version, and the
+    // derived character capacity must match ISO 18004 Table 7.
+    ASSERT(qr_max_version() >= 10);
+    ASSERT(qr_max_version() + 1 <=
+           (int)(sizeof(qr_expected_char_capacity) / sizeof(int)));
+    for (int v = 1; v <= qr_max_version(); v++) {
+        int total, ec, b1, d1, b2, d2;
+        ASSERT_EQ_INT(qr_ecc_block_info(v, &total, &ec, &b1, &d1, &b2, &d2), 0);
+        ASSERT(b1 >= 1);
+        ASSERT_EQ_INT(b1 * (d1 + ec) + b2 * (d2 + ec), total);
+        // Group 2 blocks, when present, carry exactly one more data codeword.
+        if (b2 > 0) ASSERT_EQ_INT(d2, d1 + 1);
+        // Total codewords for a version is fixed by the module count:
+        // it must match the ISO totals independent of the block split.
+        static const int totals[] = {0, 26, 44, 70, 100, 134, 172,
+                                     196, 242, 292, 346, 404};
+        ASSERT_EQ_INT(total, totals[v]);
+        int data_cw = b1 * d1 + b2 * d2;
+        int cc_bits = (v <= 9) ? 8 : 16;
+        int capacity = (data_cw * 8 - 4 - cc_bits) / 8;
+        ASSERT_EQ_INT(capacity, qr_expected_char_capacity[v]);
+    }
+    ASSERT_EQ_INT(qr_ecc_block_info(0, 0, 0, 0, 0, 0, 0), -1);
+    ASSERT_EQ_INT(qr_ecc_block_info(qr_max_version() + 1, 0, 0, 0, 0, 0, 0), -1);
+}
+
+TEST(test_qr_rs_known_vector) {
+    // The classic v1-M "HELLO WORLD" example (alphanumeric mode): its data
+    // codewords and 10 EC codewords are published in the ISO spec walkthroughs.
+    static const uint8_t data[16] = {32, 91, 11, 120, 209, 114, 220, 77,
+                                     67, 64, 236, 17, 236, 17, 236, 17};
+    static const uint8_t expected[10] = {196, 35, 39, 119, 235,
+                                         215, 231, 226, 93, 23};
+    uint8_t ecc[10];
+    qr_rs_ecc(data, 16, ecc, 10);
+    ASSERT(memcmp(ecc, expected, sizeof(expected)) == 0);
+}
+
+/* RS reference: 26 EC codewords over the 44-byte block below (the v3-M
+ * block shape), generated at dev time with an independent Python
+ * GF(256)/0x11D Reed-Solomon implementation. */
+static const char qr_rs_ref_data[45] = "tspdf reed-solomon reference vector, 44 byte";
+static const uint8_t qr_rs_ref_ecc[26] = {
+    7, 203, 226, 141, 139, 144, 176, 54, 193, 195, 192, 143, 247,
+    134, 77, 167, 60, 75, 46, 30, 5, 203, 173, 213, 182, 230,
+};
+
+TEST(test_qr_rs_reference_vector) {
+    uint8_t ecc[26];
+    qr_rs_ecc((const uint8_t *)qr_rs_ref_data, 44, ecc, 26);
+    ASSERT(memcmp(ecc, qr_rs_ref_ecc, sizeof(qr_rs_ref_ecc)) == 0);
+}
+
+TEST(test_qr_version_info_bits) {
+    // BCH(18,6) values from ISO/IEC 18004:2015 Annex D, Table D.1.
+    ASSERT(qr_version_info_bits(1) == 0);
+    ASSERT(qr_version_info_bits(6) == 0);
+    ASSERT(qr_version_info_bits(7) == 0x07C94);
+    ASSERT(qr_version_info_bits(8) == 0x085BC);
+    ASSERT(qr_version_info_bits(9) == 0x09A99);
+    ASSERT(qr_version_info_bits(10) == 0x0A4D3);
+    ASSERT(qr_version_info_bits(11) == 0x0BBF6);
+}
+
+TEST(test_qr_version_selection_boundaries) {
+    // Smallest version is chosen by the byte-mode character capacity at M.
+    struct { int len; int size; } cases[] = {
+        {14, 21},   // v1 max
+        {15, 25},   // spills to v2
+        {42, 29},   // v3 max
+        {43, 33},   // spills to v4
+        {213, 57},  // v10 max
+        {214, 61},  // spills to v11
+        {251, 61},  // v11 max
+    };
+    char buf[300];
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        memset(buf, 'a', (size_t)cases[i].len);
+        buf[cases[i].len] = '\0';
+        QrCode *qr = qr_encode(buf);
+        ASSERT(qr != NULL);
+        ASSERT_EQ_INT(qr->size, cases[i].size);
+        qr_free(qr);
+    }
+    memset(buf, 'a', 252);
+    buf[252] = '\0';
+    ASSERT(qr_encode(buf) == NULL);  // beyond v11 capacity
+}
+
+/*
+ * Golden module grids. Each row is a bitmap with bit c = column c
+ * (1 = dark). Generated from this encoder after the correctness fixes and
+ * decode-verified with OpenCV (cv2.QRCodeDetector) at dev time: every grid
+ * below decoded back to its exact payload. They pin the whole pipeline —
+ * version selection, data encoding, RS interleaving, matrix layout, format
+ * and version info, mask choice — so any behavior change shows up here.
+ */
+typedef struct {
+    const char *payload;
+    int size;
+    const uint64_t rows[61];
+} QrGolden;
+
+static const QrGolden qr_goldens[] = {
+    { /* len 10, version 1 */
+      "https://ex",
+      21,
+        { 0x1fc37f, 0x105141, 0x174a5d, 0x17555d, 0x17465d, 0x104641, 0x1fd57f, 0x500,
+          0x1a44ed, 0x1ff792, 0x1a31cc, 0xa90b3, 0x134cc1, 0x16100, 0x1017f, 0x17b941,
+          0x52e5d, 0x8e55d, 0x48f5d, 0x11d841, 0x73d7f } },
+    { /* len 30, version 3 */
+      "https://example.org/p/abcdefgh",
+      29,
+        { 0x1fc41d7f, 0x104d0a41, 0x175fa25d, 0x174dc35d, 0x1755715d, 0x105ef941,
+          0x1fd5557f, 0x24300, 0x13ebfdd1, 0x1fe41b16, 0x1070f94f, 0x1b7fbd86,
+          0x8322a41, 0x1fd57b99, 0x16170550, 0x18fa5d04, 0x83bea42, 0x1bc4178f,
+          0x14c6e4e4, 0x19cfaba8, 0x13fa38df, 0x11156d00, 0x175d137f, 0x91a5e41,
+          0x1bfaed5d, 0x884145d, 0x1e3df25d, 0x1a17e441, 0xbd2f57f } },
+    { /* len 60, version 4 */
+      "https://example.org/p/abcdefghijabcdefghijabcdefghijabcdefgh",
+      33,
+        { 0x1fcad2e7f, 0x10505f841, 0x17561235d, 0x17542d75d, 0x1749ea55d, 0x105628341,
+          0x1fd55557f, 0x1a88f00, 0x7c5a687d, 0x16cbd198c, 0xd2769ef4, 0xf63d5c1c,
+          0x3bca8ef3, 0x1c4bd5d85, 0x9e75a0ef, 0x67610799, 0x11b0afdf6, 0x16cad730c,
+          0xdc77eeec, 0x17979d216, 0x13b42bee0, 0x1449d45a7, 0xa346e47d, 0x63a55301,
+          0x19fca8cc1, 0x1513d2300, 0xd5c0b67f, 0xf1adab41, 0x13f42ab5d, 0x1f31d515d,
+          0x4e57b75d, 0x7479b041, 0x8bd2ef7f } },
+    { /* len 116, version 7 */
+      "https://example.org/p/abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij"
+      "abcdefghijabcdefghijabcdefghijabcd",
+      45,
+        { 0x1fd26229c47f, 0x10499dd8bc41, 0x174b5c0c555d, 0x1758a577d35d,
+          0x175c6bf8cd5d, 0x10429d12ab41, 0x1fd55555557f, 0x17f107500, 0x7c0cffb907d,
+          0x1919f30d1235, 0x8f4072f5df0, 0x7a77d02728c, 0x1002e3ee715d, 0x143962404280,
+          0xe4e1df166ca, 0xfbf7ccc0431, 0x20e53ec2f0, 0x14b84a286524, 0x84e1dd12a57,
+          0x17af780e5107, 0x11f6c3f7cff4, 0x1719f318651a, 0xd5e055c8559, 0xf1779161119,
+          0x13f2e1f5a1fa, 0x1451797f830a, 0xf3e0c12bbed, 0x6cf7db20813, 0x94085811d54,
+          0x1448eb72da15, 0x8961c0a2bc0, 0x16cfb99dd6be, 0x11b68288b877,
+          0x1428f37e270d, 0xab78427f550, 0xe5b79984f1e, 0x11f0e5f1b659, 0x17197b161f00,
+          0xd5e05584e7f, 0x71b771f2341, 0x13f887f6695d, 0x1da0f22a095d, 0x85e150c2d5d,
+          0x72f78125c41, 0x8dea3ae257f } },
+    { /* len 150, version 8 */
+      "https://example.org/p/abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij"
+      "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefgh",
+      49,
+        { 0x1fd107a0e4c7f, 0x105c69c6bd041, 0x175853a71d35d, 0x174bea5a8535d,
+          0x17438e7e25d5d, 0x104468c481141, 0x1fd555555557f, 0x1a31c40b900,
+          0x7ddec7f29a7d, 0x639f30882b4, 0x191d68dec00c4, 0x90a77a01288f,
+          0x1e99601e3876e, 0x8c38639b8886, 0x1b15e0597cf40, 0x11487781c0708,
+          0x69f8e5f75bd8, 0xe29e2adaf28, 0x1a05e1d9169fb, 0x980558111db3,
+          0x1413ce3f52b46, 0x7e307be9e012, 0x1bf449ff3f9f6, 0x111a31c44951e,
+          0x1f57ce5753152, 0x11a17c4b0118, 0x1ffc68fc6f1f2, 0x123fc292b80,
+          0x1f1b8a246725b, 0xeb1efe72c05, 0x19ecf82c61d74, 0x9277d35082c,
+          0x1f29e825290c1, 0xa216bafa899, 0x1a4de1b4fd5d2, 0x11635db33a06,
+          0x154be801605ef, 0x6ba9e7af428e, 0x196fe1a4b8ce2, 0x91411d820c0e,
+          0x17f9a87f102c7, 0x1138e44fc100, 0x1d5468d7e1c7f, 0x191231c60c341,
+          0x1ff5e47d0435d, 0x19db1f06cd55d, 0x6e568dfe675d, 0x107a37b2c9441,
+          0x1e1b8a411937f } },
+    { /* len 200, version 10 */
+      "https://example.org/p/abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij"
+      "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij"
+      "abcdefghijabcdefghijabcdefghijabcdefgh",
+      57,
+        { 0x1fcee38fbebf07f, 0x104a9c7050cfe41, 0x174f1e2ddda115d, 0x1748c7e02112d5d,
+          0x17487a0fdff3d5d, 0x104787e47abe741, 0x1fd55555555557f, 0x1581471db100,
+          0x7c0e38fc3dc27d, 0x1639f29f1858093, 0xcdc0d68d467c7c, 0xfbf7a16268663a,
+          0x6c1aed45c34a, 0x16b97b066be9411, 0xbc71de8c6e7e4e, 0x7937a11ed85f1d,
+          0x1064efcc0179052, 0x1019d38e3e83296, 0x87e8560867b1cf, 0xf217c73ba32528,
+          0x104685e84105b7a, 0x10b86b02bd1d8aa, 0xcce9c75ec97561, 0x17cf1821b04ab29,
+          0xa20e1d8410b1dd, 0x153861965d12405, 0x9fe05ffe3c4bf4, 0x1f1f581443f411f,
+          0x15a85ed470f55c, 0x17117a147c1d715, 0xff60d6fee41ff7, 0x16cb7a1018a8e2b,
+          0x1190e38dbc02fc1, 0x40e29a50c4e39, 0x1db71d67fe0ea51, 0x7c93c709200bb5,
+          0x1a281ae80d8563, 0x14317a115cdc715, 0xf368c779acecc6, 0x64978315928f89,
+          0x11d4a389c1d0b78, 0x1651f29e5eebbbd, 0xc9e05efe6ee0fb, 0xe5f9e01b703700,
+          0xb2687a5814f3cc, 0x1468eb061b99814, 0xabf85f57dc8065, 0x164b5816016d21f,
+          0x1f0a7cfc0a3f40, 0x1710e38c5b35100, 0x95e0d6d642b07f, 0xf1b7a145989f41,
+          0x11f685eff4ad15d, 0x1c06a15c98815d, 0x65f1d6627e695d, 0x7a934768c70441,
+          0x8d0a388229a57f } },
+};
+
+TEST(test_qr_golden_grids) {
+    for (size_t g = 0; g < sizeof(qr_goldens) / sizeof(qr_goldens[0]); g++) {
+        const QrGolden *gd = &qr_goldens[g];
+        QrCode *qr = qr_encode(gd->payload);
+        ASSERT(qr != NULL);
+        ASSERT_EQ_INT(qr->size, gd->size);
+        for (int r = 0; r < qr->size; r++) {
+            uint64_t bits = 0;
+            for (int c = 0; c < qr->size; c++) {
+                if (qr->modules[r * qr->size + c])
+                    bits |= (uint64_t)1 << c;
+            }
+            if (bits != gd->rows[r]) {
+                qr_free(qr);
+                printf("FAIL\n    golden %zu (\"%.20s...\") row %d: "
+                       "got 0x%llx want 0x%llx\n",
+                       g, gd->payload, r,
+                       (unsigned long long)bits,
+                       (unsigned long long)gd->rows[r]);
+                tests_failed++;
+                _test_failed = true;
+                return;
+            }
+        }
+        qr_free(qr);
+    }
+}
+
+// ============================================================
 // Main
 // ============================================================
 
@@ -1826,6 +2048,14 @@ int main(void) {
 
     printf("\n  Save-to-memory byte identity (wasm):\n");
     RUN(test_writer_save_to_memory_matches_file);
+
+    printf("\n  QR encoder:\n");
+    RUN(test_qr_ecc_table_consistent);
+    RUN(test_qr_rs_known_vector);
+    RUN(test_qr_rs_reference_vector);
+    RUN(test_qr_version_info_bits);
+    RUN(test_qr_version_selection_boundaries);
+    RUN(test_qr_golden_grids);
 
     printf("\n%d tests run, %d passed, %d failed, %d skipped\n",
            tests_run, tests_passed, tests_failed, tests_skipped);
