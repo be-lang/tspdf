@@ -830,6 +830,16 @@ static void tx_emit_cp(TextCtx *ctx, uint32_t cp) {
     // hiding all following page text. Also reachable via bfrange arithmetic
     // wrapping a uint16 unit to 0.
     if (cp == 0) return;
+    // Fold Latin ligature code points to their letter sequences (poppler
+    // does the same): searching extracted text for "file" should match a
+    // PDF that shows the ﬁ ligature.
+    if (cp >= 0xFB00 && cp <= 0xFB06) {
+        static const char *const lig[7] = {"ff", "fi", "fl", "ffi", "ffl",
+                                           "ft", "st"};
+        const char *s = lig[cp - 0xFB00];
+        tspdf_buffer_append(&ctx->out, s, strlen(s));
+        return;
+    }
     char buf[4];
     size_t n = tspdf_utf8_encode(cp, buf);
     tspdf_buffer_append(&ctx->out, buf, n);
@@ -849,7 +859,16 @@ static void tx_emit_units(TextCtx *ctx, const uint16_t *units, uint8_t n) {
     }
 }
 
+// Trim trailing spaces before ending a line (poppler behavior): generators
+// pad lines with explicit space glyphs, and layout gap heuristics can add
+// one more right before a baseline jump.
+static void tx_trim_line_end(TextCtx *ctx) {
+    while (ctx->out.len > 0 && ctx->out.data[ctx->out.len - 1] == ' ')
+        ctx->out.len--;
+}
+
 static void tx_newline(TextCtx *ctx) {
+    tx_trim_line_end(ctx);
     if (ctx->out.len > 0 && ctx->out.data[ctx->out.len - 1] != '\n')
         tspdf_buffer_append_byte(&ctx->out, '\n');
 }
@@ -1229,6 +1248,7 @@ const char *tspdf_reader_page_text_stats(TspdfReader *doc, size_t page_index,
         tx_interpret(&ctx, content.data, content.len, &gs, 0);
     tspdf_buffer_destroy(&content);
 
+    tx_trim_line_end(&ctx);
     if (ctx.out.len > 0 && ctx.out.data[ctx.out.len - 1] != '\n')
         tspdf_buffer_append_byte(&ctx.out, '\n');
 

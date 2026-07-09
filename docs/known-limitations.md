@@ -6,7 +6,7 @@ See the [compatibility matrix](compatibility-matrix.md) for what is tested where
 
 ## Scope
 
-- Text extraction (`tspdf text`) reads text in content-stream order: no column re-ordering, no OCR of scanned pages, and no blank-line preservation. CID fonts without a /ToUnicode map extract as U+FFFD (a stderr warning names the affected pages).
+- Text extraction (`tspdf text`) reads text in content-stream order: no column re-ordering, no OCR of scanned pages, and no blank-line preservation. CID fonts without a /ToUnicode map extract as U+FFFD (a stderr warning names the affected pages). Like pdftotext, ligature code points (U+FB00–FB06) are folded to their letter sequences (ff, fi, fl, ...) and trailing spaces are trimmed from each line; the raw code points are not preserved.
 - No rendering of pages to images.
 - Existing AcroForm forms cannot be filled (creating form fields in generated PDFs is supported).
 - md2pdf renders pipe tables and block-level `![alt](path)` images. Inline bold/italic/code only keeps its styling when the line fits unwrapped; longer lines render plain (markers stripped). Images inside a paragraph fall back to their alt text. Tables longer than 28 rows are split into stacked tables with the header repeated. Inline markup inside table cells renders as plain text. A document is capped at 1024 top-level blocks (paragraphs, headings, list items, ...); content past the cap is dropped with a warning.
