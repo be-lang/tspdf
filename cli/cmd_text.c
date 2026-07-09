@@ -11,7 +11,7 @@
 // marker.
 int cmd_text(int argc, char **argv) {
     if (argc == 0 || has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
-        printf("Usage: tspdf text <input.pdf> [--pages <range>] [-o <output.txt>]\n");
+        printf("Usage: tspdf text <input.pdf> [--pages <range>] [--password <pass>] [-o <output.txt>]\n");
         printf("\nExtract text from a PDF (all pages to stdout by default).\n");
         return argc == 0 ? 1 : 0;
     }

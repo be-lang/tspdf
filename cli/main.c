@@ -182,7 +182,7 @@ static void print_command_help(const char *cmd) {
         printf("Start a local web server for PDF tools.\n");
         printf("Default port: 8080\n");
     } else if (strcmp(cmd, "text") == 0) {
-        printf("Usage: tspdf text <input.pdf> [--pages <range>] [-o <output.txt>]\n");
+        printf("Usage: tspdf text <input.pdf> [--pages <range>] [--password <pass>] [-o <output.txt>]\n");
         printf("\n");
         printf("Extract text from a PDF, in content-stream order.\n");
         printf("All pages go to stdout by default, separated by form-feed (\\f).\n");

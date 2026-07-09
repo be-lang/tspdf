@@ -1080,6 +1080,7 @@ run_test "text -o writes file" bash -c "$TSPDF text $INPUT --pages 1 -o $TMPDIR/
 run_test "text out-of-range page message" bash -c "$TSPDF text $INPUT --pages 9 2>&1 | grep -q 'page 9 is out of range (document has 3 pages)'"
 run_test "text invalid page range fails" bash -c "! $TSPDF text $INPUT --pages bogus > /dev/null 2>&1"
 run_test "text help mentions --pages" bash -c "$TSPDF text --help | grep -q -- '--pages'"
+run_test "text help mentions --password" bash -c "$TSPDF text --help | grep -q -- '--password'"
 run_test "text missing input fails" bash -c "! $TSPDF text $TMPDIR/no_such_input.pdf > /dev/null 2>&1"
 run_test "text listed in main help" bash -c "$TSPDF --help | grep -q '^  text'"
 
