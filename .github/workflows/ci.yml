@@ -94,6 +94,18 @@ jobs:
           make lib
           test -f build/libtspdf.a
 
+      # The versioned-dylib branch of the Makefile (install_name, dylib
+      # versioning, -exported_symbols_list) cannot be tested on the Linux dev
+      # boxes, and the shared-lib tests in test_cli.sh are ELF-gated. Smoke it
+      # here: the dylib must link and install-lib must stage the symlink chain.
+      - name: Shared library smoke (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          make shared
+          stage="$(mktemp -d)"
+          make install-lib DESTDIR="$stage"
+          ls -l "$stage/usr/local/lib"
+
   sanitizers:
     name: ASan + UBSan + Leak
     runs-on: ubuntu-latest
