@@ -4,12 +4,15 @@
 a versioned `libtspdf.so`, the headers under `<tspdf/...>`, and a pkg-config file:
 
 ```bash
-cc app.c $(pkg-config --cflags --libs tspdf) -o app     # add -lm if linking the .a
+cc app.c $(pkg-config --cflags --libs tspdf) -o app
 ```
+
+That links the shared library; to link `libtspdf.a` instead, use
+`pkg-config --static --libs tspdf` (which adds `-lm`).
 
 There is also a single-file form: `make amalgamation` generates
 `build/amalgamation/tspdf.c` + `tspdf.h`. Drop both into your project and compile
-`tspdf.c` as C11; release tarballs on GitHub ship them prebuilt.
+`tspdf.c` as C11; releases after v0.1.0 ship them prebuilt as a tarball.
 
 ## Supported surface
 
@@ -108,8 +111,9 @@ Both compile against an installed tree with `cc -std=c11 example.c -ltspdf -lm`.
 
 ## Limitations
 
-The shared library has no symbol-visibility annotations yet, so it exports
-internal symbols too; treat only the `tspdf_*` names documented here as API.
+The shared library exports only `tspdf_*`/`tspr_*` symbols (a linker export
+list hides the internal helpers); the static library and the amalgamation have
+no such filter, so treat only the `tspdf_*` names documented here as API.
 No thread-safety guarantees: use one `TspdfReader`/`TspdfWriter` per thread.
 The writer has fixed compile-time capacities (fonts, images, bookmarks, form
 fields — the `TSPDF_MAX_*` constants at the top of `<tspdf/pdf/tspdf_writer.h>`).
