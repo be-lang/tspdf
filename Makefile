@@ -64,7 +64,8 @@ TSPR_SOURCES = \
 	$(SRCDIR)/reader/tspr_metadata.c \
 	$(SRCDIR)/reader/tspr_content.c \
 	$(SRCDIR)/reader/tspr_resources.c \
-	$(SRCDIR)/reader/tspr_annot.c
+	$(SRCDIR)/reader/tspr_annot.c \
+	$(SRCDIR)/reader/tspr_text.c
 
 CRYPTO_SOURCES = \
 	$(SRCDIR)/crypto/md5.c \
@@ -92,6 +93,7 @@ CLI_SOURCES = \
 	cli/cmd_img2pdf.c \
 	cli/cmd_qrcode.c \
 	cli/cmd_md2pdf.c \
+	cli/cmd_text.c \
 	cli/server.c
 
 CLI_TARGET = $(BUILDDIR)/tspdf

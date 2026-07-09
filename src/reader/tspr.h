@@ -144,6 +144,17 @@ TspdfError tspdf_reader_save_with_options(TspdfReader *doc, const char *path,
 TspdfError tspdf_reader_save_to_memory_with_options(TspdfReader *doc, uint8_t **out, size_t *out_len,
                                                      const TspdfSaveOptions *opts);
 
+// --- Text extraction ---
+
+// Extract the text of one page as UTF-8, in content-stream order (no column
+// re-ordering). Line breaks are derived from the text matrix; glyphs are
+// decoded via /ToUnicode, then /Encoding (+/Differences), then
+// StandardEncoding; unmappable glyphs become U+FFFD. The returned string is
+// owned by the reader's arena (valid until tspdf_reader_destroy); do not
+// free. Returns NULL and sets *err on failure (TSPDF_ERR_PAGE_RANGE for a
+// bad page index).
+const char *tspdf_reader_page_text(TspdfReader *doc, size_t page_index, TspdfError *err);
+
 // --- Annotations ---
 
 TspdfError tspdf_page_add_link(TspdfReader *doc, size_t page_index,

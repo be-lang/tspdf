@@ -1069,6 +1069,21 @@ else
   echo "  SKIP  staged headers compile as C++ (c++ not found)"
 fi
 
+# --- Text extraction (tspdf text) ---
+
+run_test "text extracts page text" bash -c "$TSPDF text $INPUT | grep -q 'Page 1'"
+run_test "text outputs all pages by default" bash -c "[ \$($TSPDF text $INPUT | grep -c 'Page') -eq 3 ]"
+run_test "text separates pages with form feed" bash -c "[ \$($TSPDF text $INPUT | tr -cd '\f' | wc -c) -eq 2 ]"
+run_test "text --pages selects pages" bash -c "$TSPDF text $INPUT --pages 2 | grep -q 'Page 2'"
+run_test "text --pages excludes others" bash -c "! $TSPDF text $INPUT --pages 2 | grep -q 'Page 1'"
+run_test "text -o writes file" bash -c "$TSPDF text $INPUT --pages 1 -o $TMPDIR/text_out.txt && grep -q 'Page 1' $TMPDIR/text_out.txt"
+run_test "text out-of-range page message" bash -c "$TSPDF text $INPUT --pages 9 2>&1 | grep -q 'page 9 is out of range (document has 3 pages)'"
+run_test "text invalid page range fails" bash -c "! $TSPDF text $INPUT --pages bogus > /dev/null 2>&1"
+run_test "text help mentions --pages" bash -c "$TSPDF text --help | grep -q -- '--pages'"
+run_test "text help mentions --password" bash -c "$TSPDF text --help | grep -q -- '--password'"
+run_test "text missing input fails" bash -c "! $TSPDF text $TMPDIR/no_such_input.pdf > /dev/null 2>&1"
+run_test "text listed in main help" bash -c "$TSPDF --help | grep -q '^  text'"
+
 echo ""
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ] || exit 1

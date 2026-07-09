@@ -165,6 +165,14 @@ uint8_t *tspdf_content_rewrite(const uint8_t *stream, size_t len,
                                const TspdfRenameMap *renames, size_t *out_len,
                                TspdfArena *arena);
 
+// --- Stream filter decoding ---
+
+// Run a stream's /Filter chain over raw (already decrypted) bytes. Returns a
+// malloc'd buffer the caller frees. Defined in tspr_xref.c, used by the text
+// extractor.
+TspdfError tspdf_stream_decode(TspdfObj *stream_dict, const uint8_t *raw_data,
+                               size_t raw_len, uint8_t **out_data, size_t *out_len);
+
 // --- New object registration ---
 
 uint32_t tspdf_register_new_obj(TspdfReader *doc, TspdfObj *obj);

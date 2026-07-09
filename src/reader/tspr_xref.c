@@ -857,6 +857,13 @@ static TspdfError decode_stream_data(TspdfObj *stream_dict,
     return TSPDF_OK;
 }
 
+// Internal-API wrapper so the text extractor can reuse the filter chain
+// (FlateDecode/LZW/ASCIIHex/ASCII85/RunLength + predictors) without forking it.
+TspdfError tspdf_stream_decode(TspdfObj *stream_dict, const uint8_t *raw_data,
+                               size_t raw_len, uint8_t **out_data, size_t *out_len) {
+    return decode_stream_data(stream_dict, raw_data, raw_len, out_data, out_len);
+}
+
 // Parse a classic xref table at the current parser position.
 // p->pos should point at "xref"
 // *out_trailer receives the trailer dict for this specific xref section.

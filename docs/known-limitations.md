@@ -6,7 +6,7 @@ See the [compatibility matrix](compatibility-matrix.md) for what is tested where
 
 ## Scope
 
-- No text extraction.
+- Text extraction (`tspdf text`) reads text in content-stream order: no column re-ordering, no OCR of scanned pages, and no blank-line preservation. CID fonts without a /ToUnicode map extract as U+FFFD (a stderr warning names the affected pages).
 - No rendering of pages to images.
 - Existing AcroForm forms cannot be filled (creating form fields in generated PDFs is supported).
 - md2pdf does not render tables or images.
