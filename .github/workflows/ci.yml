@@ -88,6 +88,13 @@ jobs:
       - name: Build and test (-Werror gate)
         run: make check
 
+      # `make check` above exercised the ARMv8 hardware AES path (macos-latest
+      # runners are Apple Silicon). Re-run the crypto suite with the hardware
+      # path disabled so the ARM soft path stays green too — no rebuild.
+      - name: Crypto suite on the soft AES path (macOS, TSPDF_NO_AESHW=1)
+        if: runner.os == 'macOS'
+        run: TSPDF_NO_AESHW=1 ./build/test_crypto
+
       - name: Verify static library + asset embedding
         run: |
           make clean
