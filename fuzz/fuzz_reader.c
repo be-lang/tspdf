@@ -53,6 +53,23 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     (void)tspdf_reader_get_creation_date(doc);
     (void)tspdf_reader_get_mod_date(doc);
 
+    // Text extraction parses content streams, ToUnicode CMaps, /Differences
+    // and form XObjects — all attacker-shaped. Cap the page count so a
+    // many-page input does not dominate throughput. The returned string lives
+    // in the document arena; destroy frees it.
+    size_t text_pages = pages < 4 ? pages : 4;
+    for (size_t i = 0; i < text_pages; i++) {
+        (void)tspdf_reader_page_text(doc, i, &err);
+    }
+
+    // Extract runs the doc-tree preservation path (outlines, AcroForm,
+    // named-destination flattening) over the hostile object graph.
+    if (pages > 0) {
+        size_t keep = 0;
+        TspdfReader *sub = tspdf_reader_extract(doc, &keep, 1, &err);
+        if (sub) tspdf_reader_destroy(sub);
+    }
+
     // Round-trip through the serializer to fuzz the write path over parsed,
     // possibly-degenerate object graphs.
     uint8_t *out = NULL;
