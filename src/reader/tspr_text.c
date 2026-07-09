@@ -24,6 +24,10 @@
 #define TEXT_OP_STACK 16     // operand stack (operators take at most 6)
 #define TEXT_GS_STACK 32     // q/Q nesting kept
 #define TOU_MAX_UNITS 8      // UTF-16 units per ToUnicode target (ligatures)
+// Total concatenated /Contents bytes per page. The per-stream decode cap
+// alone lets a small file with many compressed streams demand N x 128 MB;
+// past this limit extraction proceeds with what is already loaded.
+#define TEXT_CONTENT_MAX ((size_t)256 << 20)
 
 // --- Matrices (PDF row-vector convention: [a b 0; c d 0; e f 1]) ---
 
@@ -255,6 +259,7 @@ typedef struct TextFont {
     bool is_cid;                // Type0: 2-byte codes
     bool has_tou;
     ToUniEntry *tou;            // sorted by lo
+    uint32_t *tou_max_hi;       // running max of tou[0..i].hi (walk-back bound)
     size_t tou_count;
     uint16_t simple_map[256];   // byte -> code point (0 = unmapped)
     double widths[256];         // simple-font advances (1/1000 text space)
@@ -371,6 +376,10 @@ static void tx_load_page_content(TextCtx *ctx, TspdfObj *page_dict, TspdfBuffer 
         size_t slen = 0;
         uint8_t *bytes = tx_load_stream(ctx, s, num, &slen);
         if (!bytes) continue;
+        if (slen >= TEXT_CONTENT_MAX - buf->len) { // includes the '\n' below
+            free(bytes);
+            break;
+        }
         tspdf_buffer_append(buf, bytes, slen);
         tspdf_buffer_append_byte(buf, '\n');
         free(bytes);
@@ -529,17 +538,35 @@ static void tx_parse_tounicode(TextCtx *ctx, TextFont *f,
 
     if (list.n > 0) {
         qsort(list.v, list.n, sizeof(ToUniEntry), tou_cmp);
+        uint32_t *max_hi = (uint32_t *)tspdf_arena_alloc(&ctx->scratch,
+                                                         list.n * sizeof(uint32_t));
+        if (!max_hi) return; // no table beats a lookup that misses entries
+        uint32_t run = 0;
+        for (size_t i = 0; i < list.n; i++) {
+            if (list.v[i].hi > run) run = list.v[i].hi;
+            max_hi[i] = run;
+        }
         f->tou = list.v;
+        f->tou_max_hi = max_hi;
         f->tou_count = list.n;
         f->has_tou = true;
     }
 }
 
+static bool tou_entry_units(const ToUniEntry *e, uint32_t code,
+                            uint16_t *units, uint8_t *n) {
+    if (e->nunits == 0) return false;
+    memcpy(units, e->units, e->nunits * sizeof(uint16_t));
+    units[e->nunits - 1] = (uint16_t)(units[e->nunits - 1] + (code - e->lo));
+    *n = e->nunits;
+    return true;
+}
+
 static bool tou_lookup(const TextFont *f, uint32_t code,
                        uint16_t *units, uint8_t *n) {
     if (!f->tou_count) return false;
-    // Binary search for the last entry with lo <= code, then walk back a few
-    // entries to tolerate overlapping ranges.
+    // Binary search for the last entry with lo <= code; every entry before
+    // idx has lo <= code, so a covering entry only needs hi >= code.
     size_t lo = 0, hi = f->tou_count;
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
@@ -547,17 +574,28 @@ static bool tou_lookup(const TextFont *f, uint32_t code,
         else hi = mid;
     }
     size_t idx = lo;
-    for (int back = 0; idx > 0 && back < 4; back++) {
+    // Walk back most-specific-first (largest lo), e.g. bfchar point fixes
+    // sitting inside a wide bfrange. tou_max_hi bounds the walk: once the
+    // running max of hi drops below code, no earlier entry can cover it.
+    for (int back = 0; idx > 0 && back < 8; back++) {
+        if (f->tou_max_hi[idx - 1] < code) return false;
         const ToUniEntry *e = &f->tou[--idx];
-        if (e->lo > code) continue;
-        if (code > e->hi) continue;
-        if (e->nunits == 0) return false;
-        memcpy(units, e->units, e->nunits * sizeof(uint16_t));
-        units[e->nunits - 1] = (uint16_t)(units[e->nunits - 1] + (code - e->lo));
-        *n = e->nunits;
-        return true;
+        if (code <= e->hi) return tou_entry_units(e, code, units, n);
     }
-    return false;
+    if (idx == 0 || f->tou_max_hi[idx - 1] < code) return false;
+    // Still-covered code beyond the linear window (wide range with many
+    // point fixes above it): binary-search the first index where the
+    // running max reaches code — that entry's own hi produced the step,
+    // so it covers code. Keeps hostile overlap-heavy CMaps O(log n).
+    size_t blo = 0, bhi = idx;
+    while (blo < bhi) {
+        size_t mid = blo + (bhi - blo) / 2;
+        if (f->tou_max_hi[mid] >= code) bhi = mid;
+        else blo = mid + 1;
+    }
+    const ToUniEntry *e = &f->tou[blo];
+    if (code < e->lo || code > e->hi) return false; // defensive; unreachable
+    return tou_entry_units(e, code, units, n);
 }
 
 // --- Widths ---
@@ -787,6 +825,11 @@ static TextFont *tx_get_font(TextCtx *ctx, TspdfObj *resources,
 // --- Text emission + layout heuristics ---
 
 static void tx_emit_cp(TextCtx *ctx, uint32_t cp) {
+    // Skip U+0000 (pdftotext does the same): generators map .notdef glyphs
+    // to <0000>, and an embedded NUL would truncate the returned C string,
+    // hiding all following page text. Also reachable via bfrange arithmetic
+    // wrapping a uint16 unit to 0.
+    if (cp == 0) return;
     char buf[4];
     size_t n = tspdf_utf8_encode(cp, buf);
     tspdf_buffer_append(&ctx->out, buf, n);

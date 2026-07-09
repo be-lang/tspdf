@@ -6925,6 +6925,144 @@ TEST(test_text_tounicode_bfchar_bfrange) {
     free(pdf);
 }
 
+TEST(test_text_tounicode_null_cp_skipped) {
+    // A ToUnicode target of <0000> (.notdef in real generators) must be
+    // skipped: an embedded NUL would truncate the returned C string and
+    // hide all following page text.
+    size_t len = 0;
+    char *pdf = make_text_pdf_full(TEXT_HELV_RES,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
+        "/Encoding /WinAnsiEncoding /ToUnicode 5 0 R >>",
+        "",
+        "/CIDInit /ProcSet findresource begin\n"
+        "12 dict begin\n"
+        "begincmap\n"
+        "1 begincodespacerange\n<00> <FF>\nendcodespacerange\n"
+        "2 beginbfchar\n"
+        "<41> <0000>\n"
+        "<42> <0042>\n"
+        "endbfchar\n"
+        "endcmap\nend\nend",
+        "BT /F1 12 Tf 72 700 Td (AB) Tj ET", &len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    const char *text = tspdf_reader_page_text(doc, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT_EQ_STR(text, "B\n");
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_text_tounicode_wide_range_with_point_fixes) {
+    // "Big range + point fixes" layout: one wide bfrange plus many bfchar
+    // corrections above its lo. A code covered only by the wide range must
+    // still map through it, however many bfchars sit in between.
+    size_t len = 0;
+    char *pdf = make_text_pdf_full(TEXT_HELV_RES,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
+        "/Encoding /WinAnsiEncoding /ToUnicode 5 0 R >>",
+        "",
+        "/CIDInit /ProcSet findresource begin\n"
+        "12 dict begin\n"
+        "begincmap\n"
+        "1 begincodespacerange\n<00> <FF>\nendcodespacerange\n"
+        "1 beginbfrange\n<00> <FF> <0100>\nendbfrange\n"
+        "12 beginbfchar\n"
+        "<41> <0391>\n<42> <0392>\n<43> <0393>\n<44> <0394>\n"
+        "<45> <0395>\n<46> <0396>\n<47> <0397>\n<48> <0398>\n"
+        "<49> <0399>\n<4A> <039A>\n<4B> <039B>\n<4C> <039C>\n"
+        "endbfchar\n"
+        "endcmap\nend\nend",
+        "BT /F1 12 Tf 72 700 Td (AP) Tj ET", &len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    const char *text = tspdf_reader_page_text(doc, 0, &err);
+    ASSERT(text != NULL);
+    // A (0x41) hits the bfchar fix -> U+0391; P (0x50) is covered only by
+    // the wide range -> U+0100 + 0x50 = U+0150.
+    ASSERT_EQ_STR(text, "\xce\x91\xc5\x90\n");
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+// One-page PDF whose /Contents is an array of three streams; the (One) Tj
+// operator is split across the first boundary.
+static char *make_text_pdf_contents_array(size_t *out_len) {
+    const char *s5 = "BT /F1 12 Tf 72 700 Td (One)";
+    const char *s6 = "Tj ET";
+    const char *s7 = "BT /F1 12 Tf 72 680 Td (Two) Tj ET";
+    size_t cap = 4096;
+    char *pdf = (char *)malloc(cap);
+    if (!pdf) return NULL;
+    size_t pos = 0;
+    if (!appendf(pdf, cap, &pos, "%%PDF-1.4\n")) goto fail;
+    size_t obj1 = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")) goto fail;
+    size_t obj2 = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")) goto fail;
+    size_t obj3 = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                 "/Resources " TEXT_HELV_RES " /Contents [5 0 R 6 0 R 7 0 R] >>\n"
+                 "endobj\n")) goto fail;
+    size_t obj4 = pos;
+    if (!appendf(pdf, cap, &pos, "4 0 obj\n" TEXT_HELV_FONT "\nendobj\n")) goto fail;
+    size_t obj5 = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "5 0 obj\n<< /Length %zu >>\nstream\n%s\nendstream\nendobj\n",
+                 strlen(s5), s5)) goto fail;
+    size_t obj6 = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "6 0 obj\n<< /Length %zu >>\nstream\n%s\nendstream\nendobj\n",
+                 strlen(s6), s6)) goto fail;
+    size_t obj7 = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "7 0 obj\n<< /Length %zu >>\nstream\n%s\nendstream\nendobj\n",
+                 strlen(s7), s7)) goto fail;
+    size_t xref = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "xref\n"
+                 "0 8\n"
+                 "0000000000 65535 f \n"
+                 "%010zu 00000 n \n"
+                 "%010zu 00000 n \n"
+                 "%010zu 00000 n \n"
+                 "%010zu 00000 n \n"
+                 "%010zu 00000 n \n"
+                 "%010zu 00000 n \n"
+                 "%010zu 00000 n \n"
+                 "trailer\n<< /Size 8 /Root 1 0 R >>\n"
+                 "startxref\n%zu\n%%%%EOF",
+                 obj1, obj2, obj3, obj4, obj5, obj6, obj7, xref)) goto fail;
+    *out_len = pos;
+    return pdf;
+fail:
+    free(pdf);
+    return NULL;
+}
+
+TEST(test_text_contents_array_concatenated) {
+    // /Contents array streams concatenate with '\n' between (stream
+    // boundaries are token boundaries), so the split (One) Tj still lexes.
+    size_t len = 0;
+    char *pdf = make_text_pdf_contents_array(&len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    const char *text = tspdf_reader_page_text(doc, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT_EQ_STR(text, "One\nTwo\n");
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
 TEST(test_text_differences_encoding) {
     // /Differences over WinAnsi, glyph names resolved via the AGL subset.
     size_t len = 0;
@@ -7349,6 +7487,9 @@ int main(void) {
     RUN(test_text_multiline_td_tstar);
     RUN(test_text_xgap_emits_space);
     RUN(test_text_tounicode_bfchar_bfrange);
+    RUN(test_text_tounicode_null_cp_skipped);
+    RUN(test_text_tounicode_wide_range_with_point_fixes);
+    RUN(test_text_contents_array_concatenated);
     RUN(test_text_differences_encoding);
     RUN(test_text_form_xobject_recursion);
     RUN(test_text_form_xobject_self_cycle_guarded);
