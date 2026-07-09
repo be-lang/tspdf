@@ -142,10 +142,15 @@ static void dt_remap_refs(TspdfObj *obj, uint32_t offset, size_t src_count, int 
 
 // --- named destination lookup (in the source document's numbering) ---
 
+// `budget` caps the total nodes visited per lookup (same guard idea as
+// DtCtx.budget): /Kids full of self-references would otherwise fan out to
+// count^depth recursive calls under the depth cap alone.
 static TspdfObj *dt_nametree_lookup(TspdfReader *doc, TspdfParser *parser,
                                     TspdfObj *node, const uint8_t *name,
-                                    size_t name_len, int depth) {
+                                    size_t name_len, int depth, size_t *budget) {
     if (!node || node->type != TSPDF_OBJ_DICT || depth > 32) return NULL;
+    if (*budget == 0) return NULL;
+    (*budget)--;
     TspdfObj *names = dt_resolve(doc, parser, tspdf_dict_get(node, "Names"));
     if (names && names->type == TSPDF_OBJ_ARRAY) {
         for (size_t i = 0; i + 1 < names->array.count; i += 2) {
@@ -161,7 +166,7 @@ static TspdfObj *dt_nametree_lookup(TspdfReader *doc, TspdfParser *parser,
         for (size_t i = 0; i < kids->array.count; i++) {
             TspdfObj *kid = dt_resolve(doc, parser, &kids->array.items[i]);
             TspdfObj *hit = dt_nametree_lookup(doc, parser, kid, name, name_len,
-                                               depth + 1);
+                                               depth + 1, budget);
             if (hit) return hit;
         }
     }
@@ -214,9 +219,12 @@ static DtTarget dt_flatten_dest(DtCtx *ctx, TspdfObj *dest_val, TspdfObj **out_a
             }
         }
         if (!val && ctx->names_root) {
+            // A legitimate lookup visits at most one node per object; anything
+            // past that is cyclic /Kids re-visiting.
+            size_t budget = ctx->name_doc->xref.count + 16;
             val = dt_nametree_lookup(ctx->name_doc, ctx->name_parser,
                                      ctx->names_root, dest->string.data,
-                                     dest->string.len, 0);
+                                     dest->string.len, 0, &budget);
         }
         if (!val) return DT_TARGET_INVALID;
         dest = dt_resolve(ctx->name_doc, ctx->name_parser, val);

@@ -7518,6 +7518,265 @@ TEST(test_extract_prunes_field_kids_and_carries_da) {
     free(pdf);
 }
 
+// Hand-built one-page PDF whose /Names /Dests node lists itself 50 times in
+// /Kids, plus an outline item with a named destination so the lookup runs.
+// Without a node budget the tree walk fans out to 50^32 recursive calls.
+static char *dt_make_cyclic_nametree_pdf(size_t *out_len) {
+    char *pdf = (char *)malloc(8192);
+    if (!pdf) return NULL;
+    size_t pos = 0;
+    size_t off[8] = {0};
+
+    if (!appendf(pdf, 8192, &pos, "%%PDF-1.4\n")) goto fail;
+
+    off[1] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R "
+                 "/Names << /Dests 5 0 R >> >>\nendobj\n")) goto fail;
+    off[2] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")) goto fail;
+    off[3] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n")) goto fail;
+    off[4] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "4 0 obj\n<< /Type /Outlines /First 6 0 R /Last 6 0 R /Count 1 >>\nendobj\n")) goto fail;
+    off[5] = pos;
+    if (!appendf(pdf, 8192, &pos, "5 0 obj\n<< /Kids [")) goto fail;
+    for (int i = 0; i < 50; i++) {
+        if (!appendf(pdf, 8192, &pos, "5 0 R ")) goto fail;
+    }
+    if (!appendf(pdf, 8192, &pos, "] >>\nendobj\n")) goto fail;
+    off[6] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "6 0 obj\n<< /Title (CYCITEM) /Parent 4 0 R "
+                 "/Dest (loopname) >>\nendobj\n")) goto fail;
+
+    size_t xref = pos;
+    if (!appendf(pdf, 8192, &pos, "xref\n0 7\n0000000000 65535 f \n")) goto fail;
+    for (int i = 1; i <= 6; i++) {
+        if (!appendf(pdf, 8192, &pos, "%010zu 00000 n \n", off[i])) goto fail;
+    }
+    if (!appendf(pdf, 8192, &pos,
+                 "trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n%zu\n%%%%EOF",
+                 xref)) goto fail;
+
+    *out_len = pos;
+    return pdf;
+fail:
+    free(pdf);
+    return NULL;
+}
+
+// The cyclic name tree must not blow up extract or merge; the named dest is
+// unresolvable, so its outline item is dropped either way.
+TEST(test_extract_and_merge_bounded_on_cyclic_nametree) {
+    size_t len = 0;
+    char *pdf = dt_make_cyclic_nametree_pdf(&len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    size_t pages[] = {0};
+    TspdfReader *result = tspdf_reader_extract(doc, pages, 1, &err);
+    ASSERT(result != NULL);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(result, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(!bytes_contains(out, out_len, "/Outlines"));
+    ASSERT(!bytes_contains(out, out_len, "CYCITEM"));
+    free(out);
+    tspdf_reader_destroy(result);
+    tspdf_reader_destroy(doc);
+
+    TspdfReader *doc_a = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    TspdfReader *doc_b = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc_a != NULL && doc_b != NULL);
+    TspdfReader *docs[] = {doc_a, doc_b};
+    TspdfReader *merged = tspdf_reader_merge(docs, 2, &err);
+    ASSERT(merged != NULL);
+    err = tspdf_reader_save_to_memory(merged, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(!bytes_contains(out, out_len, "CYCITEM"));
+    free(out);
+    tspdf_reader_destroy(merged);
+    tspdf_reader_destroy(doc_a);
+    tspdf_reader_destroy(doc_b);
+    free(pdf);
+}
+
+// Hand-built one-page PDF with a form field whose /Kids array lists the
+// field itself 40 times. Without a node budget pruning recurses 40^32 times.
+static char *dt_make_cyclic_field_pdf(size_t *out_len) {
+    char *pdf = (char *)malloc(8192);
+    if (!pdf) return NULL;
+    size_t pos = 0;
+    size_t off[8] = {0};
+
+    if (!appendf(pdf, 8192, &pos, "%%PDF-1.4\n")) goto fail;
+
+    off[1] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R "
+                 "/AcroForm << /Fields [4 0 R] >> >>\nendobj\n")) goto fail;
+    off[2] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")) goto fail;
+    off[3] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n")) goto fail;
+    off[4] = pos;
+    if (!appendf(pdf, 8192, &pos, "4 0 obj\n<< /T (loopfield) /FT /Tx /Kids [")) goto fail;
+    for (int i = 0; i < 40; i++) {
+        if (!appendf(pdf, 8192, &pos, "4 0 R ")) goto fail;
+    }
+    if (!appendf(pdf, 8192, &pos, "] >>\nendobj\n")) goto fail;
+
+    size_t xref = pos;
+    if (!appendf(pdf, 8192, &pos, "xref\n0 5\n0000000000 65535 f \n")) goto fail;
+    for (int i = 1; i <= 4; i++) {
+        if (!appendf(pdf, 8192, &pos, "%010zu 00000 n \n", off[i])) goto fail;
+    }
+    if (!appendf(pdf, 8192, &pos,
+                 "trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n%zu\n%%%%EOF",
+                 xref)) goto fail;
+
+    *out_len = pos;
+    return pdf;
+fail:
+    free(pdf);
+    return NULL;
+}
+
+// The self-referential field never reaches a widget on a kept page, so it
+// (and the whole /AcroForm) drops out — in bounded time.
+TEST(test_extract_bounded_on_cyclic_field_kids) {
+    size_t len = 0;
+    char *pdf = dt_make_cyclic_field_pdf(&len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    size_t pages[] = {0};
+    TspdfReader *result = tspdf_reader_extract(doc, pages, 1, &err);
+    ASSERT(result != NULL);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(result, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(!bytes_contains(out, out_len, "/AcroForm"));
+    ASSERT(!bytes_contains(out, out_len, "loopfield"));
+
+    free(out);
+    tspdf_reader_destroy(result);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+// Hand-built one-page PDF whose two outline items form a /Next cycle
+// (LOOPA -> LOOPB -> LOOPA). Both point at the kept page.
+static char *dt_make_cyclic_outline_pdf(size_t *out_len) {
+    char *pdf = (char *)malloc(8192);
+    if (!pdf) return NULL;
+    size_t pos = 0;
+    size_t off[8] = {0};
+
+    if (!appendf(pdf, 8192, &pos, "%%PDF-1.4\n")) goto fail;
+
+    off[1] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>\nendobj\n")) goto fail;
+    off[2] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")) goto fail;
+    off[3] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n")) goto fail;
+    off[4] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "4 0 obj\n<< /Type /Outlines /First 5 0 R /Last 6 0 R /Count 2 >>\nendobj\n")) goto fail;
+    off[5] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "5 0 obj\n<< /Title (LOOPA) /Parent 4 0 R /Next 6 0 R "
+                 "/Dest [3 0 R /Fit] >>\nendobj\n")) goto fail;
+    off[6] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "6 0 obj\n<< /Title (LOOPB) /Parent 4 0 R /Prev 5 0 R /Next 5 0 R "
+                 "/Dest [3 0 R /Fit] >>\nendobj\n")) goto fail;
+
+    size_t xref = pos;
+    if (!appendf(pdf, 8192, &pos, "xref\n0 7\n0000000000 65535 f \n")) goto fail;
+    for (int i = 1; i <= 6; i++) {
+        if (!appendf(pdf, 8192, &pos, "%010zu 00000 n \n", off[i])) goto fail;
+    }
+    if (!appendf(pdf, 8192, &pos,
+                 "trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n%zu\n%%%%EOF",
+                 xref)) goto fail;
+
+    *out_len = pos;
+    return pdf;
+fail:
+    free(pdf);
+    return NULL;
+}
+
+// A sibling cycle must come out as a straight two-item chain: /Count 2 and
+// no /Next on the last item (not a still-cyclic /Prev//Next pair with an
+// inflated count).
+TEST(test_extract_breaks_cyclic_outline_siblings) {
+    size_t len = 0;
+    char *pdf = dt_make_cyclic_outline_pdf(&len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    size_t pages[] = {0};
+    TspdfReader *result = tspdf_reader_extract(doc, pages, 1, &err);
+    ASSERT(result != NULL);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(result, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+
+    TspdfObj *root = dt_catalog_get(re, "Outlines");
+    ASSERT(root != NULL && root->type == TSPDF_OBJ_DICT);
+    TspdfObj *count = tspdf_dict_get(root, "Count");
+    ASSERT(count != NULL && count->type == TSPDF_OBJ_INT);
+    ASSERT_EQ_INT((int)count->integer, 2);
+
+    TspdfObj *a = dt_get(re, root, "First");
+    ASSERT(a != NULL);
+    ASSERT(dt_str_eq(tspdf_dict_get(a, "Title"), "LOOPA"));
+    ASSERT(tspdf_dict_get(a, "Prev") == NULL);
+    TspdfObj *b = dt_get(re, a, "Next");
+    ASSERT(b != NULL);
+    ASSERT(dt_str_eq(tspdf_dict_get(b, "Title"), "LOOPB"));
+    ASSERT(tspdf_dict_get(b, "Next") == NULL);
+    TspdfObj *b_prev = dt_get(re, b, "Prev");
+    ASSERT(b_prev != NULL);
+    ASSERT(dt_str_eq(tspdf_dict_get(b_prev, "Title"), "LOOPA"));
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(result);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
 int main(void) {
     printf("tspr reader tests:\n");
 
@@ -7751,6 +8010,9 @@ int main(void) {
     RUN(test_extract_flattens_named_dests);
     RUN(test_merge_flattens_named_dests_and_keeps_uri_actions);
     RUN(test_extract_prunes_field_kids_and_carries_da);
+    RUN(test_extract_and_merge_bounded_on_cyclic_nametree);
+    RUN(test_extract_bounded_on_cyclic_field_kids);
+    RUN(test_extract_breaks_cyclic_outline_siblings);
 
     printf("\n%d tests, %d passed, %d failed\n",
            tests_run, tests_passed, tests_failed);
