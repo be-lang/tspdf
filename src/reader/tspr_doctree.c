@@ -282,6 +282,13 @@ static bool dt_numlist_push(DtNumList *l, uint32_t num) {
     return true;
 }
 
+static bool dt_numlist_contains(const DtNumList *l, uint32_t num) {
+    for (size_t i = 0; i < l->count; i++) {
+        if (l->nums[i] == num) return true;
+    }
+    return false;
+}
+
 // Copy `key` from `item` into `copy` verbatim (deep copy) when present.
 static TspdfError dt_copy_key(TspdfObj *copy, TspdfObj *item, const char *key,
                               TspdfArena *a) {
@@ -304,6 +311,10 @@ static TspdfError dt_prune_outline_level(DtCtx *ctx, TspdfObj *first_val,
     while (cur && cur->type == TSPDF_OBJ_REF && ctx->budget > 0) {
         ctx->budget--;
         uint32_t num = cur->ref.num;
+        // A number already kept at this level means /Next looped back; the
+        // rest of the chain retraces itself, and pushing the duplicate would
+        // re-emit the cycle as a /Prev//Next loop with an inflated /Count.
+        if (dt_numlist_contains(survivors, num)) break;
         TspdfObj *item = dt_resolve_num(ctx->doc, ctx->parser, num);
         if (!item || item->type != TSPDF_OBJ_DICT) break;
 
