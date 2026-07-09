@@ -431,6 +431,24 @@ need = {b\"HEADone\", b\"HEADtwo\", b\"HEADthree\"}
 assert found == need, (sorted(found), sorted(need))
 " "${TMPDIR}/serve_md_uni.pdf"
   '
+  run_serve_test "serve watermark honors custom text and font size" env TSPDF="$TSPDF" TMPDIR="$TMPDIR" SERVE_PORT="$SERVE_PORT" INPUT="$INPUT" bash -c '
+    curl -sf --retry 3 --retry-delay 1 --max-time 10 \
+      -F "pdf_file=@${INPUT}" \
+      -F "config={\"watermark_text\":\"WMCUSTOM\",\"font_size\":\"24\"}" \
+      "http://localhost:${SERVE_PORT}/api/watermark-existing" -o "${TMPDIR}/serve_wm.pdf" &&
+    "$TSPDF" text "${TMPDIR}/serve_wm.pdf" | grep -q WMCUSTOM
+  '
+
+  run_serve_test "serve password-protect honors distinct owner password" env TSPDF="$TSPDF" TMPDIR="$TMPDIR" SERVE_PORT="$SERVE_PORT" INPUT="$INPUT" bash -c '
+    curl -sf --retry 3 --retry-delay 1 --max-time 10 \
+      -F "pdf_file=@${INPUT}" \
+      -F "config={\"password\":\"userpw\",\"owner_password\":\"ownerpw\"}" \
+      "http://localhost:${SERVE_PORT}/api/password-protect" -o "${TMPDIR}/serve_prot.pdf" &&
+    "$TSPDF" info "${TMPDIR}/serve_prot.pdf" --password ownerpw > /dev/null &&
+    "$TSPDF" info "${TMPDIR}/serve_prot.pdf" --password userpw > /dev/null &&
+    ! "$TSPDF" info "${TMPDIR}/serve_prot.pdf" --password wrongpw > /dev/null 2>&1
+  '
+
   kill $SERVE_PID 2>/dev/null || true
   wait $SERVE_PID 2>/dev/null || true
   # Serve failures don't fail the suite (flaky due to single-threaded server)

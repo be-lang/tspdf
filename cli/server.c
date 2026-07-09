@@ -1370,6 +1370,7 @@ static void api_password_protect(int fd, MultipartForm *form)
     if (!file || !file->is_file) { send_error(fd, 400, "Missing pdf_file"); return; }
 
     char password[256] = {0};
+    char owner_password[256] = {0};
     char bits_str[32] = {0};
     if (cfg) {
         char config_buf[1024];
@@ -1377,6 +1378,7 @@ static void api_password_protect(int fd, MultipartForm *form)
         memcpy(config_buf, cfg->data, clen);
         config_buf[clen] = '\0';
         json_get_string(config_buf, "password", password, sizeof(password));
+        json_get_string(config_buf, "owner_password", owner_password, sizeof(owner_password));
         json_get_string(config_buf, "bits", bits_str, sizeof(bits_str));
     }
 
@@ -1392,7 +1394,8 @@ static void api_password_protect(int fd, MultipartForm *form)
     uint8_t *out = NULL;
     size_t out_len = 0;
     err = tspdf_reader_save_to_memory_encrypted(doc, &out, &out_len,
-                                                 password, password,
+                                                 password,
+                                                 owner_password[0] ? owner_password : password,
                                                  0xFFFFFFFF, bits);
     tspdf_reader_destroy(doc);
 
@@ -1517,17 +1520,26 @@ static void api_watermark(int fd, MultipartForm *form)
 
     char text[256] = "DRAFT";
     char opacity_str[32] = {0};
+    char font_size_str[32] = {0};
     if (cfg) {
         char config_buf[1024];
         size_t clen = cfg->data_len < sizeof(config_buf)-1 ? cfg->data_len : sizeof(config_buf)-1;
         memcpy(config_buf, cfg->data, clen);
         config_buf[clen] = '\0';
-        json_get_string(config_buf, "text", text, sizeof(text));
+        /* The watermark tool page sends "watermark_text"; keep "text" as a
+         * fallback for direct API callers. */
+        json_get_string(config_buf, "watermark_text", text, sizeof(text));
+        if (!text[0] || strcmp(text, "DRAFT") == 0)
+            json_get_string(config_buf, "text", text, sizeof(text));
+        if (!text[0]) snprintf(text, sizeof(text), "DRAFT");
         json_get_string(config_buf, "opacity", opacity_str, sizeof(opacity_str));
+        json_get_string(config_buf, "font_size", font_size_str, sizeof(font_size_str));
     }
 
     double opacity = opacity_str[0] ? atof(opacity_str) : 0.3;
     if (opacity <= 0.0 || opacity > 1.0) opacity = 0.3;
+    double cfg_font_size = font_size_str[0] ? atof(font_size_str) : 48.0;
+    if (cfg_font_size < 6.0 || cfg_font_size > 144.0) cfg_font_size = 48.0;
 
     TspdfError err = TSPDF_OK;
     TspdfReader *doc = tspdf_reader_open(
@@ -1535,7 +1547,7 @@ static void api_watermark(int fd, MultipartForm *form)
     if (!doc) { send_error(fd, 400, "Failed to open PDF"); return; }
 
     size_t page_count = tspdf_reader_page_count(doc);
-    double font_size = 48.0;
+    double font_size = cfg_font_size;
     double angle_rad = 45.0 * M_PI / 180.0;
     double cos_a = cos(angle_rad);
     double sin_a = sin(angle_rad);
