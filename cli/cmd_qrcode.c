@@ -48,7 +48,7 @@ int cmd_qrcode(int argc, char **argv) {
     TspdfWriter *doc = tspdf_writer_create();
     if (!doc) { qr_free(qr); fprintf(stderr, "tspdf qrcode: out of memory\n"); return 1; }
 
-    if (title) tspdf_writer_set_title(doc, title);
+    if (title[0]) tspdf_writer_set_title(doc, title);
     tspdf_writer_set_creator(doc, "tspdf");
 
     const char *sans = tspdf_writer_add_builtin_font(doc, "Helvetica");
@@ -91,7 +91,7 @@ int cmd_qrcode(int argc, char **argv) {
     tspdf_stream_stroke(page);
 
     /* Title above QR (if present) */
-    if (title && title[0]) {
+    if (title[0]) {
         tspdf_stream_begin_text(page);
         tspdf_stream_set_font(page, bold, 22.0);
         tspdf_stream_set_fill_color(page, tspdf_color_from_u8(20, 25, 60));

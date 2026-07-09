@@ -452,6 +452,15 @@ run_test "qrcode no text fails" bash -c "! $TSPDF qrcode -o $TMPDIR/qr_fail.pdf 
 run_test "qrcode flag-first ordering (-o/--title/--subtitle before text)" $TSPDF qrcode -o $TMPDIR/qrcode_ff.pdf --title "Test" --subtitle "Scan me" "https://example.com"
 # a flag value must not be mistaken for the text positional (only flags present → still missing text)
 run_test "qrcode title-only still reports missing text" bash -c "! $TSPDF qrcode -o $TMPDIR/qr_fail2.pdf --title MyTitle > /dev/null 2>&1"
+# --title "" suppresses the page title AND the /Title metadata entry entirely
+# (rather than writing an empty string); the default is /Title (QR Code).
+run_test "qrcode --title \"\" omits metadata title" bash -c '
+  set -e
+  "'"$TSPDF"'" qrcode "https://example.com" --title "" -o "'"$TMPDIR"'/qr_notitle.pdf" > /dev/null
+  ! grep -qa "/Title" "'"$TMPDIR"'/qr_notitle.pdf"
+  "'"$TSPDF"'" qrcode "https://example.com" -o "'"$TMPDIR"'/qr_deftitle.pdf" > /dev/null
+  grep -qa "/Title (QR Code)" "'"$TMPDIR"'/qr_deftitle.pdf"
+'
 
 # md2pdf
 cat > $TMPDIR/test.md << 'MDEOF'

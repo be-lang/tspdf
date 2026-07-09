@@ -2383,11 +2383,11 @@ static const QrGolden qr_goldens[] = {
     { /* len 30, version 3 */
       "https://example.org/p/abcdefgh",
       29,
-        { 0x1fc41d7f, 0x104d0a41, 0x175fa25d, 0x174dc35d, 0x1755715d, 0x105ef941,
-          0x1fd5557f, 0x24300, 0x13ebfdd1, 0x1fe41b16, 0x1070f94f, 0x1b7fbd86,
-          0x8322a41, 0x1fd57b99, 0x16170550, 0x18fa5d04, 0x83bea42, 0x1bc4178f,
-          0x14c6e4e4, 0x19cfaba8, 0x13fa38df, 0x11156d00, 0x175d137f, 0x91a5e41,
-          0x1bfaed5d, 0x884145d, 0x1e3df25d, 0x1a17e441, 0xbd2f57f } },
+        { 0x1fcd387f, 0x105bd141, 0x1749785d, 0x1744e65d, 0x175c555d, 0x10482241,
+          0x1fd5557f, 0xb6600, 0x902d855, 0x1252c03b, 0x1dc62262, 0x9369914,
+          0x1a7b0ed3, 0x1263a0b4, 0x1ba1de7d, 0xab37996, 0x1a72ced0, 0x1672cca2,
+          0x19703fc9, 0xb868f3a, 0x1f31c4d, 0x1d13b700, 0x1b5bc87f, 0x1b137a41,
+          0x9f3c95d, 0x532ce5d, 0x138b295d, 0x85ec041, 0x199bd17f } },
     { /* len 60, version 4 */
       "https://example.org/p/abcdefghijabcdefghijabcdefghijabcdefgh",
       33,
@@ -2448,6 +2448,34 @@ static const QrGolden qr_goldens[] = {
           0x1f0a7cfc0a3f40, 0x1710e38c5b35100, 0x95e0d6d642b07f, 0xf1b7a145989f41,
           0x11f685eff4ad15d, 0x1c06a15c98815d, 0x65f1d6627e695d, 0x7a934768c70441,
           0x8d0a388229a57f } },
+    { /* len 250, version 11 — the only version where group 1 has FEWER
+       * blocks than group 2 (1x50 + 4x51), so this pins that interleave
+       * shape end to end. */
+      "https://example.org/p/abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij"
+      "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij"
+      "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij"
+      "abcdefgh",
+      61,
+        { 0x1fdb8f2965949e7f, 0x1059e056a8fe1a41, 0x175c15c0e599d55d,
+          0x1757e81b1be8515d, 0x174f17a1f55f3f5d, 0x1045f05718d34141,
+          0x1fd555555555557f, 0x1c53a315431b00, 0x7d9ea5ff279da7d, 0x7e28e396c362480,
+          0x1e057056b8c8cb42, 0x19fc11a2672a2132, 0x659205f1ac2d7e7,
+          0x3e386390c06c20d, 0x180de056da8c235a, 0x117c15a3e11d9799,
+          0x6fb8e7c82e45d40, 0x6e38f290c61dd97, 0x1a95e056fb9a91cb,
+          0x16415c16217ca2b, 0x495e81a831695df, 0x66317a10d0f881a,
+          0x1885f0569815046d, 0x10015c166f02e9c, 0x69bca3893058d51,
+          0x7c28e390cd77aa3, 0x1e057056d817b950, 0x197855a266c16715,
+          0x7fbce7dfa1cd1f3, 0x31206a11598b916, 0x195550475b776d51,
+          0x111c1da31839e716, 0x7fb8e7dfa6265f8, 0x2cb1ea115fecba7,
+          0x1f64f8471a8a824e, 0x81415c0cba6a415, 0x1ffde81bea344c69,
+          0x8f317a09595012b, 0xa6df0570a4a0bd5, 0x101015c0e5b5c513,
+          0x156bca39636184c3, 0x6928e389575a23c, 0x1e6d70570b086f51,
+          0x189077c080294eb7, 0x77dac5ee27b9ff6, 0x2b206a095bce803,
+          0x19e570474aa807ca, 0x101635c0e1b60903, 0x72be81aea66246f,
+          0x2ab9f38959e2cbb, 0x1f4768c71a7b717c, 0x81415c0ebc31e97,
+          0x1ffde01bfa0c9ccf, 0x3131f391db02d00, 0x1d5568c753ed687f,
+          0x11015c115977f41, 0x1ffbca39fa5d5f5d, 0x117a8e39fdd1ad5d,
+          0x12e570569bfd0f5d, 0x10f877c11f842641, 0x1c05ac5ee25b9d7f } },
 };
 
 TEST(test_qr_golden_grids) {
