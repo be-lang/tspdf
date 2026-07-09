@@ -43,6 +43,13 @@ on 0.x, the CLI is considered stable but the low-level C API may still change.
   `docs/library.md` documenting the C API entry points.
 
 ### Changed
+- AES encryption/decryption is 50-100x faster: the block cipher is now
+  table-driven (pure C11), with an additional AES-NI fast path on x86 CPUs
+  selected at runtime (portable fallback kept; `TSPDF_NO_AESHW=1` forces it).
+  Decrypting a 23 MB AES-256 file drops from ~15 s to ~0.05 s. Correctness is
+  pinned by FIPS-197 and NIST SP 800-38A vectors, both paths byte-compared,
+  and key material is wiped before contexts are freed. `make bench-crypto`
+  reports throughput.
 - `compress` was overhauled and now actually compresses: the from-scratch
   DEFLATE encoder gained a lazy hash-chain matcher and dynamic Huffman blocks
   (now smaller than zlib level 6 on typical PDF payloads), and the serializer
