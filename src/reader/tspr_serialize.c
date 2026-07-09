@@ -416,12 +416,14 @@ static void write_obj(TspdfBuffer *buf, TspdfObj *obj, const RenumberMap *map, T
     }
 }
 
-static void write_catalog_obj(TspdfBuffer *buf, TspdfObj *catalog,
-                              const RenumberMap *map, TspdfReader *doc,
-                              bool strip_metadata) {
+// Writes the catalog dict body only ("<< ... >>", no obj wrapper) so the
+// caller can place it either top-level or inside an object stream.
+static void write_catalog_body(TspdfBuffer *buf, TspdfObj *catalog,
+                               const RenumberMap *map, TspdfReader *doc,
+                               bool strip_metadata) {
     bool wrote_type = false;
 
-    tspdf_buffer_append_str(buf, "1 0 obj\n<< ");
+    tspdf_buffer_append_str(buf, "<< ");
     if (catalog && catalog->type == TSPDF_OBJ_DICT) {
         for (size_t i = 0; i < catalog->dict.count; i++) {
             const char *key = catalog->dict.entries[i].key;
@@ -442,7 +444,7 @@ static void write_catalog_obj(TspdfBuffer *buf, TspdfObj *catalog,
     if (!wrote_type) {
         tspdf_buffer_append_str(buf, "/Type /Catalog ");
     }
-    tspdf_buffer_append_str(buf, "/Pages 2 0 R >>\nendobj\n");
+    tspdf_buffer_append_str(buf, "/Pages 2 0 R >>");
 }
 
 TspdfError tspdf_serialize(TspdfReader *doc, uint8_t **out_buf, size_t *out_len) {
@@ -661,20 +663,165 @@ static bool is_xmp_metadata(TspdfObj *obj) {
             strcmp((const char *)type_val->string.data, "Metadata") == 0);
 }
 
+// --- Object stream (ObjStm) packing ---
+//
+// When recompress_streams is on, eligible objects are packed into
+// /Type /ObjStm streams so thousands of small "N 0 obj … endobj" wrappers
+// (plus their 20-byte xref entries) collapse into one Flate-compressed
+// stream. Eligible objects are non-stream objects; everything this
+// serializer writes has generation 0, it never emits an encryption
+// dictionary (encrypted saves go through tspdf_serialize_encrypted, which
+// deliberately does NOT pack: strings inside an object stream must not be
+// individually encrypted, so a correct encrypted ObjStm writer would need a
+// separate no-string-encryption serialization mode — plain top-level objects
+// are simpler and safe), and the xref stream itself is written separately.
+
+enum { TSPDF_OBJSTM_CAPACITY = 128 };  // objects per ObjStm
+
+typedef struct {
+    TspdfBuffer *out;          // main output buffer
+    size_t *offsets;           // top-level offsets, indexed by new object number
+    uint32_t *objstm_of;       // ObjStm object number holding object i (0 = top-level)
+    uint32_t *objstm_idx;      // index of object i within its ObjStm
+    uint32_t next_objstm_num;  // object number the next flushed ObjStm gets
+    uint32_t count;            // objects in the current (unflushed) ObjStm
+    TspdfBuffer header;        // "objnum offset" pairs
+    TspdfBuffer body;          // concatenated object bodies
+    bool enabled;
+} ObjStmWriter;
+
+static bool objstm_writer_init(ObjStmWriter *w, TspdfBuffer *out, size_t *offsets,
+                               uint32_t *objstm_of, uint32_t *objstm_idx,
+                               uint32_t first_objstm_num, bool enabled) {
+    memset(w, 0, sizeof(*w));
+    w->out = out;
+    w->offsets = offsets;
+    w->objstm_of = objstm_of;
+    w->objstm_idx = objstm_idx;
+    w->next_objstm_num = first_objstm_num;
+    w->enabled = enabled;
+    if (enabled) {
+        w->header = tspdf_buffer_create(1024);
+        w->body = tspdf_buffer_create(16384);
+        if (w->header.error || w->body.error) return false;
+    }
+    return true;
+}
+
+static void objstm_writer_destroy(ObjStmWriter *w) {
+    if (w->enabled) {
+        tspdf_buffer_destroy(&w->header);
+        tspdf_buffer_destroy(&w->body);
+    }
+}
+
+// Write the accumulated ObjStm as a top-level stream object.
+static TspdfError objstm_writer_flush(ObjStmWriter *w) {
+    if (!w->enabled || w->count == 0) return TSPDF_OK;
+    if (w->header.error || w->body.error) return TSPDF_ERR_ALLOC;
+
+    size_t first = w->header.len;
+    size_t raw_len = first + w->body.len;
+    uint8_t *raw = (uint8_t *)malloc(raw_len > 0 ? raw_len : 1);
+    if (!raw) return TSPDF_ERR_ALLOC;
+    memcpy(raw, w->header.data, w->header.len);
+    memcpy(raw + first, w->body.data, w->body.len);
+
+    size_t comp_len = 0;
+    uint8_t *comp = deflate_compress(raw, raw_len, &comp_len);
+
+    uint32_t num = w->next_objstm_num++;
+    w->offsets[num] = w->out->len;
+    if (comp && comp_len < raw_len) {
+        tspdf_buffer_printf(w->out,
+            "%u 0 obj\n<< /Type /ObjStm /N %u /First %zu /Length %zu /Filter /FlateDecode >>\nstream\n",
+            num, w->count, first, comp_len);
+        tspdf_buffer_append(w->out, comp, comp_len);
+    } else {
+        // Incompressible payload (pathological): store verbatim.
+        tspdf_buffer_printf(w->out,
+            "%u 0 obj\n<< /Type /ObjStm /N %u /First %zu /Length %zu >>\nstream\n",
+            num, w->count, first, raw_len);
+        tspdf_buffer_append(w->out, raw, raw_len);
+    }
+    tspdf_buffer_append_str(w->out, "\nendstream\nendobj\n");
+    free(comp);
+    free(raw);
+
+    w->count = 0;
+    tspdf_buffer_reset(&w->header);
+    tspdf_buffer_reset(&w->body);
+    return w->out->error ? TSPDF_ERR_ALLOC : TSPDF_OK;
+}
+
+// Emit one non-stream object body: into the current ObjStm when packing is
+// enabled, otherwise as a plain top-level "N 0 obj … endobj".
+static TspdfError emit_nonstream_object(ObjStmWriter *w, uint32_t new_num,
+                                        const TspdfBuffer *obj_body) {
+    if (obj_body->error) return TSPDF_ERR_ALLOC;
+
+    if (!w->enabled) {
+        w->offsets[new_num] = w->out->len;
+        tspdf_buffer_printf(w->out, "%u 0 obj\n", new_num);
+        tspdf_buffer_append(w->out, obj_body->data, obj_body->len);
+        tspdf_buffer_append_str(w->out, "\nendobj\n");
+        return w->out->error ? TSPDF_ERR_ALLOC : TSPDF_OK;
+    }
+
+    tspdf_buffer_printf(&w->header, "%u %zu ", new_num, w->body.len);
+    tspdf_buffer_append(&w->body, obj_body->data, obj_body->len);
+    tspdf_buffer_append_byte(&w->body, '\n');  // whitespace between objects
+    if (w->header.error || w->body.error) return TSPDF_ERR_ALLOC;
+    w->objstm_of[new_num] = w->next_objstm_num;
+    w->objstm_idx[new_num] = w->count;
+    w->count++;
+    if (w->count >= TSPDF_OBJSTM_CAPACITY) return objstm_writer_flush(w);
+    return TSPDF_OK;
+}
+
 // --- Helper: write xref stream ---
+
+// Minimal number of big-endian bytes needed to store v.
+static int xref_field_width(uint64_t v) {
+    int w = 1;
+    while (v > 0xFF) {
+        v >>= 8;
+        w++;
+    }
+    return w;
+}
+
+// objstm_of/objstm_idx (may be NULL): objstm_of[i] != 0 means object i lives
+// in object stream objstm_of[i] at index objstm_idx[i] (type-2 entry).
 static TspdfError write_xref_stream(TspdfBuffer *buf, size_t *offsets, uint32_t total_objects,
                                       uint32_t root_ref, uint32_t info_obj_num,
-                                      bool write_info, const TspdfSaveOptions *opts) {
+                                      bool write_info, const TspdfSaveOptions *opts,
+                                      const uint32_t *objstm_of, const uint32_t *objstm_idx) {
     // The xref stream is written as a new object (total_objects + 1)
     uint32_t xref_obj_num = total_objects + 1;
     size_t xref_stream_offset = buf->len;
     uint32_t size_val = xref_obj_num + 1;  // /Size is highest object number + 1
 
-    // Build raw xref entry data: W = [1 8 2], 11 bytes per entry
-    // Entry 0 (free): type=0 offset=0 gen=65535
-    // Entries 1..total_objects and the xref stream itself are in-use.
+    // Right-size /W instead of a fixed [1 8 2] (11 bytes/entry). Field 1 is
+    // the entry type (1 byte). Field 2 holds byte offsets (type 1) or
+    // object-stream numbers (type 2); the xref stream's own offset is the
+    // largest offset since it is written last. Field 3 holds the index
+    // within an object stream for type-2 entries; free entries write 0 there
+    // (as qpdf does — a spec-literal 65535 generation would force a 2-byte
+    // field 3 on every file for no reader benefit).
+    uint64_t max_f2 = xref_stream_offset;
+    uint64_t max_f3 = 0;
+    for (uint32_t i = 1; i <= total_objects; i++) {
+        if (objstm_of && objstm_of[i] != 0) {
+            if (objstm_of[i] > max_f2) max_f2 = objstm_of[i];
+            if (objstm_idx[i] > max_f3) max_f3 = objstm_idx[i];
+        }
+    }
+    const int w2 = xref_field_width(max_f2);
+    const int w3 = xref_field_width(max_f3);
+    const size_t entry_size = (size_t)(1 + w2 + w3);
+
     size_t entry_count = (size_t)size_val;  // 0..xref_obj_num
-    const size_t entry_size = 11;
     if (entry_count > SIZE_MAX / entry_size) {
         return TSPDF_ERR_UNSUPPORTED;
     }
@@ -682,25 +829,32 @@ static TspdfError write_xref_stream(TspdfBuffer *buf, size_t *offsets, uint32_t 
     uint8_t *raw = (uint8_t *)calloc(raw_len, 1);
     if (!raw) return TSPDF_ERR_ALLOC;
 
-    // Entry 0: free
-    raw[0] = 0;  // type = free
-    raw[9] = 0xFF; raw[10] = 0xFF;  // gen = 65535
-
+    // Entry 0 stays all-zero: type 0 (free), next free 0.
     for (uint32_t i = 1; i <= xref_obj_num; i++) {
-        size_t source_offset = (i == xref_obj_num) ? xref_stream_offset : offsets[i];
-        size_t base = (size_t)i * entry_size;
+        uint8_t *e = raw + (size_t)i * entry_size;
+        uint64_t f2, f3;
 
-        if (source_offset == 0) {
-            raw[base] = 0;  // free
-            raw[base + 9] = 0xFF;
-            raw[base + 10] = 0xFF;
-            continue;
+        if (i == xref_obj_num) {
+            e[0] = 1;  // the xref stream itself
+            f2 = (uint64_t)xref_stream_offset;
+            f3 = 0;
+        } else if (objstm_of && objstm_of[i] != 0) {
+            e[0] = 2;  // compressed in an object stream
+            f2 = objstm_of[i];
+            f3 = objstm_idx[i];
+        } else if (offsets[i] != 0) {
+            e[0] = 1;  // in-use, top-level
+            f2 = (uint64_t)offsets[i];
+            f3 = 0;
+        } else {
+            continue;  // free entry: all zero
         }
 
-        raw[base] = 1;  // in-use
-        uint64_t off = (uint64_t)source_offset;
-        for (int b = 0; b < 8; b++) {
-            raw[base + 1 + b] = (uint8_t)(off >> (56 - b * 8));
+        for (int b = 0; b < w2; b++) {
+            e[1 + b] = (uint8_t)(f2 >> (8 * (w2 - 1 - b)));
+        }
+        for (int b = 0; b < w3; b++) {
+            e[1 + w2 + b] = (uint8_t)(f3 >> (8 * (w3 - 1 - b)));
         }
     }
 
@@ -711,8 +865,8 @@ static TspdfError write_xref_stream(TspdfBuffer *buf, size_t *offsets, uint32_t 
     if (!compressed) return TSPDF_ERR_ALLOC;
 
     // Write xref stream object
-    tspdf_buffer_printf(buf, "%u 0 obj\n<< /Type /XRef /Size %u /W [ 1 8 2 ] /Root %u 0 R",
-                  xref_obj_num, size_val, root_ref);
+    tspdf_buffer_printf(buf, "%u 0 obj\n<< /Type /XRef /Size %u /W [ 1 %d %d ] /Root %u 0 R",
+                  xref_obj_num, size_val, w2, w3, root_ref);
     if (write_info && !opts->strip_metadata) {
         tspdf_buffer_printf(buf, " /Info %u 0 R", info_obj_num);
     }
@@ -921,7 +1075,8 @@ TspdfError tspdf_serialize_with_options(TspdfReader *doc, uint8_t **out_buf, siz
             uint32_t root_for_trailer = orig_root_num;
             uint32_t info_for_trailer = (!opts->strip_metadata && need_producer_info) ? producer_info_num : 0;
             TspdfError xref_err = write_xref_stream(&buf, offsets, max_obj, root_for_trailer,
-                                                     info_for_trailer, info_for_trailer > 0, opts);
+                                                     info_for_trailer, info_for_trailer > 0, opts,
+                                                     NULL, NULL);
             if (xref_err != TSPDF_OK) {
                 tspdf_buffer_destroy(&buf);
                 free(offsets);
@@ -1051,6 +1206,15 @@ TspdfError tspdf_serialize_with_options(TspdfReader *doc, uint8_t **out_buf, siz
         }
     }
 
+    // Object-stream packing: only when recompression asks for minimal output.
+    // This path always writes unencrypted output (encrypted saves go through
+    // tspdf_serialize_encrypted), so the no-encryption ObjStm rule holds, and
+    // recompress implies use_xref_stream, which type-2 entries require.
+    bool use_objstm = opts->recompress_streams;
+    uint32_t max_objstms = use_objstm
+        ? total_objects / TSPDF_OBJSTM_CAPACITY + 2 : 0;
+    size_t table_size = (size_t)total_objects + max_objstms + 2;
+
     // 3. Write PDF
     TspdfBuffer buf = tspdf_buffer_create(doc->data_len > 0 ? doc->data_len : 65536);
     if (buf.error) {
@@ -1069,9 +1233,22 @@ TspdfError tspdf_serialize_with_options(TspdfReader *doc, uint8_t **out_buf, siz
     tspdf_buffer_append_byte(&buf, 0xD3);
     tspdf_buffer_append_byte(&buf, '\n');
 
-    // Track offsets for xref
-    size_t *offsets = (size_t *)calloc(total_objects + 1, sizeof(size_t));
-    if (!offsets) {
+    // Track offsets for xref, plus type-2 locations when packing
+    size_t *offsets = (size_t *)calloc(table_size, sizeof(size_t));
+    uint32_t *objstm_of = use_objstm ? (uint32_t *)calloc(table_size, sizeof(uint32_t)) : NULL;
+    uint32_t *objstm_idx = use_objstm ? (uint32_t *)calloc(table_size, sizeof(uint32_t)) : NULL;
+    // Scratch buffer for one non-stream object body at a time
+    TspdfBuffer scratch = tspdf_buffer_create(4096);
+    ObjStmWriter stm_writer;
+    bool stm_writer_ok = objstm_writer_init(&stm_writer, &buf, offsets, objstm_of,
+                                            objstm_idx, total_objects + 1, use_objstm);
+    if (!offsets || scratch.error || !stm_writer_ok ||
+        (use_objstm && (!objstm_of || !objstm_idx))) {
+        objstm_writer_destroy(&stm_writer);
+        tspdf_buffer_destroy(&scratch);
+        free(objstm_idx);
+        free(objstm_of);
+        free(offsets);
         tspdf_buffer_destroy(&buf);
         free(collected);
         free(map.old_to_new);
@@ -1079,23 +1256,29 @@ TspdfError tspdf_serialize_with_options(TspdfReader *doc, uint8_t **out_buf, siz
         return TSPDF_ERR_ALLOC;
     }
 
+    TspdfError emit_err = TSPDF_OK;
+
     // Object 1: Catalog
-    offsets[1] = buf.len;
-    write_catalog_obj(&buf, source_catalog, &map, doc, opts->strip_metadata);
+    tspdf_buffer_reset(&scratch);
+    write_catalog_body(&scratch, source_catalog, &map, doc, opts->strip_metadata);
+    emit_err = emit_nonstream_object(&stm_writer, 1, &scratch);
 
     // Object 2: Pages
-    offsets[2] = buf.len;
-    tspdf_buffer_append_str(&buf, "2 0 obj\n<< /Type /Pages /Kids [ ");
-    for (size_t i = 0; i < doc->pages.count; i++) {
-        uint32_t old_num = doc->pages.pages[i].obj_num;
-        uint32_t new_num = map.old_to_new[old_num];
-        if (i > 0) tspdf_buffer_append_byte(&buf, ' ');
-        tspdf_buffer_printf(&buf, "%u 0 R", new_num);
+    if (emit_err == TSPDF_OK) {
+        tspdf_buffer_reset(&scratch);
+        tspdf_buffer_append_str(&scratch, "<< /Type /Pages /Kids [ ");
+        for (size_t i = 0; i < doc->pages.count; i++) {
+            uint32_t old_num = doc->pages.pages[i].obj_num;
+            uint32_t new_num = map.old_to_new[old_num];
+            if (i > 0) tspdf_buffer_append_byte(&scratch, ' ');
+            tspdf_buffer_printf(&scratch, "%u 0 R", new_num);
+        }
+        tspdf_buffer_printf(&scratch, " ] /Count %zu >>", doc->pages.count);
+        emit_err = emit_nonstream_object(&stm_writer, 2, &scratch);
     }
-    tspdf_buffer_printf(&buf, " ] /Count %zu >>\nendobj\n", doc->pages.count);
 
     // Objects 3..total_objects: the collected objects
-    for (size_t i = 0; i < collected_count; i++) {
+    for (size_t i = 0; emit_err == TSPDF_OK && i < collected_count; i++) {
         uint32_t old_num = collected[i];
         uint32_t new_num = map.old_to_new[old_num];
         TspdfObj *obj = resolve_for_collect(doc, old_num, &parser);
@@ -1104,60 +1287,54 @@ TspdfError tspdf_serialize_with_options(TspdfReader *doc, uint8_t **out_buf, siz
         // Skip metadata objects if strip_metadata
         if (opts->strip_metadata && is_xmp_metadata(obj)) continue;
 
-        offsets[new_num] = buf.len;
-        tspdf_buffer_printf(&buf, "%u 0 obj\n", new_num);
-
         if (obj->type == TSPDF_OBJ_STREAM) {
-            TspdfError stream_err = write_stream_obj_with_options(
+            // Streams are never packed into object streams (spec rule);
+            // always written top-level.
+            offsets[new_num] = buf.len;
+            tspdf_buffer_printf(&buf, "%u 0 obj\n", new_num);
+            emit_err = write_stream_obj_with_options(
                 &buf, obj, &map, doc, opts, old_num, source_object_gen(doc, old_num));
-            if (stream_err != TSPDF_OK) {
-                tspdf_buffer_destroy(&buf);
-                free(offsets);
-                free(collected);
-                free(map.old_to_new);
-                free(visited);
-                return stream_err;
-            }
-        } else if (obj->type == TSPDF_OBJ_DICT) {
-            bool is_page = is_serialized_page_object(doc, old_num, obj);
-            if (is_page) {
-                bool wrote_type = false;
-                bool wrote_parent = false;
-                tspdf_buffer_append_str(&buf, "<< ");
-                for (size_t j = 0; j < obj->dict.count; j++) {
-                    const char *key = obj->dict.entries[j].key;
-                    write_name(&buf, (const uint8_t *)key, strlen(key));
-                    tspdf_buffer_append_byte(&buf, ' ');
-                    if (strcmp(key, "Type") == 0) {
-                        wrote_type = true;
-                        write_obj(&buf, obj->dict.entries[j].value, &map, doc);
-                    } else if (strcmp(key, "Parent") == 0) {
-                        wrote_parent = true;
-                        tspdf_buffer_append_str(&buf, "2 0 R");
-                    } else {
-                        write_obj(&buf, obj->dict.entries[j].value, &map, doc);
-                    }
-                    tspdf_buffer_append_byte(&buf, ' ');
-                }
-                if (!wrote_type) {
-                    tspdf_buffer_append_str(&buf, "/Type /Page ");
-                }
-                if (!wrote_parent) {
-                    tspdf_buffer_append_str(&buf, "/Parent 2 0 R ");
-                }
-                tspdf_buffer_append_str(&buf, ">>");
-            } else {
-                write_obj(&buf, obj, &map, doc);
-            }
-        } else {
-            write_obj(&buf, obj, &map, doc);
+            tspdf_buffer_append_str(&buf, "\nendobj\n");
+            continue;
         }
 
-        tspdf_buffer_append_str(&buf, "\nendobj\n");
+        tspdf_buffer_reset(&scratch);
+        if (obj->type == TSPDF_OBJ_DICT && is_serialized_page_object(doc, old_num, obj)) {
+            bool wrote_type = false;
+            bool wrote_parent = false;
+            tspdf_buffer_append_str(&scratch, "<< ");
+            for (size_t j = 0; j < obj->dict.count; j++) {
+                const char *key = obj->dict.entries[j].key;
+                write_name(&scratch, (const uint8_t *)key, strlen(key));
+                tspdf_buffer_append_byte(&scratch, ' ');
+                if (strcmp(key, "Type") == 0) {
+                    wrote_type = true;
+                    write_obj(&scratch, obj->dict.entries[j].value, &map, doc);
+                } else if (strcmp(key, "Parent") == 0) {
+                    wrote_parent = true;
+                    tspdf_buffer_append_str(&scratch, "2 0 R");
+                } else {
+                    write_obj(&scratch, obj->dict.entries[j].value, &map, doc);
+                }
+                tspdf_buffer_append_byte(&scratch, ' ');
+            }
+            if (!wrote_type) {
+                tspdf_buffer_append_str(&scratch, "/Type /Page ");
+            }
+            if (!wrote_parent) {
+                tspdf_buffer_append_str(&scratch, "/Parent 2 0 R ");
+            }
+            tspdf_buffer_append_str(&scratch, ">>");
+        } else {
+            write_obj(&scratch, obj, &map, doc);
+        }
+        emit_err = emit_nonstream_object(&stm_writer, new_num, &scratch);
     }
 
-    // Info dict object
-    if (write_info) {
+    // Info dict object. Kept top-level even when packing: write_info_dict_obj
+    // emits a complete indirect object, and one small dict does not change
+    // the size math.
+    if (emit_err == TSPDF_OK && write_info) {
         offsets[info_obj_num] = buf.len;
         if (metadata_has_changes(doc->metadata)) {
             write_info_dict_obj(&buf, doc, &parser, info_obj_num);
@@ -1167,12 +1344,36 @@ TspdfError tspdf_serialize_with_options(TspdfReader *doc, uint8_t **out_buf, siz
         }
     }
 
+    // Flush the last (partial) object stream
+    if (emit_err == TSPDF_OK) {
+        emit_err = objstm_writer_flush(&stm_writer);
+    }
+    // Object streams get numbers above the regular objects
+    uint32_t total_with_objstms = use_objstm ? stm_writer.next_objstm_num - 1
+                                             : total_objects;
+    objstm_writer_destroy(&stm_writer);
+    tspdf_buffer_destroy(&scratch);
+
+    if (emit_err != TSPDF_OK) {
+        tspdf_buffer_destroy(&buf);
+        free(objstm_idx);
+        free(objstm_of);
+        free(offsets);
+        free(collected);
+        free(map.old_to_new);
+        free(visited);
+        return emit_err;
+    }
+
     // Xref table or xref stream
     if (use_xref_stream) {
-        TspdfError xref_err = write_xref_stream(&buf, offsets, total_objects, 1,
-                                                 info_obj_num, write_info, opts);
+        TspdfError xref_err = write_xref_stream(&buf, offsets, total_with_objstms, 1,
+                                                 info_obj_num, write_info, opts,
+                                                 objstm_of, objstm_idx);
         if (xref_err != TSPDF_OK) {
             tspdf_buffer_destroy(&buf);
+            free(objstm_idx);
+            free(objstm_of);
             free(offsets);
             free(collected);
             free(map.old_to_new);
@@ -1198,6 +1399,8 @@ TspdfError tspdf_serialize_with_options(TspdfReader *doc, uint8_t **out_buf, siz
 
     if (buf.error) {
         tspdf_buffer_destroy(&buf);
+        free(objstm_idx);
+        free(objstm_of);
         free(offsets);
         free(collected);
         free(map.old_to_new);
@@ -1208,6 +1411,8 @@ TspdfError tspdf_serialize_with_options(TspdfReader *doc, uint8_t **out_buf, siz
     *out_buf = buf.data;
     *out_len = buf.len;
 
+    free(objstm_idx);
+    free(objstm_of);
     free(offsets);
     free(collected);
     free(map.old_to_new);
@@ -1397,6 +1602,11 @@ static TspdfError write_stream_obj_encrypted(TspdfBuffer *buf, TspdfObj *obj, co
     return buf->error ? TSPDF_ERR_ALLOC : TSPDF_OK;
 }
 
+// Encrypted saves intentionally do NOT pack objects into object streams.
+// Strings inside an ObjStm must not be individually encrypted (the whole
+// ObjStm stream is encrypted as one unit instead), so packing would require a
+// separate serialization mode that suppresses per-string encryption. Plain
+// top-level objects keep the encrypted writer simple and obviously correct.
 TspdfError tspdf_serialize_encrypted(TspdfReader *doc, TspdfCrypt *crypt,
                                     uint8_t **out_buf, size_t *out_len) {
     if (!doc || !crypt || !out_buf || !out_len) return TSPDF_ERR_PARSE;
