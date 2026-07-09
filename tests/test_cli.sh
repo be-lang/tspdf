@@ -296,14 +296,14 @@ open(sys.argv[1], 'wb').write(out)
 " "$TMPDIR/objheavy.pdf"
   run_test "compress object-heavy pdf" $TSPDF compress "$TMPDIR/objheavy.pdf" -o "$TMPDIR/objheavy_out.pdf"
   run_test "compress object-heavy output is smaller than input" bash -c "
-    [ \$(stat -c%s '$TMPDIR/objheavy_out.pdf') -lt \$(stat -c%s '$TMPDIR/objheavy.pdf') ]"
+    [ \$(wc -c < '$TMPDIR/objheavy_out.pdf') -lt \$(wc -c < '$TMPDIR/objheavy.pdf') ]"
   run_test "compress output contains an object stream" grep -q "/Type /ObjStm" "$TMPDIR/objheavy_out.pdf"
   run_test "compress object-heavy page count preserved" bash -c "$TSPDF info '$TMPDIR/objheavy_out.pdf' | grep -qE '^Pages:[[:space:]]*1$'"
   run_test "compress object-heavy text preserved" bash -c "$TSPDF text '$TMPDIR/objheavy_out.pdf' | grep -q 'Hello ObjStm'"
   # Do-no-harm: recompressing the ObjStm-heavy output must not inflate it.
   run_test "compress objstm-heavy input does not grow" bash -c "
     $TSPDF compress '$TMPDIR/objheavy_out.pdf' -o '$TMPDIR/objheavy_out2.pdf' > /dev/null 2>&1 &&
-    [ \$(stat -c%s '$TMPDIR/objheavy_out2.pdf') -le \$(stat -c%s '$TMPDIR/objheavy_out.pdf') ]"
+    [ \$(wc -c < '$TMPDIR/objheavy_out2.pdf') -le \$(wc -c < '$TMPDIR/objheavy_out.pdf') ]"
   if command -v qpdf > /dev/null 2>&1; then
     run_test "compress objstm output passes qpdf --check" qpdf --check "$TMPDIR/objheavy_out.pdf"
     run_test "compress objstm output has type-2 xref entries" bash -c "
@@ -376,7 +376,7 @@ img2pdf_fits() {  # <fixture.png> <out.pdf>: PDF <= 1.2x PNG + ~1.2K structure
   local src="tests/data/$1" out="$TMPDIR/$2"
   "$TSPDF" img2pdf "tests/data/$1" -o "$out" > /dev/null 2>&1 || return 1
   local ss os
-  ss=$(stat -c%s "$src") && os=$(stat -c%s "$out") || return 1
+  ss=$(wc -c < "$src") && os=$(wc -c < "$out") || return 1
   [ "$os" -le $(( ss * 12 / 10 + 1200 )) ]
 }
 run_test "img2pdf rgb png passthrough size"      img2pdf_fits img_rgb.png     pp_rgb.pdf
@@ -388,7 +388,7 @@ run_test "img2pdf 4-bit palette passthrough size" img2pdf_fits img_palette4.png 
 # (python img2pdf lands in the same place for this file).
 run_test "img2pdf palette+tRNS passthrough size" bash -c "
   $TSPDF img2pdf tests/data/img_palette_trns.png -o $TMPDIR/pp_paltrns.pdf > /dev/null 2>&1 &&
-  [ \$(stat -c%s $TMPDIR/pp_paltrns.pdf) -le \$(( \$(stat -c%s tests/data/img_palette_trns.png) * 12 / 10 + 4800 + 1200 )) ]"
+  [ \$(wc -c < $TMPDIR/pp_paltrns.pdf) -le \$(( \$(wc -c < tests/data/img_palette_trns.png) * 12 / 10 + 4800 + 1200 )) ]"
 
 # Structural checks: passthrough must keep the source colorspace (Indexed /
 # DeviceGray — no expansion to RGB) and declare the PNG predictor.
@@ -402,8 +402,8 @@ run_test "img2pdf palette+tRNS keeps Indexed + SMask" bash -c "grep -aq '/Indexe
 run_test "img2pdf rgba keeps SMask" bash -c "$TSPDF img2pdf tests/data/img_rgba.png -o $TMPDIR/pp_rgba.pdf > /dev/null 2>&1 && grep -aq '/SMask' $TMPDIR/pp_rgba.pdf"
 run_test "img2pdf gray+alpha stays DeviceGray with SMask" bash -c "$TSPDF img2pdf tests/data/img_gray_alpha.png -o $TMPDIR/pp_ga.pdf > /dev/null 2>&1 && grep -aq '/DeviceGray' $TMPDIR/pp_ga.pdf && grep -aq '/SMask' $TMPDIR/pp_ga.pdf"
 # Even the decode-path (alpha) outputs must not blow up vs the source.
-run_test "img2pdf rgba size sane" bash -c "[ \$(stat -c%s $TMPDIR/pp_rgba.pdf) -le \$(( \$(stat -c%s tests/data/img_rgba.png) * 18 / 10 + 1200 )) ]"
-run_test "img2pdf gray+alpha size sane" bash -c "[ \$(stat -c%s $TMPDIR/pp_ga.pdf) -le \$(( \$(stat -c%s tests/data/img_gray_alpha.png) * 18 / 10 + 1200 )) ]"
+run_test "img2pdf rgba size sane" bash -c "[ \$(wc -c < $TMPDIR/pp_rgba.pdf) -le \$(( \$(wc -c < tests/data/img_rgba.png) * 18 / 10 + 1200 )) ]"
+run_test "img2pdf gray+alpha size sane" bash -c "[ \$(wc -c < $TMPDIR/pp_ga.pdf) -le \$(( \$(wc -c < tests/data/img_gray_alpha.png) * 18 / 10 + 1200 )) ]"
 
 # JPEG passthrough regression: the embedded DCT stream must stay byte-identical
 # to the source file.
