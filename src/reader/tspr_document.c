@@ -36,6 +36,9 @@ static bool find_pdf_header(const uint8_t *data, size_t len, size_t *out_offset)
 static void free_reader_crypt(TspdfCrypt *crypt) {
     if (!crypt) return;
     free(crypt->file_id);
+    // Wipe key material (file key + cached expanded schedules) before the
+    // struct returns to the heap.
+    memset(crypt, 0, sizeof(*crypt));
     free(crypt);
 }
 
@@ -1475,6 +1478,8 @@ TspdfError tspdf_reader_save_to_memory_encrypted(TspdfReader *doc, uint8_t **out
     if (err != TSPDF_OK) return err;
     err = tspdf_serialize_encrypted(doc, &crypt, out, out_len);
     free(crypt.file_id);
+    // Wipe the stack copy of the key material before returning.
+    memset(&crypt, 0, sizeof(crypt));
     return err;
 }
 

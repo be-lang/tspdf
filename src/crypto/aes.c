@@ -305,9 +305,11 @@ void aes_decrypt_ecb(Aes *ctx, const uint8_t in[16], uint8_t out[16]) {
 }
 
 /* -------------------------------------------------------------------------
- * aes_encrypt_cbc — len must be a multiple of 16; in and out must not alias
+ * aes_encrypt_cbc — len is truncated to a multiple of 16; in-place (in ==
+ * out) is supported.
  * ------------------------------------------------------------------------- */
 void aes_encrypt_cbc(Aes *ctx, const uint8_t iv[16], const uint8_t *in, uint8_t *out, size_t len) {
+    len &= ~(size_t)15;
 #ifdef TSPDF_AES_HW
     if (ctx->use_hw) {
         aes_hw_encrypt_cbc(ctx, iv, in, out, len);
@@ -326,23 +328,29 @@ void aes_encrypt_cbc(Aes *ctx, const uint8_t iv[16], const uint8_t *in, uint8_t 
 }
 
 /* -------------------------------------------------------------------------
- * aes_decrypt_cbc — len must be a multiple of 16; in and out must not alias
+ * aes_decrypt_cbc — len is truncated to a multiple of 16; in-place (in ==
+ * out) is supported: the ciphertext block is saved before the output write
+ * so the soft path matches the hw path's register-held chaining.
  * ------------------------------------------------------------------------- */
 void aes_decrypt_cbc(Aes *ctx, const uint8_t iv[16], const uint8_t *in, uint8_t *out, size_t len) {
+    len &= ~(size_t)15;
 #ifdef TSPDF_AES_HW
     if (ctx->use_hw) {
         aes_hw_decrypt_cbc(ctx, iv, in, out, len);
         return;
     }
 #endif
-    const uint8_t *prev = iv;
+    uint8_t prev[16];
+    memcpy(prev, iv, 16);
 
     for (size_t i = 0; i < len; i += 16) {
+        uint8_t saved[16];
         uint8_t block[16];
+        memcpy(saved, in + i, 16);
         aes_decrypt_ecb(ctx, in + i, block);
         for (int j = 0; j < 16; j++)
             out[i + j] = block[j] ^ prev[j];
-        prev = in + i;
+        memcpy(prev, saved, 16);
     }
 }
 
