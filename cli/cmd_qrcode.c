@@ -29,7 +29,9 @@ int cmd_qrcode(int argc, char **argv) {
     }
     const char *text = positional[0];
 
+    /* Default documented in the help text; --title "" suppresses the title. */
     const char *title = find_flag(argc, argv, "--title");
+    if (!title) title = "QR Code";
     const char *subtitle = find_flag(argc, argv, "--subtitle");
     bool show_link = !has_flag(argc, argv, "--no-link");
 
@@ -75,10 +77,13 @@ int cmd_qrcode(int argc, char **argv) {
         }
     }
 
-    /* Border around QR */
+    /* Border around QR, outside the quiet zone. The QR spec requires a
+     * blank margin of at least 4 modules on every side; drawing the border
+     * inside it breaks scanners. */
+    double quiet = 4.0 * cell_size + 4.0;
     tspdf_stream_set_stroke_color(page, tspdf_color_from_u8(200, 205, 220));
     tspdf_stream_set_line_width(page, 1.0);
-    tspdf_stream_rect(page, qr_x - 8, qr_y - 8, qr_pt + 16, qr_pt + 16);
+    tspdf_stream_rect(page, qr_x - quiet, qr_y - quiet, qr_pt + 2 * quiet, qr_pt + 2 * quiet);
     tspdf_stream_stroke(page);
 
     /* Title above QR (if present) */
@@ -87,7 +92,7 @@ int cmd_qrcode(int argc, char **argv) {
         tspdf_stream_set_font(page, bold, 22.0);
         tspdf_stream_set_fill_color(page, tspdf_color_from_u8(20, 25, 60));
         double title_w = tspdf_writer_measure_text(doc, bold, 22.0, title);
-        tspdf_stream_text_position(page, (W - title_w) / 2.0, qr_y + qr_pt + 32.0);
+        tspdf_stream_text_position(page, (W - title_w) / 2.0, qr_y + qr_pt + quiet + 12.0);
         tspdf_stream_show_text(page, title);
         tspdf_stream_end_text(page);
     }
@@ -98,7 +103,7 @@ int cmd_qrcode(int argc, char **argv) {
         tspdf_stream_set_font(page, sans, 11.0);
         tspdf_stream_set_fill_color(page, tspdf_color_from_u8(79, 110, 247));
         double text_w = tspdf_writer_measure_text(doc, sans, 11.0, text);
-        tspdf_stream_text_position(page, (W - text_w) / 2.0, qr_y - 20.0);
+        tspdf_stream_text_position(page, (W - text_w) / 2.0, qr_y - quiet - 14.0);
         tspdf_stream_show_text(page, text);
         tspdf_stream_end_text(page);
     }
@@ -109,7 +114,7 @@ int cmd_qrcode(int argc, char **argv) {
         tspdf_stream_set_font(page, sans, 10.0);
         tspdf_stream_set_fill_color(page, tspdf_color_from_u8(130, 140, 170));
         double sub_w = tspdf_writer_measure_text(doc, sans, 10.0, subtitle);
-        tspdf_stream_text_position(page, (W - sub_w) / 2.0, qr_y - 36.0);
+        tspdf_stream_text_position(page, (W - sub_w) / 2.0, qr_y - quiet - 30.0);
         tspdf_stream_show_text(page, subtitle);
         tspdf_stream_end_text(page);
     }
