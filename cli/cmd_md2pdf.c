@@ -587,6 +587,17 @@ static void md_link_rect_cb(double x, double y, double w, double h,
     tspdf_writer_add_link(lc->doc, lc->page, x, y, w, h, url);
 }
 
+/* --- Heading bookmarks ---------------------------------------------------- *
+ * Headings are recorded while parsing; bookmarks are added after the
+ * pagination render pass, when each heading node knows its page (from the
+ * pagination result) and its y position (computed during its page's render). */
+typedef struct {
+    TspdfNode *node;    /* heading text node */
+    int child_index;    /* index in root's children */
+    int level;          /* 1 = #, 2 = ##, ... */
+    const char *title;  /* arena copy: raw UTF-8, inline markers stripped */
+} MdHeading;
+
 /* Detect a leading ordered-list marker "N." or "N)" followed by a space.
  * Returns the parsed number (>=0) and sets *content to the text after the
  * marker+space; returns -1 if the line is not an ordered-list item. */
@@ -612,6 +623,8 @@ int cmd_md2pdf(int argc, char **argv) {
         printf("\nConvert a Markdown document to a styled PDF.\n");
         printf("Supports headings, lists, code blocks, blockquotes, rules, pipe tables,\n");
         printf("and block-level ![alt](path) images (JPEG/PNG, path relative to the .md).\n");
+        printf("Headings become nested outline bookmarks; [text](url) becomes a\n");
+        printf("clickable link (when the styled line fits without wrapping).\n");
         printf("Text uses the built-in WinAnsi (cp1252) fonts; characters outside that\n");
         printf("range (emoji, CJK, ...) are replaced with '?' and warned about.\n");
         return argc == 0 ? 1 : 0;
@@ -711,6 +724,11 @@ int cmd_md2pdf(int argc, char **argv) {
     int tbl_nrows = 0;
     int tbl_rows_cap = 0;                 /* capacity in cells */
 
+    /* Headings collected for the outline (bookmarks added after rendering). */
+    MdHeading *headings = NULL;           /* malloc'd, freed below */
+    int heading_count = 0;
+    int heading_cap = 0;
+
     char *line = md;
     while (line && *line) {
         char *eol = strchr(line, '\n');
@@ -726,16 +744,20 @@ int cmd_md2pdf(int argc, char **argv) {
             line[line_len - 1] = '\0';
         }
 
-        /* Preserve the raw UTF-8 bytes of a potential block-image line: the
+        /* Preserve the raw UTF-8 bytes of a potential block-image line (the
          * cp1252 re-encode below would corrupt non-ASCII image paths, which
-         * must keep their original bytes for fopen(). */
+         * must keep their original bytes for fopen()) and of headings, whose
+         * bookmark titles must stay UTF-8 (written as UTF-16BE when needed). */
         const char *raw_image_line = NULL;
-        if (!in_code_block && line[0] == '!' && line[1] == '[') {
+        const char *raw_heading_line = NULL;
+        if (!in_code_block &&
+            ((line[0] == '!' && line[1] == '[') || line[0] == '#')) {
             size_t raw_len = strlen(line);
             char *copy = (char *)tspdf_arena_alloc(ctx.arena, raw_len + 1);
             if (copy) {
                 memcpy(copy, line, raw_len + 1);
-                raw_image_line = copy;
+                if (line[0] == '#') raw_heading_line = copy;
+                else raw_image_line = copy;
             }
         }
 
@@ -881,6 +903,27 @@ int cmd_md2pdf(int argc, char **argv) {
                                    sz, heading_color, content_w);
             }
             md_add_block(root, node);
+
+            /* Record for the outline (raw UTF-8 title, markers stripped). */
+            if (raw_heading_line &&
+                root->child_count > 0 &&
+                root->children[root->child_count - 1] == node) {
+                const char *rt = raw_heading_line + level;
+                while (*rt == ' ') rt++;
+                const char *title = md_strip_inline_markers(&ctx, rt);
+                if (title && title[0]) {
+                    if (heading_count == heading_cap) {
+                        int new_cap = heading_cap ? heading_cap * 2 : 16;
+                        MdHeading *grown = realloc(headings,
+                            (size_t)new_cap * sizeof(*headings));
+                        if (grown) { headings = grown; heading_cap = new_cap; }
+                    }
+                    if (heading_count < heading_cap) {
+                        headings[heading_count++] = (MdHeading){
+                            node, root->child_count - 1, level, title };
+                    }
+                }
+            }
         } else if ((line[0] == '-' || line[0] == '*') && line[1] == ' ') {
             /* List item */
             TspdfNode *row = tspdf_layout_box(&ctx);
@@ -1005,6 +1048,42 @@ int cmd_md2pdf(int argc, char **argv) {
         link_ctx.page = pg;  /* link rects reported during render land here */
         tspdf_layout_render_page_recompute(&ctx, root, &pagination, pg, page);
     }
+
+    /* Heading bookmarks. Each heading is rendered on exactly one page, so
+     * after the loop above its computed_y still holds its position on that
+     * page. Nesting: a level-N heading goes under the nearest open heading of
+     * a smaller level (# > ## > ###...). */
+    if (heading_count > 0 && root->child_count > 0) {
+        int *page_of_child = malloc((size_t)root->child_count * sizeof(int));
+        if (page_of_child) {
+            for (int i = 0; i < root->child_count; i++) page_of_child[i] = -1;
+            for (int pg = 0; pg < pagination.page_count; pg++) {
+                for (int i = pagination.pages[pg].start; i < pagination.pages[pg].end; i++)
+                    page_of_child[pagination.content_indices[i]] = pg;
+            }
+            int open_bm[7] = {-1, -1, -1, -1, -1, -1, -1};  /* per level 1..6 */
+            for (int h = 0; h < heading_count; h++) {
+                int pg = page_of_child[headings[h].child_index];
+                if (pg < 0) continue;  /* dropped past the pagination cap */
+                int lvl = headings[h].level;
+                if (lvl < 1) lvl = 1;
+                if (lvl > 6) lvl = 6;
+                int parent = -1;
+                for (int l = lvl - 1; l >= 1; l--) {
+                    if (open_bm[l] >= 0) { parent = open_bm[l]; break; }
+                }
+                /* /XYZ top: a hair above the heading's top edge. */
+                double y = H - headings[h].node->computed_y + 4;
+                int idx = tspdf_writer_add_bookmark_xyz(doc, parent,
+                                                        headings[h].title, pg, y);
+                if (idx < 0) break;  /* bookmark table full */
+                open_bm[lvl] = idx;
+                for (int l = lvl + 1; l <= 6; l++) open_bm[l] = -1;
+            }
+            free(page_of_child);
+        }
+    }
+    free(headings);
 
     TspdfError err = tspdf_writer_save(doc, output);
     tspdf_writer_destroy(doc);

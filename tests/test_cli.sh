@@ -1486,15 +1486,43 @@ run_test "md2pdf link annotation" bash -c '
   grep -qaF "/URI (https://example.com/a\\(b\\)?q=1)" "'"$TMPDIR"'/links.pdf"
 '
 
-# With qpdf available (always true in CI), also validate the file structurally.
+# md2pdf: # ## ### headings become nested outline bookmarks with /XYZ dests.
+run_test "md2pdf heading bookmarks" bash -c '
+  set -e
+  printf "# Alpha\n\ntext\n\n## Beta\n\nmore\n\n### Gamma\n\n## Delta\n\n# Omega\n" \
+    > "'"$TMPDIR"'/toc.md"
+  "'"$TSPDF"'" md2pdf "'"$TMPDIR"'/toc.md" -o "'"$TMPDIR"'/toc.pdf"
+  grep -qa "/Type /Outlines" "'"$TMPDIR"'/toc.pdf"
+  grep -qa "/Title (Alpha)" "'"$TMPDIR"'/toc.pdf"
+  grep -qa "/Title (Gamma)" "'"$TMPDIR"'/toc.pdf"
+  grep -qa "/XYZ" "'"$TMPDIR"'/toc.pdf"
+'
+
+# With qpdf available (always true in CI), also validate the file structurally
+# and assert the outline nesting via qpdf --json.
 if command -v qpdf > /dev/null 2>&1; then
-  run_test "md2pdf links pass qpdf --check" bash -c '
+  run_test "md2pdf links+bookmarks pass qpdf --check" bash -c '
     set -e
-    printf "[x](https://example.com/x) plus text\n" > "'"$TMPDIR"'/lb.md"
+    printf "# Alpha\n\n[x](https://example.com/x) plus text\n\n## Beta\n" \
+      > "'"$TMPDIR"'/lb.md"
     "'"$TSPDF"'" md2pdf "'"$TMPDIR"'/lb.md" -o "'"$TMPDIR"'/lb.pdf"
     qpdf --check "'"$TMPDIR"'/lb.pdf" > /dev/null
     qpdf --qdf "'"$TMPDIR"'/lb.pdf" "'"$TMPDIR"'/lb.qdf.pdf"
     grep -qa "/URI (https://example.com/x)" "'"$TMPDIR"'/lb.qdf.pdf"
+  '
+  run_test "md2pdf outline nesting via qpdf --json" bash -c '
+    set -e
+    printf "# Alpha\n\n## Beta\n\n### Gamma\n\n# Omega\n" > "'"$TMPDIR"'/nest.md"
+    "'"$TSPDF"'" md2pdf "'"$TMPDIR"'/nest.md" -o "'"$TMPDIR"'/nest.pdf"
+    python3 - "'"$TMPDIR"'/nest.pdf" <<PYEOF
+import json, subprocess, sys
+out = subprocess.check_output(["qpdf", "--json", "--json-key=outlines", sys.argv[1]])
+o = json.loads(out)["outlines"]
+assert [e["title"] for e in o] == ["Alpha", "Omega"], o
+assert [e["title"] for e in o[0]["kids"]] == ["Beta"], o
+assert [e["title"] for e in o[0]["kids"][0]["kids"]] == ["Gamma"], o
+assert o[1]["kids"] == [], o
+PYEOF
   '
 else
   echo "  SKIP  md2pdf qpdf structural checks (qpdf not installed)"
