@@ -1,14 +1,15 @@
 /*
  * qr_encode.c — Minimal QR code encoder.
  * Written from scratch for the tspdf project.
- * Implements QR Code Model 2, byte mode, ECC level M, versions 1-10.
+ * Implements QR Code Model 2, byte mode, ECC level M, versions 1-11.
  * No external dependencies.
  *
  * Implements the core QR code standard (ISO/IEC 18004) steps:
  *   1. Version selection
  *   2. Data encoding (byte mode)
  *   3. Reed-Solomon error correction
- *   4. Matrix construction (finder, timing, alignment, format info)
+ *   4. Matrix construction (finder, timing, alignment, format info,
+ *      version info for versions >= 7)
  *   5. Data placement (zigzag)
  *   6. Mask pattern selection (all 8, lowest penalty)
  */
@@ -19,10 +20,15 @@
 
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
-#define MAX_VERSION 10
-#define MAX_MODULES 57  /* version 10: 17 + 4*10 = 57 */
+#define MAX_VERSION 11
+#define MAX_MODULES 61  /* version 11: 17 + 4*11 = 61 */
 
-/* Data capacity in bytes for byte mode, ECC level M, versions 1-10 */
+/*
+ * Character capacity in bytes for byte mode, ECC level M, versions 1-11
+ * (ISO/IEC 18004:2015, Table 7). This is the number of payload characters
+ * that fit after the mode indicator and character count, NOT the number of
+ * data codewords — that is derived from ECC_INFO_M below.
+ */
 static const int DATA_CAPACITY_M[MAX_VERSION + 1] = {
     0,   /* version 0 doesn't exist */
     14,  /* version 1 */
@@ -35,6 +41,7 @@ static const int DATA_CAPACITY_M[MAX_VERSION + 1] = {
     152, /* version 8 */
     180, /* version 9 */
     213, /* version 10 */
+    251, /* version 11 */
 };
 
 /*
@@ -57,14 +64,15 @@ static const EccInfo ECC_INFO_M[MAX_VERSION + 1] = {
     {  0,  0, 0,  0, 0,  0}, /* v0 placeholder */
     { 26, 10, 1, 16, 0,  0}, /* v1 */
     { 44, 16, 1, 28, 0,  0}, /* v2 */
-    { 70, 26, 2, 22, 0,  0}, /* v3 */
+    { 70, 26, 1, 44, 0,  0}, /* v3 */
     {100, 18, 2, 32, 0,  0}, /* v4 */
     {134, 24, 2, 43, 0,  0}, /* v5 */
     {172, 16, 4, 27, 0,  0}, /* v6 */
     {196, 18, 4, 31, 0,  0}, /* v7 */
     {242, 22, 2, 38, 2, 39}, /* v8 */
     {292, 22, 3, 36, 2, 37}, /* v9 */
-    {346, 26, 4, 43, 1, 43}, /* v10 */
+    {346, 26, 4, 43, 1, 44}, /* v10 */
+    {404, 30, 1, 50, 4, 51}, /* v11 */
 };
 
 /* Alignment pattern centers for versions 1-10 (version 1 has none) */
@@ -81,6 +89,7 @@ static const int ALIGN_CENTERS[MAX_VERSION + 1][7] = {
     {6, 24, 42, -1},   /* v8 */
     {6, 26, 46, -1},   /* v9 */
     {6, 28, 50, -1},   /* v10 */
+    {6, 30, 54, -1},   /* v11 */
 };
 
 /* ── GF(256) Arithmetic ─────────────────────────────────────────────────── */
@@ -187,8 +196,15 @@ static int encode_data(const char *text, int text_len, int version,
     for (int i = 0; i < text_len; i++)
         bb_append(&bb, (uint8_t)text[i], 8);
 
-    int total_data_cw = DATA_CAPACITY_M[version];
+    /*
+     * Number of data codewords, derived from the ECC block structure
+     * (NOT the character capacity table, which is smaller by the
+     * mode + character count header).
+     */
+    const EccInfo *ei = &ECC_INFO_M[version];
+    int total_data_cw = ei->blocks_g1 * ei->data_g1 + ei->blocks_g2 * ei->data_g2;
     int total_bits    = total_data_cw * 8;
+    if (bb.bit_len > total_bits) return -1;
 
     /* Terminator: up to 4 zero bits */
     int remaining = total_bits - bb.bit_len;
@@ -393,6 +409,45 @@ static void reserve_format_areas(Matrix *m)
 }
 
 /*
+ * 18-bit version information value for versions >= 7: the 6-bit version
+ * number followed by a 12-bit BCH(18,6) remainder using the generator
+ * polynomial G(x) = x^12 + x^11 + x^10 + x^9 + x^8 + x^5 + x^2 + 1 (0x1F25).
+ * ISO/IEC 18004:2015 Annex D; e.g. version 7 -> 0x07C94, version 8 -> 0x085BC.
+ */
+static uint32_t version_info_bits(int version)
+{
+    if (version < 7) return 0;
+    uint32_t rem = (uint32_t)version << 12;
+    for (int i = 17; i >= 12; i--) {
+        if (rem & (1U << i))
+            rem ^= 0x1F25U << (i - 12);
+    }
+    return ((uint32_t)version << 12) | rem;
+}
+
+/*
+ * Place the two version information blocks (versions >= 7):
+ *   - bottom-left: 3 rows x 6 cols, rows n-11..n-9, cols 0..5
+ *   - top-right:   6 rows x 3 cols, rows 0..5, cols n-11..n-9
+ * Bit i (LSB first) goes to (row i/3, col n-11 + i%3) in the top-right
+ * block and to its transpose in the bottom-left block. Version info areas
+ * are function modules: reserved, and never masked.
+ */
+static void place_version_info(Matrix *m, int version)
+{
+    if (version < 7) return;
+    uint32_t bits = version_info_bits(version);
+    int n = m->size;
+    for (int i = 0; i < 18; i++) {
+        int v = (int)((bits >> i) & 1U);
+        int r = i / 3;
+        int c = n - 11 + i % 3;
+        mat_set(m, r, c, v); /* top-right block */
+        mat_set(m, c, r, v); /* bottom-left block (transposed) */
+    }
+}
+
+/*
  * Format information string for ECC level M (bits 14-13 = 00 after XOR).
  * ECC level M indicator bits: 00
  * mask bits: 3 bits (0-7)
@@ -424,41 +479,33 @@ static void place_format_info(Matrix *m, int mask)
     int n = m->size;
 
     /*
-     * Format string bit positions (bit 14 is MSB):
-     * Around top-left finder:
-     *   row 8: cols 0..5, 7, 8  (bits 0..7)
-     *   col 8: rows 7, 5..0     (bits 8..14) (skip row 6 timing)
-     * Around top-right finder (row 8, cols n-1..n-8): bits 0..7
-     * Around bottom-left finder (col 8, rows n-7..n-1): bits 8..14
+     * Format string bit positions per ISO/IEC 18004 Figure 25 (bit 0 = LSB):
+     * Copy 1, around the top-left finder:
+     *   col 8, rows 0..5        -> bits 0..5   (skip timing row 6)
+     *   (7,8), (8,8), (8,7)     -> bits 6, 7, 8
+     *   row 8, cols 5..0        -> bits 9..14  (skip timing col 6)
+     * Copy 2:
+     *   row 8, cols n-1..n-8    -> bits 0..7   (top-right)
+     *   col 8, rows n-7..n-1    -> bits 8..14  (bottom-left)
      */
 
-    /* Top-left horizontal (row 8, bit positions 0..8 going left to right) */
-    int bit = 0;
-    for (int col = 0; col <= 5; col++, bit++) {
-        int v = (fmt >> bit) & 1;
-        m->module[8][col] = (uint8_t)v;
-    }
-    /* Skip col 6 (timing) — but format bit 6 goes to col 7 */
-    m->module[8][7] = (uint8_t)((fmt >> bit) & 1); bit++;
-    m->module[8][8] = (uint8_t)((fmt >> bit) & 1); bit++;
+    /* Copy 1: vertical strip in col 8, top to bottom */
+    for (int i = 0; i <= 5; i++)
+        m->module[i][8] = (uint8_t)((fmt >> i) & 1);
+    m->module[7][8] = (uint8_t)((fmt >> 6) & 1);
+    m->module[8][8] = (uint8_t)((fmt >> 7) & 1);
+    m->module[8][7] = (uint8_t)((fmt >> 8) & 1);
+    /* Copy 1: horizontal strip in row 8, right to left */
+    for (int i = 9; i <= 14; i++)
+        m->module[8][14 - i] = (uint8_t)((fmt >> i) & 1);
 
-    /* Top-left vertical (col 8, bit positions 8..14 going bottom to top) */
-    for (int row = 7; row >= 0; row--) {
-        if (row == 6) continue; /* skip timing row */
-        m->module[row][8] = (uint8_t)((fmt >> bit) & 1); bit++;
-    }
+    /* Copy 2: top-right (row 8, cols n-1..n-8, bits 0..7) */
+    for (int i = 0; i <= 7; i++)
+        m->module[8][n - 1 - i] = (uint8_t)((fmt >> i) & 1);
 
-    /* Top-right (row 8, cols n-8..n-1, bits 7..0) */
-    bit = 7;
-    for (int col = n - 8; col < n; col++, bit--) {
-        m->module[8][col] = (uint8_t)((fmt >> bit) & 1);
-    }
-
-    /* Bottom-left (col 8, rows n-7..n-1, bits 8..14) */
-    bit = 8;
-    for (int row = n - 7; row < n; row++, bit++) {
-        m->module[row][8] = (uint8_t)((fmt >> bit) & 1);
-    }
+    /* Copy 2: bottom-left (col 8, rows n-7..n-1, bits 8..14) */
+    for (int i = 8; i <= 14; i++)
+        m->module[n - 15 + i][8] = (uint8_t)((fmt >> i) & 1);
 }
 
 /* ── Data Placement (zigzag) ────────────────────────────────────────────── */
@@ -477,11 +524,13 @@ static void place_data_bits(Matrix *m, const uint8_t *cw, int cw_count)
     int going_up = 1;
 
     while (col >= 0 && bit_idx < total_bits) {
-        /* Skip the timing column */
+        /* The vertical timing pattern occupies column 6: every column pair
+         * to its left is shifted one to the left, so the pair that would
+         * start at column 6 becomes (5, 4). */
         int c1 = col;
         int c0 = col - 1;
         if (c1 == 6) {
-            col -= 2;
+            col -= 1;
             c1 = col;
             c0 = col - 1;
         }
@@ -639,14 +688,12 @@ QrCode *qr_encode(const char *text)
 
     int text_len = (int)strlen(text);
 
-    /* Find smallest version that fits */
+    /* Find smallest version that fits (byte-mode character capacity at M).
+     * The terminator may be truncated when the data fills the symbol, so the
+     * capacity table — not "header + data + 4 bits" — is the right check. */
     int version = -1;
     for (int v = 1; v <= MAX_VERSION; v++) {
-        /* For versions 1-9: 4 + 8 + 8*len + 4 bits; for 10+: 4 + 16 + 8*len + 4 bits */
-        int header_bits = (v <= 9) ? (4 + 8) : (4 + 16);
-        int needed_bits = header_bits + text_len * 8 + 4;
-        int capacity_bits = DATA_CAPACITY_M[v] * 8;
-        if (needed_bits <= capacity_bits) {
+        if (text_len <= DATA_CAPACITY_M[v]) {
             version = v;
             break;
         }
@@ -676,7 +723,7 @@ QrCode *qr_encode(const char *text)
     place_timing(&m);
     place_alignment_patterns(&m, version);
     reserve_format_areas(&m);
-    /* (Version info areas for v7+ are not needed for v1-10 in our simplified impl) */
+    place_version_info(&m, version); /* versions >= 7; also reserves the areas */
 
     /* Place data bits */
     place_data_bits(&m, all_cw, all_cw_count);
@@ -719,4 +766,37 @@ void qr_free(QrCode *qr)
     if (!qr) return;
     free(qr->modules);
     free(qr);
+}
+
+/* ── Test Introspection Hooks ───────────────────────────────────────────── */
+
+int qr_ecc_block_info(int version, int *total_cw, int *ecc_per_block,
+                      int *blocks_g1, int *data_g1,
+                      int *blocks_g2, int *data_g2)
+{
+    if (version < 1 || version > MAX_VERSION) return -1;
+    const EccInfo *ei = &ECC_INFO_M[version];
+    if (total_cw)      *total_cw      = ei->total_cw;
+    if (ecc_per_block) *ecc_per_block = ei->ecc_per_block;
+    if (blocks_g1)     *blocks_g1     = ei->blocks_g1;
+    if (data_g1)       *data_g1       = ei->data_g1;
+    if (blocks_g2)     *blocks_g2     = ei->blocks_g2;
+    if (data_g2)       *data_g2       = ei->data_g2;
+    return 0;
+}
+
+void qr_rs_ecc(const uint8_t *data, int data_len, uint8_t *ecc, int num_ecc)
+{
+    gf_init();
+    rs_generate(data, data_len, ecc, num_ecc);
+}
+
+uint32_t qr_version_info_bits(int version)
+{
+    return version_info_bits(version);
+}
+
+int qr_max_version(void)
+{
+    return MAX_VERSION;
 }
