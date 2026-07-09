@@ -239,13 +239,19 @@ static int parse_request(const char *raw, size_t raw_len, HttpRequest *req)
  * use already-parsed req->headers, so this is purely additive.
  *
  * --bind relaxes this by tiers. A specific non-loopback address (e.g. a LAN
- * IP) additionally accepts that address in Host/Origin. Binding 0.0.0.0
- * (the Docker case) means the server is reachable under any name we cannot
- * enumerate, so the Host check is reduced to presence and the Origin check
- * becomes same-origin: a present Origin/Referer must match the request's own
- * Host (or loopback). That still blocks the cross-site browser POST, but a
- * non-loopback bind fundamentally trusts the network — there is no
- * authentication, and cmd_serve prints a warning saying so. */
+ * IP) additionally accepts that address in Host/Origin; a rebound hostname
+ * still fails the Host check on that tier. Binding 0.0.0.0 (the Docker
+ * case) means the server is reachable under any name we cannot enumerate,
+ * so the Host check is reduced to presence and the Origin check becomes
+ * same-origin: a present Origin/Referer must match the request's own Host
+ * (or loopback). Be precise about what that buys: it blocks foreign-Origin
+ * CSRF (a page on another site sends its own origin, which cannot match
+ * ours), but it does NOT mitigate DNS rebinding on 0.0.0.0 — a rebound
+ * hostname resolves to this server, so the attacker's page sends that
+ * hostname in both Host and Origin and they match each other. A
+ * non-loopback bind fundamentally trusts the network, per the documented
+ * threat model: there is no authentication, and cmd_serve prints a warning
+ * saying so. */
 
 /* Bind configuration (set once in cmd_serve before start_server). */
 static struct {
@@ -343,7 +349,8 @@ static int host_is_allowed(const char *host, int expect_port)
     if (g_bind.loopback) return 0;
     if (g_bind.any) {
         /* Reachable under any name; require presence only. The Origin
-         * same-origin check below still blocks cross-site POSTs. */
+         * same-origin check below blocks foreign-Origin CSRF, but not DNS
+         * rebinding (see the threat-model note above). */
         return host != NULL && *host != '\0';
     }
     /* Specific non-loopback bind: also accept the bound address. */
@@ -385,7 +392,9 @@ static int origin_is_allowed(const char *origin, const char *request_host, int e
                strcmp(h, g_bind.addr_str) == 0;
     }
     /* 0.0.0.0: same-origin — the Origin authority must equal the Host the
-     * request was addressed to (both carry the same host:port text). */
+     * request was addressed to (both carry the same host:port text). This
+     * stops a foreign origin only; a DNS-rebound page presents its own
+     * hostname in both headers, which match. See the threat-model note. */
     if (!request_host) return 0;
     while (*request_host == ' ' || *request_host == '\t') request_host++;
     size_t hl = strlen(request_host);
@@ -1966,8 +1975,11 @@ static void api_md2pdf(int fd, MultipartForm *form)
 
 static void handle_post(int fd, HttpRequest *req, int port)
 {
-    /* Reject cross-origin / DNS-rebound callers before touching the body so a
-     * remote page cannot drive the local tool or read back generated PDFs. */
+    /* Reject disallowed callers before touching the body so a remote page
+     * cannot drive the local tool or read back generated PDFs. What this
+     * covers depends on the bind tier (see the threat-model note above):
+     * loopback binds reject rebound hostnames outright; 0.0.0.0 only blocks
+     * foreign-Origin CSRF. */
     if (!request_is_local(req, port)) {
         send_error(fd, 403, "Forbidden: requests must originate from the local server");
         return;
