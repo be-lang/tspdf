@@ -480,6 +480,17 @@ const char *tspdf_reader_pdf_version(const TspdfReader *doc) {
     // directly.
     if (doc->catalog) {
         TspdfObj *v = tspdf_dict_get(doc->catalog, "Version");
+        // The spec wants a direct name here, but resolve an indirect
+        // reference like every other catalog lookup does instead of silently
+        // ignoring it. Resolution populates the shared object cache, so the
+        // const on doc is logical, not physical.
+        if (v && v->type == TSPDF_OBJ_REF && v->ref.num < doc->xref.count) {
+            TspdfReader *mdoc = (TspdfReader *)doc;
+            TspdfParser parser;
+            tspdf_parser_init(&parser, mdoc->data, mdoc->data_len, &mdoc->arena);
+            v = tspdf_xref_resolve(&mdoc->xref, &parser, v->ref.num,
+                                   mdoc->obj_cache, mdoc->crypt);
+        }
         if (v && v->type == TSPDF_OBJ_NAME && v->string.data && v->string.len > 0)
             return (const char *)v->string.data;
     }

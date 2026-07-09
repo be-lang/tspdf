@@ -452,6 +452,15 @@ run_test "qrcode no text fails" bash -c "! $TSPDF qrcode -o $TMPDIR/qr_fail.pdf 
 run_test "qrcode flag-first ordering (-o/--title/--subtitle before text)" $TSPDF qrcode -o $TMPDIR/qrcode_ff.pdf --title "Test" --subtitle "Scan me" "https://example.com"
 # a flag value must not be mistaken for the text positional (only flags present → still missing text)
 run_test "qrcode title-only still reports missing text" bash -c "! $TSPDF qrcode -o $TMPDIR/qr_fail2.pdf --title MyTitle > /dev/null 2>&1"
+# --title "" suppresses the page title AND the /Title metadata entry entirely
+# (rather than writing an empty string); the default is /Title (QR Code).
+run_test "qrcode --title \"\" omits metadata title" bash -c '
+  set -e
+  "'"$TSPDF"'" qrcode "https://example.com" --title "" -o "'"$TMPDIR"'/qr_notitle.pdf" > /dev/null
+  ! grep -qa "/Title" "'"$TMPDIR"'/qr_notitle.pdf"
+  "'"$TSPDF"'" qrcode "https://example.com" -o "'"$TMPDIR"'/qr_deftitle.pdf" > /dev/null
+  grep -qa "/Title (QR Code)" "'"$TMPDIR"'/qr_deftitle.pdf"
+'
 
 # md2pdf
 cat > $TMPDIR/test.md << 'MDEOF'
@@ -1810,16 +1819,37 @@ if command -v qpdf > /dev/null 2>&1; then
   '
   run_test "md2pdf outline nesting via qpdf --json" bash -c '
     set -e
-    printf "# Alpha\n\n## Beta\n\n### Gamma\n\n# Omega\n" > "'"$TMPDIR"'/nest.md"
+    printf "# Alpha\n\n## Beta\n\n### Gamma\n\n## Delta\n\n# Omega\n" > "'"$TMPDIR"'/nest.md"
     "'"$TSPDF"'" md2pdf "'"$TMPDIR"'/nest.md" -o "'"$TMPDIR"'/nest.pdf"
     python3 - "'"$TMPDIR"'/nest.pdf" <<PYEOF
 import json, subprocess, sys
 out = subprocess.check_output(["qpdf", "--json", "--json-key=outlines", sys.argv[1]])
 o = json.loads(out)["outlines"]
 assert [e["title"] for e in o] == ["Alpha", "Omega"], o
-assert [e["title"] for e in o[0]["kids"]] == ["Beta"], o
+assert [e["title"] for e in o[0]["kids"]] == ["Beta", "Delta"], o
 assert [e["title"] for e in o[0]["kids"][0]["kids"]] == ["Gamma"], o
 assert o[1]["kids"] == [], o
+
+# /Count must be the number of VISIBLE descendants (ISO 32000-1 Table 153),
+# not the direct-child count: Alpha (kids Beta+Delta, grandchild Gamma) is 3,
+# and the outline root counts every open item at any level (5 total).
+out = subprocess.check_output(["qpdf", "--json", "--json-key=qpdf", sys.argv[1]])
+objs = json.loads(out)["qpdf"][1]
+counts, root_count = {}, None
+for obj in objs.values():
+    v = obj.get("value") if isinstance(obj, dict) else None
+    if not isinstance(v, dict):
+        continue
+    if v.get("/Type") == "/Outlines":
+        root_count = v.get("/Count")
+    elif "/Title" in v and "/Parent" in v:
+        title = str(v["/Title"])
+        title = title[2:] if title.startswith("u:") else title
+        counts[title] = v.get("/Count", 0)
+assert counts.get("Alpha") == 3, counts
+assert counts.get("Beta") == 1, counts
+assert counts.get("Delta", 0) == 0, counts
+assert root_count == 5, root_count
 PYEOF
   '
 else

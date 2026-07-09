@@ -50,8 +50,6 @@ imga.putdata([((x * 2 + y + (rnd() & 15)) % 256, (x * 2) % 256)
               for y in range(H) for x in range(W)])
 imga.save(f"{out}/img_gray_alpha.png")
 
-imflat = Image.new("RGB", (W, H)); imflat.putdata([((x*3)%256, (y*4)%256, (x+y)%256) for y in range(H) for x in range(W)]); imflat.save(f"{out}/img_interlaced.png", interlace=True)
-
 im16 = Image.new("I;16", (W, H))
 im16.putdata([((x * 517 + y * 311) % 65536) for y in range(H) for x in range(W)])
 im16.save(f"{out}/img_gray16.png")

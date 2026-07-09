@@ -75,7 +75,7 @@ static const EccInfo ECC_INFO_M[MAX_VERSION + 1] = {
     {404, 30, 1, 50, 4, 51}, /* v11 */
 };
 
-/* Alignment pattern centers for versions 1-10 (version 1 has none) */
+/* Alignment pattern centers for versions 1-11 (version 1 has none) */
 /* Each row: list of centers terminated by -1 */
 static const int ALIGN_CENTERS[MAX_VERSION + 1][7] = {
     {-1},              /* v0 */
@@ -632,33 +632,42 @@ static int score_penalty(const Matrix *m)
         }
     }
 
-    /* Rule 3: specific patterns (finder-like) */
-    /* Pattern: 1,0,1,1,1,0,1,0,0,0,0 or reverse */
-    for (int row = 0; row < n; row++) {
-        for (int col = 0; col + 10 < n; col++) {
-            uint8_t *r = (uint8_t *)m->module[row]; /* cast away const for pointer arith */
-            const uint8_t p1[] = {1,0,1,1,1,0,1,0,0,0,0};
-            const uint8_t p2[] = {0,0,0,0,1,0,1,1,1,0,1};
-            int m1 = 1, m2 = 1;
-            for (int k = 0; k < 11; k++) {
-                if (r[col + k] != p1[k]) m1 = 0;
-                if (r[col + k] != p2[k]) m2 = 0;
+    /*
+     * Rule 3: finder-like patterns — 1:1:3:1:1 dark/light ratio (1011101)
+     * with 4 light modules on either side. ISO/IEC 18004 also counts
+     * occurrences whose 4-module light run falls in the quiet zone, so each
+     * scan line is padded with 4 virtual light modules at both edges.
+     */
+    {
+        static const uint8_t p1[11] = {1,0,1,1,1,0,1,0,0,0,0};
+        static const uint8_t p2[11] = {0,0,0,0,1,0,1,1,1,0,1};
+        uint8_t line[MAX_MODULES + 8];
+        memset(line, 0, sizeof(line)); /* the 4-module pads stay light */
+        for (int row = 0; row < n; row++) {
+            for (int col = 0; col < n; col++)
+                line[4 + col] = m->module[row][col];
+            for (int col = 0; col + 11 <= n + 8; col++) {
+                int m1 = 1, m2 = 1;
+                for (int k = 0; k < 11; k++) {
+                    if (line[col + k] != p1[k]) m1 = 0;
+                    if (line[col + k] != p2[k]) m2 = 0;
+                }
+                if (m1) penalty += 40;
+                if (m2) penalty += 40;
             }
-            if (m1) penalty += 40;
-            if (m2) penalty += 40;
         }
-    }
-    for (int col = 0; col < n; col++) {
-        for (int row = 0; row + 10 < n; row++) {
-            const uint8_t p1[] = {1,0,1,1,1,0,1,0,0,0,0};
-            const uint8_t p2[] = {0,0,0,0,1,0,1,1,1,0,1};
-            int m1 = 1, m2 = 1;
-            for (int k = 0; k < 11; k++) {
-                if (m->module[row + k][col] != p1[k]) m1 = 0;
-                if (m->module[row + k][col] != p2[k]) m2 = 0;
+        for (int col = 0; col < n; col++) {
+            for (int row = 0; row < n; row++)
+                line[4 + row] = m->module[row][col];
+            for (int row = 0; row + 11 <= n + 8; row++) {
+                int m1 = 1, m2 = 1;
+                for (int k = 0; k < 11; k++) {
+                    if (line[row + k] != p1[k]) m1 = 0;
+                    if (line[row + k] != p2[k]) m2 = 0;
+                }
+                if (m1) penalty += 40;
+                if (m2) penalty += 40;
             }
-            if (m1) penalty += 40;
-            if (m2) penalty += 40;
         }
     }
 

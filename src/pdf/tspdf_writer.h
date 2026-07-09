@@ -193,6 +193,7 @@ typedef struct TspdfWriter {
 
     TspdfError last_error;
     bool saved;  // guard against double-save producing corrupt PDF
+    bool truncation_warned;  // one stderr warning per document for URL/title truncation
 } TspdfWriter;
 
 // Create a new document (heap-allocated due to large struct size)

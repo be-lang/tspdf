@@ -487,6 +487,46 @@ bool png_read_passthrough(const char *path, PngPassthrough *out) {
         if (raw[(size_t)y * (stride + 1u)] > 4) goto done;
     }
 
+    // Palette rasters can reference entries past the PLTE count; the decode
+    // path rejects such files, so passthrough must treat them the same rather
+    // than embed indices other readers render differently (or refuse). The
+    // indices only exist after unfiltering, so undo the row filters in place
+    // (bpp = 1 for every palette depth; each row's predecessor is already
+    // unfiltered when we reach it) and range-check every pixel. Skipped when
+    // the palette is full for the bit depth — no index can be out of range.
+    if (color_type == 3 && out->palette_count < (1 << bit_depth)) {
+        for (int y = 0; y < out->height; y++) {
+            uint8_t *cur = raw + (size_t)y * (stride + 1u) + 1;
+            const uint8_t *prev =
+                (y > 0) ? raw + (size_t)(y - 1) * (stride + 1u) + 1 : NULL;
+            uint8_t filter = cur[-1];
+            for (size_t x = 0; x < stride; x++) {
+                uint8_t a = (x > 0) ? cur[x - 1] : 0;
+                uint8_t b = prev ? prev[x] : 0;
+                uint8_t c = (x > 0 && prev) ? prev[x - 1] : 0;
+                switch (filter) {
+                    case 1: cur[x] += a; break;
+                    case 2: cur[x] += b; break;
+                    case 3: cur[x] += (uint8_t)((a + b) / 2); break;
+                    case 4: cur[x] += (uint8_t)paeth_predictor(a, b, c); break;
+                    default: break;  // 0 = none; >4 already rejected above
+                }
+            }
+            for (int x = 0; x < out->width; x++) {
+                unsigned idx;
+                if (bit_depth == 8) {
+                    idx = cur[x];
+                } else {
+                    // Sub-byte depths pack indices MSB-first within each byte.
+                    size_t bit = (size_t)x * (size_t)bit_depth;
+                    unsigned shift = 8u - (unsigned)bit_depth - (unsigned)(bit % 8u);
+                    idx = (cur[bit / 8u] >> shift) & ((1u << bit_depth) - 1u);
+                }
+                if ((int)idx >= out->palette_count) goto done;
+            }
+        }
+    }
+
     ok = true;
 done:
     free(raw);

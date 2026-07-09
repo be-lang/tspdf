@@ -90,7 +90,7 @@ int cmd_img2pdf(int argc, char **argv) {
             // silently writing a PDF that is missing the remaining inputs.
             // --best-effort does not apply — that flag skips broken images,
             // it must not paper over dropped good ones.
-            if (doc->last_error == TSPDF_ERR_IMAGE_LIMIT) {
+            if (tspdf_writer_last_error(doc) == TSPDF_ERR_IMAGE_LIMIT) {
                 fprintf(stderr, "tspdf img2pdf: too many images (limit %d, got %d)\n",
                         TSPDF_MAX_IMAGES, nimg);
                 tspdf_writer_destroy(doc);

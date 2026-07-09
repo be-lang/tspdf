@@ -45,7 +45,8 @@ static void bw_init(BitWriter *bw, size_t initial_cap) {
 static void bw_ensure(BitWriter *bw, size_t extra) {
     // Guard len+extra against size_t wrap before comparing/growing: a wrapped
     // sum could read as < cap and skip the realloc, then bw_byte would write
-    // past the buffer. extra is small here (<=5 per call) but stay defensive.
+    // past the buffer. bw_write_bytes passes stored-block payloads of up to
+    // 65535 bytes here, so the guard is load-bearing, not just defensive.
     if (extra > SIZE_MAX - bw->len) { bw->error = true; return; }
     size_t needed = bw->len + extra;
     while (needed >= bw->cap) {
@@ -510,7 +511,9 @@ static void flush_block(Enc *e, bool final) {
     uint64_t stored_bits = UINT64_MAX;
     if (span > 0) {
         uint64_t nchunks = ((uint64_t)span + 65534) / 65535;
-        stored_bits = nchunks * 35 + (uint64_t)span * 8 + 7;  // +7: worst-case alignment
+        // Per chunk: 3 header bits + up to 5 alignment bits before LEN + 32
+        // bits LEN/NLEN = 40 (every chunk realigns, not just the first).
+        stored_bits = nchunks * 40 + (uint64_t)span * 8;
     }
 
     if (stored_bits <= fixed_bits && stored_bits <= dyn_bits) {
