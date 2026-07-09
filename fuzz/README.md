@@ -11,6 +11,7 @@ promise holds: no vendored fuzzing library, just the compiler.
 |--------------------|---------------------------------|---------|
 | `fuzz_reader.c`    | `tspdf_reader_open` + page walk + `save_to_memory` | whole PDF parsing, page tree, re-serialization |
 | `fuzz_inflate.c`   | `deflate_decompress`            | DEFLATE/zlib inflate (FlateDecode, PNG IDAT) |
+| `fuzz_deflate.c`   | `deflate_compress` round-trip   | DEFLATE/zlib compressor (every stream tspdf writes) |
 | `fuzz_ttf.c`       | `ttf_load_from_memory` + lookups | TrueType/OpenType table parsing |
 | `fuzz_png.c`       | `png_image_load_mem`            | PNG chunk parsing + unfiltering |
 
@@ -20,6 +21,7 @@ promise holds: no vendored fuzzing library, just the compiler.
 make fuzz                       # builds build/fuzz/* with clang -fsanitize=fuzzer,address,undefined
 ./build/fuzz/fuzz_reader  fuzz/corpus/reader
 ./build/fuzz/fuzz_inflate fuzz/corpus/inflate
+./build/fuzz/fuzz_deflate fuzz/corpus/deflate
 ./build/fuzz/fuzz_ttf     fuzz/corpus/ttf
 ./build/fuzz/fuzz_png     fuzz/corpus/png
 ```

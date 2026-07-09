@@ -253,6 +253,210 @@ TEST(test_deflate_large_input) {
     free(decomp);
 }
 
+TEST(test_deflate_roundtrip_empty) {
+    size_t comp_len = 0;
+    uint8_t *comp = deflate_compress((const uint8_t *)"", 0, &comp_len);
+    ASSERT(comp != NULL);
+    ASSERT(comp_len > 0);
+
+    size_t decomp_len = 12345;
+    uint8_t *decomp = deflate_decompress(comp, comp_len, &decomp_len);
+    ASSERT(decomp != NULL);
+    ASSERT_EQ_INT((int)decomp_len, 0);
+
+    free(comp);
+    free(decomp);
+}
+
+TEST(test_deflate_roundtrip_one_byte) {
+    uint8_t input = 0x42;
+    size_t comp_len = 0;
+    uint8_t *comp = deflate_compress(&input, 1, &comp_len);
+    ASSERT(comp != NULL);
+
+    size_t decomp_len = 0;
+    uint8_t *decomp = deflate_decompress(comp, comp_len, &decomp_len);
+    ASSERT(decomp != NULL);
+    ASSERT_EQ_INT((int)decomp_len, 1);
+    ASSERT(decomp[0] == 0x42);
+
+    free(comp);
+    free(decomp);
+}
+
+TEST(test_deflate_roundtrip_all_same) {
+    size_t len = 100000;
+    uint8_t *data = (uint8_t *)malloc(len);
+    ASSERT(data != NULL);
+    memset(data, 'A', len);
+
+    size_t comp_len = 0;
+    uint8_t *comp = deflate_compress(data, len, &comp_len);
+    ASSERT(comp != NULL);
+    // 100k identical bytes are runs of maximum-length matches; anything above
+    // a few hundred bytes means match emission is broken.
+    ASSERT(comp_len < 600);
+
+    size_t decomp_len = 0;
+    uint8_t *decomp = deflate_decompress(comp, comp_len, &decomp_len);
+    ASSERT(decomp != NULL);
+    ASSERT_EQ_INT((int)decomp_len, (int)len);
+    ASSERT(memcmp(decomp, data, len) == 0);
+
+    free(data);
+    free(comp);
+    free(decomp);
+}
+
+// Incompressible input must fall back to stored blocks and stay within a
+// small overhead of the raw size instead of expanding through Huffman coding.
+TEST(test_deflate_roundtrip_random_incompressible) {
+    size_t len = 262144;
+    uint8_t *data = (uint8_t *)malloc(len);
+    ASSERT(data != NULL);
+    uint32_t s = 0x12345678u;  // xorshift32: deterministic pseudo-random bytes
+    for (size_t i = 0; i < len; i++) {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        data[i] = (uint8_t)s;
+    }
+
+    size_t comp_len = 0;
+    uint8_t *comp = deflate_compress(data, len, &comp_len);
+    ASSERT(comp != NULL);
+    ASSERT(comp_len < len + len / 100 + 64);
+
+    size_t decomp_len = 0;
+    uint8_t *decomp = deflate_decompress(comp, comp_len, &decomp_len);
+    ASSERT(decomp != NULL);
+    ASSERT_EQ_INT((int)decomp_len, (int)len);
+    ASSERT(memcmp(decomp, data, len) == 0);
+
+    free(data);
+    free(comp);
+    free(decomp);
+}
+
+TEST(test_deflate_roundtrip_text_corpus) {
+    // Synthesize a text-like corpus: repetitive vocabulary, varying counters.
+    size_t cap = 300000;
+    char *text = (char *)malloc(cap);
+    ASSERT(text != NULL);
+    size_t n = 0;
+    for (int i = 0; n + 128 < cap; i++) {
+        n += (size_t)snprintf(text + n, cap - n,
+                              "%d 0 obj << /Type /Page /Parent %d 0 R /Contents %d 0 R >> "
+                              "BT /F1 %d Tf 72 %d Td (line of page text) Tj ET\n",
+                              i, i / 8, i + 1, 8 + i % 4, i % 700);
+    }
+
+    size_t comp_len = 0;
+    uint8_t *comp = deflate_compress((const uint8_t *)text, n, &comp_len);
+    ASSERT(comp != NULL);
+    ASSERT(comp_len < n / 4);  // this must compress well
+
+    size_t decomp_len = 0;
+    uint8_t *decomp = deflate_decompress(comp, comp_len, &decomp_len);
+    ASSERT(decomp != NULL);
+    ASSERT_EQ_INT((int)decomp_len, (int)n);
+    ASSERT(memcmp(decomp, text, n) == 0);
+
+    free(text);
+    free(comp);
+    free(decomp);
+}
+
+// Long repeats at distances close to the 32K window edge exercise the far end
+// of the distance code space and the hash-chain window cutoff.
+TEST(test_deflate_roundtrip_long_repeats_near_window) {
+    size_t seg = 32700;      // just under the 32768-byte window
+    size_t len = seg * 3;
+    uint8_t *data = (uint8_t *)malloc(len);
+    ASSERT(data != NULL);
+    uint32_t s = 0xC0FFEEu;
+    for (size_t i = 0; i < seg; i++) {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        data[i] = (uint8_t)(s % 61);  // compressible-ish, distinctive
+    }
+    memcpy(data + seg, data, seg);          // repeat at distance seg
+    memcpy(data + 2 * seg, data, seg);      // and again
+
+    size_t comp_len = 0;
+    uint8_t *comp = deflate_compress(data, len, &comp_len);
+    ASSERT(comp != NULL);
+    ASSERT(comp_len < len / 2);  // the repeats must be found across ~32K
+
+    size_t decomp_len = 0;
+    uint8_t *decomp = deflate_decompress(comp, comp_len, &decomp_len);
+    ASSERT(decomp != NULL);
+    ASSERT_EQ_INT((int)decomp_len, (int)len);
+    ASSERT(memcmp(decomp, data, len) == 0);
+
+    free(data);
+    free(comp);
+    free(decomp);
+}
+
+// Sizes straddling the compressor's internal block-split threshold (256K of
+// input per block) so a block boundary lands before/on/after the input end.
+TEST(test_deflate_roundtrip_block_boundaries) {
+    static const size_t sizes[] = { 262143, 262144, 262145 };
+    for (size_t si = 0; si < sizeof sizes / sizeof sizes[0]; si++) {
+        size_t len = sizes[si];
+        uint8_t *data = (uint8_t *)malloc(len);
+        ASSERT(data != NULL);
+        for (size_t i = 0; i < len; i++) {
+            data[i] = (uint8_t)((i * i) >> 3);  // mildly compressible pattern
+        }
+
+        size_t comp_len = 0;
+        uint8_t *comp = deflate_compress(data, len, &comp_len);
+        ASSERT(comp != NULL);
+
+        size_t decomp_len = 0;
+        uint8_t *decomp = deflate_decompress(comp, comp_len, &decomp_len);
+        ASSERT(decomp != NULL);
+        ASSERT_EQ_INT((int)decomp_len, (int)len);
+        ASSERT(memcmp(decomp, data, len) == 0);
+
+        free(data);
+        free(comp);
+        free(decomp);
+    }
+}
+
+TEST(test_deflate_roundtrip_multi_megabyte) {
+    size_t len = 6 * 1024 * 1024;
+    uint8_t *data = (uint8_t *)malloc(len);
+    ASSERT(data != NULL);
+    // Mixed content: incompressible stretches, zero runs, text-ish repetition.
+    uint32_t s = 0xDEADBEEFu;
+    for (size_t i = 0; i < len; i++) {
+        if (i % (1 << 20) < (1 << 18)) {
+            s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+            data[i] = (uint8_t)s;                      // random stretch
+        } else if (i % (1 << 20) < (1 << 19)) {
+            data[i] = 0;                               // zero stretch
+        } else {
+            data[i] = (uint8_t)("lorem ipsum dolor sit amet "[i % 27]);
+        }
+    }
+
+    size_t comp_len = 0;
+    uint8_t *comp = deflate_compress(data, len, &comp_len);
+    ASSERT(comp != NULL);
+    ASSERT(comp_len < len);
+
+    size_t decomp_len = 0;
+    uint8_t *decomp = deflate_decompress(comp, comp_len, &decomp_len);
+    ASSERT(decomp != NULL);
+    ASSERT_EQ_INT((int)decomp_len, (int)len);
+    ASSERT(memcmp(decomp, data, len) == 0);
+
+    free(data);
+    free(comp);
+    free(decomp);
+}
+
 // Crafted zlib: stored block with LEN that does not match one's-complement NLEN (RFC 1951).
 TEST(test_deflate_rejects_invalid_stored_nlen) {
     uint8_t zlib[] = {
@@ -1727,6 +1931,14 @@ int main(void) {
     RUN(test_deflate_roundtrip);
     RUN(test_deflate_roundtrip_repeated);
     RUN(test_deflate_large_input);
+    RUN(test_deflate_roundtrip_empty);
+    RUN(test_deflate_roundtrip_one_byte);
+    RUN(test_deflate_roundtrip_all_same);
+    RUN(test_deflate_roundtrip_random_incompressible);
+    RUN(test_deflate_roundtrip_text_corpus);
+    RUN(test_deflate_roundtrip_long_repeats_near_window);
+    RUN(test_deflate_roundtrip_block_boundaries);
+    RUN(test_deflate_roundtrip_multi_megabyte);
     RUN(test_deflate_rejects_invalid_stored_nlen);
     RUN(test_deflate_rejects_invalid_block_type);
     RUN(test_deflate_rejects_output_over_max);
