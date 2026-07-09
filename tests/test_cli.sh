@@ -180,6 +180,59 @@ else
   echo "  SKIP  compress well-compressed stream (python3 not found)"
 fi
 
+# compress packs small non-stream objects into object streams (ObjStm) so
+# object-heavy files shrink instead of growing. Build a PDF with hundreds of
+# tiny objects, compress it, and check size, structure and content survive.
+if command -v python3 > /dev/null 2>&1; then
+  python3 -c "
+import sys
+n = 300
+objs = []
+gs = ' '.join('/GS%d %d 0 R' % (i, 6 + i) for i in range(n))
+objs.append(b'<< /Type /Catalog /Pages 2 0 R >>')
+objs.append(b'<< /Type /Pages /Kids [3 0 R] /Count 1 >>')
+objs.append(('<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] '
+             '/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> '
+             '/ExtGState << %s >> >> >>' % gs).encode())
+content = b'BT /F1 12 Tf 72 720 Td (Hello ObjStm) Tj ET'
+objs.append(b'<< /Length %d >>\nstream\n' % len(content) + content + b'\nendstream')
+objs.append(b'<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>')
+for i in range(n):
+    objs.append(b'<< /Type /ExtGState /CA 0.%d /LW %d >>' % (i % 9 + 1, i % 7 + 1))
+out = bytearray(b'%PDF-1.4\n')
+offs = []
+for i, body in enumerate(objs, 1):
+    offs.append(len(out))
+    out += (b'%d 0 obj\n' % i) + body + b'\nendobj\n'
+xref = len(out)
+out += b'xref\n0 %d\n' % (len(objs) + 1)
+out += b'0000000000 65535 f \n'
+for o in offs:
+    out += b'%010d 00000 n \n' % o
+out += b'trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n' % (len(objs) + 1, xref)
+open(sys.argv[1], 'wb').write(out)
+" "$TMPDIR/objheavy.pdf"
+  run_test "compress object-heavy pdf" $TSPDF compress "$TMPDIR/objheavy.pdf" -o "$TMPDIR/objheavy_out.pdf"
+  run_test "compress object-heavy output is smaller than input" bash -c "
+    [ \$(stat -c%s '$TMPDIR/objheavy_out.pdf') -lt \$(stat -c%s '$TMPDIR/objheavy.pdf') ]"
+  run_test "compress output contains an object stream" grep -q "/Type /ObjStm" "$TMPDIR/objheavy_out.pdf"
+  run_test "compress object-heavy page count preserved" bash -c "$TSPDF info '$TMPDIR/objheavy_out.pdf' | grep -qE '^Pages:[[:space:]]*1$'"
+  run_test "compress object-heavy text preserved" bash -c "$TSPDF text '$TMPDIR/objheavy_out.pdf' | grep -q 'Hello ObjStm'"
+  # Do-no-harm: recompressing the ObjStm-heavy output must not inflate it.
+  run_test "compress objstm-heavy input does not grow" bash -c "
+    $TSPDF compress '$TMPDIR/objheavy_out.pdf' -o '$TMPDIR/objheavy_out2.pdf' > /dev/null 2>&1 &&
+    [ \$(stat -c%s '$TMPDIR/objheavy_out2.pdf') -le \$(stat -c%s '$TMPDIR/objheavy_out.pdf') ]"
+  if command -v qpdf > /dev/null 2>&1; then
+    run_test "compress objstm output passes qpdf --check" qpdf --check "$TMPDIR/objheavy_out.pdf"
+    run_test "compress objstm output has type-2 xref entries" bash -c "
+      qpdf --show-xref '$TMPDIR/objheavy_out.pdf' | grep -q 'compressed; stream ='"
+  else
+    echo "  SKIP  compress objstm qpdf oracle (qpdf not found)"
+  fi
+else
+  echo "  SKIP  compress objstm packing (python3 not found)"
+fi
+
 # img2pdf
 if command -v python3 > /dev/null 2>&1; then
   python3 -c "
