@@ -133,13 +133,15 @@ typedef struct {
 } TspdfFormField;
 
 typedef struct {
-    char title[256];
+    char title[256];       // UTF-8; non-ASCII is written as UTF-16BE with BOM
     int page_index;
     int parent;            // -1 if root-level
     int first_child;       // -1 if none
     int last_child;        // -1 if none
     int next;              // -1 if none
     int prev;              // -1 if none
+    double dest_y;         // /XYZ top coordinate (PDF space), when has_dest_y
+    bool has_dest_y;       // false = /Fit destination (legacy behavior)
     TspdfRef ref;            // allocated during save
 } TspdfBookmark;
 
@@ -277,6 +279,11 @@ TspdfError tspdf_writer_add_link(TspdfWriter *doc, int page_index, double x, dou
 int tspdf_writer_add_bookmark(TspdfWriter *doc, const char *title, int page_index);
 // Add a child bookmark under parent_index. Returns bookmark index.
 int tspdf_writer_add_child_bookmark(TspdfWriter *doc, int parent_index, const char *title, int page_index);
+// Add a bookmark with an explicit /XYZ destination: the viewer scrolls so that
+// y (PDF space, bottom-left origin) is at the top of the window. parent_index
+// -1 adds at the root level. Titles are UTF-8; non-ASCII titles are written as
+// UTF-16BE text strings. Returns bookmark index, or -1 when full/invalid.
+int tspdf_writer_add_bookmark_xyz(TspdfWriter *doc, int parent_index, const char *title, int page_index, double y);
 
 // Form fields (AcroForm)
 // Add a text input field. Coordinates are PDF space (bottom-left origin).

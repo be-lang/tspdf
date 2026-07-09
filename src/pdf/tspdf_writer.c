@@ -1,6 +1,7 @@
 #include "tspdf_writer.h"
 #include "../image/png_decoder.h"
 #include "../compress/deflate.h"
+#include "../util/pdftext.h"
 #include "../../include/tspdf/version.h"
 #include <string.h>
 #include <stdio.h>
@@ -937,6 +938,8 @@ int tspdf_writer_add_bookmark(TspdfWriter *doc, const char *title, int page_inde
     bm->last_child = -1;
     bm->next = -1;
     bm->prev = -1;
+    bm->dest_y = 0;
+    bm->has_dest_y = false;
     bm->ref.id = 0;
 
     return idx;
@@ -955,6 +958,8 @@ int tspdf_writer_add_child_bookmark(TspdfWriter *doc, int parent_index, const ch
     bm->last_child = -1;
     bm->next = -1;
     bm->prev = -1;
+    bm->dest_y = 0;
+    bm->has_dest_y = false;
     bm->ref.id = 0;
 
     TspdfBookmark *parent = &doc->bookmarks[parent_index];
@@ -969,6 +974,18 @@ int tspdf_writer_add_child_bookmark(TspdfWriter *doc, int parent_index, const ch
         parent->last_child = idx;
     }
 
+    return idx;
+}
+
+int tspdf_writer_add_bookmark_xyz(TspdfWriter *doc, int parent_index,
+                                  const char *title, int page_index, double y) {
+    int idx = parent_index < 0
+        ? tspdf_writer_add_bookmark(doc, title, page_index)
+        : tspdf_writer_add_child_bookmark(doc, parent_index, title, page_index);
+    if (idx >= 0) {
+        doc->bookmarks[idx].dest_y = y;
+        doc->bookmarks[idx].has_dest_y = true;
+    }
     return idx;
 }
 
@@ -1563,7 +1580,10 @@ TspdfError tspdf_writer_save(TspdfWriter *doc, const char *path) {
             TspdfBookmark *bm = &doc->bookmarks[i];
             tspdf_raw_writer_begin_object(w, bm->ref);
             tspdf_raw_write_dict_begin(w);
-            tspdf_raw_write_dict_name_string(w, "Title", bm->title);
+            // Same treatment as Info-dictionary strings: ASCII stays a
+            // literal string, non-ASCII UTF-8 becomes UTF-16BE with BOM.
+            tspdf_raw_write_name(w, "Title");
+            tspdf_pdftext_write_info_string(&w->output, bm->title);
 
             // Parent: either outline root or parent bookmark
             if (bm->parent == -1) {
@@ -1594,12 +1614,19 @@ TspdfError tspdf_writer_save(TspdfWriter *doc, const char *path) {
                 tspdf_raw_write_dict_name_int(w, "Count", child_count);
             }
 
-            // Destination: go to page, fit width
+            // Destination: /XYZ scroll target when set, else fit the page
             if (bm->page_index >= 0 && bm->page_index < doc->page_count) {
                 tspdf_raw_write_name(w, "Dest");
                 tspdf_raw_write_array_begin(w);
                 tspdf_raw_write_ref(w, doc->pages[bm->page_index].ref);
-                tspdf_raw_write_name(w, "Fit");
+                if (bm->has_dest_y) {
+                    tspdf_raw_write_name(w, "XYZ");
+                    tspdf_raw_write_int(w, 0);           // left edge
+                    tspdf_raw_write_real(w, bm->dest_y); // top
+                    tspdf_raw_write_null(w);             // keep zoom
+                } else {
+                    tspdf_raw_write_name(w, "Fit");
+                }
                 tspdf_raw_write_array_end(w);
             }
 

@@ -64,6 +64,7 @@ src/reader/tspr_text.h
 SOURCES="
 src/util/buffer.c
 src/util/arena.c
+src/util/pdftext.c
 src/pdf/pdf_writer.c
 src/pdf/pdf_stream.c
 src/pdf/pdf_base14.c

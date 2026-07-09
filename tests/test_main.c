@@ -812,6 +812,41 @@ TEST(test_pdf_add_bookmark) {
     tspdf_writer_destroy(doc);
 }
 
+// memmem for PDF bytes (the buffer contains binary sections, so no strstr).
+static bool bytes_contain(const uint8_t *hay, size_t hay_len, const char *needle) {
+    size_t nl = strlen(needle);
+    if (nl == 0 || hay_len < nl) return false;
+    for (size_t i = 0; i + nl <= hay_len; i++) {
+        if (memcmp(hay + i, needle, nl) == 0) return true;
+    }
+    return false;
+}
+
+TEST(test_pdf_bookmark_xyz_dest_and_unicode_title) {
+    TspdfWriter *doc = tspdf_writer_create();
+    tspdf_writer_add_page(doc);
+    tspdf_writer_add_page(doc);
+    // Root bookmark with /XYZ destination, child under it (page 1, y=700.5),
+    // and a non-ASCII title that must become a UTF-16BE hex string.
+    int root = tspdf_writer_add_bookmark_xyz(doc, -1, "Chapter 1", 0, 780.0);
+    ASSERT(root >= 0);
+    int child = tspdf_writer_add_bookmark_xyz(doc, root, "\xc3\x9c" "bersicht", 1, 700.5);
+    ASSERT(child >= 0);
+
+    uint8_t *pdf = NULL;
+    size_t len = 0;
+    ASSERT_EQ_INT(tspdf_writer_save_to_memory(doc, &pdf, &len), TSPDF_OK);
+    tspdf_writer_destroy(doc);
+
+    ASSERT(bytes_contain(pdf, len, "/Title (Chapter 1)"));
+    ASSERT(bytes_contain(pdf, len, "/XYZ 0 780.0000 null"));
+    ASSERT(bytes_contain(pdf, len, "/XYZ 0 700.5000 null"));
+    // UTF-16BE with BOM: FEFF, 'Ü' = 00DC, 'b' = 0062, ...
+    ASSERT(bytes_contain(pdf, len, "/Title <FEFF00DC0062"));
+    ASSERT(bytes_contain(pdf, len, "/Type /Outlines"));
+    free(pdf);
+}
+
 TEST(test_pdf_save) {
     TspdfWriter *doc = tspdf_writer_create();
     tspdf_writer_add_builtin_font(doc, "Helvetica");
@@ -2514,6 +2549,7 @@ int main(void) {
     RUN(test_pdf_add_checkbox);
     RUN(test_pdf_add_link);
     RUN(test_pdf_add_bookmark);
+    RUN(test_pdf_bookmark_xyz_dest_and_unicode_title);
     RUN(test_pdf_save);
 
     printf("\n  String Safety:\n");

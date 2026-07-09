@@ -3,12 +3,9 @@
 
 // Shared text-encoding helpers for PDF output: UTF-8 <-> WinAnsiEncoding
 // (cp1252) for content drawn with the built-in (base14) fonts, and UTF-16BE
-// text strings with BOM for Info-dictionary metadata (ISO 32000 §7.9.2.2).
-//
-// The definitions live at the end of src/reader/tspr_metadata.c: the Makefile
-// lists sources explicitly (no wildcard), and the reader objects are already
-// linked into every binary that needs these helpers (CLI, reader tests,
-// libtspdf), so no build changes are required.
+// text strings with BOM for Info-dictionary metadata and outline titles
+// (ISO 32000 §7.9.2.2). Definitions live in pdftext.c (part of LIB_SOURCES,
+// so both writer-only binaries and the reader link them).
 
 #include <stddef.h>
 #include <stdint.h>

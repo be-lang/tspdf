@@ -83,6 +83,7 @@ FUZZ_BIN = $(BUILDDIR)/fuzz
 LIB_SOURCES = \
 	$(SRCDIR)/util/buffer.c \
 	$(SRCDIR)/util/arena.c \
+	$(SRCDIR)/util/pdftext.c \
 	$(SRCDIR)/pdf/pdf_writer.c \
 	$(SRCDIR)/pdf/pdf_stream.c \
 	$(SRCDIR)/pdf/pdf_base14.c \
