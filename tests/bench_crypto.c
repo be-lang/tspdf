@@ -44,7 +44,13 @@ int main(void) {
         aes_init(&probe, key, 128);
         printf("AES-CBC throughput, %.0f MB buffer, best of %d runs\n", mb, REPS);
         printf("path: %s (set TSPDF_NO_AESHW=1 to force the portable path)\n\n",
-               probe.use_hw ? "hardware (AES-NI)" : "portable C");
+               probe.use_hw ?
+#if defined(__aarch64__)
+               "hardware (ARMv8 crypto)"
+#else
+               "hardware (AES-NI)"
+#endif
+               : "portable C");
     }
     printf("%-8s %-4s %10s %12s\n", "cipher", "op", "best s", "MB/s");
 
