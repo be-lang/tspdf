@@ -126,6 +126,7 @@ static const char *const VALUE_FLAGS[] = {
     "--title",
     "--subtitle",
     "--port",
+    "--page-size",
 };
 
 static bool is_value_flag(const char *arg) {

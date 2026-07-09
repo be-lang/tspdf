@@ -153,13 +153,16 @@ static void print_command_help(const char *cmd) {
         printf("  -o <output.pdf>  Output file path (required)\n");
     } else if (strcmp(cmd, "img2pdf") == 0) {
         printf("Usage: tspdf img2pdf <image1.jpg> <image2.png> [...] -o <output.pdf>\n");
+        printf("                     [--page-size a4|letter|image]\n");
         printf("\n");
         printf("Convert JPEG and PNG images into a multi-page PDF.\n");
-        printf("Each image is placed on its own A4 page, scaled to fit with margins.\n");
+        printf("Each image is placed on its own page, scaled to fit with margins.\n");
         printf("\n");
         printf("Arguments:\n");
         printf("  <image1> <image2> [...]  One or more JPEG/PNG image files\n");
         printf("  -o <output.pdf>          Output file path (required)\n");
+        printf("  --page-size <size>       a4 (default), letter, or image (page sized\n");
+        printf("                           to each image at 72 dpi, no margin)\n");
     } else if (strcmp(cmd, "qrcode") == 0) {
         printf("Usage: tspdf qrcode <text> -o <output.pdf> [--title <title>] [--subtitle <sub>]\n");
         printf("\n");

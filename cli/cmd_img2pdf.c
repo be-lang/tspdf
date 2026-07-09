@@ -18,8 +18,11 @@ static int is_png(const char *path) {
 int cmd_img2pdf(int argc, char **argv) {
     if (argc == 0 || has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
         printf("Usage: tspdf img2pdf <image1> <image2> [...] -o <output.pdf> [--best-effort]\n");
+        printf("                     [--page-size a4|letter|image]\n");
         printf("\nConvert JPEG/PNG images into a multi-page PDF (one image per page).\n");
         printf("Each image is scaled to fit the page, keeping its aspect ratio, and centered.\n");
+        printf("--page-size image sizes each page to its image at 72 dpi (no margin);\n");
+        printf("a4 (default) and letter place the image inside a 36pt margin.\n");
         printf("Exits non-zero if any input fails to load (the pages that loaded are still\n");
         printf("written). Pass --best-effort to skip unsupported inputs and exit 0.\n");
         return argc == 0 ? 1 : 0;
@@ -31,6 +34,26 @@ int cmd_img2pdf(int argc, char **argv) {
     if (!output) {
         fprintf(stderr, "tspdf img2pdf: missing -o <output.pdf>\n");
         return 1;
+    }
+
+    // Page geometry: fixed a4/letter pages (image fit inside a margin), or
+    // "image" for a page sized to each image at 72 dpi (like python img2pdf).
+    const char *page_size = find_flag(argc, argv, "--page-size");
+    double page_w = TSPDF_PAGE_A4_WIDTH;
+    double page_h = TSPDF_PAGE_A4_HEIGHT;
+    bool fit_to_image = false;
+    if (page_size) {
+        if (strcmp(page_size, "a4") == 0) {
+            // defaults above
+        } else if (strcmp(page_size, "letter") == 0) {
+            page_w = TSPDF_PAGE_LETTER_WIDTH;
+            page_h = TSPDF_PAGE_LETTER_HEIGHT;
+        } else if (strcmp(page_size, "image") == 0) {
+            fit_to_image = true;
+        } else {
+            fprintf(stderr, "tspdf img2pdf: unknown --page-size '%s' (use a4, letter, or image)\n", page_size);
+            return 1;
+        }
     }
 
     const char *images[MAX_IMAGES];
@@ -61,16 +84,23 @@ int cmd_img2pdf(int argc, char **argv) {
             continue;
         }
 
-        TspdfStream *page = tspdf_writer_add_page(doc);
-        double pw = TSPDF_PAGE_A4_WIDTH;
-        double ph = TSPDF_PAGE_A4_HEIGHT;
-        double margin = 36;
-        double aw = pw - 2 * margin;
-        double ah = ph - 2 * margin;
-
-        // Scale to fit the content box preserving aspect ratio, centered.
         // The image just added is the last entry in the writer's image table.
         const TspdfImage *img = &doc->images[doc->image_count - 1];
+
+        if (fit_to_image) {
+            // Page sized to the image at 72 dpi: 1 pixel = 1 point, no margin.
+            TspdfStream *page = tspdf_writer_add_page_sized(doc, img->width, img->height);
+            tspdf_stream_draw_image(page, img_name, 0, 0, img->width, img->height);
+            pages_added++;
+            continue;
+        }
+
+        TspdfStream *page = tspdf_writer_add_page_sized(doc, page_w, page_h);
+        double margin = 36;
+        double aw = page_w - 2 * margin;
+        double ah = page_h - 2 * margin;
+
+        // Scale to fit the content box preserving aspect ratio, centered.
         double sx = aw / img->width;
         double sy = ah / img->height;
         double scale = sx < sy ? sx : sy;
