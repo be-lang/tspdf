@@ -474,10 +474,15 @@ static void dt_build_annot_page_map(TspdfReader *src, TspdfParser *parser,
 // True when the field keeps at least one widget on a kept page. Fields with
 // /Kids are rebuilt with the surviving kids and installed into dst's cache;
 // terminal fields (the field is the widget) pass through untouched.
+// `budget` caps the total nodes visited across the whole field forest (a
+// legitimate tree visits each object at most once); without it, /Kids full
+// of self-references fan out to count^depth calls under the depth cap alone.
 static bool dt_prune_field(TspdfReader *dst, TspdfParser *parser,
                            const bool *page_kept, const uint32_t *annot_page,
-                           uint32_t field_num, int depth) {
+                           uint32_t field_num, int depth, size_t *budget) {
     if (depth > 32 || field_num >= dst->xref.count) return false;
+    if (*budget == 0) return false;
+    (*budget)--;
     TspdfObj *field = dt_resolve_num(dst, parser, field_num);
     if (!field || field->type != TSPDF_OBJ_DICT) return false;
 
@@ -488,7 +493,7 @@ static bool dt_prune_field(TspdfReader *dst, TspdfParser *parser,
             TspdfObj *kid = &kids->array.items[i];
             if (kid->type != TSPDF_OBJ_REF) continue;
             if (dt_prune_field(dst, parser, page_kept, annot_page,
-                               kid->ref.num, depth + 1)) {
+                               kid->ref.num, depth + 1, budget)) {
                 if (!dt_numlist_push(&kept, kid->ref.num)) {
                     free(kept.nums);
                     return false;
@@ -897,11 +902,12 @@ TspdfError tspdf_doctree_extract_attach(TspdfReader *src, TspdfReader *dst) {
                     dt_build_annot_page_map(src, &src_parser, annot_page);
 
                     DtNumList kept = {0};
+                    size_t field_budget = dst->xref.count + 16;
                     for (size_t i = 0; i < fields->array.count; i++) {
                         TspdfObj *f = &fields->array.items[i];
                         if (f->type != TSPDF_OBJ_REF) continue;
                         if (dt_prune_field(dst, &dst_parser, page_kept, annot_page,
-                                           f->ref.num, 0)) {
+                                           f->ref.num, 0, &field_budget)) {
                             if (!dt_numlist_push(&kept, f->ref.num)) {
                                 err = TSPDF_ERR_ALLOC;
                                 break;
