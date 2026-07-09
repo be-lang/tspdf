@@ -10,6 +10,17 @@ on 0.x, the CLI is considered stable but the low-level C API may still change.
 ## [0.2.0] - 2026-07-09
 
 ### Added
+- `pagenum --pages <range>` stamps only the selected pages (skip cover pages);
+  numbering still reflects true page positions.
+- `img2pdf --page-size a4|letter|image` (`image` sizes each page to its image
+  at 72 dpi, like python img2pdf).
+- md2pdf: `[text](url)` becomes a real clickable link annotation, headings
+  become nested PDF bookmarks, and `***bold-italic***` renders styled.
+- `info` reports the PDF version, encryption scheme (e.g. "AES-256, R6"),
+  and whether the file has bookmarks or form fields; four matching C API
+  accessors (`tspdf_reader_pdf_version`, `tspdf_reader_encryption_info`,
+  `tspdf_reader_has_outlines`, `tspdf_reader_has_acroform`).
+- A deflate round-trip fuzz harness (`fuzz/fuzz_deflate.c`).
 - `tspdf text`: text extraction in content-stream order, with ToUnicode CMaps,
   /Differences, standard encodings, CID/Identity-H fonts, and form XObjects.
   Also available as `tspdf_reader_page_text()` in the C API.
@@ -32,6 +43,21 @@ on 0.x, the CLI is considered stable but the low-level C API may still change.
   `docs/library.md` documenting the C API entry points.
 
 ### Changed
+- `compress` was overhauled and now actually compresses: the from-scratch
+  DEFLATE encoder gained a lazy hash-chain matcher and dynamic Huffman blocks
+  (now smaller than zlib level 6 on typical PDF payloads), and the serializer
+  packs small objects into object streams with a right-sized cross-reference
+  stream. The 23.7 MB reference file shrinks 9.8% (previously 0.4%), and
+  object-stream-heavy inputs no longer grow. Everything tspdf writes (md2pdf,
+  img2pdf, merge/split output) benefits from the better encoder.
+- img2pdf embeds PNG image data verbatim (no recompression) for non-interlaced
+  gray/RGB/palette PNGs and keeps their colorspace, instead of expanding to
+  RGB and re-encoding — output is now typically smaller than python img2pdf's
+  (previously up to 358x larger).
+- `tspdf text` folds ligature code points (U+FB00-FB06) to ASCII sequences
+  and trims trailing spaces, so extracted text is searchable.
+- Extra positional arguments are now rejected with an error instead of being
+  silently ignored.
 - merge and split preserve bookmarks (outlines) and AcroForm form fields;
   split keeps only entries pointing at kept pages and flattens named
   destinations to explicit ones.
@@ -40,6 +66,16 @@ on 0.x, the CLI is considered stable but the low-level C API may still change.
   `pkg-config --static`).
 
 ### Fixed
+- The QR encoder now produces spec-conformant, decode-verified symbols across
+  all supported sizes (versions 1-11, up to 251 characters). Previously the
+  module placement skipped a column, one format-info copy was bit-reversed,
+  the v3/v10 block tables were wrong, and versions 7+ lacked the mandatory
+  version-information block — strict decoders rejected most output, and
+  27-42-character payloads (typical URLs) were always broken.
+- merge and img2pdf accept any number of inputs; previously inputs past the
+  64th were silently dropped.
+- watermark centers on the visible page area (nonzero MediaBox origins) and
+  reads upright on rotated pages, in both the CLI and the web UI.
 - Text extraction is hardened against hostile PDFs: NUL codepoints from
   ToUnicode no longer truncate output, wide-bfrange CMaps with point fixes
   resolve correctly, and total page content is capped.
