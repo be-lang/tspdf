@@ -1,0 +1,33 @@
+# Maintainer: Benjamin Lang <beni@lbau.org>
+pkgname=tspdf
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Zero-dependency PDF toolkit and CLI in pure C11"
+arch=('x86_64' 'aarch64')
+url="https://github.com/be-lang/tspdf"
+license=('MIT')
+depends=('glibc')
+# v0.1.0 ships the C library as libtspdf.a only; without this makepkg would
+# strip it and package headers with no library.
+options=('staticlibs')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('a291e593aad65e96cd743afd07531edf68862df13c9ed0f48779d5d0552efda5')
+
+build() {
+    cd "$pkgname-$pkgver"
+    make
+    # Build the library here too (v0.1.0's `make install` needs libtspdf.a),
+    # so package() only copies files and compiles nothing under fakeroot.
+    make lib
+}
+
+check() {
+    cd "$pkgname-$pkgver"
+    make test
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+    make DESTDIR="$pkgdir" PREFIX=/usr install
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

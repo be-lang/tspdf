@@ -1,0 +1,8 @@
+# Exported-symbols list for libtspdf.dylib (ld64 -exported_symbols_list).
+# Mach-O spelling of scripts/libtspdf.map: only the public tspdf_*/tspr_*
+# API is exported, internal helpers stay hidden. C symbols carry a leading
+# underscore in Mach-O; ld64 supports * wildcards in this file.
+# Untested locally (no macOS machine here); the CI macOS shared-lib smoke
+# step links with it.
+_tspdf_*
+_tspr_*

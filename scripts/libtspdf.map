@@ -1,0 +1,19 @@
+/* Linker version script for libtspdf.so (GNU ld / lld, -Wl,--version-script).
+ *
+ * Only the public tspdf_* and tspr_* names enter the dynamic symbol table;
+ * every internal helper (aes_*, sha256_*, md5_*, rc4_*, deflate_*, jpeg_*,
+ * png_*, qr_*, ttf_*, buffer_*, arena_*, ...) stays local. A system-wide
+ * shared library with generic names like sha256_init would otherwise
+ * interpose same-named symbols in other libraries at runtime.
+ *
+ * Anonymous node on purpose: it filters visibility without introducing ELF
+ * symbol versioning (no NAME@VERSION decoration), which would itself be an
+ * ABI commitment. Darwin equivalent: scripts/libtspdf.exp.
+ */
+{
+    global:
+        tspdf_*;
+        tspr_*;
+    local:
+        *;
+};
