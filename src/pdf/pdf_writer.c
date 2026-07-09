@@ -147,8 +147,8 @@ void tspdf_raw_write_stream(TspdfRawWriter *w, const uint8_t *data, size_t len) 
 }
 
 void tspdf_raw_write_stream_compressed(TspdfRawWriter *w, const uint8_t *data, size_t len) {
-    // Skip compression for small streams — the HashChain allocation (~160KB)
-    // and LZ77 overhead exceeds any benefit for tiny data
+    // Skip compression for small streams — the compressor's scratch state
+    // (~0.5MB of hash chains + symbol buffer) exceeds any benefit for tiny data
     if (len < 256) {
         tspdf_raw_write_stream(w, data, len);
         return;
