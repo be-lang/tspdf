@@ -8,6 +8,37 @@
 #include <stdlib.h>
 #include <math.h>
 
+/*
+ * Copy src into the cap-byte buffer dst (NUL included), truncating at a UTF-8
+ * codepoint boundary so a multi-byte sequence is never split mid-way. Returns
+ * true when truncation occurred.
+ */
+static bool tsw_copy_utf8_truncated(char *dst, size_t cap, const char *src) {
+    size_t len = strlen(src);
+    if (len < cap) {
+        memcpy(dst, src, len + 1);
+        return false;
+    }
+    size_t n = cap - 1;
+    /* Back off over continuation bytes: the codepoint that would be split
+     * is dropped entirely. */
+    while (n > 0 && ((unsigned char)src[n] & 0xC0) == 0x80)
+        n--;
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+    return true;
+}
+
+/* A truncated URL is a silently broken link and a truncated title loses
+ * text, so say it once per document on stderr (same policy as the md2pdf
+ * block-limit warning) instead of failing or spamming per call. */
+static void tsw_warn_truncation(TspdfWriter *doc, const char *what, size_t cap) {
+    if (doc->truncation_warned) return;
+    doc->truncation_warned = true;
+    fprintf(stderr, "tspdf: warning: %s longer than %zu bytes was truncated "
+                    "(reported once per document)\n", what, cap - 1);
+}
+
 TspdfWriter *tspdf_writer_create(void) {
     TspdfWriter *doc = calloc(1, sizeof(TspdfWriter));
     if (!doc) return NULL;
@@ -920,7 +951,8 @@ TspdfError tspdf_writer_add_link(TspdfWriter *doc, int page_index, double x, dou
     annot->y = y;
     annot->w = w;
     annot->h = h;
-    snprintf(annot->url, sizeof(annot->url), "%s", url);
+    if (tsw_copy_utf8_truncated(annot->url, sizeof(annot->url), url))
+        tsw_warn_truncation(doc, "link URL", sizeof(annot->url));
     annot->ref.id = 0; // allocated later during save
     doc->last_error = TSPDF_OK;
     return TSPDF_OK;
@@ -931,7 +963,8 @@ int tspdf_writer_add_bookmark(TspdfWriter *doc, const char *title, int page_inde
 
     int idx = doc->bookmark_count++;
     TspdfBookmark *bm = &doc->bookmarks[idx];
-    snprintf(bm->title, sizeof(bm->title), "%s", title);
+    if (tsw_copy_utf8_truncated(bm->title, sizeof(bm->title), title))
+        tsw_warn_truncation(doc, "bookmark title", sizeof(bm->title));
     bm->page_index = page_index;
     bm->parent = -1;
     bm->first_child = -1;
@@ -951,7 +984,8 @@ int tspdf_writer_add_child_bookmark(TspdfWriter *doc, int parent_index, const ch
 
     int idx = doc->bookmark_count++;
     TspdfBookmark *bm = &doc->bookmarks[idx];
-    snprintf(bm->title, sizeof(bm->title), "%s", title);
+    if (tsw_copy_utf8_truncated(bm->title, sizeof(bm->title), title))
+        tsw_warn_truncation(doc, "bookmark title", sizeof(bm->title));
     bm->page_index = page_index;
     bm->parent = parent_index;
     bm->first_child = -1;
@@ -1552,14 +1586,12 @@ TspdfError tspdf_writer_save(TspdfWriter *doc, const char *path) {
             doc->bookmarks[i].ref = tspdf_raw_writer_alloc_object(w);
         }
 
-        // Count children helper: count direct children of a parent (-1 = root level)
-        // and find first/last among root-level bookmarks
-        int root_first = -1, root_last = -1, root_count = 0;
+        // Find first/last among root-level bookmarks
+        int root_first = -1, root_last = -1;
         for (int i = 0; i < doc->bookmark_count; i++) {
             if (doc->bookmarks[i].parent == -1) {
                 if (root_first == -1) root_first = i;
                 root_last = i;
-                root_count++;
             }
         }
 
@@ -1604,14 +1636,20 @@ TspdfError tspdf_writer_save(TspdfWriter *doc, const char *path) {
             if (bm->first_child >= 0) {
                 tspdf_raw_write_dict_name_ref(w, "First", doc->bookmarks[bm->first_child].ref);
                 tspdf_raw_write_dict_name_ref(w, "Last", doc->bookmarks[bm->last_child].ref);
-                // Count children (negative = closed by default)
-                int child_count = 0;
-                int c = bm->first_child;
-                while (c >= 0) {
-                    child_count++;
-                    c = doc->bookmarks[c].next;
+                // /Count is the number of VISIBLE descendants (ISO 32000-1
+                // Table 153) — children plus every open descendant below
+                // them, not just direct children. A negative value would mark
+                // this item closed; every item we write is open, so this is
+                // the positive full-descendant total. Count by walking each
+                // bookmark's ancestor chain (iterative, no recursion).
+                int visible_desc = 0;
+                for (int j = 0; j < doc->bookmark_count; j++) {
+                    for (int p = doc->bookmarks[j].parent; p >= 0;
+                         p = doc->bookmarks[p].parent) {
+                        if (p == i) { visible_desc++; break; }
+                    }
                 }
-                tspdf_raw_write_dict_name_int(w, "Count", child_count);
+                tspdf_raw_write_dict_name_int(w, "Count", visible_desc);
             }
 
             // Destination: /XYZ scroll target when set, else fit the page
@@ -1642,7 +1680,9 @@ TspdfError tspdf_writer_save(TspdfWriter *doc, const char *path) {
         if (root_first >= 0) {
             tspdf_raw_write_dict_name_ref(w, "First", doc->bookmarks[root_first].ref);
             tspdf_raw_write_dict_name_ref(w, "Last", doc->bookmarks[root_last].ref);
-            tspdf_raw_write_dict_name_int(w, "Count", root_count);
+            // Root /Count = total outline items open (visible) at any level;
+            // all items we write are open, so that is every bookmark.
+            tspdf_raw_write_dict_name_int(w, "Count", doc->bookmark_count);
         }
         tspdf_raw_write_dict_end(w);
         tspdf_buffer_append_str(&w->output, "\n");

@@ -847,6 +847,62 @@ TEST(test_pdf_bookmark_xyz_dest_and_unicode_title) {
     free(pdf);
 }
 
+TEST(test_pdf_bookmark_count_is_visible_descendants) {
+    // ISO 32000-1 Table 153: /Count of an open item is the number of VISIBLE
+    // descendants, not direct children. Root bookmark with two children, the
+    // first child having one child of its own: item /Count 3, root child
+    // /Count 1, and outline root /Count 4 (all items are written open).
+    TspdfWriter *doc = tspdf_writer_create();
+    tspdf_writer_add_page(doc);
+    int root = tspdf_writer_add_bookmark(doc, "Top", 0);
+    ASSERT(root >= 0);
+    int kid1 = tspdf_writer_add_child_bookmark(doc, root, "Kid1", 0);
+    ASSERT(kid1 >= 0);
+    ASSERT(tspdf_writer_add_child_bookmark(doc, kid1, "Grandkid", 0) >= 0);
+    ASSERT(tspdf_writer_add_child_bookmark(doc, root, "Kid2", 0) >= 0);
+
+    uint8_t *pdf = NULL;
+    size_t len = 0;
+    ASSERT_EQ_INT(tspdf_writer_save_to_memory(doc, &pdf, &len), TSPDF_OK);
+    tspdf_writer_destroy(doc);
+
+    ASSERT(bytes_contain(pdf, len, "/Count 3"));   // "Top": Kid1+Grandkid+Kid2
+    ASSERT(bytes_contain(pdf, len, "/Count 1"));   // "Kid1": Grandkid
+    ASSERT(bytes_contain(pdf, len, "/Count 4"));   // outline root: all items
+    ASSERT(!bytes_contain(pdf, len, "/Count 2"));  // direct-child count is wrong
+    free(pdf);
+}
+
+TEST(test_pdf_bookmark_title_truncates_at_utf8_boundary) {
+    // A title longer than the 255-byte buffer is truncated; a multi-byte
+    // UTF-8 sequence spanning the cut must be dropped whole, never split.
+    // 254 * 'a' + "é" (C3 A9) = 256 bytes: naive truncation would keep the
+    // lone C3 byte, the fixed path cuts after the 254 ASCII bytes.
+    char title[257];
+    memset(title, 'a', 254);
+    title[254] = '\xc3';
+    title[255] = '\xa9';
+    title[256] = '\0';
+
+    TspdfWriter *doc = tspdf_writer_create();
+    tspdf_writer_add_page(doc);
+    ASSERT(tspdf_writer_add_bookmark(doc, title, 0) >= 0);
+
+    uint8_t *pdf = NULL;
+    size_t len = 0;
+    ASSERT_EQ_INT(tspdf_writer_save_to_memory(doc, &pdf, &len), TSPDF_OK);
+    tspdf_writer_destroy(doc);
+
+    // Expect a pure-ASCII literal string of exactly 254 'a's.
+    char needle[300];
+    memcpy(needle, "/Title (", 8);
+    memset(needle + 8, 'a', 254);
+    needle[8 + 254] = ')';
+    needle[8 + 255] = '\0';
+    ASSERT(bytes_contain(pdf, len, needle));
+    free(pdf);
+}
+
 TEST(test_pdf_save) {
     TspdfWriter *doc = tspdf_writer_create();
     tspdf_writer_add_builtin_font(doc, "Helvetica");
@@ -2578,6 +2634,8 @@ int main(void) {
     RUN(test_pdf_add_link);
     RUN(test_pdf_add_bookmark);
     RUN(test_pdf_bookmark_xyz_dest_and_unicode_title);
+    RUN(test_pdf_bookmark_count_is_visible_descendants);
+    RUN(test_pdf_bookmark_title_truncates_at_utf8_boundary);
     RUN(test_pdf_save);
 
     printf("\n  String Safety:\n");
