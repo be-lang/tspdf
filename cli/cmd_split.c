@@ -49,7 +49,7 @@ static int split_burst(TspdfReader *doc, const char *output) {
         zero_pad(num, sizeof(num), i + 1, width);
         memcpy(name, output, base_len);
         snprintf(name + base_len, 32, "-%s.pdf", num);
-        if (i == 0) memcpy(first_name, name, base_len + 32);
+        if (i == 0) memcpy(first_name, name, strlen(name) + 1);
 
         TspdfError err = TSPDF_OK;
         TspdfReader *page = tspdf_reader_extract(doc, &i, 1, &err);
