@@ -3,12 +3,18 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Hardware AES (AES-NI) is compiled only for x86 under GCC/Clang: the
- * intrinsics are enabled per-function with __attribute__((target(...))), so
- * the build needs no -maes flag and every other target (ARM, wasm/emcc, MSVC)
- * gets the portable path alone. ARM crypto extensions are a follow-up. */
+/* Hardware AES is compiled only under GCC/Clang, for x86 (AES-NI) and
+ * AArch64 (ARMv8 crypto extensions): the intrinsics are enabled per-function
+ * with __attribute__((target(...))), so the build needs no -maes/-march flag
+ * and every other target (wasm/emcc, MSVC, other CPUs) gets the portable
+ * path alone. */
 #if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
 #define TSPDF_AES_HW 1
+#elif defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
+#define TSPDF_AES_HW 1
+#endif
+
+#ifdef TSPDF_AES_HW
 static int aes_hw_available(void);
 static void aes_hw_encrypt_cbc(const Aes *ctx, const uint8_t iv[16],
                                const uint8_t *in, uint8_t *out, size_t len);
@@ -206,12 +212,13 @@ void aes_init(Aes *ctx, const uint8_t *key, int key_bits) {
         for (int j = 0; j < 4; j++)
             ctx->dec_keys[4*i + j] = inv_mix_word(ctx->dec_keys[4*i + j]);
 
-    /* Hardware dispatch. The AES-NI round keys are the FIPS schedules above
-     * serialized in byte order (each word stored big-endian): AESENC consumes
-     * round_keys as-is and AESDEC consumes the equivalent-inverse-cipher
-     * dec_keys, whose per-word InvMixColumns pass is exactly what AESIMC
-     * would compute. Deriving both from the one soft expansion keeps the two
-     * paths on provably identical keys. */
+    /* Hardware dispatch. The hardware round keys are the FIPS schedules
+     * above serialized in byte order (each word stored big-endian): AESENC
+     * (x86) and AESE (ARM) consume round_keys as-is, and AESDEC / AESD
+     * consume the equivalent-inverse-cipher dec_keys, whose per-word
+     * InvMixColumns pass is exactly what AESIMC would compute. Deriving both
+     * from the one soft expansion keeps the paths on provably identical
+     * keys. */
     ctx->use_hw = 0;
 #ifdef TSPDF_AES_HW
     if (aes_hw_available()) {
@@ -355,18 +362,21 @@ void aes_decrypt_cbc(Aes *ctx, const uint8_t iv[16], const uint8_t *in, uint8_t 
 }
 
 /* =========================================================================
- * Hardware AES (x86 AES-NI)
+ * Hardware AES
  *
  * Kept at the bottom of this file (not a separate source) so the
  * amalgamation script's hardcoded file list stays valid. Each function
- * carries __attribute__((target("aes,sse2"))), which lets GCC/Clang emit
- * AESENC/AESDEC here without -maes on the command line; aes_init only sets
- * use_hw after __builtin_cpu_supports("aes") confirms the CPU executes them.
- * Round keys come from the Aes struct's hw_keys/hw_dec_keys byte schedules
- * (see aes_init) via unaligned loads, so no alignment demands leak into the
- * public struct.
+ * carries a per-function __attribute__((target(...))), which lets GCC/Clang
+ * emit the AES instructions without -maes/-march on the command line;
+ * aes_init only sets use_hw after aes_hw_available() confirms the CPU
+ * executes them. Round keys come from the Aes struct's hw_keys/hw_dec_keys
+ * byte schedules (see aes_init) via unaligned loads, so no alignment
+ * demands leak into the public struct.
  * ========================================================================= */
 #ifdef TSPDF_AES_HW
+#if defined(__x86_64__) || defined(__i386__)
+
+/* ---- x86 AES-NI ---- */
 
 #include <emmintrin.h>   /* SSE2 */
 #include <wmmintrin.h>   /* AES-NI */
@@ -454,4 +464,138 @@ static void aes_hw_decrypt_cbc(const Aes *ctx, const uint8_t iv[16],
     }
 }
 
+#else /* __aarch64__ */
+
+/* ---- ARMv8 crypto extensions (AArch64) ----
+ *
+ * The NEON AES instructions cut the round at a different joint than AES-NI:
+ * AESE (vaeseq_u8) computes ShiftRows(SubBytes(state ^ key)) — AddRoundKey
+ * happens FIRST, inside the instruction — and MixColumns is the separate
+ * AESMC (vaesmcq_u8). Folding the FIPS cipher
+ *
+ *     state = pt ^ rk[0]
+ *     rounds 1..Nr-1:  state = MixColumns(ShiftRows(SubBytes(state))) ^ rk[r]
+ *     final:           state = ShiftRows(SubBytes(state)) ^ rk[Nr]
+ *
+ * into that shape absorbs each round's trailing AddRoundKey into the next
+ * AESE's leading key XOR:
+ *
+ *     for r = 0..Nr-2:  state = AESMC(AESE(state, rk[r]))
+ *     state = AESE(state, rk[Nr-1]) ^ rk[Nr]
+ *
+ * so encryption consumes the same hw_keys schedule as AESENC, front to
+ * back: AESE/AESD act bytewise on the state's plain memory layout, which is
+ * exactly the big-endian-per-word serialization hw_keys holds, so vld1q_u8
+ * loads the keys directly. Decryption mirrors this with AESD (vaesdq_u8,
+ * key XOR then InvSubBytes/InvShiftRows) and AESIMC (vaesimcq_u8). The
+ * equivalent inverse cipher (see aes_init: dec_keys[0] = rk[Nr], middle
+ * keys InvMixColumns'd, dec_keys[Nr] = rk[0]) folds the same way —
+ *
+ *     for r = 0..Nr-2:  state = AESIMC(AESD(state, dk[r]))
+ *     state = AESD(state, dk[Nr-1]) ^ dk[Nr]
+ *
+ * — because each round's "^ dk[r] then InvMixColumns of the state" in the
+ * software path splits into AESIMC now and the key XOR absorbed by the next
+ * AESD. hw_dec_keys is therefore consumed as stored, in the same order
+ * AESDEC uses it. */
+
+#include <arm_neon.h>
+
+#if defined(__linux__)
+#include <sys/auxv.h>
+#ifndef HWCAP_AES
+#define HWCAP_AES (1UL << 3)   /* Linux UAPI bit; missing from older headers */
+#endif
+#endif
+
+/* CPU support probed once; the TSPDF_NO_AESHW override is read per init so
+ * tests can flip between paths with setenv + aes_init in one process. */
+static int aes_hw_available(void) {
+#if defined(__APPLE__)
+    /* AES is architecturally guaranteed here: every Apple Silicon CPU
+     * (M1 onward) implements FEAT_AES, and arm64 macOS runs on nothing
+     * else, so there is no runtime probe to do. */
+    int cpu_has_aes = 1;
+#elif defined(__linux__)
+    static int cpu_has_aes = -1;
+    if (cpu_has_aes < 0)
+        cpu_has_aes = (getauxval(AT_HWCAP) & HWCAP_AES) ? 1 : 0;
+#else
+    /* No portable probe on this OS — stay on the C path. */
+    int cpu_has_aes = 0;
+#endif
+    const char *off = getenv("TSPDF_NO_AESHW");
+    if (off && off[0] != '\0')
+        return 0;
+    return cpu_has_aes;
+}
+
+/* CBC encryption is inherently serial (each block chains into the next), so
+ * one block per AESE/AESMC chain is the best available shape. */
+__attribute__((target("+crypto")))
+static void aes_hw_encrypt_cbc(const Aes *ctx, const uint8_t iv[16],
+                               const uint8_t *in, uint8_t *out, size_t len) {
+    const int nr = ctx->nr;
+    uint8x16_t rk[15];
+    for (int r = 0; r <= nr; r++)
+        rk[r] = vld1q_u8(ctx->hw_keys + 16*r);
+
+    uint8x16_t prev = vld1q_u8(iv);
+    for (size_t i = 0; i < len; i += 16) {
+        uint8x16_t x = veorq_u8(vld1q_u8(in + i), prev);
+        for (int r = 0; r < nr - 1; r++)
+            x = vaesmcq_u8(vaeseq_u8(x, rk[r]));
+        x = veorq_u8(vaeseq_u8(x, rk[nr - 1]), rk[nr]);
+        vst1q_u8(out + i, x);
+        prev = x;
+    }
+}
+
+/* CBC decryption is parallel (every block's cipher input is ciphertext we
+ * already hold), so run four AESD chains at once to cover the instruction
+ * latency, then XOR each result with the preceding ciphertext block. */
+__attribute__((target("+crypto")))
+static void aes_hw_decrypt_cbc(const Aes *ctx, const uint8_t iv[16],
+                               const uint8_t *in, uint8_t *out, size_t len) {
+    const int nr = ctx->nr;
+    uint8x16_t rk[15];
+    for (int r = 0; r <= nr; r++)
+        rk[r] = vld1q_u8(ctx->hw_dec_keys + 16*r);
+
+    uint8x16_t prev = vld1q_u8(iv);
+    size_t i = 0;
+    for (; i + 64 <= len; i += 64) {
+        uint8x16_t c0 = vld1q_u8(in + i);
+        uint8x16_t c1 = vld1q_u8(in + i + 16);
+        uint8x16_t c2 = vld1q_u8(in + i + 32);
+        uint8x16_t c3 = vld1q_u8(in + i + 48);
+        uint8x16_t x0 = c0, x1 = c1, x2 = c2, x3 = c3;
+        for (int r = 0; r < nr - 1; r++) {
+            x0 = vaesimcq_u8(vaesdq_u8(x0, rk[r]));
+            x1 = vaesimcq_u8(vaesdq_u8(x1, rk[r]));
+            x2 = vaesimcq_u8(vaesdq_u8(x2, rk[r]));
+            x3 = vaesimcq_u8(vaesdq_u8(x3, rk[r]));
+        }
+        x0 = veorq_u8(vaesdq_u8(x0, rk[nr - 1]), rk[nr]);
+        x1 = veorq_u8(vaesdq_u8(x1, rk[nr - 1]), rk[nr]);
+        x2 = veorq_u8(vaesdq_u8(x2, rk[nr - 1]), rk[nr]);
+        x3 = veorq_u8(vaesdq_u8(x3, rk[nr - 1]), rk[nr]);
+        vst1q_u8(out + i,      veorq_u8(x0, prev));
+        vst1q_u8(out + i + 16, veorq_u8(x1, c0));
+        vst1q_u8(out + i + 32, veorq_u8(x2, c1));
+        vst1q_u8(out + i + 48, veorq_u8(x3, c2));
+        prev = c3;
+    }
+    for (; i < len; i += 16) {
+        uint8x16_t ct = vld1q_u8(in + i);
+        uint8x16_t x = ct;
+        for (int r = 0; r < nr - 1; r++)
+            x = vaesimcq_u8(vaesdq_u8(x, rk[r]));
+        x = veorq_u8(vaesdq_u8(x, rk[nr - 1]), rk[nr]);
+        vst1q_u8(out + i, veorq_u8(x, prev));
+        prev = ct;
+    }
+}
+
+#endif /* arch */
 #endif /* TSPDF_AES_HW */

@@ -48,4 +48,7 @@ zero-dependency rule. These are used for PDF-format encryption/decryption
 compatibility, not as a general-purpose cryptography library. Do not reuse them
 for other security purposes. In particular they are not constant-time: AES uses
 key-dependent table lookups, so cache-timing attacks by co-resident processes
-are outside the threat model of a local file tool.
+are outside the threat model of a local file tool. On x86 CPUs with AES-NI and
+on ARMv8 (AArch64) CPUs with the crypto extensions, AES-CBC dispatches to the
+hardware instructions instead, which avoid data-dependent lookups; set
+`TSPDF_NO_AESHW` to force the portable path.

@@ -474,7 +474,8 @@ TEST(test_aes_hw_env_override) {
  * both must reproduce the SP 800-38A CBC vectors, and both must agree on a
  * multi-KB pseudo-random buffer sized to hit the 4-block ILP body plus a
  * non-multiple-of-64 tail. Skips where there is no hardware path to compare
- * (non-x86 build, CPU without AES-NI, or TSPDF_NO_AESHW set). */
+ * (no hw path compiled, CPU without AES-NI / ARMv8 crypto, or TSPDF_NO_AESHW
+ * set). */
 TEST(test_aes_hw_soft_identity) {
     Aes probe;
     aes_init(&probe, sp800_key128, 128);
