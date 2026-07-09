@@ -46,4 +46,6 @@ Especially interested in:
 tspdf implements MD5, RC4, AES, and the SHA-2 family from scratch to honor its
 zero-dependency rule. These are used for PDF-format encryption/decryption
 compatibility, not as a general-purpose cryptography library. Do not reuse them
-for other security purposes.
+for other security purposes. In particular they are not constant-time: AES uses
+key-dependent table lookups, so cache-timing attacks by co-resident processes
+are outside the threat model of a local file tool.

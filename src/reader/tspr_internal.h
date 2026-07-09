@@ -3,6 +3,7 @@
 
 #include "tspr.h"
 #include "../util/arena.h"
+#include "../crypto/aes.h"
 
 // --- Parser ---
 
@@ -47,6 +48,11 @@ typedef struct {
     uint8_t Perms[16];
     size_t O_len;           // 32 for V<=4, 48 for V=5
     size_t U_len;           // 32 for V<=4, 48 for V=5
+    // V=5 only: the file key IS the object key (no per-object derivation), so
+    // one AES-256 schedule serves every string/stream. Built lazily on first
+    // use by tspr_crypt.c; V<=4 derives a per-object key and cannot cache.
+    Aes aes_v5;
+    bool aes_v5_ready;
 } TspdfCrypt;
 
 // --- Metadata ---

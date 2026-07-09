@@ -725,6 +725,22 @@ static int derive_object_key(TspdfCrypt *crypt, uint32_t obj_num, uint16_t gen,
     return n;
 }
 
+/* Return the AES context for one object. V=5 uses the file key for every
+ * object, so one cached schedule (built on first use) serves the whole
+ * document instead of re-expanding per string/stream. V<=4 derives a
+ * per-object key (Algorithm 1), so a fresh schedule goes into *tmp. */
+static Aes *object_aes(TspdfCrypt *crypt, const uint8_t *obj_key, Aes *tmp) {
+    if (crypt->version == 5) {
+        if (!crypt->aes_v5_ready) {
+            aes_init(&crypt->aes_v5, crypt->file_key, 256);
+            crypt->aes_v5_ready = true;
+        }
+        return &crypt->aes_v5;
+    }
+    aes_init(tmp, obj_key, 128);
+    return tmp;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Decrypt string in-place                                            */
 /* ------------------------------------------------------------------ */
@@ -764,9 +780,9 @@ TspdfError tspdf_crypt_decrypt_string(TspdfCrypt *crypt, uint32_t obj_num,
     uint8_t *plaintext = (uint8_t *)malloc(ct_len);
     if (!plaintext) return TSPDF_ERR_ALLOC;
 
-    Aes aes;
-    aes_init(&aes, key, crypt->version == 5 ? 256 : 128);
-    aes_decrypt_cbc(&aes, iv, data + 16, plaintext, ct_len);
+    Aes aes_local;
+    Aes *aes = object_aes(crypt, key, &aes_local);
+    aes_decrypt_cbc(aes, iv, data + 16, plaintext, ct_len);
 
     /* Remove PKCS#7 padding */
     uint8_t pad_byte = plaintext[ct_len - 1];
@@ -846,9 +862,9 @@ uint8_t *tspdf_crypt_decrypt_stream(TspdfCrypt *crypt, uint32_t obj_num,
     uint8_t *plaintext = (uint8_t *)malloc(ct_len);
     if (!plaintext) { if (out_len) *out_len = 0; return NULL; }
 
-    Aes aes;
-    aes_init(&aes, key, crypt->version == 5 ? 256 : 128);
-    aes_decrypt_cbc(&aes, iv, data + 16, plaintext, ct_len);
+    Aes aes_local;
+    Aes *aes = object_aes(crypt, key, &aes_local);
+    aes_decrypt_cbc(aes, iv, data + 16, plaintext, ct_len);
 
     /* Remove PKCS#7 padding */
     uint8_t pad_byte = plaintext[ct_len - 1];
@@ -1122,9 +1138,9 @@ uint8_t *tspdf_crypt_encrypt_string(TspdfCrypt *crypt, uint32_t obj_num,
     memcpy(out, iv, 16);
 
     /* Encrypt */
-    Aes aes;
-    aes_init(&aes, key, crypt->version == 5 ? 256 : 128);
-    aes_encrypt_cbc(&aes, iv, padded, out + 16, padded_len);
+    Aes aes_local;
+    Aes *aes = object_aes(crypt, key, &aes_local);
+    aes_encrypt_cbc(aes, iv, padded, out + 16, padded_len);
 
     free(padded);
     *out_len = total_len;
