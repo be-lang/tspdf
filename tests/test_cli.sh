@@ -218,6 +218,83 @@ else
 fi
 run_test "img2pdf no images fails" bash -c "! $TSPDF img2pdf -o $TMPDIR/img2pdf_fail.pdf > /dev/null 2>&1"
 
+# img2pdf PNG embedding: non-interlaced gray/RGB/palette PNGs are embedded via
+# IDAT passthrough (the zlib stream goes in verbatim with a /Predictor 15
+# DecodeParms), so the output PDF must stay near the source PNG size instead of
+# ballooning from decode + naive recompression. Fixtures live in tests/data
+# (regenerate with tests/data/gen_img_fixtures.py).
+img2pdf_fits() {  # <fixture.png> <out.pdf>: PDF <= 1.2x PNG + ~1.2K structure
+  local src="tests/data/$1" out="$TMPDIR/$2"
+  "$TSPDF" img2pdf "tests/data/$1" -o "$out" > /dev/null 2>&1 || return 1
+  local ss os
+  ss=$(stat -c%s "$src") && os=$(stat -c%s "$out") || return 1
+  [ "$os" -le $(( ss * 12 / 10 + 1200 )) ]
+}
+run_test "img2pdf rgb png passthrough size"      img2pdf_fits img_rgb.png     pp_rgb.pdf
+run_test "img2pdf gray png passthrough size"     img2pdf_fits img_gray.png    pp_gray.pdf
+run_test "img2pdf palette png passthrough size"  img2pdf_fits img_palette.png pp_pal.pdf
+run_test "img2pdf 4-bit palette passthrough size" img2pdf_fits img_palette4.png pp_pal4.pdf
+# palette+tRNS: the color stream passes through, but the 32-byte tRNS table
+# becomes a real 80x60 SMask raster, so allow that on top of the 1.2x bound
+# (python img2pdf lands in the same place for this file).
+run_test "img2pdf palette+tRNS passthrough size" bash -c "
+  $TSPDF img2pdf tests/data/img_palette_trns.png -o $TMPDIR/pp_paltrns.pdf > /dev/null 2>&1 &&
+  [ \$(stat -c%s $TMPDIR/pp_paltrns.pdf) -le \$(( \$(stat -c%s tests/data/img_palette_trns.png) * 12 / 10 + 4800 + 1200 )) ]"
+
+# Structural checks: passthrough must keep the source colorspace (Indexed /
+# DeviceGray — no expansion to RGB) and declare the PNG predictor.
+run_test "img2pdf rgb output uses Predictor 15"  bash -c "grep -aq '/Predictor 15' $TMPDIR/pp_rgb.pdf"
+run_test "img2pdf gray output uses DeviceGray"   bash -c "grep -aq '/DeviceGray' $TMPDIR/pp_gray.pdf"
+run_test "img2pdf palette output uses Indexed"   bash -c "grep -aq '/Indexed' $TMPDIR/pp_pal.pdf"
+run_test "img2pdf palette+tRNS keeps Indexed + SMask" bash -c "grep -aq '/Indexed' $TMPDIR/pp_paltrns.pdf && grep -aq '/SMask' $TMPDIR/pp_paltrns.pdf"
+
+# Alpha PNGs cannot passthrough (alpha is interleaved) but must not expand
+# grayscale to RGB, and must still carry an SMask.
+run_test "img2pdf rgba keeps SMask" bash -c "$TSPDF img2pdf tests/data/img_rgba.png -o $TMPDIR/pp_rgba.pdf > /dev/null 2>&1 && grep -aq '/SMask' $TMPDIR/pp_rgba.pdf"
+run_test "img2pdf gray+alpha stays DeviceGray with SMask" bash -c "$TSPDF img2pdf tests/data/img_gray_alpha.png -o $TMPDIR/pp_ga.pdf > /dev/null 2>&1 && grep -aq '/DeviceGray' $TMPDIR/pp_ga.pdf && grep -aq '/SMask' $TMPDIR/pp_ga.pdf"
+# Even the decode-path (alpha) outputs must not blow up vs the source.
+run_test "img2pdf rgba size sane" bash -c "[ \$(stat -c%s $TMPDIR/pp_rgba.pdf) -le \$(( \$(stat -c%s tests/data/img_rgba.png) * 18 / 10 + 1200 )) ]"
+run_test "img2pdf gray+alpha size sane" bash -c "[ \$(stat -c%s $TMPDIR/pp_ga.pdf) -le \$(( \$(stat -c%s tests/data/img_gray_alpha.png) * 18 / 10 + 1200 )) ]"
+
+# JPEG passthrough regression: the embedded DCT stream must stay byte-identical
+# to the source file.
+run_test "img2pdf jpeg stream byte-identical" bash -c "
+  $TSPDF img2pdf examples/test.jpg -o $TMPDIR/pp_jpg.pdf > /dev/null 2>&1 &&
+  python3 - examples/test.jpg $TMPDIR/pp_jpg.pdf << 'PYEOF'
+import sys
+jpg = open(sys.argv[1], 'rb').read()
+pdf = open(sys.argv[2], 'rb').read()
+sys.exit(0 if jpg in pdf else 1)
+PYEOF"
+
+if command -v qpdf > /dev/null 2>&1; then
+  run_test "img2pdf passthrough PDFs pass qpdf --check" bash -c "
+    qpdf --check $TMPDIR/pp_rgb.pdf > /dev/null 2>&1 &&
+    qpdf --check $TMPDIR/pp_gray.pdf > /dev/null 2>&1 &&
+    qpdf --check $TMPDIR/pp_pal.pdf > /dev/null 2>&1 &&
+    qpdf --check $TMPDIR/pp_pal4.pdf > /dev/null 2>&1 &&
+    qpdf --check $TMPDIR/pp_paltrns.pdf > /dev/null 2>&1 &&
+    qpdf --check $TMPDIR/pp_rgba.pdf > /dev/null 2>&1 &&
+    qpdf --check $TMPDIR/pp_ga.pdf > /dev/null 2>&1"
+else
+  echo "  SKIP  img2pdf qpdf --check (qpdf not found)"
+fi
+
+# --page-size: a4 (default), letter, or image (page = image size at 72 dpi)
+run_test "img2pdf --page-size image sizes page to image" bash -c "
+  $TSPDF img2pdf tests/data/img_rgb.png --page-size image -o $TMPDIR/ps_img.pdf > /dev/null 2>&1 &&
+  grep -aq 'MediaBox \[ 0 0 80.0000 60.0000 \]' $TMPDIR/ps_img.pdf"
+run_test "img2pdf --page-size letter" bash -c "
+  $TSPDF img2pdf tests/data/img_rgb.png --page-size letter -o $TMPDIR/ps_letter.pdf > /dev/null 2>&1 &&
+  grep -aq 'MediaBox \[ 0 0 612.0000 792.0000 \]' $TMPDIR/ps_letter.pdf"
+run_test "img2pdf --page-size a4 (default)" bash -c "
+  $TSPDF img2pdf tests/data/img_rgb.png --page-size a4 -o $TMPDIR/ps_a4.pdf > /dev/null 2>&1 &&
+  grep -aq 'MediaBox \[ 0 0 595.2760 841.8900 \]' $TMPDIR/ps_a4.pdf"
+run_test "img2pdf --page-size rejects unknown value" bash -c "! $TSPDF img2pdf tests/data/img_rgb.png --page-size a5 -o $TMPDIR/ps_bad.pdf > /dev/null 2>&1"
+run_test "img2pdf --page-size value not eaten as input" bash -c "
+  $TSPDF img2pdf tests/data/img_rgb.png --page-size letter -o $TMPDIR/ps_pos.pdf > /dev/null 2>&1 &&
+  $TSPDF info $TMPDIR/ps_pos.pdf | grep -qE '^Pages:[[:space:]]*1$'"
+
 # qrcode
 run_test "qrcode" $TSPDF qrcode "https://example.com" -o $TMPDIR/qrcode.pdf
 run_test "qrcode with title" $TSPDF qrcode "https://example.com" -o $TMPDIR/qrcode2.pdf --title "Test" --subtitle "Scan me"

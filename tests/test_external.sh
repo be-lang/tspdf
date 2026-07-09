@@ -176,6 +176,23 @@ else
     echo "  SKIP  img2pdf (python3 not found, cannot build test PNG)"
 fi
 
+# Committed PNG fixtures cover every embed path: IDAT passthrough (RGB, gray,
+# 8/4-bit palette), Indexed + soft mask (palette tRNS), and the decode/split
+# path (RGBA, gray+alpha). One multi-image PDF checks them all at once.
+if "$TSPDF" img2pdf tests/data/img_rgb.png tests/data/img_gray.png \
+        tests/data/img_palette.png tests/data/img_palette4.png \
+        tests/data/img_palette_trns.png tests/data/img_rgba.png \
+        tests/data/img_gray_alpha.png -o "$TMPDIR/img2pdf_all.pdf" > /dev/null 2>&1; then
+    strict_check "img2pdf png embed matrix" "$TMPDIR/img2pdf_all.pdf"
+else
+    echo "  FAIL  img2pdf png embed matrix (command failed)"; fail=$((fail + 1))
+fi
+if "$TSPDF" img2pdf tests/data/img_rgb.png --page-size image -o "$TMPDIR/img2pdf_ps.pdf" > /dev/null 2>&1; then
+    strict_check "img2pdf --page-size image" "$TMPDIR/img2pdf_ps.pdf"
+else
+    echo "  FAIL  img2pdf --page-size image (command failed)"; fail=$((fail + 1))
+fi
+
 if "$TSPDF" qrcode "https://example.com" -o "$TMPDIR/qrcode.pdf" > /dev/null 2>&1; then
     strict_check "qrcode" "$TMPDIR/qrcode.pdf"
 else
