@@ -1638,6 +1638,205 @@ TEST(test_png_palette_embeds_in_writer) {
 }
 
 // ============================================================
+// PNG IDAT passthrough (img2pdf size track)
+// ============================================================
+
+// Write a PNG with the given IHDR fields and one IDAT holding the
+// deflate-compressed `raw` filtered raster. No PLTE/tRNS (use
+// test_png_write_palette_file for palette images).
+static bool test_png_write_raw_file(const char *path, int width, int height,
+                                    int bit_depth, int color_type, int interlace,
+                                    const uint8_t *raw, size_t raw_len) {
+    size_t comp_len = 0;
+    uint8_t *comp = deflate_compress(raw, raw_len, &comp_len);
+    if (!comp) return false;
+    FILE *f = fopen(path, "wb");
+    if (!f) { free(comp); return false; }
+    static const uint8_t sig[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+    fwrite(sig, 1, 8, f);
+    uint8_t ihdr[13] = {
+        (uint8_t)((width >> 24) & 0xff), (uint8_t)((width >> 16) & 0xff),
+        (uint8_t)((width >> 8) & 0xff), (uint8_t)(width & 0xff),
+        (uint8_t)((height >> 24) & 0xff), (uint8_t)((height >> 16) & 0xff),
+        (uint8_t)((height >> 8) & 0xff), (uint8_t)(height & 0xff),
+        (uint8_t)bit_depth, (uint8_t)color_type, 0, 0, (uint8_t)interlace,
+    };
+    test_png_write_chunk(f, "IHDR", ihdr, 13);
+    test_png_write_chunk(f, "IDAT", comp, comp_len);
+    test_png_write_chunk(f, "IEND", NULL, 0);
+    fclose(f);
+    free(comp);
+    return true;
+}
+
+// An RGB PNG's concatenated IDAT is extracted verbatim and inflates back to
+// the exact filtered raster — the passthrough embed loses nothing.
+TEST(test_png_passthrough_rgb_extracts_idat) {
+    const char *path = "/tmp/tspdf_test_png_pt_rgb.png";
+    // 2x2 RGB, filter 0 rows
+    static const uint8_t raw[] = {
+        0, 255, 0, 0,  0, 255, 0,
+        0, 0, 0, 255,  255, 255, 0,
+    };
+    ASSERT(test_png_write_raw_file(path, 2, 2, 8, 2, 0, raw, sizeof(raw)));
+
+    PngPassthrough pt;
+    bool ok = png_read_passthrough(path, &pt);
+    remove(path);
+    ASSERT(ok);
+    ASSERT_EQ_INT(pt.width, 2);
+    ASSERT_EQ_INT(pt.height, 2);
+    ASSERT_EQ_INT(pt.bit_depth, 8);
+    ASSERT_EQ_INT(pt.color_type, 2);
+    ASSERT_EQ_INT(pt.palette_count, 0);
+    ASSERT(!pt.has_alpha);
+    size_t out_len = 0;
+    uint8_t *out = deflate_decompress(pt.idat, pt.idat_len, &out_len);
+    ASSERT(out != NULL);
+    ASSERT_EQ_SIZE(out_len, sizeof(raw));
+    ASSERT(memcmp(out, raw, sizeof(raw)) == 0);
+    free(out);
+    png_passthrough_free(&pt);
+}
+
+// Grayscale (color type 0) is eligible too, and reports 1 component.
+TEST(test_png_passthrough_gray) {
+    const char *path = "/tmp/tspdf_test_png_pt_gray.png";
+    static const uint8_t raw[] = { 0, 10, 20,  0, 30, 40 };  // 2x2 gray
+    ASSERT(test_png_write_raw_file(path, 2, 2, 8, 0, 0, raw, sizeof(raw)));
+
+    PngPassthrough pt;
+    bool ok = png_read_passthrough(path, &pt);
+    remove(path);
+    ASSERT(ok);
+    ASSERT_EQ_INT(pt.color_type, 0);
+    ASSERT_EQ_INT(pt.bit_depth, 8);
+    ASSERT(!pt.has_alpha);
+    png_passthrough_free(&pt);
+}
+
+// Palette PNGs report the PLTE triplets; tRNS flips has_alpha (the caller
+// must then build a decoded soft mask).
+TEST(test_png_passthrough_palette) {
+    const char *path = "/tmp/tspdf_test_png_pt_pal.png";
+    static const uint8_t palette[] = { 1, 2, 3,  4, 5, 6 };
+    static const uint8_t indices[] = { 0, 1, 1, 0 };  // 2x2
+    ASSERT(test_png_write_palette_file(path, 2, 2, 8, palette, 2, NULL, 0, indices));
+    PngPassthrough pt;
+    bool ok = png_read_passthrough(path, &pt);
+    remove(path);
+    ASSERT(ok);
+    ASSERT_EQ_INT(pt.color_type, 3);
+    ASSERT_EQ_INT(pt.palette_count, 2);
+    ASSERT(memcmp(pt.palette, palette, sizeof(palette)) == 0);
+    ASSERT(!pt.has_alpha);
+    png_passthrough_free(&pt);
+
+    static const uint8_t trns[] = { 128 };
+    ASSERT(test_png_write_palette_file(path, 2, 2, 8, palette, 2, trns, 1, indices));
+    ok = png_read_passthrough(path, &pt);
+    remove(path);
+    ASSERT(ok);
+    ASSERT(pt.has_alpha);
+    png_passthrough_free(&pt);
+}
+
+// Sub-8-bit palette depths keep their packed bit depth for the embed.
+TEST(test_png_passthrough_palette_4bit) {
+    const char *path = "/tmp/tspdf_test_png_pt_pal4.png";
+    static const uint8_t palette[] = { 1, 2, 3,  4, 5, 6 };
+    static const uint8_t indices[] = { 0, 1, 1, 0 };  // 2x2, packs 2 per byte
+    ASSERT(test_png_write_palette_file(path, 2, 2, 4, palette, 2, NULL, 0, indices));
+    PngPassthrough pt;
+    bool ok = png_read_passthrough(path, &pt);
+    remove(path);
+    ASSERT(ok);
+    ASSERT_EQ_INT(pt.bit_depth, 4);
+    ASSERT_EQ_INT(pt.palette_count, 2);
+    png_passthrough_free(&pt);
+}
+
+// Interlaced files cannot passthrough (row order differs) and alpha color
+// types carry interleaved alpha PDF cannot split — both must be refused so
+// the caller falls back to full decode.
+TEST(test_png_passthrough_rejects_interlaced_and_alpha) {
+    const char *path = "/tmp/tspdf_test_png_pt_rej.png";
+    static const uint8_t raw_rgb[] = { 0, 255, 0, 0 };  // 1x1 RGB
+    ASSERT(test_png_write_raw_file(path, 1, 1, 8, 2, 1, raw_rgb, sizeof(raw_rgb)));
+    PngPassthrough pt;
+    ASSERT(!png_read_passthrough(path, &pt));
+
+    static const uint8_t raw_rgba[] = { 0, 255, 0, 0, 128 };  // 1x1 RGBA
+    ASSERT(test_png_write_raw_file(path, 1, 1, 8, 6, 0, raw_rgba, sizeof(raw_rgba)));
+    ASSERT(!png_read_passthrough(path, &pt));
+
+    static const uint8_t raw_ga[] = { 0, 255, 128 };  // 1x1 gray+alpha
+    ASSERT(test_png_write_raw_file(path, 1, 1, 8, 4, 0, raw_ga, sizeof(raw_ga)));
+    ASSERT(!png_read_passthrough(path, &pt));
+    remove(path);
+}
+
+// The IDAT is validated before embedding: a stream that inflates to the wrong
+// raster size, or one with an out-of-spec row filter byte, must be refused —
+// otherwise the broken bytes would be embedded verbatim into the PDF.
+TEST(test_png_passthrough_rejects_damaged_idat) {
+    const char *path = "/tmp/tspdf_test_png_pt_bad.png";
+    static const uint8_t short_raw[] = { 0, 255, 0 };  // 1x1 RGB needs 4 bytes
+    ASSERT(test_png_write_raw_file(path, 1, 1, 8, 2, 0, short_raw, sizeof(short_raw)));
+    PngPassthrough pt;
+    ASSERT(!png_read_passthrough(path, &pt));
+
+    static const uint8_t bad_filter[] = { 5, 255, 0, 0 };  // filter byte 5 > 4
+    ASSERT(test_png_write_raw_file(path, 1, 1, 8, 2, 0, bad_filter, sizeof(bad_filter)));
+    ASSERT(!png_read_passthrough(path, &pt));
+    remove(path);
+}
+
+// End-to-end guarantee: the writer embeds a passthrough-eligible PNG's IDAT
+// bytes verbatim (found unchanged inside the saved PDF).
+TEST(test_png_passthrough_embeds_idat_verbatim) {
+    const char *path = "/tmp/tspdf_test_png_pt_embed.png";
+    // 4x2 RGB with a non-zero (Sub) filter on row 2: filter bytes are part of
+    // the predictor data and must survive untouched.
+    static const uint8_t raw[] = {
+        0, 10, 20, 30,  40, 50, 60,  70, 80, 90,  100, 110, 120,
+        1, 5, 5, 5,  1, 1, 1,  2, 2, 2,  3, 3, 3,
+    };
+    ASSERT(test_png_write_raw_file(path, 4, 2, 8, 2, 0, raw, sizeof(raw)));
+
+    PngPassthrough pt;
+    ASSERT(png_read_passthrough(path, &pt));
+
+    TspdfWriter *doc = tspdf_writer_create();
+    ASSERT(doc != NULL);
+    const char *name = tspdf_writer_add_png_image(doc, path);
+    remove(path);
+    ASSERT(name != NULL);
+    ASSERT(doc->images[0].smask_ref.id == 0);  // no alpha -> no soft mask
+    TspdfStream *page = tspdf_writer_add_page(doc);
+    ASSERT(page != NULL);
+    tspdf_stream_draw_image(page, name, 36, 36, 100, 100);
+
+    uint8_t *pdf = NULL;
+    size_t pdf_len = 0;
+    TspdfError err = tspdf_writer_save_to_memory(doc, &pdf, &pdf_len);
+    ASSERT(err == TSPDF_OK);
+    // The concatenated IDAT bytes must appear verbatim in the PDF output.
+    bool found = false;
+    if (pdf_len >= pt.idat_len) {
+        for (size_t i = 0; i + pt.idat_len <= pdf_len && !found; i++) {
+            if (pdf[i] == pt.idat[0] && memcmp(pdf + i, pt.idat, pt.idat_len) == 0) {
+                found = true;
+            }
+        }
+    }
+    free(pdf);
+    tspdf_writer_destroy(doc);
+    png_passthrough_free(&pt);
+    ASSERT(found);
+}
+
+// ============================================================
 // Save-to-memory byte identity (wasm track)
 // ============================================================
 
@@ -1823,6 +2022,13 @@ int main(void) {
     RUN(test_png_palette_missing_plte_rejected);
     RUN(test_png_interlaced_still_rejected);
     RUN(test_png_palette_embeds_in_writer);
+    RUN(test_png_passthrough_rgb_extracts_idat);
+    RUN(test_png_passthrough_gray);
+    RUN(test_png_passthrough_palette);
+    RUN(test_png_passthrough_palette_4bit);
+    RUN(test_png_passthrough_rejects_interlaced_and_alpha);
+    RUN(test_png_passthrough_rejects_damaged_idat);
+    RUN(test_png_passthrough_embeds_idat_verbatim);
 
     printf("\n  Save-to-memory byte identity (wasm):\n");
     RUN(test_writer_save_to_memory_matches_file);
