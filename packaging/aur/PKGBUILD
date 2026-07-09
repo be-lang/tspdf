@@ -16,6 +16,9 @@ sha256sums=('a291e593aad65e96cd743afd07531edf68862df13c9ed0f48779d5d0552efda5')
 build() {
     cd "$pkgname-$pkgver"
     make
+    # Build the library here too (v0.1.0's `make install` needs libtspdf.a),
+    # so package() only copies files and compiles nothing under fakeroot.
+    make lib
 }
 
 check() {
