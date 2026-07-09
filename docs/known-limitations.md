@@ -14,6 +14,7 @@ See the [compatibility matrix](compatibility-matrix.md) for what is tested where
 - Merge and split preserve bookmarks and form fields (split keeps only what points at kept pages; named destinations are flattened to explicit ones). Structure trees and page labels are still dropped.
 - Merging files that use the same form field name leaves the duplicate names as-is; viewers will treat them as one shared field.
 - Watermark support is text-only (no image watermark pipeline yet).
+- PNG color-key transparency (a tRNS chunk on RGB or grayscale images, color types 0/2) is not mapped to an SMask: those pixels render opaque in the generated PDF. Palette tRNS (color type 3) is fully supported.
 - Web server mode is intentionally simple and local-first; it is not a general-purpose multi-tenant service.
 
 ## PDF Coverage

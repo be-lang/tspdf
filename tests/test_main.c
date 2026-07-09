@@ -2052,6 +2052,35 @@ TEST(test_png_passthrough_palette_4bit) {
     png_passthrough_free(&pt);
 }
 
+// Passthrough must reject palette indices past the PLTE entry count, exactly
+// like the decode path does — otherwise the same file would embed verbatim
+// via passthrough but fail full decode.
+TEST(test_png_passthrough_palette_index_out_of_range_rejected) {
+    const char *path = "/tmp/tspdf_test_png_pt_pal_oob.png";
+    static const uint8_t palette[] = { 255, 0, 0,   0, 255, 0 };  // 2 entries
+    static const uint8_t bad_indices[] = { 0, 5 };  // 5 >= 2 -> invalid
+    ASSERT(test_png_write_palette_file(path, 2, 1, 8, palette, 2, NULL, 0, bad_indices));
+    PngPassthrough pt;
+    bool ok = png_read_passthrough(path, &pt);
+    remove(path);
+    ASSERT(!ok);
+
+    // Sub-byte depth: 4-bit indices with only 2 palette entries, index 9 bad.
+    static const uint8_t bad_indices4[] = { 0, 9 };
+    ASSERT(test_png_write_palette_file(path, 2, 1, 4, palette, 2, NULL, 0, bad_indices4));
+    ok = png_read_passthrough(path, &pt);
+    remove(path);
+    ASSERT(!ok);
+
+    // Control: the same shape with in-range indices still passes through.
+    static const uint8_t good_indices[] = { 0, 1 };
+    ASSERT(test_png_write_palette_file(path, 2, 1, 8, palette, 2, NULL, 0, good_indices));
+    ok = png_read_passthrough(path, &pt);
+    remove(path);
+    ASSERT(ok);
+    png_passthrough_free(&pt);
+}
+
 // Interlaced files cannot passthrough (row order differs) and alpha color
 // types carry interleaved alpha PDF cannot split — both must be refused so
 // the caller falls back to full decode.
@@ -2702,6 +2731,7 @@ int main(void) {
     RUN(test_png_passthrough_gray);
     RUN(test_png_passthrough_palette);
     RUN(test_png_passthrough_palette_4bit);
+    RUN(test_png_passthrough_palette_index_out_of_range_rejected);
     RUN(test_png_passthrough_rejects_interlaced_and_alpha);
     RUN(test_png_passthrough_rejects_damaged_idat);
     RUN(test_png_passthrough_rejects_nonstandard_zlib_header);
