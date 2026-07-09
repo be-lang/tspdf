@@ -129,6 +129,17 @@ jobs:
       - name: Sanitize writer/crypto suite
         run: make test-asan
 
+      # The run above exercised the AES-NI dispatch path (GitHub's x86 runners
+      # all have AES-NI). Re-run the same instrumented binary with the hardware
+      # path disabled so the portable soft path stays green too — no rebuild,
+      # one env var.
+      - name: Crypto suite on the soft AES path (TSPDF_NO_AESHW=1)
+        run: |
+          TSPDF_NO_AESHW=1 \
+          ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 \
+          UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+          ./build/test_crypto
+
       - name: Sanitize reader/parser suite
         run: make test-asan-reader
 
