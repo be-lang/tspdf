@@ -78,6 +78,18 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         free(out);
     }
 
+    // The compress path is a distinct serializer: reachability GC, stream
+    // re-deflation, object-stream packing, and the right-sized xref stream.
+    TspdfSaveOptions opts = tspdf_save_options_default();
+    opts.strip_unused_objects = true;
+    opts.recompress_streams = true;
+    opts.strip_metadata = true;
+    out = NULL;
+    out_len = 0;
+    if (tspdf_reader_save_to_memory_with_options(doc, &out, &out_len, &opts) == TSPDF_OK) {
+        free(out);
+    }
+
     tspdf_reader_destroy(doc);
     return 0;
 }
