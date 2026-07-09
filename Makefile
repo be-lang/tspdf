@@ -153,7 +153,7 @@ WEB_EMBED_INPUTS = scripts/embed_assets.sh $(WEB_EMBED_CORE) $(WEB_EMBED_TOOLS)
 .PHONY: all cli install install-lib uninstall clean test test-all test-cli test-reader test-crypto \
         test-asan test-asan-bin test-asan-reader test-asan-reader-bin test-external \
         check ci fuzz fuzz-corpus print-version amalgamation \
-        lib shared demo bench bench-reader minimal reader-demo generate-test-pdfs
+        lib shared demo bench bench-reader bench-crypto minimal reader-demo generate-test-pdfs
 
 # --- Default: build the CLI ---
 
@@ -496,6 +496,13 @@ bench-reader: $(BUILDDIR)/bench_reader
 $(BUILDDIR)/bench_reader: examples/bench_reader.c $(ALL_SOURCES)
 	@mkdir -p $(BUILDDIR)
 	$(CC) $(CPPFLAGS) $(ALL_CFLAGS) $(LDFLAGS) -o $@ $< $(LIB_SOURCES) $(TSPR_SOURCES) $(CRYPTO_SOURCES) -lm
+
+bench-crypto: $(BUILDDIR)/bench_crypto
+	./$(BUILDDIR)/bench_crypto
+
+$(BUILDDIR)/bench_crypto: tests/bench_crypto.c $(CRYPTO_SOURCES)
+	@mkdir -p $(BUILDDIR)
+	$(CC) $(CPPFLAGS) $(ALL_CFLAGS) $(LDFLAGS) -o $@ $< $(CRYPTO_SOURCES) -lm
 
 generate-test-pdfs: $(BUILDDIR)/generate_test_pdfs
 	@mkdir -p tests/data
