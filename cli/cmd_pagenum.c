@@ -34,10 +34,13 @@ int cmd_pagenum(int argc, char **argv) {
     if (argc == 0 || has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
         printf("Usage: tspdf pagenum <input.pdf> -o <output.pdf> [--format \"%%d / %%d\"]\n");
         printf("                     [--position <pos>] [--start N] [--font-size N]\n");
+        printf("                     [--pages <range>]\n");
         printf("\nStamp a page number on every page.\n");
         printf("The format may contain up to two %%d: the page number and the total.\n");
         printf("Positions: bottom-center (default), bottom-left, bottom-right,\n");
         printf("           top-center, top-left, top-right\n");
+        printf("With --pages (e.g. 2-10), only those pages are stamped; the number\n");
+        printf("still reflects the true page position (useful to skip cover pages).\n");
         return argc == 0 ? 1 : 0;
     }
 
@@ -104,11 +107,25 @@ int cmd_pagenum(int argc, char **argv) {
         }
     }
 
+    // --pages restricts which pages get a stamp (e.g. skip cover pages);
+    // the printed number still reflects the true page position.
+    size_t sel_count = 0;
+    size_t *sel = NULL;
+    const char *pages_spec = find_flag(argc, argv, "--pages");
+    if (pages_spec) {
+        sel = parse_page_range(pages_spec, &sel_count);
+        if (!sel) {
+            fprintf(stderr, "tspdf pagenum: invalid page range '%s'\n", pages_spec);
+            return 1;
+        }
+    }
+
     // The stamp is drawn with the built-in Helvetica font (WinAnsi/cp1252);
     // re-encode the format up front, same as cmd_watermark does for --text.
     char *wa_format = malloc(strlen(format) + 1);
     if (!wa_format) {
         fprintf(stderr, "tspdf pagenum: out of memory\n");
+        free(sel);
         return 1;
     }
     uint32_t bad_cp = 0;
@@ -124,6 +141,7 @@ int cmd_pagenum(int argc, char **argv) {
             fprintf(stderr, "tspdf pagenum: --format is not valid UTF-8\n");
         }
         free(wa_format);
+        free(sel);
         return 1;
     }
 
@@ -132,6 +150,7 @@ int cmd_pagenum(int argc, char **argv) {
     if (!doc) {
         fprintf(stderr, "tspdf pagenum: failed to open '%s': %s\n", input, tspdf_error_string(err));
         free(wa_format);
+        free(sel);
         return 1;
     }
 
@@ -139,7 +158,35 @@ int cmd_pagenum(int argc, char **argv) {
     long total = start + (long)page_count - 1;
     double margin = 30.0;
 
+    // Turn the selected pages into a per-page mask; NULL means "stamp all".
+    // (Checked index by index: these values index the mask below, so an
+    // out-of-range entry must never slip through.)
+    bool *stamp = NULL;
+    if (sel) {
+        for (size_t k = 0; k < sel_count; k++) {
+            if (sel[k] >= page_count) {
+                fprintf(stderr, "tspdf pagenum: page %zu is out of range (document has %zu page%s)\n",
+                        sel[k] + 1, page_count, page_count == 1 ? "" : "s");
+                tspdf_reader_destroy(doc);
+                free(wa_format);
+                free(sel);
+                return 1;
+            }
+        }
+        stamp = calloc(page_count, sizeof(bool));
+        if (!stamp) {
+            fprintf(stderr, "tspdf pagenum: out of memory\n");
+            tspdf_reader_destroy(doc);
+            free(wa_format);
+            free(sel);
+            return 1;
+        }
+        for (size_t k = 0; k < sel_count; k++) stamp[sel[k]] = true;
+    }
+
+    size_t stamped = 0;
     for (size_t i = 0; i < page_count; i++) {
+        if (stamp && !stamp[i]) continue;
         TspdfReaderPage *page = tspdf_reader_get_page(doc, i);
         if (!page) continue;
 
@@ -202,8 +249,11 @@ int cmd_pagenum(int argc, char **argv) {
                     i + 1, tspdf_error_string(err));
             tspdf_reader_destroy(doc);
             free(wa_format);
+            free(sel);
+            free(stamp);
             return 1;
         }
+        stamped++;
     }
 
     err = tspdf_reader_save(doc, output);
@@ -211,12 +261,16 @@ int cmd_pagenum(int argc, char **argv) {
         fprintf(stderr, "tspdf pagenum: failed to save '%s': %s\n", output, tspdf_error_string(err));
         tspdf_reader_destroy(doc);
         free(wa_format);
+        free(sel);
+        free(stamp);
         return 1;
     }
 
-    printf("Numbered %zu page(s) → %s\n", page_count, output);
+    printf("Numbered %zu of %zu page(s) → %s\n", stamped, page_count, output);
 
     tspdf_reader_destroy(doc);
     free(wa_format);
+    free(sel);
+    free(stamp);
     return 0;
 }

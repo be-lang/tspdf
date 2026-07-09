@@ -202,6 +202,7 @@ static void print_command_help(const char *cmd) {
     } else if (strcmp(cmd, "pagenum") == 0) {
         printf("Usage: tspdf pagenum <input.pdf> -o <output.pdf> [--format \"%%d / %%d\"]\n");
         printf("                     [--position <pos>] [--start N] [--font-size N]\n");
+        printf("                     [--pages <range>]\n");
         printf("\n");
         printf("Stamp a page number on every page of a PDF.\n");
         printf("\n");
@@ -213,6 +214,8 @@ static void print_command_help(const char *cmd) {
         printf("                     top-center, top-left, top-right\n");
         printf("  --start N          Number of the first page (default: 1)\n");
         printf("  --font-size N      Font size in points (default: 10)\n");
+        printf("  --pages <range>    Only stamp these pages, e.g. 2-10 or 2,4 (default:\n");
+        printf("                     all). Numbering still reflects the true position.\n");
         printf("  -o <output.pdf>    Output file path (required)\n");
     } else {
         /* Unknown command — fall back to general help */

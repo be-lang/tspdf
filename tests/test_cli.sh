@@ -1304,7 +1304,27 @@ run_test "pagenum rejects invalid --position" bash -c "
 
 run_test "pagenum accepts top-right position and custom size" $TSPDF pagenum $INPUT -o $TMPDIR/pntr.pdf --position top-right --font-size 8
 
+# --pages: stamp only part of the document (e.g. skip cover pages). The
+# number still reflects the true page position and the %d total stays the
+# real page count.
+$TSPDF merge $INPUT $TMPDIR/split.pdf -o $TMPDIR/pn4.pdf > /dev/null 2>&1  # 4-page doc
+run_test "pagenum --pages 2-3 stamps pages 2 and 3" bash -c "
+  set -e
+  $TSPDF pagenum $TMPDIR/pn4.pdf -o $TMPDIR/pnrange.pdf --pages 2-3 --format '[%d/%d]' > /dev/null
+  $TSPDF text $TMPDIR/pnrange.pdf --pages 2 | grep -q '\[2/4\]'
+  $TSPDF text $TMPDIR/pnrange.pdf --pages 3 | grep -q '\[3/4\]'"
+run_test "pagenum --pages leaves page 1 unstamped" bash -c "
+  ! $TSPDF text $TMPDIR/pnrange.pdf --pages 1 | grep -q '\[1/4\]'"
+run_test "pagenum --pages leaves page 4 unstamped" bash -c "
+  ! $TSPDF text $TMPDIR/pnrange.pdf --pages 4 | grep -q '\[4/4\]'"
+run_test "pagenum --pages out of range fails with page count" bash -c "
+  ! $TSPDF pagenum $TMPDIR/pn4.pdf -o $TMPDIR/pnbad.pdf --pages 9 > /dev/null 2>&1"
+run_test "pagenum rejects invalid --pages" bash -c "
+  ! $TSPDF pagenum $TMPDIR/pn4.pdf -o $TMPDIR/pnbad.pdf --pages abc 2>/dev/null"
+run_test "pagenum help mentions --pages" bash -c "$TSPDF pagenum --help | grep -q -- '--pages'"
+
 run_test "help pagenum shows command-specific usage" bash -c "$TSPDF help pagenum 2>/dev/null | grep -q 'Usage: tspdf pagenum'"
+run_test "help pagenum documents --pages" bash -c "$TSPDF help pagenum 2>/dev/null | grep -q -- '--pages'"
 
 # md2pdf emphasis: *x*/_x_ italic, **x** bold; literal markers must not leak.
 if command -v qpdf > /dev/null 2>&1; then
