@@ -19,17 +19,25 @@ int cmd_merge(int argc, char **argv) {
 
     // Collect input files. collect_positional already skips value-taking flag
     // arguments (such as the -o output path), so the positionals are the inputs.
-    const char *inputs[64];
-    int npos = collect_positional(argc, argv, inputs, 64);
+    // argc bounds the number of positionals, so an argc-sized array can never
+    // truncate the list (a fixed cap used to silently drop inputs past 64).
+    const char **inputs = calloc((size_t)argc, sizeof(*inputs));
+    if (!inputs) {
+        fprintf(stderr, "tspdf merge: out of memory\n");
+        return 1;
+    }
+    int npos = collect_positional(argc, argv, inputs, argc);
 
     if (npos < 2) {
         fprintf(stderr, "tspdf merge: need at least 2 input files\n");
+        free(inputs);
         return 1;
     }
 
     TspdfReader **docs = calloc((size_t)npos, sizeof(TspdfReader *));
     if (!docs) {
         fprintf(stderr, "tspdf merge: out of memory\n");
+        free(inputs);
         return 1;
     }
 
@@ -68,5 +76,6 @@ cleanup:
         if (docs[i]) tspdf_reader_destroy(docs[i]);
     }
     free(docs);
+    free(inputs);
     return ret;
 }

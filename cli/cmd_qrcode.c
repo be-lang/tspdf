@@ -21,10 +21,14 @@ int cmd_qrcode(int argc, char **argv) {
     // collect_positional already skips value-taking flag arguments (such as the
     // -o output path and the --title/--subtitle values), so the lone positional
     // is the text/URL to encode.
-    const char *positional[1];
-    int npos = collect_positional(argc, argv, positional, 1);
+    const char *positional[2];
+    int npos = collect_positional(argc, argv, positional, 2);
     if (npos < 1) {
         fprintf(stderr, "tspdf qrcode: missing text/URL to encode\n");
+        return 1;
+    }
+    if (npos > 1) {
+        fprintf(stderr, "tspdf qrcode: unexpected extra argument '%s'\n", positional[1]);
         return 1;
     }
     const char *text = positional[0];

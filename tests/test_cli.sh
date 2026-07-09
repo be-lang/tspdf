@@ -89,6 +89,24 @@ run_test "merge two files" $TSPDF merge $INPUT $TMPDIR/split.pdf -o $TMPDIR/merg
 # flag-first ordering: -o output must not be counted as an input file
 run_test "merge flag-first ordering (-o before inputs)" $TSPDF merge -o $TMPDIR/merged_ff.pdf $INPUT $TMPDIR/split.pdf
 
+# merge must not silently truncate a long input list (was capped at 64 inputs,
+# printing "Merged 64 files" and dropping the rest with exit 0 — data loss).
+MANY_DIR=$TMPDIR/merge_many
+mkdir -p $MANY_DIR
+$TSPDF split $INPUT --pages 1 -o $MANY_DIR/page.pdf > /dev/null 2>&1
+MANY_INPUTS=()
+for i in $(seq 1 70); do
+  cp $MANY_DIR/page.pdf $MANY_DIR/in_$i.pdf
+  MANY_INPUTS+=("$MANY_DIR/in_$i.pdf")
+done
+run_test "merge 70 files exits 0" $TSPDF merge "${MANY_INPUTS[@]}" -o $TMPDIR/merged_many.pdf
+run_test "merge 70 files keeps every page" bash -c "$TSPDF info $TMPDIR/merged_many.pdf | grep -qE '^Pages:[[:space:]]*70$'"
+
+# single-input commands must reject extra positionals instead of silently
+# ignoring them (a user merging/splitting the wrong file must hear about it)
+run_test "split rejects a second input file" bash -c "! $TSPDF split $INPUT $TMPDIR/split.pdf --pages 1 -o $TMPDIR/split_extra.pdf > /dev/null 2>&1"
+run_test "watermark rejects a second input file" bash -c "! $TSPDF watermark $INPUT $TMPDIR/split.pdf --text DRAFT -o $TMPDIR/wm_extra.pdf > /dev/null 2>&1"
+
 # rotate
 run_test "rotate all 90" $TSPDF rotate $INPUT --angle 90 -o $TMPDIR/rotated.pdf
 run_test "rotate specific pages" $TSPDF rotate $INPUT --pages 1 --angle 180 -o $TMPDIR/rotated2.pdf
@@ -213,6 +231,20 @@ sys.stdout.buffer.write(sig + chunk(b'IHDR',ihdr) + chunk(b'IDAT',raw) + chunk(b
   run_test "img2pdf --best-effort tolerates unsupported input (exit 0)" $TSPDF img2pdf $TMPDIR/test.png $TMPDIR/interlaced.png --best-effort -o $TMPDIR/img2pdf_be.pdf
   # All-good inputs still exit 0
   run_test "img2pdf all-good inputs exit 0" $TSPDF img2pdf $TMPDIR/test.png examples/test.jpg -o $TMPDIR/img2pdf_good.pdf
+
+  # img2pdf must not silently drop images past the writer's 64-image limit:
+  # exceeding it is a hard error (even with --best-effort), never a quiet
+  # 64-page PDF with the rest of the inputs missing.
+  IMG_MANY_DIR=$TMPDIR/img_many
+  mkdir -p $IMG_MANY_DIR
+  IMG_MANY=()
+  for i in $(seq 1 70); do
+    cp $TMPDIR/test.png $IMG_MANY_DIR/img_$i.png
+    IMG_MANY+=("$IMG_MANY_DIR/img_$i.png")
+  done
+  run_test "img2pdf >64 images fails loudly" bash -c "! $TSPDF img2pdf ${IMG_MANY[*]} -o $TMPDIR/img2pdf_many.pdf > /dev/null 2>&1"
+  run_test "img2pdf >64 images names the image limit" bash -c "$TSPDF img2pdf ${IMG_MANY[*]} -o $TMPDIR/img2pdf_many2.pdf 2>&1 | grep -qi 'too many images'"
+  run_test "img2pdf >64 images fails even with --best-effort" bash -c "! $TSPDF img2pdf ${IMG_MANY[*]} --best-effort -o $TMPDIR/img2pdf_many3.pdf > /dev/null 2>&1"
 else
   echo "  SKIP  img2pdf (python3 not found)"
 fi

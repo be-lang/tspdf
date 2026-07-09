@@ -1,9 +1,8 @@
 #include "commands.h"
 #include "../include/tspdf.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
-
-#define MAX_IMAGES 64
 
 static int is_png(const char *path) {
     size_t len = strlen(path);
@@ -33,15 +32,23 @@ int cmd_img2pdf(int argc, char **argv) {
         return 1;
     }
 
-    const char *images[MAX_IMAGES];
-    int nimg = collect_positional(argc, argv, images, MAX_IMAGES);
+    // argc bounds the number of positionals, so an argc-sized array can never
+    // truncate the list (a fixed cap used to silently drop images past 64).
+    const char **images = calloc((size_t)argc, sizeof(*images));
+    if (!images) { fprintf(stderr, "tspdf img2pdf: out of memory\n"); return 1; }
+    int nimg = collect_positional(argc, argv, images, argc);
     if (nimg == 0) {
         fprintf(stderr, "tspdf img2pdf: no input images specified\n");
+        free(images);
         return 1;
     }
 
     TspdfWriter *doc = tspdf_writer_create();
-    if (!doc) { fprintf(stderr, "tspdf img2pdf: out of memory\n"); return 1; }
+    if (!doc) {
+        fprintf(stderr, "tspdf img2pdf: out of memory\n");
+        free(images);
+        return 1;
+    }
 
     tspdf_writer_set_title(doc, "Image Collection");
 
@@ -56,6 +63,17 @@ int cmd_img2pdf(int argc, char **argv) {
         }
 
         if (!img_name) {
+            // The writer's image table is a hard limit: bail out instead of
+            // silently writing a PDF that is missing the remaining inputs.
+            // --best-effort does not apply — that flag skips broken images,
+            // it must not paper over dropped good ones.
+            if (doc->last_error == TSPDF_ERR_IMAGE_LIMIT) {
+                fprintf(stderr, "tspdf img2pdf: too many images (limit %d, got %d)\n",
+                        TSPDF_MAX_IMAGES, nimg);
+                tspdf_writer_destroy(doc);
+                free(images);
+                return 1;
+            }
             fprintf(stderr, "tspdf img2pdf: failed to load '%s'\n", images[i]);
             load_failures++;
             continue;
@@ -82,6 +100,8 @@ int cmd_img2pdf(int argc, char **argv) {
         tspdf_stream_draw_image(page, img_name, dx, dy, dw, dh);
         pages_added++;
     }
+
+    free(images);
 
     if (pages_added == 0) {
         fprintf(stderr, "tspdf img2pdf: no valid images found\n");

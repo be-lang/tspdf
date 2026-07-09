@@ -17,10 +17,14 @@ int cmd_metadata(int argc, char **argv) {
         return argc == 0 ? 1 : 0;
     }
 
-    const char *positional[1];
-    int npos = collect_positional(argc, argv, positional, 1);
+    const char *positional[2];
+    int npos = collect_positional(argc, argv, positional, 2);
     if (npos < 1) {
         fprintf(stderr, "tspdf metadata: missing input file\n");
+        return 1;
+    }
+    if (npos > 1) {
+        fprintf(stderr, "tspdf metadata: unexpected extra argument '%s'\n", positional[1]);
         return 1;
     }
     const char *input = positional[0];
