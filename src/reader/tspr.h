@@ -79,6 +79,21 @@ void tspdf_reader_destroy(TspdfReader *doc);
 size_t tspdf_reader_page_count(const TspdfReader *doc);
 TspdfReaderPage *tspdf_reader_get_page(const TspdfReader *doc, size_t index);
 
+// PDF version, e.g. "1.7": the catalog /Version name when present,
+// otherwise the file header. Owned by the reader; valid until destroy.
+const char *tspdf_reader_pdf_version(const TspdfReader *doc);
+
+// Encryption details of an encrypted document opened with a password.
+// Returns false (outputs untouched) if the document is not encrypted.
+// *algorithm is a static string such as "RC4-40", "RC4-128", "AES-128"
+// or "AES-256"; *revision is the /R value (2-6).
+bool tspdf_reader_encryption_info(const TspdfReader *doc, int *revision,
+                                  const char **algorithm);
+
+// Catalog presence flags: document outline (bookmarks) and AcroForm.
+bool tspdf_reader_has_outlines(const TspdfReader *doc);
+bool tspdf_reader_has_acroform(const TspdfReader *doc);
+
 // Manipulate (returns new document, source unchanged).
 // The source document must outlive the returned document unless saved first,
 // because the returned document references the source's stream data.

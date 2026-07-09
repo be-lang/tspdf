@@ -42,6 +42,9 @@ int cmd_info(int argc, char **argv) {
     size_t page_count = tspdf_reader_page_count(doc);
 
     printf("File:       %s\n", input);
+    const char *pdf_version = tspdf_reader_pdf_version(doc);
+    if (pdf_version && pdf_version[0])
+        printf("Version:    PDF %s\n", pdf_version);
     printf("Pages:      %zu\n", page_count);
 
     // Show page sizes
@@ -84,7 +87,14 @@ int cmd_info(int argc, char **argv) {
         }
     }
 
-    printf("Encrypted:  %s\n", password ? "yes (opened with password)" : "no");
+    int enc_revision = 0;
+    const char *enc_algorithm = NULL;
+    if (tspdf_reader_encryption_info(doc, &enc_revision, &enc_algorithm))
+        printf("Encrypted:  yes (%s, R%d)\n", enc_algorithm, enc_revision);
+    else
+        printf("Encrypted:  no\n");
+    printf("Outlines:   %s\n", tspdf_reader_has_outlines(doc) ? "yes" : "no");
+    printf("AcroForm:   %s\n", tspdf_reader_has_acroform(doc) ? "yes" : "no");
 
     tspdf_reader_destroy(doc);
     return 0;

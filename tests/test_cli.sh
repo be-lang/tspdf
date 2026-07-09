@@ -76,6 +76,17 @@ run_test "cli regenerates embedded assets on build" bash -c '
 
 # info
 run_test "info" $TSPDF info $INPUT
+run_test "info shows the PDF version" bash -c "$TSPDF info $INPUT | grep -qE '^Version:[[:space:]]+PDF 1\.7$'"
+run_test "info flags outlines and AcroForm when present" bash -c "
+  set -e
+  out=\$($TSPDF info tests/data/outline_form.pdf)
+  echo \"\$out\" | grep -qE '^Outlines:[[:space:]]+yes$'
+  echo \"\$out\" | grep -qE '^AcroForm:[[:space:]]+yes$'"
+run_test "info flags absent outlines and AcroForm" bash -c "
+  set -e
+  out=\$($TSPDF info $INPUT)
+  echo \"\$out\" | grep -qE '^Outlines:[[:space:]]+no$'
+  echo \"\$out\" | grep -qE '^AcroForm:[[:space:]]+no$'"
 
 # split
 run_test "split pages 1-2" $TSPDF split $INPUT --pages 1-2 -o $TMPDIR/split.pdf
@@ -130,6 +141,12 @@ run_test "reorder flag-first result has 3 pages" bash -c "$TSPDF info $TMPDIR/re
 run_test "encrypt AES-128" $TSPDF encrypt $INPUT -o $TMPDIR/enc128.pdf --password secret
 run_test "encrypt AES-256" $TSPDF encrypt $INPUT -o $TMPDIR/enc256.pdf --password secret --bits 256
 run_test "decrypt" $TSPDF decrypt $TMPDIR/enc128.pdf -o $TMPDIR/decrypted.pdf --password secret
+
+# info must name the encryption scheme when it can open the file
+run_test "info reports AES-128 R4 encryption details" bash -c "
+  $TSPDF info $TMPDIR/enc128.pdf --password secret | grep -qE '^Encrypted:[[:space:]]+yes \(AES-128, R4\)$'"
+run_test "info reports AES-256 R6 encryption details" bash -c "
+  $TSPDF info $TMPDIR/enc256.pdf --password secret | grep -qE '^Encrypted:[[:space:]]+yes \(AES-256, R6\)$'"
 
 # metadata
 run_test "metadata view" $TSPDF metadata $INPUT
@@ -1307,7 +1324,8 @@ run_test "pagenum accepts top-right position and custom size" $TSPDF pagenum $IN
 # --pages: stamp only part of the document (e.g. skip cover pages). The
 # number still reflects the true page position and the %d total stays the
 # real page count.
-$TSPDF merge $INPUT $TMPDIR/split.pdf -o $TMPDIR/pn4.pdf > /dev/null 2>&1  # 4-page doc
+$TSPDF split $INPUT --pages 1 -o $TMPDIR/pn1.pdf > /dev/null 2>&1
+$TSPDF merge $INPUT $TMPDIR/pn1.pdf -o $TMPDIR/pn4.pdf > /dev/null 2>&1  # 4-page doc
 run_test "pagenum --pages 2-3 stamps pages 2 and 3" bash -c "
   set -e
   $TSPDF pagenum $TMPDIR/pn4.pdf -o $TMPDIR/pnrange.pdf --pages 2-3 --format '[%d/%d]' > /dev/null
