@@ -510,10 +510,465 @@ TspdfError tspdf_reader_form_fields(TspdfReader *doc,
     return TSPDF_OK;
 }
 
+// --- object builders (all allocations in the document arena) ---
+
+static TspdfObj *form_obj_new(TspdfArena *a, TspdfObjType type) {
+    TspdfObj *o = (TspdfObj *)tspdf_arena_alloc_zero(a, sizeof(TspdfObj));
+    if (o) o->type = type;
+    return o;
+}
+
+static TspdfObj *form_make_name(TspdfArena *a, const char *name) {
+    TspdfObj *o = form_obj_new(a, TSPDF_OBJ_NAME);
+    if (!o) return NULL;
+    size_t len = strlen(name);
+    o->string.data = (uint8_t *)tspdf_arena_alloc(a, len + 1);
+    if (!o->string.data) return NULL;
+    memcpy(o->string.data, name, len + 1);
+    o->string.len = len;
+    return o;
+}
+
+static TspdfObj *form_make_bool(TspdfArena *a, bool v) {
+    TspdfObj *o = form_obj_new(a, TSPDF_OBJ_BOOL);
+    if (o) o->boolean = v;
+    return o;
+}
+
+static TspdfObj *form_make_ref(TspdfArena *a, uint32_t num) {
+    TspdfObj *o = form_obj_new(a, TSPDF_OBJ_REF);
+    if (o) o->ref.num = num;
+    return o;
+}
+
+static TspdfObj *form_make_int(TspdfArena *a, int64_t v) {
+    TspdfObj *o = form_obj_new(a, TSPDF_OBJ_INT);
+    if (o) o->integer = v;
+    return o;
+}
+
+// Append or replace `key` in an arena-backed dict.
+static TspdfError form_dict_put(TspdfObj *dict, const char *key,
+                                TspdfObj *value, TspdfArena *a) {
+    if (!dict || dict->type != TSPDF_OBJ_DICT || !value) return TSPDF_ERR_ALLOC;
+    for (size_t i = 0; i < dict->dict.count; i++) {
+        if (strcmp(dict->dict.entries[i].key, key) == 0) {
+            dict->dict.entries[i].value = value;
+            return TSPDF_OK;
+        }
+    }
+    TspdfDictEntry *entries = (TspdfDictEntry *)tspdf_arena_alloc(a,
+        sizeof(TspdfDictEntry) * (dict->dict.count + 1));
+    if (!entries) return TSPDF_ERR_ALLOC;
+    if (dict->dict.count > 0) {
+        memcpy(entries, dict->dict.entries,
+               sizeof(TspdfDictEntry) * dict->dict.count);
+    }
+    size_t klen = strlen(key);
+    char *kcopy = (char *)tspdf_arena_alloc(a, klen + 1);
+    if (!kcopy) return TSPDF_ERR_ALLOC;
+    memcpy(kcopy, key, klen + 1);
+    entries[dict->dict.count].key = kcopy;
+    entries[dict->dict.count].value = value;
+    dict->dict.entries = entries;
+    dict->dict.count++;
+    return TSPDF_OK;
+}
+
+static void form_dict_remove(TspdfObj *dict, const char *key) {
+    if (!dict || dict->type != TSPDF_OBJ_DICT) return;
+    for (size_t i = 0; i < dict->dict.count; i++) {
+        if (strcmp(dict->dict.entries[i].key, key) == 0) {
+            memmove(&dict->dict.entries[i], &dict->dict.entries[i + 1],
+                    sizeof(TspdfDictEntry) * (dict->dict.count - i - 1));
+            dict->dict.count--;
+            return;
+        }
+    }
+}
+
+// PDF text string object for a UTF-8 value: ASCII stays raw, anything else
+// becomes a BOM-prefixed UTF-16BE string (ISO 32000 §7.9.2.2), matching the
+// Info-dictionary convention. Invalid UTF-8 is stored raw.
+static TspdfObj *form_make_text_string(TspdfArena *a, const char *utf8) {
+    TspdfObj *o = form_obj_new(a, TSPDF_OBJ_STRING);
+    if (!o) return NULL;
+    size_t len = strlen(utf8);
+    if (tspdf_str_is_ascii(utf8)) {
+        o->string.data = (uint8_t *)tspdf_arena_alloc(a, len + 1);
+        if (!o->string.data) return NULL;
+        memcpy(o->string.data, utf8, len + 1);
+        o->string.len = len;
+        return o;
+    }
+    // Worst case: every UTF-8 byte becomes a surrogate pair unit.
+    uint8_t *buf = (uint8_t *)tspdf_arena_alloc(a, 2 + len * 4 + 1);
+    if (!buf) return NULL;
+    size_t pos = 0;
+    buf[pos++] = 0xFE;
+    buf[pos++] = 0xFF;
+    const char *p = utf8;
+    while (*p) {
+        uint32_t cp = 0;
+        size_t consumed = tspdf_utf8_decode(p, &cp);
+        if (consumed == 0) {
+            // Not valid UTF-8 after all: store the raw bytes unchanged.
+            uint8_t *raw = (uint8_t *)tspdf_arena_alloc(a, len + 1);
+            if (!raw) return NULL;
+            memcpy(raw, utf8, len + 1);
+            o->string.data = raw;
+            o->string.len = len;
+            return o;
+        }
+        p += consumed;
+        if (cp > 0xFFFF) {
+            uint32_t v = cp - 0x10000;
+            uint32_t hi = 0xD800 + (v >> 10);
+            uint32_t lo = 0xDC00 + (v & 0x3FF);
+            buf[pos++] = (uint8_t)(hi >> 8);
+            buf[pos++] = (uint8_t)hi;
+            buf[pos++] = (uint8_t)(lo >> 8);
+            buf[pos++] = (uint8_t)lo;
+        } else {
+            buf[pos++] = (uint8_t)(cp >> 8);
+            buf[pos++] = (uint8_t)cp;
+        }
+    }
+    o->string.data = buf;
+    o->string.len = pos;
+    return o;
+}
+
+// --- default appearance (/DA) parsing ---
+
+// Extract "<font> <size> Tf" from a DA string ("0 0 0 rg /Helv 0 Tf" and
+// friends). Defaults: font "Helv", size 0 (= auto).
+static void form_parse_da(const TspdfObj *da, char *font, size_t font_sz,
+                          double *size) {
+    snprintf(font, font_sz, "Helv");
+    *size = 0;
+    if (!da || da->type != TSPDF_OBJ_STRING || !da->string.data) return;
+
+    const uint8_t *s = da->string.data;
+    size_t len = da->string.len;
+    char tok[2][64] = {{0}, {0}};  // previous two tokens
+    size_t i = 0;
+    while (i < len) {
+        while (i < len && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' ||
+                           s[i] == '\n')) i++;
+        if (i >= len) break;
+        size_t start = i;
+        while (i < len && s[i] != ' ' && s[i] != '\t' && s[i] != '\r' &&
+               s[i] != '\n') i++;
+        size_t tlen = i - start;
+        if (tlen == 2 && s[start] == 'T' && s[start + 1] == 'f') {
+            // tok[0] = font name, tok[1] = size
+            if (tok[0][0] == '/' && tok[0][1] != '\0') {
+                size_t flen = strlen(tok[0] + 1);
+                if (flen >= font_sz) flen = font_sz - 1;
+                memcpy(font, tok[0] + 1, flen);
+                font[flen] = '\0';
+            }
+            double sz = strtod(tok[1], NULL);
+            if (sz > 0 && sz < 1000) *size = sz;
+            return;
+        }
+        memcpy(tok[0], tok[1], sizeof(tok[0]));
+        size_t copy = tlen < sizeof(tok[1]) - 1 ? tlen : sizeof(tok[1]) - 1;
+        memcpy(tok[1], s + start, copy);
+        tok[1][copy] = '\0';
+    }
+}
+
+// --- appearance stream generation (text fields) ---
+
+// Grow-append for the content buffer (malloc'd, caller frees).
+static bool form_buf_append(char **buf, size_t *len, size_t *cap,
+                            const char *data, size_t n) {
+    if (*len + n + 1 > *cap) {
+        size_t grown = *cap == 0 ? 256 : *cap;
+        while (grown < *len + n + 1) grown *= 2;
+        char *nb = (char *)realloc(*buf, grown);
+        if (!nb) return false;
+        *buf = nb;
+        *cap = grown;
+    }
+    memcpy(*buf + *len, data, n);
+    *len += n;
+    (*buf)[*len] = '\0';
+    return true;
+}
+
+// The font object the appearance stream references: the AcroForm /DR /Font
+// entry when it exists (kept as a shared reference), else a synthesized
+// WinAnsi Helvetica.
+static TspdfObj *form_appearance_font(FormCtx *ctx, const char *da_font) {
+    TspdfObj *dr = form_resolve(ctx->doc, &ctx->parser,
+                                tspdf_dict_get(ctx->acroform, "DR"));
+    if (dr && dr->type == TSPDF_OBJ_DICT) {
+        TspdfObj *fonts = form_resolve(ctx->doc, &ctx->parser,
+                                       tspdf_dict_get(dr, "Font"));
+        if (fonts && fonts->type == TSPDF_OBJ_DICT) {
+            TspdfObj *f = tspdf_dict_get(fonts, da_font);
+            if (f && (f->type == TSPDF_OBJ_REF || f->type == TSPDF_OBJ_DICT)) {
+                return f;
+            }
+        }
+    }
+    TspdfObj *font = form_obj_new(ctx->a, TSPDF_OBJ_DICT);
+    if (!font) return NULL;
+    if (form_dict_put(font, "Type", form_make_name(ctx->a, "Font"), ctx->a) != TSPDF_OK ||
+        form_dict_put(font, "Subtype", form_make_name(ctx->a, "Type1"), ctx->a) != TSPDF_OK ||
+        form_dict_put(font, "BaseFont", form_make_name(ctx->a, "Helvetica"), ctx->a) != TSPDF_OK ||
+        form_dict_put(font, "Encoding", form_make_name(ctx->a, "WinAnsiEncoding"), ctx->a) != TSPDF_OK) {
+        return NULL;
+    }
+    return font;
+}
+
+// Build and attach /AP << /N form-XObject >> showing `value` in the widget's
+// rect. Single-line v1: newlines become spaces, no comb/multiline layout;
+// the XObject /BBox clips overlong values.
+static TspdfError form_set_text_appearance(FormCtx *ctx, TspdfObj *widget,
+                                           const char *value) {
+    TspdfObj *rect = form_resolve(ctx->doc, &ctx->parser,
+                                  tspdf_dict_get(widget, "Rect"));
+    if (!rect || rect->type != TSPDF_OBJ_ARRAY || rect->array.count != 4) {
+        return TSPDF_OK;  // no rect, nothing to draw (value alone still set)
+    }
+    double x0 = form_number(form_resolve(ctx->doc, &ctx->parser, &rect->array.items[0]), 0);
+    double y0 = form_number(form_resolve(ctx->doc, &ctx->parser, &rect->array.items[1]), 0);
+    double x1 = form_number(form_resolve(ctx->doc, &ctx->parser, &rect->array.items[2]), 0);
+    double y1 = form_number(form_resolve(ctx->doc, &ctx->parser, &rect->array.items[3]), 0);
+    double w = x1 > x0 ? x1 - x0 : x0 - x1;
+    double h = y1 > y0 ? y1 - y0 : y0 - y1;
+    if (w <= 0 || h <= 0) return TSPDF_OK;
+
+    char da_font[64];
+    double size = 0;
+    TspdfObj *da = form_resolve(ctx->doc, &ctx->parser,
+                                tspdf_dict_get(widget, "DA"));
+    if (!da || da->type != TSPDF_OBJ_STRING) {
+        // effective DA was carried on the terminal; the caller passes it via
+        // ctx->acroform lookups — widgets usually repeat it, so fall back.
+        da = form_resolve(ctx->doc, &ctx->parser,
+                          tspdf_dict_get(ctx->acroform, "DA"));
+    }
+    form_parse_da(da, da_font, sizeof(da_font), &size);
+    if (size <= 0) {
+        size = h * 0.62;                 // auto-size: fit the rect height
+        if (size > 12) size = 12;
+        if (size < 4) size = 4;
+    }
+
+    // Single line: fold line breaks, then cp1252 (lossy) for a base14 font.
+    size_t vlen = strlen(value);
+    char *line = (char *)malloc(vlen + 1);
+    if (!line) return TSPDF_ERR_ALLOC;
+    memcpy(line, value, vlen + 1);
+    for (size_t i = 0; i < vlen; i++) {
+        if (line[i] == '\n' || line[i] == '\r') line[i] = ' ';
+    }
+    tspdf_utf8_to_cp1252_lossy(line, line, NULL);
+
+    // Content: /Tx BMC q BT <da font+size> 0 g x y Td (line) Tj ET Q EMC
+    char *content = NULL;
+    size_t clen = 0, ccap = 0;
+    char head[256];
+    double baseline = (h - size * 0.7) / 2.0;
+    if (baseline < 1) baseline = 1;
+    int n = snprintf(head, sizeof(head),
+                     "/Tx BMC\nq\nBT\n/%s %.2f Tf\n0 g\n2 %.2f Td\n(",
+                     da_font, size, baseline);
+    bool ok = n > 0 && form_buf_append(&content, &clen, &ccap, head, (size_t)n);
+    for (const char *p = line; ok && *p; p++) {
+        char c = *p;
+        if (c == '(' || c == ')' || c == '\\') {
+            char esc[2] = {'\\', c};
+            ok = form_buf_append(&content, &clen, &ccap, esc, 2);
+        } else {
+            ok = form_buf_append(&content, &clen, &ccap, &c, 1);
+        }
+    }
+    if (ok) ok = form_buf_append(&content, &clen, &ccap, ") Tj\nET\nQ\nEMC", 13);
+    free(line);
+    if (!ok) {
+        free(content);
+        return TSPDF_ERR_ALLOC;
+    }
+
+    // Form XObject: dict + self-contained stream.
+    TspdfArena *a = ctx->a;
+    TspdfObj *sdict = form_obj_new(a, TSPDF_OBJ_DICT);
+    TspdfObj *bbox = form_obj_new(a, TSPDF_OBJ_ARRAY);
+    TspdfObj *resources = form_obj_new(a, TSPDF_OBJ_DICT);
+    TspdfObj *fonts = form_obj_new(a, TSPDF_OBJ_DICT);
+    TspdfObj *font = form_appearance_font(ctx, da_font);
+    TspdfObj *stream = form_obj_new(a, TSPDF_OBJ_STREAM);
+    if (!sdict || !bbox || !resources || !fonts || !font || !stream) {
+        free(content);
+        return TSPDF_ERR_ALLOC;
+    }
+    bbox->array.items = (TspdfObj *)tspdf_arena_alloc_zero(a, 4 * sizeof(TspdfObj));
+    if (!bbox->array.items) {
+        free(content);
+        return TSPDF_ERR_ALLOC;
+    }
+    bbox->array.count = 4;
+    bbox->array.items[0].type = TSPDF_OBJ_REAL;
+    bbox->array.items[1].type = TSPDF_OBJ_REAL;
+    bbox->array.items[2] = (TspdfObj){.type = TSPDF_OBJ_REAL, .real = w};
+    bbox->array.items[3] = (TspdfObj){.type = TSPDF_OBJ_REAL, .real = h};
+
+    TspdfError err = form_dict_put(fonts, da_font, font, a);
+    if (err == TSPDF_OK) err = form_dict_put(resources, "Font", fonts, a);
+    if (err == TSPDF_OK) err = form_dict_put(sdict, "Type", form_make_name(a, "XObject"), a);
+    if (err == TSPDF_OK) err = form_dict_put(sdict, "Subtype", form_make_name(a, "Form"), a);
+    if (err == TSPDF_OK) err = form_dict_put(sdict, "BBox", bbox, a);
+    if (err == TSPDF_OK) err = form_dict_put(sdict, "Resources", resources, a);
+    if (err == TSPDF_OK) err = form_dict_put(sdict, "Length", form_make_int(a, (int64_t)clen), a);
+    if (err != TSPDF_OK) {
+        free(content);
+        return err;
+    }
+
+    stream->stream.dict = sdict;
+    stream->stream.data = (uint8_t *)tspdf_arena_alloc(a, clen);
+    if (!stream->stream.data) {
+        free(content);
+        return TSPDF_ERR_ALLOC;
+    }
+    memcpy(stream->stream.data, content, clen);
+    stream->stream.len = clen;
+    stream->stream.self_contained = true;
+    free(content);
+
+    uint32_t stream_num = tspdf_register_new_obj(ctx->doc, stream);
+    if (stream_num == 0) return TSPDF_ERR_ALLOC;
+
+    TspdfObj *ap = form_obj_new(a, TSPDF_OBJ_DICT);
+    TspdfObj *nref = form_make_ref(a, stream_num);
+    if (!ap || !nref) return TSPDF_ERR_ALLOC;
+    err = form_dict_put(ap, "N", nref, a);
+    if (err == TSPDF_OK) err = form_dict_put(widget, "AP", ap, a);
+    return err;
+}
+
+// --- fill ---
+
+static TspdfError form_fill_button(FormCtx *ctx, FormTerminal *term,
+                                   const char *value) {
+    // Validate: "Off" or one of the field's on-state names.
+    bool is_off = strcmp(value, "Off") == 0;
+    if (!is_off) {
+        const char **options = NULL;
+        size_t option_count = 0;
+        TspdfError err = form_button_options(ctx, term, &options, &option_count);
+        if (err != TSPDF_OK) return err;
+        bool known = form_option_seen(options, option_count, value);
+        // Widgets without /AP (e.g. tspdf's own writer) publish no on-state
+        // names; accept the caller's state as-is for those.
+        if (!known && option_count > 0) return TSPDF_ERR_INVALID_ARG;
+    }
+
+    TspdfArena *a = ctx->a;
+    TspdfObj *vname = form_make_name(a, value);
+    if (!vname) return TSPDF_ERR_ALLOC;
+    TspdfError err = form_dict_put(term->field, "V", vname, a);
+    if (err != TSPDF_OK) return err;
+
+    for (size_t w = 0; w < term->widget_count && err == TSPDF_OK; w++) {
+        TspdfObj *widget = term->widgets[w];
+        const char *as = "Off";
+        if (!is_off) {
+            TspdfObj *ap = form_resolve(ctx->doc, &ctx->parser,
+                                        tspdf_dict_get(widget, "AP"));
+            TspdfObj *n = ap && ap->type == TSPDF_OBJ_DICT
+                ? form_resolve(ctx->doc, &ctx->parser, tspdf_dict_get(ap, "N"))
+                : NULL;
+            if (n && n->type == TSPDF_OBJ_DICT) {
+                as = tspdf_dict_get(n, value) ? value : "Off";
+            } else {
+                as = value;  // no /AP states to consult
+            }
+        }
+        TspdfObj *asname = form_make_name(a, as);
+        if (!asname) return TSPDF_ERR_ALLOC;
+        err = form_dict_put(widget, "AS", asname, a);
+    }
+    return err;
+}
+
+static TspdfError form_fill_text(FormCtx *ctx, FormTerminal *term,
+                                 const char *value) {
+    TspdfObj *vstr = form_make_text_string(ctx->a, value);
+    if (!vstr) return TSPDF_ERR_ALLOC;
+    TspdfError err = form_dict_put(term->field, "V", vstr, ctx->a);
+    for (size_t w = 0; w < term->widget_count && err == TSPDF_OK; w++) {
+        err = form_set_text_appearance(ctx, term->widgets[w], value);
+    }
+    return err;
+}
+
+static TspdfError form_fill_choice(FormCtx *ctx, FormTerminal *term,
+                                   const char *value) {
+    TspdfObj *vstr = form_make_text_string(ctx->a, value);
+    if (!vstr) return TSPDF_ERR_ALLOC;
+    TspdfError err = form_dict_put(term->field, "V", vstr, ctx->a);
+    // A stale selection index would override the new /V in some viewers.
+    if (err == TSPDF_OK) form_dict_remove(term->field, "I");
+    return err;
+}
+
 TspdfError tspdf_reader_form_fill(TspdfReader *doc, const char *name,
                                   const char *value, bool force) {
-    (void)doc; (void)name; (void)value; (void)force;
-    return TSPDF_ERR_UNSUPPORTED;
+    if (!doc || !name || !value) return TSPDF_ERR_INVALID_ARG;
+
+    FormCtx ctx;
+    TspdfError err = form_collect_terminals(doc, &ctx);
+    if (err != TSPDF_OK) return err;
+
+    FormTerminal *term = NULL;
+    for (size_t i = 0; i < ctx.count; i++) {
+        if (strcmp(ctx.items[i].name, name) == 0) {
+            term = &ctx.items[i];
+            break;
+        }
+    }
+    if (!term) {
+        form_terminals_free(&ctx);
+        return TSPDF_ERR_INVALID_ARG;
+    }
+    if ((term->ff & 1) && !force) {
+        form_terminals_free(&ctx);
+        return TSPDF_ERR_UNSUPPORTED;
+    }
+
+    switch (term->type) {
+        case TSPDF_FIELD_TEXT:
+            err = form_fill_text(&ctx, term, value);
+            break;
+        case TSPDF_FIELD_CHECKBOX:
+        case TSPDF_FIELD_RADIO:
+            err = form_fill_button(&ctx, term, value);
+            break;
+        case TSPDF_FIELD_CHOICE:
+            err = form_fill_choice(&ctx, term, value);
+            break;
+        default:
+            err = TSPDF_ERR_UNSUPPORTED;  // pushbutton/signature/unknown
+            break;
+    }
+
+    // Belt: ask viewers to regenerate appearances for everything we set.
+    if (err == TSPDF_OK && ctx.acroform) {
+        TspdfObj *na = form_make_bool(&doc->arena, true);
+        if (!na) err = TSPDF_ERR_ALLOC;
+        else err = form_dict_put(ctx.acroform, "NeedAppearances", na, &doc->arena);
+    }
+    if (err == TSPDF_OK) doc->modified = true;
+    form_terminals_free(&ctx);
+    return err;
 }
 
 TspdfError tspdf_reader_form_flatten(TspdfReader *doc) {
