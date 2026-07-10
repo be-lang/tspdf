@@ -140,6 +140,7 @@ CLI_SOURCES = \
 	cli/cmd_md2pdf.c \
 	cli/cmd_text.c \
 	cli/cmd_pagenum.c \
+	cli/cmd_attach.c \
 	cli/server.c
 
 CLI_TARGET = $(BUILDDIR)/tspdf
