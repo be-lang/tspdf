@@ -8636,6 +8636,497 @@ TEST(test_extract_breaks_cyclic_outline_siblings) {
 }
 
 // ============================================================
+// Embedded file attachments (feat/attach)
+// ============================================================
+
+// Binary payload with NULs and high bytes so byte identity means something.
+static const uint8_t att_payload[] = {
+    'H', 'e', 'l', 'l', 'o', 0x00, 0xFF, 0x01, '\n', 'w', 'o', 'r', 'l', 'd',
+    0x80, 0x00, 'e', 'n', 'd'
+};
+
+// Open → add → save → reopen. Returns the reopened doc; caller destroys it
+// and frees *out_buf.
+static TspdfReader *att_add_and_reopen(const char *name, const uint8_t *data,
+                                       size_t len, const char *desc,
+                                       uint8_t **out_buf) {
+    size_t src_len = 0;
+    uint8_t *src = dt_writer_pdf(2, false, false, "AT", "Helvetica", &src_len);
+    if (!src) return NULL;
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open(src, src_len, &err);
+    if (!doc) {
+        free(src);
+        return NULL;
+    }
+    if (tspdf_reader_attachment_add(doc, name, data, len, desc) != TSPDF_OK) {
+        tspdf_reader_destroy(doc);
+        free(src);
+        return NULL;
+    }
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    tspdf_reader_destroy(doc);
+    free(src);
+    if (err != TSPDF_OK) {
+        free(out);
+        return NULL;
+    }
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    if (!re) {
+        free(out);
+        return NULL;
+    }
+    *out_buf = out;
+    return re;
+}
+
+TEST(test_attach_add_save_reopen_roundtrip) {
+    uint8_t *buf = NULL;
+    TspdfReader *re = att_add_and_reopen("hello.txt", att_payload,
+                                         sizeof(att_payload), "greeting", &buf);
+    ASSERT(re != NULL);
+
+    TspdfAttachmentInfo *infos = NULL;
+    size_t count = 0;
+    TspdfError err = tspdf_reader_attachments(re, &infos, &count);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_SIZE(count, 1);
+    ASSERT(infos != NULL);
+    ASSERT_EQ_STR(infos[0].name, "hello.txt");
+    ASSERT_EQ_SIZE(infos[0].size, sizeof(att_payload));
+    ASSERT(infos[0].desc != NULL);
+    ASSERT_EQ_STR(infos[0].desc, "greeting");
+
+    uint8_t *bytes = NULL;
+    size_t blen = 0;
+    err = tspdf_reader_attachment_get(re, "hello.txt", &bytes, &blen);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_SIZE(blen, sizeof(att_payload));
+    ASSERT(memcmp(bytes, att_payload, blen) == 0);
+    free(bytes);
+
+    // Unknown names report NOT_FOUND, not a parse error.
+    err = tspdf_reader_attachment_get(re, "nope.txt", &bytes, &blen);
+    ASSERT_EQ_INT(err, TSPDF_ERR_NOT_FOUND);
+
+    tspdf_reader_destroy(re);
+    free(buf);
+}
+
+TEST(test_attach_flat_tree_keys_sorted) {
+    size_t src_len = 0;
+    uint8_t *src = dt_writer_pdf(1, false, false, "AT", "Helvetica", &src_len);
+    ASSERT(src != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open(src, src_len, &err);
+    ASSERT(doc != NULL);
+    // Insert out of order; the flat node must come out sorted.
+    ASSERT_EQ_INT(tspdf_reader_attachment_add(doc, "m.bin", att_payload, 4, NULL), TSPDF_OK);
+    ASSERT_EQ_INT(tspdf_reader_attachment_add(doc, "a.bin", att_payload, 3, NULL), TSPDF_OK);
+    ASSERT_EQ_INT(tspdf_reader_attachment_add(doc, "z.bin", att_payload, 5, NULL), TSPDF_OK);
+    ASSERT_EQ_INT(tspdf_reader_attachment_add(doc, "ab.bin", att_payload, 2, NULL), TSPDF_OK);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    tspdf_reader_destroy(doc);
+    free(src);
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    TspdfAttachmentInfo *infos = NULL;
+    size_t count = 0;
+    ASSERT_EQ_INT(tspdf_reader_attachments(re, &infos, &count), TSPDF_OK);
+    ASSERT_EQ_SIZE(count, 4);
+    // Enumeration follows tree order, so this asserts the stored key order
+    // ("a" < "ab": shorter prefix sorts first).
+    ASSERT_EQ_STR(infos[0].name, "a.bin");
+    ASSERT_EQ_STR(infos[1].name, "ab.bin");
+    ASSERT_EQ_STR(infos[2].name, "m.bin");
+    ASSERT_EQ_STR(infos[3].name, "z.bin");
+    // Sizes tell the entries apart, proving values track their keys.
+    ASSERT_EQ_SIZE(infos[0].size, 3);
+    ASSERT_EQ_SIZE(infos[1].size, 2);
+    ASSERT_EQ_SIZE(infos[2].size, 4);
+    ASSERT_EQ_SIZE(infos[3].size, 5);
+
+    tspdf_reader_destroy(re);
+    free(out);
+}
+
+TEST(test_attach_add_replaces_same_name) {
+    size_t src_len = 0;
+    uint8_t *src = dt_writer_pdf(1, false, false, "AT", "Helvetica", &src_len);
+    ASSERT(src != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open(src, src_len, &err);
+    ASSERT(doc != NULL);
+    ASSERT_EQ_INT(tspdf_reader_attachment_add(doc, "f.txt",
+                  (const uint8_t *)"old", 3, NULL), TSPDF_OK);
+    ASSERT_EQ_INT(tspdf_reader_attachment_add(doc, "f.txt",
+                  (const uint8_t *)"newer", 5, NULL), TSPDF_OK);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    ASSERT_EQ_INT(tspdf_reader_save_to_memory(doc, &out, &out_len), TSPDF_OK);
+    tspdf_reader_destroy(doc);
+    free(src);
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    TspdfAttachmentInfo *infos = NULL;
+    size_t count = 0;
+    ASSERT_EQ_INT(tspdf_reader_attachments(re, &infos, &count), TSPDF_OK);
+    ASSERT_EQ_SIZE(count, 1);
+
+    uint8_t *bytes = NULL;
+    size_t blen = 0;
+    ASSERT_EQ_INT(tspdf_reader_attachment_get(re, "f.txt", &bytes, &blen), TSPDF_OK);
+    ASSERT_EQ_SIZE(blen, 5);
+    ASSERT(memcmp(bytes, "newer", 5) == 0);
+    free(bytes);
+
+    tspdf_reader_destroy(re);
+    free(out);
+}
+
+TEST(test_attach_remove) {
+    size_t src_len = 0;
+    uint8_t *src = dt_writer_pdf(1, false, false, "AT", "Helvetica", &src_len);
+    ASSERT(src != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open(src, src_len, &err);
+    ASSERT(doc != NULL);
+    ASSERT_EQ_INT(tspdf_reader_attachment_add(doc, "keep.txt",
+                  (const uint8_t *)"keep", 4, NULL), TSPDF_OK);
+    ASSERT_EQ_INT(tspdf_reader_attachment_add(doc, "drop.txt",
+                  (const uint8_t *)"drop", 4, NULL), TSPDF_OK);
+
+    ASSERT_EQ_INT(tspdf_reader_attachment_remove(doc, "missing.txt"),
+                  TSPDF_ERR_NOT_FOUND);
+    ASSERT_EQ_INT(tspdf_reader_attachment_remove(doc, "drop.txt"), TSPDF_OK);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    ASSERT_EQ_INT(tspdf_reader_save_to_memory(doc, &out, &out_len), TSPDF_OK);
+    tspdf_reader_destroy(doc);
+    free(src);
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    TspdfAttachmentInfo *infos = NULL;
+    size_t count = 0;
+    ASSERT_EQ_INT(tspdf_reader_attachments(re, &infos, &count), TSPDF_OK);
+    ASSERT_EQ_SIZE(count, 1);
+    ASSERT_EQ_STR(infos[0].name, "keep.txt");
+    // The removed attachment's objects must not linger in the output.
+    ASSERT(!bytes_contains(out, out_len, "drop.txt"));
+    tspdf_reader_destroy(re);
+    free(out);
+
+    // Removing the last attachment removes the whole /EmbeddedFiles tree
+    // (and the then-empty /Names dict).
+    src = dt_writer_pdf(1, false, false, "AT", "Helvetica", &src_len);
+    ASSERT(src != NULL);
+    doc = tspdf_reader_open(src, src_len, &err);
+    ASSERT(doc != NULL);
+    ASSERT_EQ_INT(tspdf_reader_attachment_add(doc, "only.txt",
+                  (const uint8_t *)"x", 1, NULL), TSPDF_OK);
+    ASSERT_EQ_INT(tspdf_reader_attachment_remove(doc, "only.txt"), TSPDF_OK);
+    ASSERT_EQ_INT(tspdf_reader_save_to_memory(doc, &out, &out_len), TSPDF_OK);
+    ASSERT(!bytes_contains(out, out_len, "/EmbeddedFiles"));
+    tspdf_reader_destroy(doc);
+    free(src);
+    free(out);
+}
+
+// Hand-built one-page PDF whose /EmbeddedFiles node lists itself 40 times in
+// /Kids. Without a node budget enumeration recurses 40^32 times.
+static char *att_make_cyclic_embeddedfiles_pdf(size_t *out_len) {
+    char *pdf = (char *)malloc(8192);
+    if (!pdf) return NULL;
+    size_t pos = 0;
+    size_t off[8] = {0};
+
+    if (!appendf(pdf, 8192, &pos, "%%PDF-1.4\n")) goto fail;
+
+    off[1] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R "
+                 "/Names << /EmbeddedFiles 4 0 R >> >>\nendobj\n")) goto fail;
+    off[2] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")) goto fail;
+    off[3] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n")) goto fail;
+    off[4] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "4 0 obj\n<< /Names [(cyc.txt) 5 0 R] /Kids [")) goto fail;
+    for (int i = 0; i < 40; i++) {
+        if (!appendf(pdf, 8192, &pos, "4 0 R ")) goto fail;
+    }
+    if (!appendf(pdf, 8192, &pos, "] >>\nendobj\n")) goto fail;
+    off[5] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "5 0 obj\n<< /Type /Filespec /F (cyc.txt) /UF (cyc.txt) "
+                 "/EF << /F 6 0 R >> >>\nendobj\n")) goto fail;
+    off[6] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "6 0 obj\n<< /Type /EmbeddedFile /Length 9 >>\nstream\n"
+                 "CYCBYTES!\nendstream\nendobj\n")) goto fail;
+
+    size_t xref = pos;
+    if (!appendf(pdf, 8192, &pos, "xref\n0 7\n0000000000 65535 f \n")) goto fail;
+    for (int i = 1; i <= 6; i++) {
+        if (!appendf(pdf, 8192, &pos, "%010zu 00000 n \n", off[i])) goto fail;
+    }
+    if (!appendf(pdf, 8192, &pos,
+                 "trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n%zu\n%%%%EOF",
+                 xref)) goto fail;
+
+    *out_len = pos;
+    return pdf;
+fail:
+    free(pdf);
+    return NULL;
+}
+
+TEST(test_attach_cyclic_embeddedfiles_tree_bounded) {
+    size_t len = 0;
+    char *pdf = att_make_cyclic_embeddedfiles_pdf(&len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    // Enumeration terminates and reports the entry exactly once.
+    TspdfAttachmentInfo *infos = NULL;
+    size_t count = 0;
+    ASSERT_EQ_INT(tspdf_reader_attachments(doc, &infos, &count), TSPDF_OK);
+    ASSERT_EQ_SIZE(count, 1);
+    ASSERT_EQ_STR(infos[0].name, "cyc.txt");
+
+    uint8_t *bytes = NULL;
+    size_t blen = 0;
+    ASSERT_EQ_INT(tspdf_reader_attachment_get(doc, "cyc.txt", &bytes, &blen), TSPDF_OK);
+    ASSERT_EQ_SIZE(blen, 9);
+    ASSERT(memcmp(bytes, "CYCBYTES!", 9) == 0);
+    free(bytes);
+
+    // Extract (which re-adds all attachments) is bounded too, and the
+    // rebuilt flat tree carries the entry through.
+    size_t pages[] = {0};
+    TspdfReader *result = tspdf_reader_extract(doc, pages, 1, &err);
+    ASSERT(result != NULL);
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    ASSERT_EQ_INT(tspdf_reader_save_to_memory(result, &out, &out_len), TSPDF_OK);
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    ASSERT_EQ_INT(tspdf_reader_attachment_get(re, "cyc.txt", &bytes, &blen), TSPDF_OK);
+    ASSERT_EQ_SIZE(blen, 9);
+    ASSERT(memcmp(bytes, "CYCBYTES!", 9) == 0);
+    free(bytes);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(result);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_attach_extract_keeps_all_attachments) {
+    uint8_t *buf = NULL;
+    TspdfReader *src = att_add_and_reopen("data.bin", att_payload,
+                                          sizeof(att_payload), "desc here", &buf);
+    ASSERT(src != NULL);
+
+    // Extract only page 1 of 2: attachments are document-level and all survive.
+    size_t pages[] = {1};
+    TspdfError err;
+    TspdfReader *result = tspdf_reader_extract(src, pages, 1, &err);
+    ASSERT(result != NULL);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    ASSERT_EQ_INT(tspdf_reader_save_to_memory(result, &out, &out_len), TSPDF_OK);
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(re), 1);
+
+    TspdfAttachmentInfo *infos = NULL;
+    size_t count = 0;
+    ASSERT_EQ_INT(tspdf_reader_attachments(re, &infos, &count), TSPDF_OK);
+    ASSERT_EQ_SIZE(count, 1);
+    ASSERT_EQ_STR(infos[0].name, "data.bin");
+    ASSERT(infos[0].desc != NULL);
+    ASSERT_EQ_STR(infos[0].desc, "desc here");
+
+    uint8_t *bytes = NULL;
+    size_t blen = 0;
+    ASSERT_EQ_INT(tspdf_reader_attachment_get(re, "data.bin", &bytes, &blen), TSPDF_OK);
+    ASSERT_EQ_SIZE(blen, sizeof(att_payload));
+    ASSERT(memcmp(bytes, att_payload, blen) == 0);
+    free(bytes);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(result);
+    tspdf_reader_destroy(src);
+    free(buf);
+}
+
+TEST(test_attach_merge_unions_first_wins) {
+    uint8_t *buf_a = NULL;
+    uint8_t *buf_b = NULL;
+    TspdfReader *doc_a = att_add_and_reopen("shared.txt",
+                                            (const uint8_t *)"from A", 6,
+                                            NULL, &buf_a);
+    TspdfReader *doc_b = att_add_and_reopen("shared.txt",
+                                            (const uint8_t *)"from B!!", 8,
+                                            NULL, &buf_b);
+    ASSERT(doc_a != NULL && doc_b != NULL);
+    ASSERT_EQ_INT(tspdf_reader_attachment_add(doc_a, "a.txt",
+                  (const uint8_t *)"AA", 2, NULL), TSPDF_OK);
+    ASSERT_EQ_INT(tspdf_reader_attachment_add(doc_b, "b.txt",
+                  (const uint8_t *)"BB", 2, NULL), TSPDF_OK);
+
+    TspdfError err;
+    TspdfReader *docs[] = {doc_a, doc_b};
+    TspdfReader *merged = tspdf_reader_merge(docs, 2, &err);
+    ASSERT(merged != NULL);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    ASSERT_EQ_INT(tspdf_reader_save_to_memory(merged, &out, &out_len), TSPDF_OK);
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+
+    TspdfAttachmentInfo *infos = NULL;
+    size_t count = 0;
+    ASSERT_EQ_INT(tspdf_reader_attachments(re, &infos, &count), TSPDF_OK);
+    ASSERT_EQ_SIZE(count, 3);
+    ASSERT_EQ_STR(infos[0].name, "a.txt");
+    ASSERT_EQ_STR(infos[1].name, "b.txt");
+    ASSERT_EQ_STR(infos[2].name, "shared.txt");
+
+    // First source wins the name collision.
+    uint8_t *bytes = NULL;
+    size_t blen = 0;
+    ASSERT_EQ_INT(tspdf_reader_attachment_get(re, "shared.txt", &bytes, &blen), TSPDF_OK);
+    ASSERT_EQ_SIZE(blen, 6);
+    ASSERT(memcmp(bytes, "from A", 6) == 0);
+    free(bytes);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(merged);
+    tspdf_reader_destroy(doc_a);
+    tspdf_reader_destroy(doc_b);
+    free(buf_a);
+    free(buf_b);
+}
+
+TEST(test_attach_delete_pages_keeps_attachments) {
+    uint8_t *buf = NULL;
+    TspdfReader *src = att_add_and_reopen("data.bin", att_payload,
+                                          sizeof(att_payload), NULL, &buf);
+    ASSERT(src != NULL);
+
+    size_t pages[] = {0};
+    TspdfError err;
+    TspdfReader *result = tspdf_reader_delete(src, pages, 1, &err);
+    ASSERT(result != NULL);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    ASSERT_EQ_INT(tspdf_reader_save_to_memory(result, &out, &out_len), TSPDF_OK);
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    uint8_t *bytes = NULL;
+    size_t blen = 0;
+    ASSERT_EQ_INT(tspdf_reader_attachment_get(re, "data.bin", &bytes, &blen), TSPDF_OK);
+    ASSERT_EQ_SIZE(blen, sizeof(att_payload));
+    ASSERT(memcmp(bytes, att_payload, blen) == 0);
+    free(bytes);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(result);
+    tspdf_reader_destroy(src);
+    free(buf);
+}
+
+TEST(test_attach_encrypted_roundtrip) {
+    size_t src_len = 0;
+    uint8_t *src = dt_writer_pdf(1, false, false, "AT", "Helvetica", &src_len);
+    ASSERT(src != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open(src, src_len, &err);
+    ASSERT(doc != NULL);
+    ASSERT_EQ_INT(tspdf_reader_attachment_add(doc, "secret.bin", att_payload,
+                                              sizeof(att_payload), NULL), TSPDF_OK);
+
+    uint8_t *enc = NULL;
+    size_t enc_len = 0;
+    ASSERT_EQ_INT(tspdf_reader_save_to_memory_encrypted(doc, &enc, &enc_len,
+                                                        "pw", "pw", 0xFFFFFFFF, 256),
+                  TSPDF_OK);
+    tspdf_reader_destroy(doc);
+    free(src);
+
+    // Wrong/missing password never reaches the attachment.
+    TspdfReader *no_pw = tspdf_reader_open(enc, enc_len, &err);
+    ASSERT(no_pw == NULL);
+    ASSERT_EQ_INT(err, TSPDF_ERR_ENCRYPTED);
+
+    // With the password the attachment stream decrypts and decodes.
+    TspdfReader *re = tspdf_reader_open_with_password(enc, enc_len, "pw", &err);
+    ASSERT(re != NULL);
+    uint8_t *bytes = NULL;
+    size_t blen = 0;
+    ASSERT_EQ_INT(tspdf_reader_attachment_get(re, "secret.bin", &bytes, &blen), TSPDF_OK);
+    ASSERT_EQ_SIZE(blen, sizeof(att_payload));
+    ASSERT(memcmp(bytes, att_payload, blen) == 0);
+    free(bytes);
+
+    // And an extract of the encrypted document still carries it.
+    size_t pages[] = {0};
+    TspdfReader *result = tspdf_reader_extract(re, pages, 1, &err);
+    ASSERT(result != NULL);
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    ASSERT_EQ_INT(tspdf_reader_save_to_memory(result, &out, &out_len), TSPDF_OK);
+    TspdfReader *re2 = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re2 != NULL);
+    ASSERT_EQ_INT(tspdf_reader_attachment_get(re2, "secret.bin", &bytes, &blen), TSPDF_OK);
+    ASSERT_EQ_SIZE(blen, sizeof(att_payload));
+    ASSERT(memcmp(bytes, att_payload, blen) == 0);
+    free(bytes);
+
+    tspdf_reader_destroy(re2);
+    free(out);
+    tspdf_reader_destroy(result);
+    tspdf_reader_destroy(re);
+    free(enc);
+}
+
+// ============================================================
 // Save-to-memory byte identity (wasm track)
 // ============================================================
 
@@ -8986,6 +9477,18 @@ int main(void) {
     RUN(test_extract_and_merge_bounded_on_cyclic_nametree);
     RUN(test_extract_bounded_on_cyclic_field_kids);
     RUN(test_extract_breaks_cyclic_outline_siblings);
+
+    printf("\n  Embedded file attachments:\n");
+    RUN(test_attach_add_save_reopen_roundtrip);
+    RUN(test_attach_flat_tree_keys_sorted);
+    RUN(test_attach_add_replaces_same_name);
+    RUN(test_attach_remove);
+    RUN(test_attach_cyclic_embeddedfiles_tree_bounded);
+    RUN(test_attach_extract_keeps_all_attachments);
+    RUN(test_attach_merge_unions_first_wins);
+    RUN(test_attach_delete_pages_keeps_attachments);
+    RUN(test_attach_encrypted_roundtrip);
+
     printf("\n  Save-to-memory byte identity (wasm):\n");
     RUN(test_reader_save_to_memory_matches_file);
     RUN(test_reader_save_to_memory_with_options_matches_file);

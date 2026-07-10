@@ -57,8 +57,9 @@ static TspdfObj *dt_obj_name(TspdfArena *a, const char *name) {
     return o;
 }
 
-// Append or replace `key` in an arena-backed dict.
-static TspdfError dt_dict_put(TspdfObj *dict, const char *key, TspdfObj *value,
+// Append or replace `key` in an arena-backed dict. Non-static: tspr_attach.c
+// builds its Filespec/name-tree dicts with the same helper.
+TspdfError tspdf_obj_dict_put(TspdfObj *dict, const char *key, TspdfObj *value,
                               TspdfArena *a) {
     if (!dict || dict->type != TSPDF_OBJ_DICT || !value) return TSPDF_ERR_ALLOC;
     for (size_t i = 0; i < dict->dict.count; i++) {
@@ -84,6 +85,12 @@ static TspdfError dt_dict_put(TspdfObj *dict, const char *key, TspdfObj *value,
     return TSPDF_OK;
 }
 
+// Short local alias (historical name; the body moved to tspdf_obj_dict_put).
+static TspdfError dt_dict_put(TspdfObj *dict, const char *key, TspdfObj *value,
+                              TspdfArena *a) {
+    return tspdf_obj_dict_put(dict, key, value, a);
+}
+
 // Length-checked name compare: parsed names can carry embedded NULs via
 // #00 escapes, so strcmp against string.data would match too eagerly.
 static bool dt_name_is(const TspdfObj *o, const char *name) {
@@ -96,7 +103,9 @@ static bool dt_name_is(const TspdfObj *o, const char *name) {
 
 // Resolve an object number through `doc`. Merged documents have no backing
 // buffer; for them only cached objects and registered new objects resolve.
-static TspdfObj *dt_resolve_num(TspdfReader *doc, TspdfParser *parser, uint32_t num) {
+// Non-static (declared in tspr_doctree.h): tspr_attach.c resolves through the
+// same numbering, including registered new objects.
+TspdfObj *tspdf_doctree_resolve_num(TspdfReader *doc, TspdfParser *parser, uint32_t num) {
     if (num < doc->xref.count) {
         if (doc->obj_cache[num]) return doc->obj_cache[num];
         if (!doc->data) return NULL;
@@ -107,9 +116,18 @@ static TspdfObj *dt_resolve_num(TspdfReader *doc, TspdfParser *parser, uint32_t 
     return NULL;
 }
 
-static TspdfObj *dt_resolve(TspdfReader *doc, TspdfParser *parser, TspdfObj *obj) {
+TspdfObj *tspdf_doctree_resolve(TspdfReader *doc, TspdfParser *parser, TspdfObj *obj) {
     if (!obj || obj->type != TSPDF_OBJ_REF) return obj;
-    return dt_resolve_num(doc, parser, obj->ref.num);
+    return tspdf_doctree_resolve_num(doc, parser, obj->ref.num);
+}
+
+// Short local aliases for the exported resolvers.
+static TspdfObj *dt_resolve_num(TspdfReader *doc, TspdfParser *parser, uint32_t num) {
+    return tspdf_doctree_resolve_num(doc, parser, num);
+}
+
+static TspdfObj *dt_resolve(TspdfReader *doc, TspdfParser *parser, TspdfObj *obj) {
+    return tspdf_doctree_resolve(doc, parser, obj);
 }
 
 // The catalog of a source document (merged documents used as merge input
@@ -150,22 +168,22 @@ static void dt_remap_refs(TspdfObj *obj, uint32_t offset, size_t src_count, int 
 
 // --- named destination lookup (in the source document's numbering) ---
 
-// `budget` caps the total nodes visited per lookup (same guard idea as
+// `budget` caps the total nodes visited per walk (same guard idea as
 // DtCtx.budget): /Kids full of self-references would otherwise fan out to
-// count^depth recursive calls under the depth cap alone.
-static TspdfObj *dt_nametree_lookup(TspdfReader *doc, TspdfParser *parser,
-                                    TspdfObj *node, const uint8_t *name,
-                                    size_t name_len, int depth, size_t *budget) {
-    if (!node || node->type != TSPDF_OBJ_DICT || depth > 32) return NULL;
-    if (*budget == 0) return NULL;
+// count^depth recursive calls under the depth cap alone. Non-static: this is
+// the one name-tree walker; the destination lookup below and the attachment
+// enumeration in tspr_attach.c are both built on it.
+bool tspdf_nametree_walk(TspdfReader *doc, TspdfParser *parser, TspdfObj *node,
+                         int depth, size_t *budget,
+                         TspdfNametreeVisitFn visit, void *ctx) {
+    if (!node || node->type != TSPDF_OBJ_DICT || depth > 32) return true;
+    if (*budget == 0) return false;
     (*budget)--;
     TspdfObj *names = dt_resolve(doc, parser, tspdf_dict_get(node, "Names"));
     if (names && names->type == TSPDF_OBJ_ARRAY) {
         for (size_t i = 0; i + 1 < names->array.count; i += 2) {
-            TspdfObj *key = &names->array.items[i];
-            if (key->type == TSPDF_OBJ_STRING && key->string.len == name_len &&
-                memcmp(key->string.data, name, name_len) == 0) {
-                return &names->array.items[i + 1];
+            if (!visit(ctx, &names->array.items[i], &names->array.items[i + 1])) {
+                return false;
             }
         }
     }
@@ -173,12 +191,37 @@ static TspdfObj *dt_nametree_lookup(TspdfReader *doc, TspdfParser *parser,
     if (kids && kids->type == TSPDF_OBJ_ARRAY) {
         for (size_t i = 0; i < kids->array.count; i++) {
             TspdfObj *kid = dt_resolve(doc, parser, &kids->array.items[i]);
-            TspdfObj *hit = dt_nametree_lookup(doc, parser, kid, name, name_len,
-                                               depth + 1, budget);
-            if (hit) return hit;
+            if (!tspdf_nametree_walk(doc, parser, kid, depth + 1, budget,
+                                     visit, ctx)) {
+                return false;
+            }
         }
     }
-    return NULL;
+    return true;
+}
+
+typedef struct {
+    const uint8_t *name;
+    size_t name_len;
+    TspdfObj *hit;
+} DtLookupCtx;
+
+static bool dt_lookup_visit(void *vctx, TspdfObj *key, TspdfObj *value) {
+    DtLookupCtx *c = (DtLookupCtx *)vctx;
+    if (key->type == TSPDF_OBJ_STRING && key->string.len == c->name_len &&
+        memcmp(key->string.data, c->name, c->name_len) == 0) {
+        c->hit = value;
+        return false;
+    }
+    return true;
+}
+
+static TspdfObj *dt_nametree_lookup(TspdfReader *doc, TspdfParser *parser,
+                                    TspdfObj *node, const uint8_t *name,
+                                    size_t name_len, int depth, size_t *budget) {
+    DtLookupCtx c = {name, name_len, NULL};
+    tspdf_nametree_walk(doc, parser, node, depth, budget, dt_lookup_visit, &c);
+    return c.hit;
 }
 
 // --- outline pruning ---

@@ -170,6 +170,41 @@ TspdfError tspdf_reader_save_to_memory_with_options(TspdfReader *doc, uint8_t **
 // bad page index).
 const char *tspdf_reader_page_text(TspdfReader *doc, size_t page_index, TspdfError *err);
 
+// --- Embedded file attachments ---
+
+typedef struct {
+    const char *name;   // name-tree key (stored filename), NUL-terminated
+    size_t size;        // decoded (uncompressed) size in bytes
+    const char *desc;   // Filespec /Desc if present, else NULL
+    const char *mime;   // embedded stream /Subtype (MIME type) if present, else NULL
+} TspdfAttachmentInfo;
+
+// List document-level embedded files (/Names /EmbeddedFiles). On success
+// *out points at an array of *count entries owned by the reader's arena
+// (valid until tspdf_reader_destroy; do not free). *out is NULL when the
+// document has no attachments.
+TspdfError tspdf_reader_attachments(TspdfReader *doc, TspdfAttachmentInfo **out,
+                                    size_t *count);
+
+// Fetch the decoded bytes of the attachment stored under `name`. *out is
+// malloc'd (caller frees). TSPDF_ERR_NOT_FOUND when no attachment has that
+// name.
+TspdfError tspdf_reader_attachment_get(TspdfReader *doc, const char *name,
+                                       uint8_t **out, size_t *out_len);
+
+// Add (or replace, by name) an embedded file. Creates the catalog /Names
+// dictionary and /EmbeddedFiles tree when absent; the tree is always written
+// as a single flat node with lexicographically sorted keys. `desc` may be
+// NULL. The bytes are copied; the document must be saved for the attachment
+// to persist.
+TspdfError tspdf_reader_attachment_add(TspdfReader *doc, const char *name,
+                                       const uint8_t *data, size_t len,
+                                       const char *desc);
+
+// Remove the attachment stored under `name`. TSPDF_ERR_NOT_FOUND when no
+// attachment has that name.
+TspdfError tspdf_reader_attachment_remove(TspdfReader *doc, const char *name);
+
 // --- Annotations ---
 
 TspdfError tspdf_page_add_link(TspdfReader *doc, size_t page_index,
