@@ -95,6 +95,58 @@ run_test "split result has exactly 2 pages (info output)" bash -c "$TSPDF info $
 run_test "split flag-first ordering (-o before input)" $TSPDF split -o $TMPDIR/split_ff.pdf --pages 1 $INPUT
 run_test "split flag-first result is the real input (1 page)" bash -c "$TSPDF info $TMPDIR/split_ff.pdf | grep -qE '^Pages:[[:space:]]*1$'"
 
+# page labels survive split and merge (verified through qpdf's label view)
+if command -v python3 > /dev/null 2>&1 && command -v qpdf > /dev/null 2>&1; then
+  python3 - "$TMPDIR/labeled.pdf" << 'PYEOF'
+import sys
+# five pages labeled i, ii, iii, 1, 2
+objs = [
+    b'<< /Type /Catalog /Pages 2 0 R /PageLabels 8 0 R >>',
+    b'<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 6 0 R 7 0 R] /Count 5 >>',
+] + [b'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>'] * 5 + [
+    b'<< /Nums [0 << /S /r >> 3 << /S /D >>] >>',
+]
+out = bytearray(b'%PDF-1.4\n')
+offs = []
+for i, body in enumerate(objs, 1):
+    offs.append(len(out))
+    out += (b'%d 0 obj\n' % i) + body + b'\nendobj\n'
+xref = len(out)
+out += b'xref\n0 %d\n' % (len(objs)+1) + b'0000000000 65535 f \n'
+for o in offs:
+    out += b'%010d 00000 n \n' % o
+out += b'trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n' % (len(objs)+1, xref)
+open(sys.argv[1], 'wb').write(out)
+PYEOF
+  run_test "split keeps effective page labels (iii, 1)" bash -c "
+    set -e
+    $TSPDF split $TMPDIR/labeled.pdf --pages 3-4 -o $TMPDIR/labeled_ex.pdf > /dev/null
+    qpdf --json --json-key=pagelabels $TMPDIR/labeled_ex.pdf 2>/dev/null | python3 -c '
+import json, sys
+labels = json.load(sys.stdin)[\"pagelabels\"]
+assert labels[0] == {\"index\": 0, \"label\": {\"/S\": \"/r\", \"/St\": 3}}, labels
+assert labels[1] == {\"index\": 1, \"label\": {\"/S\": \"/D\", \"/St\": 1}}, labels
+assert len(labels) == 2, labels
+'"
+  run_test "merge offsets labels, unlabeled doc gets decimal range" bash -c "
+    set -e
+    $TSPDF merge $TMPDIR/labeled.pdf $INPUT -o $TMPDIR/labeled_mg.pdf > /dev/null
+    qpdf --json --json-key=pagelabels $TMPDIR/labeled_mg.pdf 2>/dev/null | python3 -c '
+import json, sys
+labels = json.load(sys.stdin)[\"pagelabels\"]
+assert labels[0] == {\"index\": 0, \"label\": {\"/S\": \"/r\", \"/St\": 1}}, labels
+assert labels[1] == {\"index\": 3, \"label\": {\"/S\": \"/D\", \"/St\": 1}}, labels
+assert labels[2] == {\"index\": 5, \"label\": {\"/S\": \"/D\", \"/St\": 1}}, labels
+assert len(labels) == 3, labels
+'"
+  run_test "merge of unlabeled docs emits no /PageLabels" bash -c "
+    set -e
+    $TSPDF merge $INPUT $INPUT -o $TMPDIR/unlabeled_mg.pdf > /dev/null
+    ! grep -qa '/PageLabels' $TMPDIR/unlabeled_mg.pdf"
+else
+  echo "  SKIP  page label preservation assertions (python3/qpdf not found)"
+fi
+
 # merge
 run_test "merge two files" $TSPDF merge $INPUT $TMPDIR/split.pdf -o $TMPDIR/merged.pdf
 # flag-first ordering: -o output must not be counted as an input file
@@ -148,12 +200,141 @@ run_test "info reports AES-128 R4 encryption details" bash -c "
 run_test "info reports AES-256 R6 encryption details" bash -c "
   $TSPDF info $TMPDIR/enc256.pdf --password secret | grep -qE '^Encrypted:[[:space:]]+yes \(AES-256, R6\)$'"
 
+# encrypt --permissions: listed actions allowed, everything else denied
+run_test "encrypt --permissions rejects unknown tokens" bash -c "! $TSPDF encrypt $INPUT -o $TMPDIR/encbad.pdf --password secret --permissions print,teleport > /dev/null 2>&1"
+run_test "encrypt --permissions print" $TSPDF encrypt $INPUT -o $TMPDIR/encperm.pdf --password secret --permissions print
+run_test "restricted file still opens with the user password" bash -c "
+  $TSPDF info $TMPDIR/encperm.pdf --password secret | grep -qE '^Pages:[[:space:]]*3$'"
+if command -v qpdf > /dev/null 2>&1; then
+  run_test "qpdf sees print allowed, the rest denied" bash -c "
+    set -e
+    out=\$(qpdf --password=secret --show-encryption $TMPDIR/encperm.pdf)
+    echo \"\$out\" | grep -q '^print low resolution: allowed'
+    echo \"\$out\" | grep -q '^print high resolution: not allowed'
+    echo \"\$out\" | grep -q '^extract for any purpose: not allowed'
+    echo \"\$out\" | grep -q '^modify anything: not allowed'
+    echo \"\$out\" | grep -q '^modify forms: not allowed'
+    echo \"\$out\" | grep -q '^modify document assembly: not allowed'"
+  # AES-256 (R6) carries /P into the crypt-protected Perms field too
+  run_test "qpdf sees the same restrictions on AES-256" bash -c "
+    set -e
+    $TSPDF encrypt $INPUT -o $TMPDIR/encperm256.pdf --password secret --bits 256 --permissions copy > /dev/null
+    out=\$(qpdf --password=secret --show-encryption $TMPDIR/encperm256.pdf)
+    echo \"\$out\" | grep -q '^extract for any purpose: allowed'
+    echo \"\$out\" | grep -q '^print low resolution: not allowed'"
+  run_test "default without --permissions allows everything" bash -c "
+    ! qpdf --password=secret --show-encryption $TMPDIR/enc128.pdf | grep -q 'not allowed'"
+else
+  echo "  SKIP  encrypt --permissions qpdf assertions (qpdf not found)"
+fi
+
 # metadata
 run_test "metadata view" $TSPDF metadata $INPUT
 run_test "metadata set" $TSPDF metadata $INPUT --set title="Test Title" --set author="Test Author" -o $TMPDIR/meta.pdf
 # flag-first ordering: -o output and --set values must not be swallowed as input
 run_test "metadata flag-first ordering (-o/--set before input)" $TSPDF metadata -o $TMPDIR/meta_ff.pdf --set title="FF" $INPUT
 run_test "metadata flag-first applied the title" bash -c "$TSPDF metadata $TMPDIR/meta_ff.pdf | grep -qi 'FF'"
+
+# metadata --set producer and --clear
+run_test "metadata set producer" bash -c "
+  set -e
+  $TSPDF metadata $INPUT --set producer='Custom Producer' -o $TMPDIR/meta_prod.pdf > /dev/null
+  $TSPDF metadata $TMPDIR/meta_prod.pdf | grep -q '^Producer:.*Custom Producer'"
+run_test "metadata clear title removes the field" bash -c "
+  set -e
+  $TSPDF metadata $TMPDIR/meta.pdf --clear title -o $TMPDIR/meta_noclear.pdf > /dev/null
+  ! $TSPDF metadata $TMPDIR/meta_noclear.pdf | grep -q '^Title:'"
+run_test "metadata clear rejects unknown keys" bash -c "! $TSPDF metadata $INPUT --clear bogus -o $TMPDIR/meta_bad.pdf > /dev/null 2>&1"
+run_test "metadata clear requires -o" bash -c "! $TSPDF metadata $INPUT --clear title > /dev/null 2>&1"
+if command -v qpdf > /dev/null 2>&1; then
+  # Verify against the actual Info dict through qpdf --qdf, not just our
+  # own view path: set producer must survive the writer's update_producer
+  # default, and a cleared title must be absent from the dict.
+  run_test "metadata set/clear verified via qpdf --qdf" bash -c "
+    set -e
+    $TSPDF metadata $TMPDIR/meta.pdf --set producer='Oracle Producer' --clear title -o $TMPDIR/meta_qdf.pdf > /dev/null
+    qpdf --qdf $TMPDIR/meta_qdf.pdf $TMPDIR/meta_qdf.qdf
+    grep -aq '/Producer (Oracle Producer)' $TMPDIR/meta_qdf.qdf
+    ! grep -aq '/Title' $TMPDIR/meta_qdf.qdf"
+else
+  echo "  SKIP  metadata qpdf --qdf assertions (qpdf not found)"
+fi
+
+# metadata prints PDF dates human-readable (D:YYYYMMDDHHmmSS -> ISO-ish);
+# meta.pdf just got a fresh ModDate from the --set save above.
+run_test "metadata prints dates human-readable" bash -c "$TSPDF metadata $TMPDIR/meta.pdf | grep -qE '^Modified:[[:space:]]+[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\$'"
+
+# info --json
+if command -v python3 > /dev/null 2>&1; then
+  run_test "info --json is valid JSON with the expected fields" bash -c "
+    $TSPDF info $INPUT --json | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d[\"pages\"] == 3, d
+assert d[\"encrypted\"] is False and d[\"encryption\"] is None, d
+assert d[\"outlines\"] is False and d[\"acroform\"] is False, d
+assert d[\"version\"] == \"1.7\", d
+# uniform A4 pages collapse to a single [w, h] pair
+assert d[\"page_sizes\"] == [595.28, 841.89], d
+assert \"title\" in d and \"producer\" in d, d
+'"
+  run_test "info --json reports outlines/acroform" bash -c "
+    $TSPDF info tests/data/outline_form.pdf --json | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d[\"outlines\"] is True and d[\"acroform\"] is True, d
+'"
+  run_test "info --json formats dates and keeps the raw value" bash -c "
+    $TSPDF info $TMPDIR/meta.pdf --json | python3 -c '
+import json, re, sys
+d = json.load(sys.stdin)
+assert d[\"title\"] == \"Test Title\", d
+assert d[\"created_raw\"].startswith(\"D:\"), d
+assert re.fullmatch(r\"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\", d[\"modified\"]), d
+'"
+  # Real files often store BOM-less UTF-16BE or PDFDocEncoded /Author//Title,
+  # so a metadata getter can hand back RAW, non-UTF-8 bytes. The JSON writer
+  # must still emit a decodable UTF-8 string (invalid bytes -> U+FFFD) so
+  # json.load never raises UnicodeDecodeError.
+  TMPDIR="$TMPDIR" python3 - << 'PYEOF'
+import os
+# /Author = "Ünïcödé" in PDFDocEncoding: DC 6E EF 63 F6 64 E9 (lone 0xDC etc,
+# not valid UTF-8). /Title is plain ASCII and must survive intact.
+body = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n"
+offs = {}
+def emit(i, data):
+    global body
+    offs[i] = len(body); body += data
+emit(1, b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
+emit(2, b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")
+emit(3, b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n")
+emit(4, b"4 0 obj\n<< /Author (\xDC\x6E\xEF\x63\xF6\x64\xE9) /Title (Plain ASCII) >>\nendobj\n")
+xo = len(body)
+body += b"xref\n0 5\n0000000000 65535 f \n"
+for i in range(1, 5):
+    body += b"%010d 00000 n \n" % offs[i]
+body += b"trailer\n<< /Size 5 /Root 1 0 R /Info 4 0 R >>\nstartxref\n%d\n%%%%EOF\n" % xo
+open(os.path.join(os.environ["TMPDIR"], "rawmeta.pdf"), "wb").write(body)
+PYEOF
+  run_test "info --json emits decodable UTF-8 for non-UTF-8 metadata bytes" bash -c "
+    $TSPDF info $TMPDIR/rawmeta.pdf --json | python3 -c '
+import json, sys
+d = json.load(sys.stdin)            # must not raise UnicodeDecodeError
+assert d[\"title\"] == \"Plain ASCII\", d
+# every raw high byte was replaced with U+FFFD; ASCII 0x6E/0x63/0x64 survive
+assert d[\"author\"] == \"�n�c�d�\", repr(d[\"author\"])
+'"
+  # And valid non-ASCII UTF-8 metadata must pass through the JSON unchanged.
+  $TSPDF metadata $INPUT --set title='Prüfbericht café' -o $TMPDIR/utf8meta.pdf > /dev/null 2>&1
+  run_test "info --json preserves valid UTF-8 metadata unchanged" bash -c "
+    $TSPDF info $TMPDIR/utf8meta.pdf --json | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d[\"title\"] == \"Prüfbericht café\", repr(d[\"title\"])
+'"
+else
+  echo "  SKIP  info --json assertions (python3 not found)"
+fi
 
 # watermark
 run_test "watermark" $TSPDF watermark $INPUT -o $TMPDIR/watermark.pdf --text "DRAFT"
@@ -569,6 +750,22 @@ run_test "qrcode --title \"\" omits metadata title" bash -c '
   "'"$TSPDF"'" qrcode "https://example.com" -o "'"$TMPDIR"'/qr_deftitle.pdf" > /dev/null
   grep -qa "/Title (QR Code)" "'"$TMPDIR"'/qr_deftitle.pdf"
 '
+# --ec-level: all four levels accepted (upper or lower case), junk rejected.
+# A higher level spends more modules on error correction, so the same text
+# must yield a larger PDF page payload at H than at L.
+run_test "qrcode --ec-level L" $TSPDF qrcode "https://example.com" --ec-level L -o $TMPDIR/qr_l.pdf
+run_test "qrcode --ec-level M" $TSPDF qrcode "https://example.com" --ec-level M -o $TMPDIR/qr_m.pdf
+run_test "qrcode --ec-level Q" $TSPDF qrcode "https://example.com" --ec-level Q -o $TMPDIR/qr_q.pdf
+run_test "qrcode --ec-level H" $TSPDF qrcode "https://example.com" --ec-level H -o $TMPDIR/qr_h.pdf
+run_test "qrcode --ec-level lowercase h" $TSPDF qrcode "https://example.com" --ec-level h -o $TMPDIR/qr_h2.pdf
+run_test "qrcode --ec-level X rejected" bash -c "! $TSPDF qrcode 'https://example.com' --ec-level X -o $TMPDIR/qr_x.pdf > /dev/null 2>&1"
+run_test "qrcode H symbol denser than L" bash -c "
+  [ \$(stat -c%s $TMPDIR/qr_h.pdf) -gt \$(stat -c%s $TMPDIR/qr_l.pdf) ]"
+# level H shrinks capacity: 137 bytes is the v11 ceiling at H, 138 must fail
+run_test "qrcode --ec-level H capacity ceiling" bash -c "
+  set -e
+  $TSPDF qrcode \"\$(printf 'a%.0s' {1..137})\" --ec-level H -o $TMPDIR/qr_hmax.pdf > /dev/null
+  ! $TSPDF qrcode \"\$(printf 'a%.0s' {1..138})\" --ec-level H -o $TMPDIR/qr_hover.pdf > /dev/null 2>&1"
 
 # md2pdf
 cat > $TMPDIR/test.md << 'MDEOF'
@@ -751,6 +948,19 @@ assert found == need, (sorted(found), sorted(need))
 import json, sys
 j = json.load(sys.stdin)
 assert j['title'] == '<img src=x onerror=1>', j['title']
+\"
+  "
+  # metadata-view must also emit decodable UTF-8 when the getter returns RAW,
+  # non-UTF-8 bytes (BOM-less UTF-16BE / PDFDocEncoded). rawmeta.pdf (crafted
+  # in the info --json block) has a PDFDocEncoded /Author with lone high bytes.
+  run_serve_test "serve metadata-view emits decodable UTF-8 for non-UTF-8 bytes" bash -c "
+    [ -f \"$TMPDIR/rawmeta.pdf\" ] &&
+    curl -sf --retry 3 --retry-delay 1 --max-time 10 -F \"pdf_file=@$TMPDIR/rawmeta.pdf\" http://localhost:${SERVE_PORT}/api/metadata-view |
+    python3 -c \"
+import json, sys
+j = json.load(sys.stdin)
+assert j['title'] == 'Plain ASCII', j['title']
+assert j['author'] == '�n�c�d�', repr(j['author'])
 \"
   "
   # json_get_string must not let a   NUL truncate the text, nor emit an

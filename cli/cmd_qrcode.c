@@ -6,9 +6,12 @@
 
 int cmd_qrcode(int argc, char **argv) {
     if (argc == 0 || has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
-        printf("Usage: tspdf qrcode <text> -o <output.pdf> [--title <title>] [--subtitle <sub>] [--no-link]\n");
+        printf("Usage: tspdf qrcode <text> -o <output.pdf> [--title <title>] [--subtitle <sub>]\n");
+        printf("                    [--no-link] [--ec-level L|M|Q|H]\n");
         printf("\nGenerate a PDF with a QR code.\n");
-        printf("  --no-link    Hide the URL/text below the QR code\n");
+        printf("  --no-link     Hide the URL/text below the QR code\n");
+        printf("  --ec-level    Error correction level (default M): L ~7%% recovery,\n");
+        printf("                M ~15%%, Q ~25%%, H ~30%%. Higher levels fit less text.\n");
         return argc == 0 ? 1 : 0;
     }
 
@@ -39,7 +42,20 @@ int cmd_qrcode(int argc, char **argv) {
     const char *subtitle = find_flag(argc, argv, "--subtitle");
     bool show_link = !has_flag(argc, argv, "--no-link");
 
-    QrCode *qr = qr_encode(text);
+    QrEcLevel level = QR_EC_M;
+    const char *level_str = find_flag(argc, argv, "--ec-level");
+    if (level_str) {
+        if ((level_str[0] == 'L' || level_str[0] == 'l') && !level_str[1]) level = QR_EC_L;
+        else if ((level_str[0] == 'M' || level_str[0] == 'm') && !level_str[1]) level = QR_EC_M;
+        else if ((level_str[0] == 'Q' || level_str[0] == 'q') && !level_str[1]) level = QR_EC_Q;
+        else if ((level_str[0] == 'H' || level_str[0] == 'h') && !level_str[1]) level = QR_EC_H;
+        else {
+            fprintf(stderr, "tspdf qrcode: --ec-level must be L, M, Q, or H (got '%s')\n", level_str);
+            return 1;
+        }
+    }
+
+    QrCode *qr = qr_encode_level(text, level);
     if (!qr) {
         fprintf(stderr, "tspdf qrcode: failed to encode QR code (text too long?)\n");
         return 1;

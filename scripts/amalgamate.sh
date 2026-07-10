@@ -55,6 +55,7 @@ src/crypto/aes.h
 src/image/png_decoder.h
 src/qr/qr_encode.h
 src/util/pdftext.h
+src/util/pdfdate.h
 src/reader/tspr_internal.h
 src/reader/tspr_doctree.h
 src/reader/tspr_attach.h
@@ -66,6 +67,7 @@ SOURCES="
 src/util/buffer.c
 src/util/arena.c
 src/util/pdftext.c
+src/util/pdfdate.c
 src/pdf/pdf_writer.c
 src/pdf/pdf_stream.c
 src/pdf/pdf_base14.c

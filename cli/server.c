@@ -932,23 +932,69 @@ static bool json_buffer_append_byte(JsonBuffer *buf, char ch)
     return json_buffer_append_bytes(buf, &ch, 1u);
 }
 
+/* Length of the valid UTF-8 sequence starting at u (1..4), or 0 if u does not
+ * begin a well-formed sequence — including overlong forms, out-of-range code
+ * points, and truncated sequences (a continuation byte missing or out of the
+ * 0x80..0xBF range). Metadata getters can return RAW bytes (BOM-less UTF-16BE
+ * or PDFDocEncoded /Title//Author), so the input is not guaranteed UTF-8. */
+static int json_utf8_seq_len(const unsigned char *u)
+{
+    unsigned char c = u[0];
+    if (c < 0x80u) return 1;
+    if (c < 0xC2u) return 0;                 /* stray cont / overlong 0xC0-0xC1 */
+    if (c < 0xE0u) {                         /* 2-byte */
+        if ((u[1] & 0xC0u) != 0x80u) return 0;
+        return 2;
+    }
+    if (c < 0xF0u) {                         /* 3-byte */
+        if ((u[1] & 0xC0u) != 0x80u || (u[2] & 0xC0u) != 0x80u) return 0;
+        if (c == 0xE0u && u[1] < 0xA0u) return 0;                 /* overlong */
+        if (c == 0xEDu && u[1] >= 0xA0u) return 0;                /* surrogate */
+        return 3;
+    }
+    if (c < 0xF5u) {                         /* 4-byte */
+        if ((u[1] & 0xC0u) != 0x80u || (u[2] & 0xC0u) != 0x80u ||
+            (u[3] & 0xC0u) != 0x80u) return 0;
+        if (c == 0xF0u && u[1] < 0x90u) return 0;                 /* overlong */
+        if (c == 0xF4u && u[1] >= 0x90u) return 0;                /* > U+10FFFF */
+        return 4;
+    }
+    return 0;                                /* 0xF5..0xFF */
+}
+
+/* JSON string emission (same escaping rules as the CLI's writer in
+ * cmd_info.c — keep them in sync): control bytes as \u00XX, quote and
+ * backslash escaped, valid UTF-8 passed through verbatim, and any byte that
+ * does not form well-formed UTF-8 replaced with U+FFFD so the output is always
+ * a decodable UTF-8 JSON string. */
 static bool json_buffer_append_str_json(JsonBuffer *buf, const char *s)
 {
     if (!s) s = "";
     if (!json_buffer_append_byte(buf, '"'))
         return false;
-    for (const unsigned char *u = (const unsigned char *)s; *u; u++) {
+    for (const unsigned char *u = (const unsigned char *)s; *u; ) {
         if (*u < 0x20u) {
             char esc[7];
             int nw = snprintf(esc, sizeof(esc), "\\u%04x", (unsigned)*u);
             if (nw != 6 || !json_buffer_append_bytes(buf, esc, (size_t)nw))
                 return false;
+            u++;
         } else if (*u == '"' || *u == '\\') {
             char esc[2] = {'\\', (char)*u};
             if (!json_buffer_append_bytes(buf, esc, sizeof(esc)))
                 return false;
-        } else if (!json_buffer_append_byte(buf, (char)*u)) {
-            return false;
+            u++;
+        } else {
+            int n = json_utf8_seq_len(u);
+            if (n == 0) {
+                if (!json_buffer_append_bytes(buf, "\xEF\xBF\xBD", 3u))
+                    return false;            /* U+FFFD REPLACEMENT CHARACTER */
+                u++;
+            } else {
+                if (!json_buffer_append_bytes(buf, u, (size_t)n))
+                    return false;
+                u += n;
+            }
         }
     }
     return json_buffer_append_byte(buf, '"');

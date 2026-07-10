@@ -768,9 +768,9 @@ static TspdfReader *create_doc_from_pages(TspdfReader *src, const size_t *page_i
 // Catalog entries dropped when extracting pages into a new document. These
 // document-level trees (structure tree, outlines, destination/name trees,
 // page labels, form fields) reference the source's full page set and would
-// keep the entire object graph reachable in the extracted file. Outlines and
-// AcroForm are re-attached afterwards, pruned to the kept pages, by
-// tspdf_doctree_extract_attach; the rest stays dropped.
+// keep the entire object graph reachable in the extracted file. Outlines,
+// AcroForm, and PageLabels are re-attached afterwards, remapped to the kept
+// pages, by tspdf_doctree_extract_attach; the rest stays dropped.
 static bool extract_drops_catalog_key(const char *key) {
     static const char *const dropped[] = {
         "StructTreeRoot", "Outlines", "Dests", "Names", "PageLabels",

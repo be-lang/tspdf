@@ -679,6 +679,209 @@ static TspdfError dt_merge_dr(TspdfObj *dr, TspdfObj *other, TspdfArena *arena) 
     return TSPDF_OK;
 }
 
+// --- page label preservation ---
+
+// The effective label of one output page: display style (/S), prefix
+// string (/P, resolved in the source document), and the numeric value the
+// page has within its source range.
+typedef struct {
+    char style;        // 'D', 'R', 'r', 'A', 'a', or 0 = none
+    TspdfObj *prefix;  // resolved /P string object, or NULL
+    int64_t value;     // numeric portion for this page (>= 1)
+} DtPageLabel;
+
+typedef struct {
+    int64_t key;
+    TspdfObj *label;
+} DtNumEntry;
+
+typedef struct {
+    DtNumEntry *items;
+    size_t count;
+    size_t cap;
+    bool oom;
+} DtNumEntryList;
+
+static void dt_numentry_push(DtNumEntryList *l, int64_t key, TspdfObj *label) {
+    if (l->oom) return;
+    if (l->count >= l->cap) {
+        size_t cap = l->cap == 0 ? 8 : l->cap * 2;
+        DtNumEntry *grown = (DtNumEntry *)realloc(l->items, cap * sizeof(DtNumEntry));
+        if (!grown) {
+            l->oom = true;
+            return;
+        }
+        l->items = grown;
+        l->cap = cap;
+    }
+    l->items[l->count].key = key;
+    l->items[l->count].label = label;
+    l->count++;
+}
+
+// Collect the (page index, label dict) pairs of a /PageLabels number tree.
+// `budget` caps the total nodes visited (same cycle guard as the name-tree
+// walker: a legitimate tree visits each object at most once, so /Kids full
+// of self-references run out of budget instead of fanning out).
+static void dt_numtree_collect(TspdfReader *doc, TspdfParser *parser,
+                               TspdfObj *node, int depth, size_t *budget,
+                               DtNumEntryList *out) {
+    if (!node || node->type != TSPDF_OBJ_DICT || depth > 32) return;
+    if (*budget == 0) return;
+    (*budget)--;
+    TspdfObj *nums = dt_resolve(doc, parser, tspdf_dict_get(node, "Nums"));
+    if (nums && nums->type == TSPDF_OBJ_ARRAY) {
+        for (size_t i = 0; i + 1 < nums->array.count; i += 2) {
+            TspdfObj *key = &nums->array.items[i];
+            if (key->type != TSPDF_OBJ_INT || key->integer < 0) continue;
+            TspdfObj *label = dt_resolve(doc, parser, &nums->array.items[i + 1]);
+            if (label && label->type == TSPDF_OBJ_DICT) {
+                dt_numentry_push(out, key->integer, label);
+            }
+        }
+    }
+    TspdfObj *kids = dt_resolve(doc, parser, tspdf_dict_get(node, "Kids"));
+    if (kids && kids->type == TSPDF_OBJ_ARRAY) {
+        for (size_t i = 0; i < kids->array.count; i++) {
+            TspdfObj *kid = dt_resolve(doc, parser, &kids->array.items[i]);
+            dt_numtree_collect(doc, parser, kid, depth + 1, budget, out);
+        }
+    }
+}
+
+static int dt_numentry_cmp(const void *a, const void *b) {
+    int64_t ka = ((const DtNumEntry *)a)->key;
+    int64_t kb = ((const DtNumEntry *)b)->key;
+    return ka < kb ? -1 : (ka > kb ? 1 : 0);
+}
+
+// Collect and sort the page-label ranges of `catalog`'s /PageLabels tree.
+// An absent or empty tree leaves `out` empty (success). Returns false only
+// on allocation failure.
+static bool dt_collect_page_labels(TspdfReader *src, TspdfParser *parser,
+                                   TspdfObj *catalog, DtNumEntryList *out) {
+    TspdfObj *root = dt_resolve(src, parser, tspdf_dict_get(catalog, "PageLabels"));
+    if (!root || root->type != TSPDF_OBJ_DICT) return true;
+    size_t budget = src->xref.count + src->new_objs.count + 16;
+    dt_numtree_collect(src, parser, root, 0, &budget, out);
+    if (out->oom) return false;
+    if (out->count > 1) {
+        qsort(out->items, out->count, sizeof(DtNumEntry), dt_numentry_cmp);
+    }
+    return true;
+}
+
+// Effective label of source page `idx` (0-based) under the sorted ranges.
+// A malformed tree that does not cover the page (the spec mandates a key 0)
+// falls back to plain decimal numbering, matching viewer behavior for
+// unlabeled documents.
+static DtPageLabel dt_label_for_page(const DtNumEntryList *l, TspdfReader *doc,
+                                     TspdfParser *parser, int64_t idx) {
+    DtPageLabel out = {'D', NULL, idx + 1};
+    const DtNumEntry *hit = NULL;
+    for (size_t i = 0; i < l->count && l->items[i].key <= idx; i++) {
+        hit = &l->items[i];
+    }
+    if (!hit) return out;
+
+    out.style = 0;
+    TspdfObj *s = dt_resolve(doc, parser, tspdf_dict_get(hit->label, "S"));
+    if (s && s->type == TSPDF_OBJ_NAME && s->string.len == 1) {
+        char c = (char)s->string.data[0];
+        if (c == 'D' || c == 'R' || c == 'r' || c == 'A' || c == 'a') {
+            out.style = c;
+        }
+    }
+    TspdfObj *p = dt_resolve(doc, parser, tspdf_dict_get(hit->label, "P"));
+    if (p && p->type == TSPDF_OBJ_STRING) out.prefix = p;
+    int64_t st = 1;
+    TspdfObj *stv = dt_resolve(doc, parser, tspdf_dict_get(hit->label, "St"));
+    if (stv && stv->type == TSPDF_OBJ_INT && stv->integer >= 1) st = stv->integer;
+    out.value = st + (idx - hit->key);
+    return out;
+}
+
+static bool dt_prefix_eq(const TspdfObj *a, const TspdfObj *b) {
+    if (!a && !b) return true;
+    if (!a || !b) return false;
+    return a->string.len == b->string.len &&
+           (a->string.len == 0 ||
+            memcmp(a->string.data, b->string.data, a->string.len) == 0);
+}
+
+// A new number-tree range starts wherever the label run breaks: different
+// style or prefix, or a numeric value that does not continue the previous
+// page's value.
+static bool dt_label_starts_range(const DtPageLabel *labels, size_t i) {
+    if (i == 0) return true;
+    return labels[i].style != labels[i - 1].style ||
+           !dt_prefix_eq(labels[i].prefix, labels[i - 1].prefix) ||
+           labels[i].value != labels[i - 1].value + 1;
+}
+
+// Build a /PageLabels number tree with one range per label-run change and
+// point `catalog` at it. `labels[i]` is the label of output page i; prefix
+// strings are deep-copied into the destination arena.
+static TspdfError dt_attach_page_labels(TspdfReader *doc, TspdfArena *arena,
+                                        const DtPageLabel *labels, size_t count,
+                                        TspdfObj *catalog) {
+    if (count == 0) return TSPDF_OK;
+
+    size_t ranges = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (dt_label_starts_range(labels, i)) ranges++;
+    }
+
+    TspdfObj *nums = dt_obj_new(arena, TSPDF_OBJ_ARRAY);
+    if (!nums) return TSPDF_ERR_ALLOC;
+    nums->array.items = (TspdfObj *)tspdf_arena_alloc(arena,
+        sizeof(TspdfObj) * ranges * 2);
+    if (!nums->array.items) return TSPDF_ERR_ALLOC;
+    nums->array.count = 0;
+
+    for (size_t i = 0; i < count; i++) {
+        if (!dt_label_starts_range(labels, i)) continue;
+        TspdfObj *ldict = dt_obj_new(arena, TSPDF_OBJ_DICT);
+        if (!ldict) return TSPDF_ERR_ALLOC;
+        if (labels[i].style != 0) {
+            char sname[2] = {labels[i].style, '\0'};
+            TspdfObj *s = dt_obj_name(arena, sname);
+            if (!s || dt_dict_put(ldict, "S", s, arena) != TSPDF_OK) {
+                return TSPDF_ERR_ALLOC;
+            }
+        }
+        if (labels[i].prefix) {
+            TspdfObj *p = tspdf_obj_deep_copy(labels[i].prefix, arena);
+            if (!p || dt_dict_put(ldict, "P", p, arena) != TSPDF_OK) {
+                return TSPDF_ERR_ALLOC;
+            }
+        }
+        if (labels[i].value != 1) {
+            TspdfObj *st = dt_obj_int(arena, labels[i].value);
+            if (!st || dt_dict_put(ldict, "St", st, arena) != TSPDF_OK) {
+                return TSPDF_ERR_ALLOC;
+            }
+        }
+        TspdfObj *key = &nums->array.items[nums->array.count];
+        memset(key, 0, sizeof(TspdfObj));
+        key->type = TSPDF_OBJ_INT;
+        key->integer = (int64_t)i;
+        nums->array.items[nums->array.count + 1] = *ldict;
+        nums->array.count += 2;
+    }
+
+    TspdfObj *root = dt_obj_new(arena, TSPDF_OBJ_DICT);
+    if (!root) return TSPDF_ERR_ALLOC;
+    TspdfError err = dt_dict_put(root, "Nums", nums, arena);
+    if (err != TSPDF_OK) return err;
+
+    uint32_t root_num = tspdf_register_new_obj(doc, root);
+    if (root_num == 0) return TSPDF_ERR_ALLOC;
+    TspdfObj *rref = dt_obj_ref(arena, root_num);
+    if (!rref) return TSPDF_ERR_ALLOC;
+    return dt_dict_put(catalog, "PageLabels", rref, arena);
+}
+
 // --- merge entry points ---
 
 // Resolve the outline items of one level into the source cache; dest arrays
@@ -874,7 +1077,50 @@ TspdfError tspdf_doctree_merge_attach(TspdfReader *merged, TspdfReader **docs,
         }
     }
 
-    if (err == TSPDF_OK && (top.count > 0 || acro_fields.count > 0)) {
+    // Page labels: preserved when at least one source has them. Sources
+    // without labels contribute explicit decimal-from-1 ranges (the spec
+    // default for unlabeled documents), so their numbering is unchanged in
+    // the merged file.
+    DtPageLabel *labels = NULL;
+    size_t label_count = 0;
+    bool any_labels = false;
+    if (err == TSPDF_OK && merged->pages.count > 0) {
+        labels = (DtPageLabel *)malloc(sizeof(DtPageLabel) * merged->pages.count);
+        if (!labels) err = TSPDF_ERR_ALLOC;
+        size_t out_idx = 0;
+        for (size_t d = 0; d < count && err == TSPDF_OK; d++) {
+            TspdfReader *src = docs[d];
+            TspdfParser src_parser;
+            tspdf_parser_init(&src_parser, src->data, src->data_len, &src->arena);
+            TspdfObj *src_catalog = dt_source_catalog(src, &src_parser);
+            DtNumEntryList entries = {0};
+            if (src_catalog &&
+                !dt_collect_page_labels(src, &src_parser, src_catalog, &entries)) {
+                err = TSPDF_ERR_ALLOC;
+            }
+            if (err == TSPDF_OK) {
+                if (entries.count > 0) any_labels = true;
+                for (size_t i = 0; i < src->pages.count &&
+                                   out_idx < merged->pages.count; i++) {
+                    if (entries.count > 0) {
+                        labels[out_idx] = dt_label_for_page(&entries, src,
+                                                            &src_parser,
+                                                            (int64_t)i);
+                    } else {
+                        labels[out_idx].style = 'D';
+                        labels[out_idx].prefix = NULL;
+                        labels[out_idx].value = (int64_t)i + 1;
+                    }
+                    out_idx++;
+                }
+            }
+            free(entries.items);
+        }
+        label_count = out_idx;
+    }
+
+    if (err == TSPDF_OK &&
+        (top.count > 0 || acro_fields.count > 0 || any_labels)) {
         merged->catalog = dt_obj_new(&merged->arena, TSPDF_OBJ_DICT);
         if (!merged->catalog) err = TSPDF_ERR_ALLOC;
         if (err == TSPDF_OK) {
@@ -885,8 +1131,13 @@ TspdfError tspdf_doctree_merge_attach(TspdfReader *merged, TspdfReader **docs,
             err = dt_attach_acroform(merged, &merged->arena, &acro_fields, dr, da,
                                      need_appearances, merged->catalog);
         }
+        if (err == TSPDF_OK && any_labels) {
+            err = dt_attach_page_labels(merged, &merged->arena, labels,
+                                        label_count, merged->catalog);
+        }
     }
 
+    free(labels);
     free(top.nums);
     free(acro_fields.nums);
     free(page_kept);
@@ -995,6 +1246,40 @@ TspdfError tspdf_doctree_extract_attach(TspdfReader *src, TspdfReader *dst) {
                 }
             }
         }
+    }
+
+    // Page labels: each kept page carries its effective source label; a
+    // fresh number tree is rebuilt over the new page indices.
+    if (err == TSPDF_OK && dst->pages.count > 0) {
+        DtNumEntryList entries = {0};
+        if (!dt_collect_page_labels(src, &src_parser, src_catalog, &entries)) {
+            err = TSPDF_ERR_ALLOC;
+        } else if (entries.count > 0) {
+            DtPageLabel *labels = (DtPageLabel *)malloc(
+                sizeof(DtPageLabel) * dst->pages.count);
+            if (!labels) {
+                err = TSPDF_ERR_ALLOC;
+            } else {
+                for (size_t i = 0; i < dst->pages.count; i++) {
+                    // Extract keeps source object numbers, so the kept
+                    // page's index in the source is found by object number.
+                    int64_t src_idx = (int64_t)i;
+                    for (size_t j = 0; j < src->pages.count; j++) {
+                        if (src->pages.pages[j].obj_num ==
+                            dst->pages.pages[i].obj_num) {
+                            src_idx = (int64_t)j;
+                            break;
+                        }
+                    }
+                    labels[i] = dt_label_for_page(&entries, src, &src_parser,
+                                                  src_idx);
+                }
+                err = dt_attach_page_labels(dst, &dst->arena, labels,
+                                            dst->pages.count, dst->catalog);
+                free(labels);
+            }
+        }
+        free(entries.items);
     }
 
     free(page_kept);
