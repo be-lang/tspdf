@@ -9291,6 +9291,105 @@ TEST(test_form_fill_readonly_requires_force) {
     tspdf_reader_destroy(doc);
 }
 
+// --- flatten ---
+
+TEST(test_form_flatten_fixture) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/form_fields.pdf", &err);
+    ASSERT(doc != NULL);
+
+    err = tspdf_reader_form_fill(doc, "name", "Grace", false);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    err = tspdf_reader_form_flatten(doc);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    // The form is gone: no catalog /AcroForm, no widget annotations.
+    ASSERT(!bytes_contains(out, out_len, "/AcroForm"));
+    ASSERT(!bytes_contains(out, out_len, "/Widget"));
+    // The checked radio ("Red") appearance stream was stamped into the page
+    // content as a form XObject.
+    ASSERT(bytes_contains(out, out_len, "/TspdfFx0 Do"));
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    ASSERT(!tspdf_reader_has_acroform(re));
+
+    TspdfFormFieldInfo *fields = NULL;
+    size_t count = 123;
+    err = tspdf_reader_form_fields(re, &fields, &count);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_SIZE(count, 0);
+
+    // All fixture annotations were widgets, so the page has none left.
+    TspdfObj *annots = dt_get(re, re->pages.pages[0].page_dict, "Annots");
+    ASSERT(annots == NULL || annots->array.count == 0);
+
+    // The stamped values extract as page text.
+    const char *text = tspdf_reader_page_text(re, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT(strstr(text, "Grace") != NULL);
+    ASSERT(strstr(text, "Berlin") != NULL);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(doc);
+}
+
+TEST(test_form_flatten_no_form_noop) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/three_pages.pdf", &err);
+    ASSERT(doc != NULL);
+    err = tspdf_reader_form_flatten(doc);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *out = NULL;
+    TspdfReader *re = form_reopen(doc, &out);
+    ASSERT(re != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(re), 3);
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(doc);
+}
+
+// tspdf's own writer emits checkboxes without /AP appearance streams; the
+// flattener falls back to drawing a check mark directly.
+TEST(test_form_flatten_writer_checkbox_fallback) {
+    size_t len = 0;
+    uint8_t *pdf = dt_writer_pdf(1, false, true, "W2", "Helvetica", &len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open(pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    err = tspdf_reader_form_flatten(doc);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(!bytes_contains(out, out_len, "/AcroForm"));
+    ASSERT(!bytes_contains(out, out_len, "/Widget"));
+    // Vector check-mark fallback for the checked box (distinctive line width).
+    ASSERT(bytes_contains(out, out_len, "1.5 w"));
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    const char *text = tspdf_reader_page_text(re, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT(strstr(text, "hello") != NULL);  // flattened text field value
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
 int main(void) {
     printf("tspr reader tests:\n");
 
@@ -9571,6 +9670,9 @@ int main(void) {
     RUN(test_form_fill_choice);
     RUN(test_form_fill_unknown_name_errors);
     RUN(test_form_fill_readonly_requires_force);
+    RUN(test_form_flatten_fixture);
+    RUN(test_form_flatten_no_form_noop);
+    RUN(test_form_flatten_writer_checkbox_fallback);
 
 
     printf("\n%d tests, %d passed, %d failed\n",

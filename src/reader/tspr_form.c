@@ -6,6 +6,7 @@
 // count^depth visits under a depth cap alone.
 
 #include "tspr_internal.h"
+#include "tspr_overlay.h"
 #include "../util/pdftext.h"
 #include <stdlib.h>
 #include <string.h>
@@ -971,7 +972,325 @@ TspdfError tspdf_reader_form_fill(TspdfReader *doc, const char *name,
     return err;
 }
 
+// --- flatten ---
+
+// Append the value text of a widget to the page content buffer, clipped to
+// the widget rect. Uses the shared flattening font (see form_flatten_font).
+static void form_flatten_draw_text(FormCtx *ctx, TspdfBuffer *content,
+                                   TspdfObj *widget, const char *utf8,
+                                   double x0, double y0, double w, double h,
+                                   bool *used_font) {
+    char da_font[64];
+    double size = 0;
+    TspdfObj *da = form_resolve(ctx->doc, &ctx->parser,
+                                tspdf_dict_get(widget, "DA"));
+    if (!da || da->type != TSPDF_OBJ_STRING) {
+        da = form_resolve(ctx->doc, &ctx->parser,
+                          tspdf_dict_get(ctx->acroform, "DA"));
+    }
+    form_parse_da(da, da_font, sizeof(da_font), &size);
+    if (size <= 0) {
+        size = h * 0.62;
+        if (size > 12) size = 12;
+        if (size < 4) size = 4;
+    }
+
+    size_t vlen = strlen(utf8);
+    char *line = (char *)malloc(vlen + 1);
+    if (!line) return;
+    memcpy(line, utf8, vlen + 1);
+    for (size_t i = 0; i < vlen; i++) {
+        if (line[i] == '\n' || line[i] == '\r') line[i] = ' ';
+    }
+    tspdf_utf8_to_cp1252_lossy(line, line, NULL);
+
+    double baseline = y0 + (h - size * 0.7) / 2.0;
+    if (baseline < y0 + 1) baseline = y0 + 1;
+    tspdf_buffer_printf(content,
+                        "q\n%.2f %.2f %.2f %.2f re W n\nBT\n/TspdfFf %.2f Tf\n"
+                        "0 g\n%.2f %.2f Td\n(",
+                        x0, y0, w, h, size, x0 + 2, baseline);
+    for (const char *p = line; *p; p++) {
+        if (*p == '(' || *p == ')' || *p == '\\') {
+            tspdf_buffer_append_byte(content, '\\');
+        }
+        tspdf_buffer_append_byte(content, (uint8_t)*p);
+    }
+    tspdf_buffer_append_str(content, ") Tj\nET\nQ\n");
+    *used_font = true;
+    free(line);
+}
+
+// The on-state of a button widget, or NULL when it is off: /AS wins, then
+// the field /V when this widget's /AP /N carries that state.
+static const char *form_widget_on_state(FormCtx *ctx, const FormTerminal *term,
+                                        TspdfObj *widget) {
+    TspdfObj *as = form_resolve(ctx->doc, &ctx->parser,
+                                tspdf_dict_get(widget, "AS"));
+    if (as && as->type == TSPDF_OBJ_NAME) {
+        if (form_name_is(as, "Off")) return NULL;
+        return form_decode_text(ctx->a, as);
+    }
+    if (term->v && term->v->type == TSPDF_OBJ_NAME &&
+        !form_name_is(term->v, "Off")) {
+        return form_decode_text(ctx->a, term->v);
+    }
+    if (term->v && term->v->type == TSPDF_OBJ_STRING && term->v->string.len > 0 &&
+        !(term->v->string.len == 3 &&
+          memcmp(term->v->string.data, "Off", 3) == 0)) {
+        // tspdf's own writer stores checkbox /V as a string.
+        return form_decode_text(ctx->a, term->v);
+    }
+    return NULL;
+}
+
+// The /AP /N appearance stream for `state` when it is trivially reusable:
+// an indirect reference to a stream with a 4-number /BBox and no /Matrix.
+// Returns the object number (for /XObject resources) or 0.
+static uint32_t form_widget_ap_stream(FormCtx *ctx, TspdfObj *widget,
+                                      const char *state, double bbox[4]) {
+    TspdfObj *ap = form_resolve(ctx->doc, &ctx->parser,
+                                tspdf_dict_get(widget, "AP"));
+    if (!ap || ap->type != TSPDF_OBJ_DICT) return 0;
+    TspdfObj *n_val = tspdf_dict_get(ap, "N");
+    TspdfObj *n = form_resolve(ctx->doc, &ctx->parser, n_val);
+    TspdfObj *stream_val = NULL;
+    if (n && n->type == TSPDF_OBJ_DICT) {
+        stream_val = tspdf_dict_get(n, state);
+    } else if (n && n->type == TSPDF_OBJ_STREAM) {
+        stream_val = n_val;  // direct stream (no per-state dict)
+    }
+    if (!stream_val || stream_val->type != TSPDF_OBJ_REF) return 0;
+    TspdfObj *stream = form_resolve(ctx->doc, &ctx->parser, stream_val);
+    if (!stream || stream->type != TSPDF_OBJ_STREAM || !stream->stream.dict) {
+        return 0;
+    }
+    // Only an absent or identity /Matrix is trivially reusable.
+    TspdfObj *mtx = form_resolve(ctx->doc, &ctx->parser,
+                                 tspdf_dict_get(stream->stream.dict, "Matrix"));
+    if (mtx) {
+        if (mtx->type != TSPDF_OBJ_ARRAY || mtx->array.count != 6) return 0;
+        static const double identity[6] = {1, 0, 0, 1, 0, 0};
+        for (size_t i = 0; i < 6; i++) {
+            double m = form_number(form_resolve(ctx->doc, &ctx->parser,
+                                                &mtx->array.items[i]), 0);
+            if (m != identity[i]) return 0;
+        }
+    }
+    TspdfObj *bb = form_resolve(ctx->doc, &ctx->parser,
+                                tspdf_dict_get(stream->stream.dict, "BBox"));
+    if (!bb || bb->type != TSPDF_OBJ_ARRAY || bb->array.count != 4) return 0;
+    for (size_t i = 0; i < 4; i++) {
+        bbox[i] = form_number(form_resolve(ctx->doc, &ctx->parser,
+                                           &bb->array.items[i]), 0);
+    }
+    if (!(bbox[2] - bbox[0] > 0) || !(bbox[3] - bbox[1] > 0)) return 0;
+    return stream_val->ref.num;
+}
+
+// Vector check mark inside the rect (fallback when no /AP stream applies).
+static void form_flatten_draw_check(TspdfBuffer *content, double x0, double y0,
+                                    double w, double h) {
+    tspdf_buffer_printf(content,
+                        "q\n0 g 1.5 w\n%.2f %.2f m\n%.2f %.2f l\n%.2f %.2f l\nS\nQ\n",
+                        x0 + 0.20 * w, y0 + 0.55 * h,
+                        x0 + 0.42 * w, y0 + 0.25 * h,
+                        x0 + 0.80 * w, y0 + 0.75 * h);
+}
+
 TspdfError tspdf_reader_form_flatten(TspdfReader *doc) {
-    (void)doc;
-    return TSPDF_ERR_UNSUPPORTED;
+    if (!doc) return TSPDF_ERR_INVALID_ARG;
+
+    FormCtx ctx;
+    TspdfError err = form_collect_terminals(doc, &ctx);
+    if (err != TSPDF_OK) return err;
+
+    TspdfObj *catalog = form_catalog(doc, &ctx.parser);
+    if (!ctx.acroform || !catalog) {
+        form_terminals_free(&ctx);
+        return TSPDF_OK;
+    }
+
+    size_t map_size = 0;
+    size_t *annot_map = form_build_annot_page_map(doc, &ctx.parser, &map_size);
+    TspdfArena *a = &doc->arena;
+    uint32_t font_num = 0;  // shared flattening font, registered on first use
+
+    // Stamp values page by page.
+    for (size_t p = 0; p < doc->pages.count && err == TSPDF_OK; p++) {
+        TspdfBuffer content = tspdf_buffer_create(256);
+        TspdfObj *xobjects = NULL;  // /XObject additions for this page
+        bool used_font = false;
+        size_t xobj_counter = 0;
+
+        for (size_t i = 0; i < ctx.count && err == TSPDF_OK; i++) {
+            FormTerminal *term = &ctx.items[i];
+            for (size_t wi = 0; wi < term->widget_count && err == TSPDF_OK; wi++) {
+                TspdfObj *widget = term->widgets[wi];
+                if (form_widget_page(doc, &ctx.parser, widget,
+                                     term->widget_nums[wi], annot_map,
+                                     map_size) != p) {
+                    continue;
+                }
+                TspdfObj *rect = form_resolve(doc, &ctx.parser,
+                                              tspdf_dict_get(widget, "Rect"));
+                if (!rect || rect->type != TSPDF_OBJ_ARRAY ||
+                    rect->array.count != 4) {
+                    continue;
+                }
+                double rx0 = form_number(form_resolve(doc, &ctx.parser, &rect->array.items[0]), 0);
+                double ry0 = form_number(form_resolve(doc, &ctx.parser, &rect->array.items[1]), 0);
+                double rx1 = form_number(form_resolve(doc, &ctx.parser, &rect->array.items[2]), 0);
+                double ry1 = form_number(form_resolve(doc, &ctx.parser, &rect->array.items[3]), 0);
+                double x0 = rx0 < rx1 ? rx0 : rx1;
+                double y0 = ry0 < ry1 ? ry0 : ry1;
+                double w = rx0 < rx1 ? rx1 - rx0 : rx0 - rx1;
+                double h = ry0 < ry1 ? ry1 - ry0 : ry0 - ry1;
+                if (w <= 0 || h <= 0) continue;
+
+                if (term->type == TSPDF_FIELD_TEXT ||
+                    term->type == TSPDF_FIELD_CHOICE) {
+                    if (!term->v || (term->v->type != TSPDF_OBJ_STRING &&
+                                     term->v->type != TSPDF_OBJ_NAME)) {
+                        continue;
+                    }
+                    const char *utf8 = form_decode_text(a, term->v);
+                    if (!utf8) {
+                        err = TSPDF_ERR_ALLOC;
+                        break;
+                    }
+                    if (utf8[0] == '\0') continue;
+                    form_flatten_draw_text(&ctx, &content, widget, utf8,
+                                           x0, y0, w, h, &used_font);
+                } else if (term->type == TSPDF_FIELD_CHECKBOX ||
+                           term->type == TSPDF_FIELD_RADIO) {
+                    const char *state = form_widget_on_state(&ctx, term, widget);
+                    if (!state) continue;
+                    double bbox[4] = {0};
+                    uint32_t ap_num = form_widget_ap_stream(&ctx, widget,
+                                                            state, bbox);
+                    if (ap_num > 0) {
+                        char xname[32];
+                        snprintf(xname, sizeof(xname), "TspdfFx%zu",
+                                 xobj_counter++);
+                        if (!xobjects) xobjects = form_obj_new(a, TSPDF_OBJ_DICT);
+                        TspdfObj *ref = form_make_ref(a, ap_num);
+                        if (!xobjects || !ref) {
+                            err = TSPDF_ERR_ALLOC;
+                            break;
+                        }
+                        err = form_dict_put(xobjects, xname, ref, a);
+                        if (err != TSPDF_OK) break;
+                        double bw = bbox[2] - bbox[0];
+                        double bh = bbox[3] - bbox[1];
+                        double sx = w / bw;
+                        double sy = h / bh;
+                        tspdf_buffer_printf(&content,
+                                            "q\n%.4f 0 0 %.4f %.2f %.2f cm\n/%s Do\nQ\n",
+                                            sx, sy, x0 - bbox[0] * sx,
+                                            y0 - bbox[1] * sy, xname);
+                    } else {
+                        form_flatten_draw_check(&content, x0, y0, w, h);
+                    }
+                }
+            }
+        }
+
+        if (err == TSPDF_OK && content.len > 0) {
+            // Build the resource additions and merge them into the page,
+            // rewriting our operator names on collision.
+            TspdfObj *new_res = form_obj_new(a, TSPDF_OBJ_DICT);
+            if (!new_res) err = TSPDF_ERR_ALLOC;
+            if (err == TSPDF_OK && used_font) {
+                if (font_num == 0) {
+                    TspdfObj *font = form_appearance_font(&ctx, "TspdfFf");
+                    if (font) font_num = tspdf_register_new_obj(doc, font);
+                    if (font_num == 0) err = TSPDF_ERR_ALLOC;
+                }
+                if (err == TSPDF_OK) {
+                    TspdfObj *fonts = form_obj_new(a, TSPDF_OBJ_DICT);
+                    TspdfObj *fref = form_make_ref(a, font_num);
+                    if (!fonts || !fref) err = TSPDF_ERR_ALLOC;
+                    if (err == TSPDF_OK) err = form_dict_put(fonts, "TspdfFf", fref, a);
+                    if (err == TSPDF_OK) err = form_dict_put(new_res, "Font", fonts, a);
+                }
+            }
+            if (err == TSPDF_OK && xobjects) {
+                err = form_dict_put(new_res, "XObject", xobjects, a);
+            }
+
+            TspdfRenameMap renames = {0};
+            if (err == TSPDF_OK && new_res->dict.count > 0) {
+                err = tspdf_resources_merge(doc->pages.pages[p].page_dict,
+                                            new_res, a, &renames);
+            }
+            const uint8_t *final_content = content.data;
+            size_t final_len = content.len;
+            if (err == TSPDF_OK && renames.count > 0) {
+                size_t rewritten_len = 0;
+                uint8_t *rewritten = tspdf_content_rewrite(content.data,
+                    content.len, &renames, &rewritten_len, a);
+                if (rewritten) {
+                    final_content = rewritten;
+                    final_len = rewritten_len;
+                }
+            }
+            if (err == TSPDF_OK) {
+                TspdfStream *stream = tspdf_page_begin_content(doc, p);
+                if (!stream) {
+                    err = TSPDF_ERR_ALLOC;
+                } else {
+                    tspdf_buffer_append(&stream->buf, final_content, final_len);
+                    err = tspdf_page_end_content(doc, p, stream, NULL);
+                }
+            }
+        }
+        tspdf_buffer_destroy(&content);
+    }
+
+    // Remove widget annotations from every page, then drop the form itself.
+    for (size_t p = 0; p < doc->pages.count && err == TSPDF_OK; p++) {
+        TspdfObj *page_dict = doc->pages.pages[p].page_dict;
+        TspdfObj *annots = form_resolve(doc, &ctx.parser,
+                                        tspdf_dict_get(page_dict, "Annots"));
+        if (!annots || annots->type != TSPDF_OBJ_ARRAY || annots->array.count == 0) {
+            continue;
+        }
+        TspdfObj *kept = form_obj_new(a, TSPDF_OBJ_ARRAY);
+        if (!kept) {
+            err = TSPDF_ERR_ALLOC;
+            break;
+        }
+        kept->array.items = (TspdfObj *)tspdf_arena_alloc_zero(a,
+            annots->array.count * sizeof(TspdfObj));
+        if (!kept->array.items) {
+            err = TSPDF_ERR_ALLOC;
+            break;
+        }
+        for (size_t i = 0; i < annots->array.count; i++) {
+            TspdfObj *annot = form_resolve(doc, &ctx.parser,
+                                           &annots->array.items[i]);
+            if (annot && annot->type == TSPDF_OBJ_DICT &&
+                form_name_is(form_resolve(doc, &ctx.parser,
+                                          tspdf_dict_get(annot, "Subtype")),
+                             "Widget")) {
+                continue;
+            }
+            kept->array.items[kept->array.count++] = annots->array.items[i];
+        }
+        if (kept->array.count == annots->array.count) continue;
+        if (kept->array.count == 0) {
+            form_dict_remove(page_dict, "Annots");
+        } else {
+            err = form_dict_put(page_dict, "Annots", kept, a);
+        }
+    }
+
+    if (err == TSPDF_OK) {
+        form_dict_remove(catalog, "AcroForm");
+        doc->modified = true;
+    }
+    free(annot_map);
+    form_terminals_free(&ctx);
+    return err;
 }
