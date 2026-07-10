@@ -3,6 +3,7 @@
 // every binary (LIB_SOURCES), so both the writer and the reader can use them.
 
 #include "pdftext.h"
+#include <string.h>
 
 size_t tspdf_utf8_decode(const char *s, uint32_t *out_cp) {
     const uint8_t *p = (const uint8_t *)s;
@@ -244,5 +245,152 @@ char *tspdf_utf16be_to_utf8(const uint8_t *data, size_t len, TspdfArena *arena) 
         o += tspdf_utf8_encode(cp, out + o);  // lone surrogates become '?'
     }
     out[o] = '\0';  // a trailing odd byte is ignored
+    return out;
+}
+
+uint32_t tspdf_pdfdoc_to_codepoint(uint8_t b) {
+    // ISO 32000 Annex D: accents replacing the C0 controls 0x18-0x1F.
+    static const uint16_t accents[8] = {
+        0x02D8, 0x02C7, 0x02C6, 0x02D9,  // breve, caron, circumflex, dot above
+        0x02DD, 0x02DB, 0x02DA, 0x02DC,  // double acute, ogonek, ring, tilde
+    };
+    // 0x80-0xA0: typography, ligatures and the euro (0x9F is unassigned).
+    static const uint16_t high[33] = {
+        0x2022, 0x2020, 0x2021, 0x2026, 0x2014, 0x2013, 0x0192, 0x2044,
+        0x2039, 0x203A, 0x2212, 0x2030, 0x201E, 0x201C, 0x201D, 0x2018,
+        0x2019, 0x201A, 0x2122, 0xFB01, 0xFB02, 0x0141, 0x0152, 0x0160,
+        0x0178, 0x017D, 0x0131, 0x0142, 0x0153, 0x0161, 0x017E, 0xFFFD,
+        0x20AC,
+    };
+    if (b >= 0x18 && b <= 0x1F) return accents[b - 0x18];
+    if (b >= 0x80 && b <= 0xA0) return high[b - 0x80];
+    if (b == 0x7F || b == 0xAD) return 0xFFFD;  // unassigned slots
+    return b;  // ASCII controls/printables and the Latin-1 row are identity
+}
+
+// Length (1-4) of the well-formed UTF-8 sequence starting at p, or 0. Unlike
+// tspdf_utf8_decode this is bounded by `avail`, so it is safe on string
+// bytes that may contain interior NULs or end without a terminator.
+static size_t pdftext_utf8_seq_len(const uint8_t *p, size_t avail,
+                                   uint32_t *out_cp) {
+    if (avail == 0) return 0;
+    if (p[0] < 0x80) {
+        if (out_cp) *out_cp = p[0];
+        return 1;
+    }
+    size_t need = (p[0] & 0xE0) == 0xC0 ? 2
+                : (p[0] & 0xF0) == 0xE0 ? 3
+                : (p[0] & 0xF8) == 0xF0 ? 4 : 0;
+    if (need == 0 || avail < need) return 0;
+    // All continuation bytes present: reuse the strict decoder (it also
+    // rejects overlong forms, surrogates and out-of-range code points).
+    uint32_t cp;
+    size_t n = tspdf_utf8_decode((const char *)p, &cp);
+    if (n != need) return 0;
+    if (out_cp) *out_cp = cp;
+    return n;
+}
+
+static bool pdftext_bytes_are_utf8(const uint8_t *data, size_t len) {
+    for (size_t i = 0; i < len;) {
+        size_t n = pdftext_utf8_seq_len(data + i, len - i, NULL);
+        if (n == 0) return false;
+        i += n;
+    }
+    return true;
+}
+
+char *tspdf_pdf_text_to_utf8(const uint8_t *data, size_t len, TspdfArena *arena) {
+    if (!data) len = 0;
+
+    // UTF-16BE with BOM.
+    if (len >= 2 && data[0] == 0xFE && data[1] == 0xFF) {
+        return tspdf_utf16be_to_utf8(data, len, arena);
+    }
+
+    // UTF-8 BOM (PDF 2.0): strip it, then validate the payload below.
+    bool had_utf8_bom = false;
+    if (len >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF) {
+        data += 3;
+        len -= 3;
+        had_utf8_bom = true;
+    }
+
+    // Already valid UTF-8 (pure ASCII, a BOM-marked string, or a
+    // non-conformant writer that stored raw UTF-8): copy verbatim.
+    if (pdftext_bytes_are_utf8(data, len)) {
+        char *out = (char *)tspdf_arena_alloc(arena, len + 1);
+        if (!out) return NULL;
+        if (len > 0) memcpy(out, data, len);
+        out[len] = '\0';
+        return out;
+    }
+
+    // Not UTF-8: decode per byte — malformed bytes after a UTF-8 BOM become
+    // U+FFFD, BOM-less bytes are PDFDocEncoding. Worst case 3 output bytes
+    // per input byte (U+FFFD and the specials are 3-byte UTF-8).
+    char *out = (char *)tspdf_arena_alloc(arena, len * 3 + 1);
+    if (!out) return NULL;
+    size_t o = 0;
+    for (size_t i = 0; i < len;) {
+        if (had_utf8_bom) {
+            uint32_t cp;
+            size_t n = pdftext_utf8_seq_len(data + i, len - i, &cp);
+            if (n > 0) {
+                o += tspdf_utf8_encode(cp, out + o);
+                i += n;
+            } else {
+                o += tspdf_utf8_encode(0xFFFD, out + o);
+                i++;
+            }
+        } else {
+            o += tspdf_utf8_encode(tspdf_pdfdoc_to_codepoint(data[i]), out + o);
+            i++;
+        }
+    }
+    out[o] = '\0';
+    return out;
+}
+
+uint8_t *tspdf_utf8_to_pdf_text(const char *utf8, size_t *out_len, TspdfArena *arena) {
+    size_t len = strlen(utf8);
+
+    // Pure ASCII stays as-is; invalid UTF-8 is never half-encoded — both are
+    // copied verbatim (mirroring tspdf_pdftext_write_info_string).
+    if (tspdf_str_is_ascii(utf8) ||
+        !pdftext_bytes_are_utf8((const uint8_t *)utf8, len)) {
+        uint8_t *out = (uint8_t *)tspdf_arena_alloc(arena, len + 1);
+        if (!out) return NULL;
+        if (len > 0) memcpy(out, utf8, len);
+        out[len] = '\0';
+        if (out_len) *out_len = len;
+        return out;
+    }
+
+    // BOM + UTF-16BE. Each UTF-8 sequence of 1-3 bytes becomes one 2-byte
+    // unit; a 4-byte sequence becomes a 4-byte surrogate pair.
+    uint8_t *out = (uint8_t *)tspdf_arena_alloc(arena, 2 + len * 2 + 1);
+    if (!out) return NULL;
+    size_t o = 0;
+    out[o++] = 0xFE;
+    out[o++] = 0xFF;
+    for (const char *p = utf8; *p;) {
+        uint32_t cp;
+        p += tspdf_utf8_decode(p, &cp);
+        if (cp >= 0x10000) {
+            uint32_t v = cp - 0x10000;
+            uint32_t hi = 0xD800 + (v >> 10);
+            uint32_t lo = 0xDC00 + (v & 0x3FF);
+            out[o++] = (uint8_t)(hi >> 8);
+            out[o++] = (uint8_t)hi;
+            out[o++] = (uint8_t)(lo >> 8);
+            out[o++] = (uint8_t)lo;
+        } else {
+            out[o++] = (uint8_t)(cp >> 8);
+            out[o++] = (uint8_t)cp;
+        }
+    }
+    out[o] = '\0';
+    if (out_len) *out_len = o;
     return out;
 }

@@ -292,10 +292,10 @@ assert d[\"title\"] == \"Test Title\", d
 assert d[\"created_raw\"].startswith(\"D:\"), d
 assert re.fullmatch(r\"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\", d[\"modified\"]), d
 '"
-  # Real files often store BOM-less UTF-16BE or PDFDocEncoded /Author//Title,
-  # so a metadata getter can hand back RAW, non-UTF-8 bytes. The JSON writer
-  # must still emit a decodable UTF-8 string (invalid bytes -> U+FFFD) so
-  # json.load never raises UnicodeDecodeError.
+  # Real files often store PDFDocEncoded /Author//Title (BOM-less, ISO 32000
+  # §7.9.2.2). The reader must decode PDFDocEncoding to UTF-8, so both the
+  # text and JSON outputs show the intended characters — never raw high bytes
+  # that make json.load raise UnicodeDecodeError.
   TMPDIR="$TMPDIR" python3 - << 'PYEOF'
 import os
 # /Author = "Ünïcödé" in PDFDocEncoding: DC 6E EF 63 F6 64 E9 (lone 0xDC etc,
@@ -316,13 +316,18 @@ for i in range(1, 5):
 body += b"trailer\n<< /Size 5 /Root 1 0 R /Info 4 0 R >>\nstartxref\n%d\n%%%%EOF\n" % xo
 open(os.path.join(os.environ["TMPDIR"], "rawmeta.pdf"), "wb").write(body)
 PYEOF
-  run_test "info --json emits decodable UTF-8 for non-UTF-8 metadata bytes" bash -c "
+  run_test "info --json decodes PDFDocEncoded metadata to UTF-8" bash -c "
     $TSPDF info $TMPDIR/rawmeta.pdf --json | python3 -c '
 import json, sys
 d = json.load(sys.stdin)            # must not raise UnicodeDecodeError
 assert d[\"title\"] == \"Plain ASCII\", d
-# every raw high byte was replaced with U+FFFD; ASCII 0x6E/0x63/0x64 survive
-assert d[\"author\"] == \"�n�c�d�\", repr(d[\"author\"])
+assert d[\"author\"] == \"Ünïcödé\", repr(d[\"author\"])
+'"
+  run_test "metadata prints PDFDocEncoded values as valid UTF-8" bash -c "
+    $TSPDF metadata $TMPDIR/rawmeta.pdf | python3 -c '
+import sys
+out = sys.stdin.buffer.read().decode(\"utf-8\")   # must not raise
+assert \"Ünïcödé\" in out, repr(out)
 '"
   # And valid non-ASCII UTF-8 metadata must pass through the JSON unchanged.
   $TSPDF metadata $INPUT --set title='Prüfbericht café' -o $TMPDIR/utf8meta.pdf > /dev/null 2>&1
@@ -334,6 +339,80 @@ assert d[\"title\"] == \"Prüfbericht café\", repr(d[\"title\"])
 '"
 else
   echo "  SKIP  info --json assertions (python3 not found)"
+fi
+
+# attach: names are PDF text strings (ISO 32000 §7.9.2.2) — ASCII stays
+# literal, anything else is UTF-16BE with BOM; foreign encodings must decode.
+printf 'unicode payload' > "$TMPDIR/spaced ünïcode name.txt"
+run_test "attach add with a unicode file name" \
+    $TSPDF attach add $INPUT "$TMPDIR/spaced ünïcode name.txt" -o $TMPDIR/att_uni.pdf
+run_test "attach list prints the UTF-8 name" bash -c "
+    $TSPDF attach list $TMPDIR/att_uni.pdf | grep -qF 'spaced ünïcode name.txt'"
+run_test "attach stores the name as UTF-16BE, not raw UTF-8" bash -c "
+    ! grep -qa 'ünïcode' $TMPDIR/att_uni.pdf"
+run_test "attach extract --name accepts the unicode name" bash -c "
+    mkdir -p $TMPDIR/attx_uni &&
+    $TSPDF attach extract $TMPDIR/att_uni.pdf --name 'spaced ünïcode name.txt' -o $TMPDIR/attx_uni &&
+    cmp \"$TMPDIR/attx_uni/spaced ünïcode name.txt\" \"$TMPDIR/spaced ünïcode name.txt\""
+run_test "attach remove accepts the unicode name" bash -c "
+    $TSPDF attach remove $TMPDIR/att_uni.pdf --name 'spaced ünïcode name.txt' -o $TMPDIR/att_uni_rm.pdf &&
+    [ -z \"\$($TSPDF attach list $TMPDIR/att_uni_rm.pdf)\" ]"
+if command -v qpdf > /dev/null 2>&1; then
+  run_test "qpdf reads the unicode attachment name correctly" bash -c "
+    qpdf --list-attachments $TMPDIR/att_uni.pdf | grep -qF 'spaced ünïcode name.txt'"
+else
+  echo "  SKIP  qpdf attachment-name interop (qpdf not found)"
+fi
+
+# Attachments named by other tools: a UTF-16BE key with BOM (pymupdf-style)
+# and a PDFDocEncoded key (qpdf-style). Both must list and extract under
+# their decoded UTF-8 names.
+if command -v python3 > /dev/null 2>&1; then
+  TMPDIR="$TMPDIR" python3 - << 'PYEOF'
+import os
+def build(path, key_bytes, uf_bytes, payload):
+    body = b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n"
+    offs = {}
+    def emit(i, data):
+        nonlocal body
+        offs[i] = len(body); body += data
+    emit(1, b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Names << /EmbeddedFiles 4 0 R >> >>\nendobj\n")
+    emit(2, b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")
+    emit(3, b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n")
+    emit(4, b"4 0 obj\n<< /Names [" + key_bytes + b" 5 0 R] >>\nendobj\n")
+    emit(5, b"5 0 obj\n<< /Type /Filespec /F " + uf_bytes + b" /UF " + uf_bytes +
+            b" /EF << /F 6 0 R >> >>\nendobj\n")
+    emit(6, b"6 0 obj\n<< /Type /EmbeddedFile /Length %d >>\nstream\n" % len(payload) +
+            payload + b"\nendstream\nendobj\n")
+    xo = len(body)
+    body += b"xref\n0 7\n0000000000 65535 f \n"
+    for i in range(1, 7):
+        body += b"%010d 00000 n \n" % offs[i]
+    body += b"trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % xo
+    open(path, "wb").write(body)
+
+tmp = os.environ["TMPDIR"]
+# "ünïcode.txt" as UTF-16BE with BOM, in a hex string.
+u16 = b"<FEFF" + "ünïcode.txt".encode("utf-16-be").hex().upper().encode() + b">"
+build(os.path.join(tmp, "att_utf16.pdf"), u16, u16, b"hello utf16")
+# "spaced ünïcode.txt" in PDFDocEncoding (Latin-1 range bytes, no BOM).
+pdoc = b"(spaced \xFCn\xEFcode.txt)"
+build(os.path.join(tmp, "att_pdfdoc.pdf"), pdoc, pdoc, b"hello pdfdoc")
+PYEOF
+  run_test "attach list decodes UTF-16BE names from other tools" bash -c "
+    $TSPDF attach list $TMPDIR/att_utf16.pdf | grep -qF 'ünïcode.txt'"
+  run_test "attach extract --all handles a UTF-16BE-named file" bash -c "
+    mkdir -p $TMPDIR/attx_u16 &&
+    $TSPDF attach extract $TMPDIR/att_utf16.pdf --all -o $TMPDIR/attx_u16 &&
+    [ \"\$(cat \"$TMPDIR/attx_u16/ünïcode.txt\")\" = 'hello utf16' ]"
+  run_test "attach list decodes PDFDocEncoded names from other tools" bash -c "
+    $TSPDF attach list $TMPDIR/att_pdfdoc.pdf | grep -qF 'spaced ünïcode.txt'"
+  run_test "attach extract --all handles a PDFDocEncoded-named file" bash -c "
+    mkdir -p $TMPDIR/attx_pdoc &&
+    $TSPDF attach extract $TMPDIR/att_pdfdoc.pdf --all -o $TMPDIR/attx_pdoc &&
+    [ \"\$(cat \"$TMPDIR/attx_pdoc/spaced ünïcode.txt\")\" = 'hello pdfdoc' ]"
+else
+  echo "  SKIP  attach foreign-encoding fixtures (python3 not found)"
 fi
 
 # watermark
@@ -950,17 +1029,17 @@ j = json.load(sys.stdin)
 assert j['title'] == '<img src=x onerror=1>', j['title']
 \"
   "
-  # metadata-view must also emit decodable UTF-8 when the getter returns RAW,
-  # non-UTF-8 bytes (BOM-less UTF-16BE / PDFDocEncoded). rawmeta.pdf (crafted
-  # in the info --json block) has a PDFDocEncoded /Author with lone high bytes.
-  run_serve_test "serve metadata-view emits decodable UTF-8 for non-UTF-8 bytes" bash -c "
+  # metadata-view goes through the same getters as the CLI, so a PDFDocEncoded
+  # /Author decodes to UTF-8. rawmeta.pdf (crafted in the info --json block)
+  # stores "Ünïcödé" as PDFDocEncoding high bytes.
+  run_serve_test "serve metadata-view decodes PDFDocEncoded bytes to UTF-8" bash -c "
     [ -f \"$TMPDIR/rawmeta.pdf\" ] &&
     curl -sf --retry 3 --retry-delay 1 --max-time 10 -F \"pdf_file=@$TMPDIR/rawmeta.pdf\" http://localhost:${SERVE_PORT}/api/metadata-view |
     python3 -c \"
 import json, sys
 j = json.load(sys.stdin)
 assert j['title'] == 'Plain ASCII', j['title']
-assert j['author'] == '�n�c�d�', repr(j['author'])
+assert j['author'] == 'Ünïcödé', repr(j['author'])
 \"
   "
   # json_get_string must not let a   NUL truncate the text, nor emit an

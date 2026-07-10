@@ -27,14 +27,12 @@ static const char *get_info_field(const TspdfReader *doc, const char *key) {
     if (!info || info->type != TSPDF_OBJ_DICT) return NULL;
     TspdfObj *val = tspdf_dict_get(info, key);
     if (!val || val->type != TSPDF_OBJ_STRING) return NULL;
-    // UTF-16BE text strings (BOM FE FF, ISO 32000 §7.9.2.2) contain NUL bytes,
-    // so decode them to UTF-8 for display; the arena keeps the copy alive for
-    // the lifetime of the document. Other strings are returned as-is.
+    // Info values are PDF text strings (ISO 32000 §7.9.2.2): UTF-16BE with
+    // BOM, or PDFDocEncoding otherwise. Decode to UTF-8 for display; the
+    // arena keeps the copy alive for the lifetime of the document.
     TspdfReader *mut_doc = (TspdfReader *)doc;
-    char *utf8 = tspdf_utf16be_to_utf8(val->string.data, val->string.len,
-                                       &mut_doc->arena);
-    if (utf8) return utf8;
-    return (const char *)val->string.data;
+    return tspdf_pdf_text_to_utf8(val->string.data, val->string.len,
+                                  &mut_doc->arena);
 }
 
 const char *tspdf_reader_get_title(const TspdfReader *doc) { return get_info_field(doc, "Title"); }

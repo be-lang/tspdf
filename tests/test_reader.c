@@ -8196,6 +8196,114 @@ TEST(test_pdftext_utf16be_roundtrip) {
     tspdf_arena_destroy(&arena);
 }
 
+TEST(test_pdftext_pdfdoc_decode) {
+    // ASCII and the Latin-1 rows map to themselves.
+    ASSERT_EQ_INT((int)tspdf_pdfdoc_to_codepoint('A'), 'A');
+    ASSERT_EQ_INT((int)tspdf_pdfdoc_to_codepoint(0xE9), 0xE9);    // é
+    ASSERT_EQ_INT((int)tspdf_pdfdoc_to_codepoint(0xFC), 0xFC);    // ü
+    // PDFDocEncoding specials in 0x18-0x1F (accents) and 0x80-0xA0.
+    ASSERT_EQ_INT((int)tspdf_pdfdoc_to_codepoint(0x18), 0x02D8);  // breve
+    ASSERT_EQ_INT((int)tspdf_pdfdoc_to_codepoint(0x1F), 0x02DC);  // small tilde
+    ASSERT_EQ_INT((int)tspdf_pdfdoc_to_codepoint(0x80), 0x2022);  // bullet
+    ASSERT_EQ_INT((int)tspdf_pdfdoc_to_codepoint(0x85), 0x2013);  // en-dash
+    ASSERT_EQ_INT((int)tspdf_pdfdoc_to_codepoint(0x8A), 0x2212);  // minus sign
+    ASSERT_EQ_INT((int)tspdf_pdfdoc_to_codepoint(0x93), 0xFB01);  // fi ligature
+    ASSERT_EQ_INT((int)tspdf_pdfdoc_to_codepoint(0x9E), 0x017E);  // ž
+    ASSERT_EQ_INT((int)tspdf_pdfdoc_to_codepoint(0xA0), 0x20AC);  // euro
+    // Undefined slots decode to U+FFFD, never to garbage bytes.
+    ASSERT_EQ_INT((int)tspdf_pdfdoc_to_codepoint(0x7F), 0xFFFD);
+    ASSERT_EQ_INT((int)tspdf_pdfdoc_to_codepoint(0x9F), 0xFFFD);
+    ASSERT_EQ_INT((int)tspdf_pdfdoc_to_codepoint(0xAD), 0xFFFD);
+}
+
+TEST(test_pdftext_text_string_decode) {
+    TspdfArena arena = tspdf_arena_create(1024);
+
+    // UTF-16BE with BOM (incl. a surrogate pair) decodes to UTF-8.
+    const uint8_t utf16[] = {0xFE, 0xFF, 0x00, 0xFC, 0x00, 'n',
+                             0xD8, 0x3D, 0xDE, 0x00};
+    char *s = tspdf_pdf_text_to_utf8(utf16, sizeof(utf16), &arena);
+    ASSERT(s != NULL);
+    ASSERT_EQ_STR(s, "\xC3\xBCn\xF0\x9F\x98\x80");  // ü n 😀
+
+    // No BOM + non-UTF-8 bytes: PDFDocEncoding ("caf\xE9" -> café).
+    s = tspdf_pdf_text_to_utf8((const uint8_t *)"caf\xE9", 4, &arena);
+    ASSERT(s != NULL);
+    ASSERT_EQ_STR(s, "caf\xC3\xA9");
+
+    // PDFDocEncoding specials: 0x85 en-dash, 0xA0 euro, 0x9F undefined->U+FFFD.
+    const uint8_t docenc[] = {'a', 0x85, 0xA0, 0x9F, 'z'};
+    s = tspdf_pdf_text_to_utf8(docenc, sizeof(docenc), &arena);
+    ASSERT(s != NULL);
+    ASSERT_EQ_STR(s, "a\xE2\x80\x93\xE2\x82\xAC\xEF\xBF\xBDz");
+
+    // Pure ASCII is returned unchanged.
+    s = tspdf_pdf_text_to_utf8((const uint8_t *)"plain.txt", 9, &arena);
+    ASSERT(s != NULL);
+    ASSERT_EQ_STR(s, "plain.txt");
+
+    // Bytes that already form valid non-ASCII UTF-8 (common non-conformant
+    // writers) pass through instead of being mangled as PDFDocEncoding.
+    s = tspdf_pdf_text_to_utf8((const uint8_t *)"caf\xC3\xA9", 5, &arena);
+    ASSERT(s != NULL);
+    ASSERT_EQ_STR(s, "caf\xC3\xA9");
+
+    // UTF-8 BOM (PDF 2.0): stripped, payload validated.
+    const uint8_t u8bom[] = {0xEF, 0xBB, 0xBF, 'o', 'k', 0xC3, 0xA9};
+    s = tspdf_pdf_text_to_utf8(u8bom, sizeof(u8bom), &arena);
+    ASSERT(s != NULL);
+    ASSERT_EQ_STR(s, "ok\xC3\xA9");
+
+    // Empty input decodes to the empty string, not NULL.
+    s = tspdf_pdf_text_to_utf8((const uint8_t *)"", 0, &arena);
+    ASSERT(s != NULL);
+    ASSERT_EQ_STR(s, "");
+
+    tspdf_arena_destroy(&arena);
+}
+
+TEST(test_pdftext_text_string_encode) {
+    TspdfArena arena = tspdf_arena_create(1024);
+    size_t len = 0;
+
+    // Pure ASCII stays byte-identical (no BOM).
+    uint8_t *b = tspdf_utf8_to_pdf_text("plain.txt", &len, &arena);
+    ASSERT(b != NULL);
+    ASSERT_EQ_SIZE(len, 9);
+    ASSERT(memcmp(b, "plain.txt", 9) == 0);
+
+    // Non-ASCII UTF-8 becomes UTF-16BE with BOM.
+    b = tspdf_utf8_to_pdf_text("\xC3\xBCn\xC3\xAF" "code.txt", &len, &arena);
+    ASSERT(b != NULL);
+    const uint8_t want[] = {0xFE, 0xFF, 0x00, 0xFC, 0x00, 'n', 0x00, 0xEF,
+                            0x00, 'c', 0x00, 'o', 0x00, 'd', 0x00, 'e',
+                            0x00, '.', 0x00, 't', 0x00, 'x', 0x00, 't'};
+    ASSERT_EQ_SIZE(len, sizeof(want));
+    ASSERT(memcmp(b, want, sizeof(want)) == 0);
+
+    // Astral code points use a surrogate pair.
+    b = tspdf_utf8_to_pdf_text("\xF0\x9F\x98\x80", &len, &arena);  // 😀
+    ASSERT(b != NULL);
+    const uint8_t want2[] = {0xFE, 0xFF, 0xD8, 0x3D, 0xDE, 0x00};
+    ASSERT_EQ_SIZE(len, sizeof(want2));
+    ASSERT(memcmp(b, want2, sizeof(want2)) == 0);
+
+    // Encode/decode round-trip through the codec.
+    b = tspdf_utf8_to_pdf_text("sp \xC3\xBCn\xC3\xAF" "code.txt", &len, &arena);
+    ASSERT(b != NULL);
+    char *back = tspdf_pdf_text_to_utf8(b, len, &arena);
+    ASSERT(back != NULL);
+    ASSERT_EQ_STR(back, "sp \xC3\xBCn\xC3\xAF" "code.txt");
+
+    // Invalid UTF-8 input is kept verbatim (never half-encoded).
+    b = tspdf_utf8_to_pdf_text("bad\xC3", &len, &arena);
+    ASSERT(b != NULL);
+    ASSERT_EQ_SIZE(len, 4);
+    ASSERT(memcmp(b, "bad\xC3", 4) == 0);
+
+    tspdf_arena_destroy(&arena);
+}
+
 TEST(test_metadata_non_ascii_utf16_roundtrip) {
     // Non-ASCII metadata must be written as UTF-16BE with BOM (ISO 32000
     // text string), not raw UTF-8 bytes in a PDFDocEncoded literal.
@@ -8248,6 +8356,68 @@ TEST(test_metadata_ascii_stays_literal) {
     tspdf_reader_destroy(doc2);
     free(out);
     tspdf_reader_destroy(doc);
+}
+
+// Hand-built one-page PDF whose /Info holds a PDFDocEncoded /Title
+// ("caf\xE9" = café) and a BOM-less pure-ASCII /Author.
+static char *meta_make_pdfdoc_info_pdf(size_t *out_len) {
+    char *pdf = (char *)malloc(2048);
+    if (!pdf) return NULL;
+    size_t pos = 0;
+    size_t off[8] = {0};
+
+    if (!appendf(pdf, 2048, &pos, "%%PDF-1.4\n")) goto fail;
+    off[1] = pos;
+    if (!appendf(pdf, 2048, &pos,
+                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")) goto fail;
+    off[2] = pos;
+    if (!appendf(pdf, 2048, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")) goto fail;
+    off[3] = pos;
+    if (!appendf(pdf, 2048, &pos,
+                 "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n")) goto fail;
+    off[4] = pos;
+    if (!appendf(pdf, 2048, &pos,
+                 "4 0 obj\n<< /Title (caf\xE9) /Author (Plain Author) >>\nendobj\n")) goto fail;
+
+    {
+        size_t xref = pos;
+        if (!appendf(pdf, 2048, &pos, "xref\n0 5\n0000000000 65535 f \n")) goto fail;
+        for (int i = 1; i <= 4; i++) {
+            if (!appendf(pdf, 2048, &pos, "%010zu 00000 n \n", off[i])) goto fail;
+        }
+        if (!appendf(pdf, 2048, &pos,
+                     "trailer\n<< /Size 5 /Root 1 0 R /Info 4 0 R >>\nstartxref\n%zu\n%%%%EOF",
+                     xref)) goto fail;
+    }
+
+    *out_len = pos;
+    return pdf;
+fail:
+    free(pdf);
+    return NULL;
+}
+
+TEST(test_metadata_pdfdoc_encoded_decodes_to_utf8) {
+    // A BOM-less Info string is PDFDocEncoding (ISO 32000 §7.9.2.2); the
+    // getter must hand back UTF-8, never the raw 0xE9 byte.
+    size_t len = 0;
+    char *pdf = meta_make_pdfdoc_info_pdf(&len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    const char *title = tspdf_reader_get_title(doc);
+    ASSERT(title != NULL);
+    ASSERT_EQ_STR(title, "caf\xC3\xA9");
+    const char *author = tspdf_reader_get_author(doc);
+    ASSERT(author != NULL);
+    ASSERT_EQ_STR(author, "Plain Author");
+
+    tspdf_reader_destroy(doc);
+    free(pdf);
 }
 
 TEST(test_save_producer_is_tspdf_with_version) {
@@ -10566,6 +10736,176 @@ TEST(test_attach_encrypted_roundtrip) {
     free(enc);
 }
 
+TEST(test_attach_unicode_name_stored_as_utf16_roundtrip) {
+    // A non-ASCII attachment name is a PDF text string: it must be written
+    // as UTF-16BE with BOM (ISO 32000 §7.9.2.2) in /F, /UF and the
+    // EmbeddedFiles name-tree key — not as raw UTF-8 bytes.
+    const char *name = "sp \xC3\xBCn\xC3\xAF" "code.txt";  // "sp ünïcode.txt"
+    const char *desc = "d\xC3\xA9sc";                      // "désc"
+
+    size_t src_len = 0;
+    uint8_t *src = dt_writer_pdf(1, false, false, "AT", "Helvetica", &src_len);
+    ASSERT(src != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open(src, src_len, &err);
+    ASSERT(doc != NULL);
+    ASSERT_EQ_INT(tspdf_reader_attachment_add(doc, name, att_payload,
+                                              sizeof(att_payload), desc), TSPDF_OK);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    ASSERT_EQ_INT(tspdf_reader_save_to_memory(doc, &out, &out_len), TSPDF_OK);
+    tspdf_reader_destroy(doc);
+    free(src);
+
+    // Raw bytes: the escaped UTF-16 BOM (\376\377) is present and no raw
+    // UTF-8 tail leaked into any string.
+    ASSERT(bytes_contains(out, out_len, "\\376\\377"));
+    ASSERT(!bytes_contains(out, out_len, "\xC3\xBCn\xC3\xAF"));
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+
+    // Listing decodes the stored name and description back to UTF-8.
+    TspdfAttachmentInfo *infos = NULL;
+    size_t count = 0;
+    ASSERT_EQ_INT(tspdf_reader_attachments(re, &infos, &count), TSPDF_OK);
+    ASSERT_EQ_SIZE(count, 1);
+    ASSERT_EQ_STR(infos[0].name, name);
+    ASSERT(infos[0].desc != NULL);
+    ASSERT_EQ_STR(infos[0].desc, desc);
+
+    // Lookup, replace and remove all accept the UTF-8 name.
+    uint8_t *bytes = NULL;
+    size_t blen = 0;
+    ASSERT_EQ_INT(tspdf_reader_attachment_get(re, name, &bytes, &blen), TSPDF_OK);
+    ASSERT_EQ_SIZE(blen, sizeof(att_payload));
+    ASSERT(memcmp(bytes, att_payload, blen) == 0);
+    free(bytes);
+
+    ASSERT_EQ_INT(tspdf_reader_attachment_add(re, name,
+                                              (const uint8_t *)"newer", 5, NULL),
+                  TSPDF_OK);
+    TspdfAttachmentInfo *infos2 = NULL;
+    size_t count2 = 0;
+    ASSERT_EQ_INT(tspdf_reader_attachments(re, &infos2, &count2), TSPDF_OK);
+    ASSERT_EQ_SIZE(count2, 1);  // replaced, not duplicated
+
+    ASSERT_EQ_INT(tspdf_reader_attachment_remove(re, name), TSPDF_OK);
+    tspdf_reader_destroy(re);
+    free(out);
+}
+
+// Hand-built PDF with two attachments named the way other tools name them:
+// a UTF-16BE key with BOM ("ünïcode.txt", pymupdf-style) and a PDFDocEncoded
+// key ("café.txt", qpdf-style).
+static char *att_make_foreign_names_pdf(size_t *out_len) {
+    char *pdf = (char *)malloc(4096);
+    if (!pdf) return NULL;
+    size_t pos = 0;
+    size_t off[10] = {0};
+
+    if (!appendf(pdf, 4096, &pos, "%%PDF-1.5\n")) goto fail;
+    off[1] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R "
+                 "/Names << /EmbeddedFiles 4 0 R >> >>\nendobj\n")) goto fail;
+    off[2] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")) goto fail;
+    off[3] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n")) goto fail;
+    off[4] = pos;
+    // Keys sorted by raw bytes: (caf\xE9.txt) < <FEFF...>.
+    if (!appendf(pdf, 4096, &pos,
+                 "4 0 obj\n<< /Names [(caf\xE9.txt) 5 0 R "
+                 "<FEFF00FC006E00EF0063006F00640065002E007400780074> 7 0 R] >>\nendobj\n")) goto fail;
+    off[5] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "5 0 obj\n<< /Type /Filespec /F (caf\xE9.txt) /UF (caf\xE9.txt) "
+                 "/EF << /F 6 0 R >> >>\nendobj\n")) goto fail;
+    off[6] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "6 0 obj\n<< /Type /EmbeddedFile /Length 12 >>\nstream\n"
+                 "hello pdfdoc\nendstream\nendobj\n")) goto fail;
+    off[7] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "7 0 obj\n<< /Type /Filespec /F (unicode.txt) "
+                 "/UF <FEFF00FC006E00EF0063006F00640065002E007400780074> "
+                 "/EF << /F 8 0 R >> >>\nendobj\n")) goto fail;
+    off[8] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "8 0 obj\n<< /Type /EmbeddedFile /Length 11 >>\nstream\n"
+                 "hello utf16\nendstream\nendobj\n")) goto fail;
+
+    {
+        size_t xref = pos;
+        if (!appendf(pdf, 4096, &pos, "xref\n0 9\n0000000000 65535 f \n")) goto fail;
+        for (int i = 1; i <= 8; i++) {
+            if (!appendf(pdf, 4096, &pos, "%010zu 00000 n \n", off[i])) goto fail;
+        }
+        if (!appendf(pdf, 4096, &pos,
+                     "trailer\n<< /Size 9 /Root 1 0 R >>\nstartxref\n%zu\n%%%%EOF",
+                     xref)) goto fail;
+    }
+
+    *out_len = pos;
+    return pdf;
+fail:
+    free(pdf);
+    return NULL;
+}
+
+TEST(test_attach_reads_foreign_encoded_names) {
+    size_t len = 0;
+    char *pdf = att_make_foreign_names_pdf(&len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    // Listing decodes both encodings to UTF-8 (tree order: PDFDoc key first).
+    TspdfAttachmentInfo *infos = NULL;
+    size_t count = 0;
+    ASSERT_EQ_INT(tspdf_reader_attachments(doc, &infos, &count), TSPDF_OK);
+    ASSERT_EQ_SIZE(count, 2);
+    ASSERT_EQ_STR(infos[0].name, "caf\xC3\xA9.txt");
+    ASSERT_EQ_STR(infos[1].name, "\xC3\xBCn\xC3\xAF" "code.txt");
+
+    // Lookup by the decoded UTF-8 name works for both.
+    uint8_t *bytes = NULL;
+    size_t blen = 0;
+    ASSERT_EQ_INT(tspdf_reader_attachment_get(doc, "\xC3\xBCn\xC3\xAF" "code.txt",
+                                              &bytes, &blen), TSPDF_OK);
+    ASSERT_EQ_SIZE(blen, 11);
+    ASSERT(memcmp(bytes, "hello utf16", 11) == 0);
+    free(bytes);
+    ASSERT_EQ_INT(tspdf_reader_attachment_get(doc, "caf\xC3\xA9.txt",
+                                              &bytes, &blen), TSPDF_OK);
+    ASSERT_EQ_SIZE(blen, 12);
+    ASSERT(memcmp(bytes, "hello pdfdoc", 12) == 0);
+    free(bytes);
+
+    // Adding under the same UTF-8 name replaces the PDFDocEncoded entry
+    // instead of creating a differently-encoded duplicate.
+    ASSERT_EQ_INT(tspdf_reader_attachment_add(doc, "caf\xC3\xA9.txt",
+                                              (const uint8_t *)"newer", 5, NULL),
+                  TSPDF_OK);
+    TspdfAttachmentInfo *infos2 = NULL;
+    size_t count2 = 0;
+    ASSERT_EQ_INT(tspdf_reader_attachments(doc, &infos2, &count2), TSPDF_OK);
+    ASSERT_EQ_SIZE(count2, 2);
+
+    // Removal by the decoded name works too.
+    ASSERT_EQ_INT(tspdf_reader_attachment_remove(doc, "\xC3\xBCn\xC3\xAF" "code.txt"),
+                  TSPDF_OK);
+
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
 // ============================================================
 // Page label preservation (extract/merge)
 // ============================================================
@@ -12397,8 +12737,12 @@ int main(void) {
     RUN(test_pdftext_utf8_to_cp1252_strict);
     RUN(test_pdftext_utf8_to_cp1252_lossy);
     RUN(test_pdftext_utf16be_roundtrip);
+    RUN(test_pdftext_pdfdoc_decode);
+    RUN(test_pdftext_text_string_decode);
+    RUN(test_pdftext_text_string_encode);
     RUN(test_metadata_non_ascii_utf16_roundtrip);
     RUN(test_metadata_ascii_stays_literal);
+    RUN(test_metadata_pdfdoc_encoded_decodes_to_utf8);
     RUN(test_save_producer_is_tspdf_with_version);
     RUN(test_save_preserve_ids_producer_is_tspdf_with_version);
 
@@ -12461,6 +12805,8 @@ int main(void) {
     RUN(test_attach_merge_unions_first_wins);
     RUN(test_attach_delete_pages_keeps_attachments);
     RUN(test_attach_encrypted_roundtrip);
+    RUN(test_attach_unicode_name_stored_as_utf16_roundtrip);
+    RUN(test_attach_reads_foreign_encoded_names);
 
     printf("\n  Save-to-memory byte identity (wasm):\n");
     RUN(test_reader_save_to_memory_matches_file);
