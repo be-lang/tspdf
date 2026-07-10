@@ -89,6 +89,12 @@ export function makeTspdf(Module) {
       return takeResult((lp) => Module._tspdf_wasm_save(h, lp));
     },
 
+    // Save with the encryption removed (plain save keeps a password-opened
+    // document encrypted). Used by the demo's unlock tool.
+    saveDecrypted(h) {
+      return takeResult((lp) => Module._tspdf_wasm_save_decrypted(h, lp));
+    },
+
     merge(handles) {
       const arr = allocU32Array(handles);
       try {

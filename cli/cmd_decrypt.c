@@ -47,7 +47,11 @@ int cmd_decrypt(int argc, char **argv) {
         return 1;
     }
 
-    err = tspdf_reader_save(doc, output);
+    // Saves preserve a source document's encryption by default; decrypt is
+    // the one command whose whole point is the opt-out.
+    TspdfSaveOptions opts = tspdf_save_options_default();
+    opts.decrypt = true;
+    err = tspdf_reader_save_with_options(doc, output, &opts);
     if (err != TSPDF_OK) {
         fprintf(stderr, "tspdf decrypt: failed to save '%s': %s\n", output, tspdf_error_string(err));
         tspdf_reader_destroy(doc);

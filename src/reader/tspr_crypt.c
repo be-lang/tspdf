@@ -1098,10 +1098,22 @@ TspdfError tspdf_crypt_encrypt_init(TspdfCrypt *crypt, const char *user_pass,
     return TSPDF_OK;
 }
 
-uint8_t *tspdf_crypt_encrypt_string(TspdfCrypt *crypt, uint32_t obj_num,
+/* Shared cipher for strings and streams. `identity` mirrors the V=4
+ * /StrF or /StmF Identity crypt filter: the bytes are stored in the clear,
+ * returned as a plain copy so callers free uniformly. */
+static uint8_t *crypt_encrypt_bytes(TspdfCrypt *crypt, uint32_t obj_num,
                                     uint16_t gen, const uint8_t *data,
-                                    size_t len, size_t *out_len) {
+                                    size_t len, size_t *out_len,
+                                    bool identity) {
     if (!crypt || !out_len) return NULL;
+
+    if (identity) {
+        uint8_t *out = (uint8_t *)malloc(len ? len : 1);
+        if (!out) return NULL;
+        if (len > 0) memcpy(out, data, len);
+        *out_len = len;
+        return out;
+    }
 
     uint8_t key[32];
     int key_len = derive_object_key(crypt, obj_num, gen, key);
@@ -1147,9 +1159,16 @@ uint8_t *tspdf_crypt_encrypt_string(TspdfCrypt *crypt, uint32_t obj_num,
     return out;
 }
 
+uint8_t *tspdf_crypt_encrypt_string(TspdfCrypt *crypt, uint32_t obj_num,
+                                    uint16_t gen, const uint8_t *data,
+                                    size_t len, size_t *out_len) {
+    return crypt_encrypt_bytes(crypt, obj_num, gen, data, len, out_len,
+                               crypt && crypt->identity_str);
+}
+
 uint8_t *tspdf_crypt_encrypt_stream(TspdfCrypt *crypt, uint32_t obj_num,
                                     uint16_t gen, const uint8_t *data,
                                     size_t len, size_t *out_len) {
-    /* Same as encrypt_string */
-    return tspdf_crypt_encrypt_string(crypt, obj_num, gen, data, len, out_len);
+    return crypt_encrypt_bytes(crypt, obj_num, gen, data, len, out_len,
+                               crypt && crypt->identity_stm);
 }

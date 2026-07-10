@@ -711,11 +711,12 @@ run_test "stamp --stamp-page selects the stamp page" bash -c "
   $TSPDF stamp $INPUT --stamp $TMPDIR/stamp_2pg.pdf --stamp-page 2 -o $TMPDIR/stamped_sp2.pdf > /dev/null
   $TSPDF text $TMPDIR/stamped_sp2.pdf --pages 1 | grep -q SECONDMARK
   ! $TSPDF text $TMPDIR/stamped_sp2.pdf --pages 1 | grep -q APPROVED"
-run_test "stamp encrypted input with --password" bash -c "
+run_test "stamp encrypted input with --password (output stays encrypted)" bash -c "
   set -e
   $TSPDF encrypt $INPUT --password sec -o $TMPDIR/stamp_enc_in.pdf > /dev/null
   $TSPDF stamp $TMPDIR/stamp_enc_in.pdf --password sec --stamp $TMPDIR/stamp_src.pdf -o $TMPDIR/stamped_enc.pdf > /dev/null
-  $TSPDF text $TMPDIR/stamped_enc.pdf --pages 1 | grep -q APPROVED"
+  ! $TSPDF text $TMPDIR/stamped_enc.pdf --pages 1 > /dev/null 2>&1
+  $TSPDF text $TMPDIR/stamped_enc.pdf --password sec --pages 1 | grep -q APPROVED"
 run_test "stamp source with image resources" bash -c "
   set -e
   printf '# LOGOMARK\n\n![logo](%s/tests/data/img_rgb.png)\n' $(pwd) > $TMPDIR/stamp_img.md
@@ -734,7 +735,8 @@ if command -v qpdf > /dev/null 2>&1; then
     qpdf --check $TMPDIR/stamped.pdf > /dev/null 2>&1 &&
     qpdf --check $TMPDIR/stamped_under.pdf > /dev/null 2>&1 &&
     qpdf --check $TMPDIR/stamped_img.pdf > /dev/null 2>&1 &&
-    qpdf --check $TMPDIR/stamped_enc.pdf > /dev/null 2>&1"
+    qpdf --is-encrypted $TMPDIR/stamped_enc.pdf &&
+    qpdf --password=sec --check $TMPDIR/stamped_enc.pdf > /dev/null 2>&1"
 else
   echo "  SKIP  stamp qpdf --check (qpdf not found)"
 fi
@@ -2647,6 +2649,80 @@ if command -v qpdf > /dev/null 2>&1; then
 else
   echo "  SKIP  form qpdf conformance checks (qpdf not installed)"
 fi
+
+# Filling/flattening an encrypted form must NOT silently strip its
+# encryption: the output stays encrypted with the ORIGINAL password and
+# carries the new value.
+if command -v qpdf > /dev/null 2>&1; then
+  run_test "form fill keeps encrypted input encrypted" bash -c "
+    set -e
+    $TSPDF form fill $FORM_ENC_PDF --password secret --set name=EncBob -o $TMPDIR/fill_enc.pdf
+    qpdf --is-encrypted $TMPDIR/fill_enc.pdf
+    qpdf --password=secret --check $TMPDIR/fill_enc.pdf > /dev/null
+    $TSPDF form list $TMPDIR/fill_enc.pdf --password secret | grep -q '\"EncBob\"'"
+  run_test "form flatten keeps encrypted input encrypted" bash -c "
+    set -e
+    $TSPDF form flatten $TMPDIR/fill_enc.pdf --password secret -o $TMPDIR/flat_enc.pdf
+    qpdf --is-encrypted $TMPDIR/flat_enc.pdf
+    qpdf --password=secret --check $TMPDIR/flat_enc.pdf > /dev/null
+    $TSPDF text $TMPDIR/flat_enc.pdf --password secret | grep -q 'EncBob'"
+  # The seam is the shared save path, so every mutating command benefits:
+  # spot-check one other command.
+  run_test "bookmark add keeps encrypted input encrypted" bash -c "
+    set -e
+    $TSPDF bookmark add $FORM_ENC_PDF --password secret --title Intro --page 1 -o $TMPDIR/bm_enc.pdf
+    qpdf --is-encrypted $TMPDIR/bm_enc.pdf
+    qpdf --password=secret --check $TMPDIR/bm_enc.pdf > /dev/null
+    $TSPDF bookmark list $TMPDIR/bm_enc.pdf --password secret | grep -q 'Intro'"
+  # nup builds its output from imported (decrypted) page copies rather than
+  # the shared source structure — it must still re-encrypt on save.
+  run_test "nup keeps encrypted input encrypted" bash -c "
+    set -e
+    $TSPDF nup 2 $FORM_ENC_PDF --password secret -o $TMPDIR/nup_enc.pdf
+    qpdf --is-encrypted $TMPDIR/nup_enc.pdf
+    qpdf --password=secret --check $TMPDIR/nup_enc.pdf > /dev/null
+    $TSPDF info $TMPDIR/nup_enc.pdf --password secret | grep -q 'Pages'"
+  # decrypt is the explicit opt-out and must still write plaintext.
+  run_test "decrypt still writes an unencrypted file" bash -c "
+    set -e
+    $TSPDF decrypt $FORM_ENC_PDF --password secret -o $TMPDIR/form_dec.pdf
+    if qpdf --is-encrypted $TMPDIR/form_dec.pdf; then exit 1; fi
+    qpdf --check $TMPDIR/form_dec.pdf > /dev/null"
+else
+  echo "  SKIP  encrypted form round-trips (qpdf not installed)"
+fi
+
+# Choice fields validate against /Opt (city is Berlin/Paris/Oslo)...
+run_test "form fill rejects a non-option choice value" bash -c "
+  set -e
+  if $TSPDF form fill $FORM_PDF --set city=Atlantis -o $TMPDIR/city_bad.pdf 2> $TMPDIR/city_err.txt; then
+    exit 1
+  fi
+  grep -q 'Atlantis' $TMPDIR/city_err.txt
+  grep -q 'Berlin, Paris, Oslo' $TMPDIR/city_err.txt
+  [ ! -e $TMPDIR/city_bad.pdf ]"
+# ...unless the combo is editable (/Ff Combo|Edit): free text is legal there.
+run_test "form fill accepts free text in an editable combo" bash -c "
+  set -e
+  $TSPDF form fill tests/data/form_combo_edit.pdf --set nickname=Zaphod -o $TMPDIR/combo.pdf
+  $TSPDF form list $TMPDIR/combo.pdf | grep -q '\"Zaphod\"'"
+
+# Values outside the appearance font's encoding are stored intact in /V but
+# render as '?' in the generated appearance — that must be warned about.
+run_test "form fill warns when the appearance loses characters" bash -c "
+  set -e
+  $TSPDF form fill $FORM_PDF --set 'name=日本語' -o $TMPDIR/cjk.pdf 2> $TMPDIR/cjk_err.txt
+  grep -q 'not representable' $TMPDIR/cjk_err.txt
+  grep -q \"'name'\" $TMPDIR/cjk_err.txt
+  $TSPDF form list $TMPDIR/cjk.pdf | grep -q '日本語'"
+run_test "form fill does not warn for cp1252-safe values" bash -c "
+  set -e
+  $TSPDF form fill $FORM_PDF --set 'name=Grüße' -o $TMPDIR/latin.pdf 2> $TMPDIR/latin_err.txt
+  ! grep -q 'not representable' $TMPDIR/latin_err.txt"
+run_test "form flatten warns when a stamped value loses characters" bash -c "
+  set -e
+  $TSPDF form flatten $TMPDIR/cjk.pdf -o $TMPDIR/cjk_flat.pdf 2> $TMPDIR/cjk_flat_err.txt
+  grep -q 'not representable' $TMPDIR/cjk_flat_err.txt"
 
 # info --json: page dimensions must be JSON numbers (not strings); page_sizes
 # is a single [w,h] for a uniform document and an array of [w,h] for a mixed one.

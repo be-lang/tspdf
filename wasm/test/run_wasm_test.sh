@@ -24,13 +24,15 @@ cp wasm/dist/tspdf.js wasm/dist/tspdf.wasm wasm/tspdf-api.js wasm/demo/wasm-back
 printf '{ "type": "module" }\n' > "$OUT/package.json"
 node wasm/test/wasm-backend-test.js "$OUT/fixture_a.pdf" "$OUT/fixture_b.pdf" "$OUT"
 
-# qpdf conformance gate over every wasm-produced output. The encrypted output
-# needs its password to be checkable.
+# qpdf conformance gate over every wasm-produced output. The encrypted
+# outputs need their password to be checkable; everything else (including
+# out_decrypted.pdf, the unlock result) must open WITHOUT one.
 fail=0
 for f in "$OUT"/out_*.pdf; do
     case "$f" in
-        *out_encrypted.pdf) set -- qpdf --password=wasmpw --check "$f" ;;
-        *)                  set -- qpdf --check "$f" ;;
+        *out_encrypted.pdf | *out_resaved_encrypted.pdf)
+            set -- qpdf --password=wasmpw --check "$f" ;;
+        *)  set -- qpdf --check "$f" ;;
     esac
     if "$@" > /dev/null 2>&1; then
         echo "  qpdf --check OK: $f"

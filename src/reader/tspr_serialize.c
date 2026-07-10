@@ -513,7 +513,10 @@ static TspdfError get_stream_bytes(TspdfReader *doc, TspdfObj *obj,
     size_t raw_len = obj->stream.raw_len;
 
     if (doc->crypt && src_obj_num > 0 && src_obj_num < doc->xref.count &&
-        !stream_dict_type_is(obj, "XRef") && raw_len > 0) {
+        !stream_dict_type_is(obj, "XRef") && raw_len > 0 &&
+        /* /EncryptMetadata false: the XMP metadata stream is stored in the
+         * clear, so "decrypting" it would only garble it. */
+        (doc->crypt->encrypt_metadata || !stream_dict_type_is(obj, "Metadata"))) {
         size_t decrypted_len = 0;
         uint8_t *decrypted = tspdf_crypt_decrypt_stream(doc->crypt, src_obj_num,
                                                         src_gen, raw, raw_len,
@@ -882,6 +885,17 @@ static TspdfError write_xref_stream(TspdfBuffer *buf, size_t *offsets, uint32_t 
 TspdfError tspdf_serialize_with_options(TspdfReader *doc, uint8_t **out_buf, size_t *out_len,
                                       const TspdfSaveOptions *opts) {
     if (!doc || !out_buf || !out_len || !opts) return TSPDF_ERR_PARSE;
+
+    // A document opened with a password stays encrypted on save: silently
+    // writing it decrypted would strip its protection behind the caller's
+    // back. The encrypted writer reuses the recovered file key and copies the
+    // source /Encrypt dict and /ID verbatim, so both original passwords keep
+    // working. opts->decrypt is the explicit opt-out (`tspdf decrypt`). This
+    // path ignores objstm/recompress options — the encrypted writer keeps
+    // plain top-level objects (see tspdf_serialize_encrypted).
+    if (doc->crypt && !opts->decrypt) {
+        return tspdf_serialize_encrypted(doc, doc->crypt, out_buf, out_len);
+    }
 
     // recompress_streams targets minimal output size, so it also implies the
     // compact compressed xref stream over the classic table (whose 20 bytes
@@ -1526,6 +1540,70 @@ static void write_obj_encrypted(TspdfBuffer *buf, TspdfObj *obj, const RenumberM
     }
 }
 
+// Write a preserved source /Encrypt dictionary verbatim: strings (O/U/OE/UE/
+// Perms...) as raw hex, never object-key encrypted (the /Encrypt dict is the
+// one place the spec exempts). References are resolved and inlined — the spec
+// requires /Encrypt entries to be direct, but a lenient copy beats emitting a
+// dangling reference into the renumbered file. `depth` guards hostile cycles.
+static void write_encrypt_dict_plain(TspdfBuffer *buf, TspdfObj *obj,
+                                     TspdfReader *doc, TspdfParser *parser,
+                                     int depth) {
+    if (!obj || depth > 32) {
+        tspdf_buffer_append_str(buf, "null");
+        return;
+    }
+
+    switch (obj->type) {
+        case TSPDF_OBJ_NULL:
+            tspdf_buffer_append_str(buf, "null");
+            break;
+        case TSPDF_OBJ_BOOL:
+            tspdf_buffer_append_str(buf, obj->boolean ? "true" : "false");
+            break;
+        case TSPDF_OBJ_INT:
+            tspdf_buffer_printf(buf, "%lld", (long long)obj->integer);
+            break;
+        case TSPDF_OBJ_REAL:
+            tspdf_buffer_printf(buf, "%.6f", obj->real);
+            break;
+        case TSPDF_OBJ_STRING:
+            write_hex_string(buf, obj->string.data, obj->string.len);
+            break;
+        case TSPDF_OBJ_NAME:
+            write_name(buf, obj->string.data, obj->string.len);
+            break;
+        case TSPDF_OBJ_ARRAY:
+            tspdf_buffer_append_str(buf, "[ ");
+            for (size_t i = 0; i < obj->array.count; i++) {
+                if (i > 0) tspdf_buffer_append_byte(buf, ' ');
+                write_encrypt_dict_plain(buf, &obj->array.items[i], doc,
+                                         parser, depth + 1);
+            }
+            tspdf_buffer_append_str(buf, " ]");
+            break;
+        case TSPDF_OBJ_DICT:
+            tspdf_buffer_append_str(buf, "<< ");
+            for (size_t i = 0; i < obj->dict.count; i++) {
+                write_name(buf, (const uint8_t *)obj->dict.entries[i].key,
+                           strlen(obj->dict.entries[i].key));
+                tspdf_buffer_append_byte(buf, ' ');
+                write_encrypt_dict_plain(buf, obj->dict.entries[i].value, doc,
+                                         parser, depth + 1);
+                tspdf_buffer_append_byte(buf, ' ');
+            }
+            tspdf_buffer_append_str(buf, ">>");
+            break;
+        case TSPDF_OBJ_REF:
+            write_encrypt_dict_plain(buf,
+                resolve_for_collect(doc, obj->ref.num, parser), doc, parser,
+                depth + 1);
+            break;
+        case TSPDF_OBJ_STREAM:
+            tspdf_buffer_append_str(buf, "null");
+            break;
+    }
+}
+
 static void write_catalog_obj_encrypted(TspdfBuffer *buf, TspdfObj *catalog,
                                         const RenumberMap *map, TspdfReader *doc,
                                         TspdfCrypt *crypt) {
@@ -1569,10 +1647,17 @@ static TspdfError write_stream_obj_encrypted(TspdfBuffer *buf, TspdfObj *obj, co
         return err;
     }
 
-    /* Encrypt the stream data */
+    /* Encrypt the stream data. Exception: when the (preserved) crypt says
+     * /EncryptMetadata false, the XMP metadata stream is stored in the clear
+     * (ISO 32000 §7.6.3.2); encrypting it anyway would garble it for readers
+     * honoring the flag. */
+    bool skip_encrypt =
+        !crypt->encrypt_metadata && stream_dict_type_is(obj, "Metadata");
     size_t enc_len = 0;
-    uint8_t *enc = tspdf_crypt_encrypt_stream(crypt, cur_obj_num, cur_gen,
-                                              stream.data, stream.len, &enc_len);
+    uint8_t *enc = skip_encrypt
+        ? NULL
+        : tspdf_crypt_encrypt_stream(crypt, cur_obj_num, cur_gen,
+                                     stream.data, stream.len, &enc_len);
     const uint8_t *write_data = enc ? enc : stream.data;
     size_t write_len = enc ? enc_len : stream.len;
 
@@ -1645,6 +1730,18 @@ TspdfError tspdf_serialize_encrypted(TspdfReader *doc, TspdfCrypt *crypt,
             collect_from_page_obj(doc, page->page_dict, visited, &parser);
         }
         collect_from_catalog_entries(doc, source_catalog, visited, &parser, false);
+    }
+
+    /* The source /Encrypt dict is re-emitted as a dedicated object below
+     * (either preserved verbatim or freshly generated); never copy the
+     * original as a normal — and then string-encrypted — object. Check the
+     * SOURCE document's crypt, not `crypt`: when re-encrypting with new
+     * passwords, `crypt` is a fresh encryption crypt (src_encrypt_num 0)
+     * while the old dict is recorded in doc->crypt, and copying it would
+     * embed the old (offline-crackable) O/U hashes as an orphan object. */
+    if (doc->crypt && doc->crypt->src_encrypt_num > 0 &&
+        doc->crypt->src_encrypt_num < total_objs) {
+        visited[doc->crypt->src_encrypt_num] = false;
     }
 
     /* 2. Build renumbering map */
@@ -1798,7 +1895,13 @@ TspdfError tspdf_serialize_encrypted(TspdfReader *doc, TspdfCrypt *crypt,
     offsets[encrypt_obj_num] = buf.len;
     tspdf_buffer_printf(&buf, "%u 0 obj\n", encrypt_obj_num);
 
-    if (crypt->version == 4) {
+    if (crypt->src_encrypt_dict) {
+        /* Preserving the source encryption: copy the original /Encrypt dict
+         * verbatim. Together with the original first /ID string (written in
+         * the trailer below) and the recovered file key used for the object
+         * encryption above, this keeps both original passwords working. */
+        write_encrypt_dict_plain(&buf, crypt->src_encrypt_dict, doc, &parser, 0);
+    } else if (crypt->version == 4) {
         tspdf_buffer_append_str(&buf, "<< /Filter /Standard /V 4 /R 4 /Length 128");
         tspdf_buffer_append_str(&buf, " /CF << /StdCF << /CFM /AESV2 /Length 16 /AuthEvent /DocOpen >> >>");
         tspdf_buffer_append_str(&buf, " /StmF /StdCF /StrF /StdCF");

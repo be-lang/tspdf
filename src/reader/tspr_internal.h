@@ -53,6 +53,16 @@ typedef struct {
     // use by tspr_crypt.c; V<=4 derives a per-object key and cannot cache.
     Aes aes_v5;
     bool aes_v5_ready;
+    // Source-document /Encrypt preservation (set for crypts created by
+    // tspdf_crypt_init when opening an encrypted file, NULL for crypts made
+    // by tspdf_crypt_encrypt_init). The dict lives in the owning document's
+    // arena; encrypted saves copy it verbatim so the original passwords (and
+    // permissions) keep working — the recovered file key is reused, since
+    // the "other" password can never be re-derived. src_encrypt_num is the
+    // object number of the source /Encrypt dict (0 when it was inline) so
+    // the serializer can skip that now-superseded object.
+    TspdfObj *src_encrypt_dict;
+    uint32_t src_encrypt_num;
 } TspdfCrypt;
 
 // --- Metadata ---
@@ -148,6 +158,11 @@ uint8_t *tspdf_crypt_encrypt_string(TspdfCrypt *crypt, uint32_t obj_num,
 uint8_t *tspdf_crypt_encrypt_stream(TspdfCrypt *crypt, uint32_t obj_num,
                                     uint16_t gen, const uint8_t *data,
                                     size_t len, size_t *out_len);
+// Clone a reader's crypt into a derived document so its save preserves the
+// source encryption (malloc'd; freed by tspdf_reader_destroy). The clone's
+// src_encrypt_dict points into the source's arena: valid only under the
+// derived-document rule that the source outlives it until it is saved.
+TspdfCrypt *tspdf_crypt_clone(const TspdfCrypt *src);
 void tspdf_random_bytes(uint8_t *buf, size_t len);
 TspdfError tspdf_serialize_encrypted(TspdfReader *doc, TspdfCrypt *crypt,
                                     uint8_t **out_buf, size_t *out_len);

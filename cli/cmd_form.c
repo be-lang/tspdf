@@ -13,6 +13,7 @@
 
 #include "commands.h"
 #include "../include/tspdf.h"
+#include "../src/util/pdftext.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,11 +36,15 @@ static void form_usage(void) {
     printf("                                      content and remove the form\n");
     printf("\n");
     printf("Options:\n");
-    printf("  --password <pass>  Password for encrypted PDFs (optional)\n");
+    printf("  --password <pass>  Password for encrypted PDFs (optional).\n");
+    printf("                     Encrypted inputs stay encrypted on output,\n");
+    printf("                     with the same passwords.\n");
     printf("\n");
     printf("Checkboxes and radio groups take an \"on\" state name (see the\n");
-    printf("options array in `form list`), \"Off\", or true/false.\n");
-    printf("Text appearances are single-line (no comb/multiline layout).\n");
+    printf("options array in `form list`), \"Off\", or true/false. Choice\n");
+    printf("fields only accept their listed options, unless the combo is\n");
+    printf("editable. Text appearances are single-line (no comb/multiline\n");
+    printf("layout).\n");
 }
 
 // --- JSON string output ---
@@ -413,6 +418,26 @@ static const TspdfFormFieldInfo *form_find_field(
     return NULL;
 }
 
+// Generated text appearances (fill) and flatten stamping render values with
+// a WinAnsi (cp1252) base font: characters outside it display as '?'. The
+// stored /V keeps the full value, so this is a visual-only loss — but a
+// silent one, hence the warning.
+static void form_warn_lossy_value(const char *name, const char *value) {
+    if (tspdf_str_is_ascii(value)) return;
+    size_t len = strlen(value);
+    char *scratch = malloc(len + 1);  // cp1252 is never longer than UTF-8
+    if (!scratch) return;
+    size_t subs = tspdf_utf8_to_cp1252_lossy(value, scratch, NULL);
+    free(scratch);
+    if (subs > 0) {
+        fprintf(stderr,
+                "tspdf form: warning: value for field '%s' contains "
+                "characters not representable in the appearance font; "
+                "they will display as '?' (the stored value is intact)\n",
+                name);
+    }
+}
+
 // Checkbox/radio convenience: true/false (and friends) map to the first
 // "on" state / "Off"; anything else passes through as a state name.
 static const char *form_map_button_value(const TspdfFormFieldInfo *f,
@@ -537,11 +562,26 @@ static int form_fill(int argc, char **argv, const char *input,
             rc = 1;
             break;
         }
+        if (err == TSPDF_ERR_INVALID_ARG && f->type == TSPDF_FIELD_CHOICE) {
+            fprintf(stderr, "tspdf form: '%s' is not an option of '%s' "
+                    "(options: ", pairs.vals[i], pairs.keys[i]);
+            for (size_t j = 0; j < f->option_count; j++) {
+                fprintf(stderr, "%s%s", j > 0 ? ", " : "", f->options[j]);
+            }
+            fprintf(stderr, ")\n");
+            rc = 1;
+            break;
+        }
         if (err != TSPDF_OK) {
             fprintf(stderr, "tspdf form: cannot fill '%s': %s\n",
                     pairs.keys[i], tspdf_error_string(err));
             rc = 1;
             break;
+        }
+        // The generated appearance stream (text fields) uses a cp1252 base
+        // font: warn when that loses characters. /V itself is unaffected.
+        if (f->type == TSPDF_FIELD_TEXT) {
+            form_warn_lossy_value(pairs.keys[i], value);
         }
     }
 
@@ -568,6 +608,22 @@ static int form_flatten(const char *input, const char *output,
     }
     TspdfReader *doc = form_open(input, password);
     if (!doc) return 1;
+
+    // Flatten stamps current values with a cp1252 base font: warn up front
+    // about values that will lose characters in the stamped page content.
+    {
+        TspdfFormFieldInfo *fields = NULL;
+        size_t count = 0;
+        if (tspdf_reader_form_fields(doc, &fields, &count) == TSPDF_OK) {
+            for (size_t i = 0; i < count; i++) {
+                if ((fields[i].type == TSPDF_FIELD_TEXT ||
+                     fields[i].type == TSPDF_FIELD_CHOICE) &&
+                    fields[i].value) {
+                    form_warn_lossy_value(fields[i].name, fields[i].value);
+                }
+            }
+        }
+    }
 
     TspdfError err = tspdf_reader_form_flatten(doc);
     if (err != TSPDF_OK) {

@@ -19,6 +19,8 @@
 // decrypts encrypted sources and bounds hostile resource cycles) and placed in
 // its grid cell with a uniform-scale `cm` matrix. Only page content is carried
 // over: bookmarks, forms and annotations are dropped (this is imposition).
+// An encrypted source's crypt is cloned into the output, so the save
+// re-encrypts it with the original passwords like every other derived doc.
 
 #include "tspr_internal.h"
 #include "tspr_overlay.h"
@@ -392,6 +394,21 @@ TspdfReader *tspdf_reader_nup(TspdfReader *src, const TspdfNupOptions *opts,
         if (eerr != TSPDF_OK) {
             tspdf_reader_destroy(out);
             if (err) *err = eerr;
+            return NULL;
+        }
+    }
+
+    // An encrypted source stays encrypted: carry its crypt into the output so
+    // the save re-encrypts with the recovered file key and preserved /Encrypt
+    // dict (the same mechanism extract/delete/rotate use). The clone points
+    // into the source's arena, which the lifetime rule above already covers.
+    // Set last so no build step above consults it — the imported objects are
+    // self-contained plaintext, encrypted only as they are written out.
+    if (src->crypt) {
+        out->crypt = tspdf_crypt_clone(src->crypt);
+        if (!out->crypt) {
+            tspdf_reader_destroy(out);
+            if (err) *err = TSPDF_ERR_ALLOC;
             return NULL;
         }
     }

@@ -1399,9 +1399,12 @@ static void api_unlock(int fd, MultipartForm *form)
         (const uint8_t *)file->data, file->data_len, password, &err);
     if (!doc) { send_error(fd, 400, "Failed to open PDF (wrong password?)"); return; }
 
+    // Saves preserve encryption by default; unlocking is the explicit opt-out.
+    TspdfSaveOptions opts = tspdf_save_options_default();
+    opts.decrypt = true;
     uint8_t *out = NULL;
     size_t out_len = 0;
-    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    err = tspdf_reader_save_to_memory_with_options(doc, &out, &out_len, &opts);
     tspdf_reader_destroy(doc);
 
     if (err != TSPDF_OK) { free(out); send_error(fd, 500, "Save failed"); return; }

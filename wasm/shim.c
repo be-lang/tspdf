@@ -134,6 +134,26 @@ WASM_EXPORT uint8_t *tspdf_wasm_save(int h, uint32_t *out_len) {
     return wasm_save_doc(doc, out_len);
 }
 
+// Save with the encryption removed. A plain save preserves a password-opened
+// document's encryption, so the unlock tool needs this explicit opt-out
+// (mirroring `tspdf decrypt` and the server's unlock endpoint).
+WASM_EXPORT uint8_t *tspdf_wasm_save_decrypted(int h, uint32_t *out_len) {
+    TspdfReader *doc = wasm_get(h);
+    if (!doc) return NULL;
+    TspdfSaveOptions opts = tspdf_save_options_default();
+    opts.decrypt = true;
+    uint8_t *out = NULL;
+    size_t len = 0;
+    TspdfError err = tspdf_reader_save_to_memory_with_options(doc, &out, &len, &opts);
+    if (err != TSPDF_OK) {
+        free(out);
+        wasm_set_error_code(err);
+        return NULL;
+    }
+    *out_len = (uint32_t)len;
+    return out;
+}
+
 WASM_EXPORT uint8_t *tspdf_wasm_merge(const int *handles, uint32_t n, uint32_t *out_len) {
     if (n < 2) { wasm_set_error("merge needs at least 2 documents"); return NULL; }
     TspdfReader *docs[WASM_MAX_DOCS];
