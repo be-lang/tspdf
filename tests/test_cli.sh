@@ -1733,6 +1733,38 @@ else
   echo "  SKIP  split keeps only the kept pages' bookmarks and fields (qpdf or fixture missing)"
 fi
 
+# --- Indirect outline titles (pdfTeX/hyperref store /Title as N 0 R) ---
+# tests/data/indirect_title.pdf: Alpha -> p1 (child Alpha Sub -> p2), Beta -> p2,
+# every /Title (and one /Dest) an indirect object.
+INDIRECT_INPUT=tests/data/indirect_title.pdf
+run_test "bookmark list resolves indirect titles" bash -c "
+  set -e
+  out=\$($TSPDF bookmark list $INDIRECT_INPUT)
+  echo \"\$out\" | grep -q 'Alpha'
+  echo \"\$out\" | grep -q 'Alpha Sub'
+  echo \"\$out\" | grep -q 'Beta'"
+run_test "bookmark add keeps existing indirect titles" bash -c "
+  set -e
+  $TSPDF bookmark add $INDIRECT_INPUT --title Appendix --page 1 -o $TMPDIR/it_add.pdf
+  out=\$($TSPDF bookmark list $TMPDIR/it_add.pdf)
+  echo \"\$out\" | grep -q 'Alpha'
+  echo \"\$out\" | grep -q 'Beta'
+  echo \"\$out\" | grep -q 'Appendix'"
+run_test "merge copies indirect outline strings (no offset-0 xref entries)" bash -c "
+  set -e
+  $TSPDF merge $INDIRECT_INPUT $INDIRECT_INPUT -o $TMPDIR/it_merged.pdf
+  ! grep -qa '0000000000 00000 n' $TMPDIR/it_merged.pdf
+  $TSPDF bookmark list $TMPDIR/it_merged.pdf | grep -q 'Alpha Sub'"
+if command -v qpdf > /dev/null 2>&1; then
+  run_test "merged indirect-title output passes qpdf --check" bash -c "
+    set -e
+    $TSPDF merge $INDIRECT_INPUT $INDIRECT_INPUT -o $TMPDIR/it_merged_q.pdf
+    qpdf --check $TMPDIR/it_merged_q.pdf
+    qpdf --json --json-key=outlines $TMPDIR/it_merged_q.pdf | grep -q 'Alpha Sub'"
+else
+  echo "  SKIP  merged indirect-title output passes qpdf --check (qpdf missing)"
+fi
+
 # --- md2pdf tables/images, burst split, page numbers, serve --bind ---
 
 # Burst split: no --pages splits every page into its own zero-padded file.

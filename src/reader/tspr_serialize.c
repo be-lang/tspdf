@@ -1385,7 +1385,15 @@ TspdfError tspdf_serialize_with_options(TspdfReader *doc, uint8_t **out_buf, siz
         tspdf_buffer_printf(&buf, "xref\n0 %u\n", total_objects + 1);
         tspdf_buffer_append_str(&buf, "0000000000 65535 f \n");
         for (uint32_t i = 1; i <= total_objects; i++) {
-            tspdf_buffer_printf(&buf, "%010zu 00000 n \n", offsets[i]);
+            if (offsets[i] > 0) {
+                tspdf_buffer_printf(&buf, "%010zu 00000 n \n", offsets[i]);
+            } else {
+                // The object was collected but never written (e.g. a dangling
+                // in-use source entry that failed to resolve). An in-use
+                // (type 1) entry with offset 0 is structurally invalid; a
+                // free entry lets refs to it resolve to null instead.
+                tspdf_buffer_append_str(&buf, "0000000000 65535 f \n");
+            }
         }
 
         if (write_info) {
@@ -1831,7 +1839,13 @@ TspdfError tspdf_serialize_encrypted(TspdfReader *doc, TspdfCrypt *crypt,
     tspdf_buffer_printf(&buf, "xref\n0 %u\n", total_objects + 1);
     tspdf_buffer_append_str(&buf, "0000000000 65535 f \n");
     for (uint32_t i = 1; i <= total_objects; i++) {
-        tspdf_buffer_printf(&buf, "%010zu 00000 n \n", offsets[i]);
+        if (offsets[i] > 0) {
+            tspdf_buffer_printf(&buf, "%010zu 00000 n \n", offsets[i]);
+        } else {
+            /* Never emit an in-use (type 1) entry with offset 0: an object
+             * that could not be written becomes a free entry instead. */
+            tspdf_buffer_append_str(&buf, "0000000000 65535 f \n");
+        }
     }
 
     /* Trailer with /Encrypt and /ID */

@@ -179,8 +179,12 @@ static bool bm_num_contains(const BmNumList *l, uint32_t num) {
 
 // Decode an outline /Title value to arena-owned UTF-8. UTF-16BE-with-BOM
 // strings are decoded; plain strings are copied verbatim (NUL-terminated).
-static const char *bm_title_utf8(TspdfReader *doc, TspdfObj *item) {
-    TspdfObj *t = tspdf_dict_get(item, "Title");
+// The value is resolved first: pdfTeX/hyperref store /Title as an indirect
+// string object (/Title 4 0 R).
+static const char *bm_title_utf8(TspdfReader *doc, TspdfParser *parser,
+                                 TspdfObj *item) {
+    TspdfObj *t = tspdf_doctree_resolve(doc, parser,
+                                        tspdf_dict_get(item, "Title"));
     if (!t || t->type != TSPDF_OBJ_STRING) return "";
     char *utf8 = tspdf_utf16be_to_utf8(t->string.data, t->string.len, &doc->arena);
     if (utf8) return utf8;
@@ -208,11 +212,12 @@ static void bm_walk_level(TspdfReader *doc, TspdfParser *parser, TspdfObj *catal
         if (!item || item->type != TSPDF_OBJ_DICT) break;
         if (!bm_num_push(seen, num)) return;
 
-        TspdfObj *count = tspdf_dict_get(item, "Count");
+        TspdfObj *count = tspdf_doctree_resolve(doc, parser,
+                                                tspdf_dict_get(item, "Count"));
         bool open = !(count && count->type == TSPDF_OBJ_INT && count->integer < 0);
 
         TspdfBookmarkInfo info;
-        info.title = bm_title_utf8(doc, item);
+        info.title = bm_title_utf8(doc, parser, item);
         info.level = level;
         info.page_index = bm_resolve_dest(doc, parser, catalog,
                                           bm_item_dest(doc, parser, item));
