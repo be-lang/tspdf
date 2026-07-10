@@ -53,6 +53,16 @@ typedef struct {
     // use by tspr_crypt.c; V<=4 derives a per-object key and cannot cache.
     Aes aes_v5;
     bool aes_v5_ready;
+    // Source-document /Encrypt preservation (set for crypts created by
+    // tspdf_crypt_init when opening an encrypted file, NULL for crypts made
+    // by tspdf_crypt_encrypt_init). The dict lives in the owning document's
+    // arena; encrypted saves copy it verbatim so the original passwords (and
+    // permissions) keep working — the recovered file key is reused, since
+    // the "other" password can never be re-derived. src_encrypt_num is the
+    // object number of the source /Encrypt dict (0 when it was inline) so
+    // the serializer can skip that now-superseded object.
+    TspdfObj *src_encrypt_dict;
+    uint32_t src_encrypt_num;
 } TspdfCrypt;
 
 // --- Metadata ---

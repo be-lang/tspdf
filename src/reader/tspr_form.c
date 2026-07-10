@@ -941,6 +941,23 @@ static TspdfError form_fill_text(FormCtx *ctx, FormTerminal *term,
 
 static TspdfError form_fill_choice(FormCtx *ctx, FormTerminal *term,
                                    const char *value) {
+    // Validate against the /Opt export values, mirroring the checkbox/radio
+    // state check. Exceptions: an editable combo (/Ff bit 18 Combo AND bit
+    // 19 Edit) legally takes free text, the empty string always clears the
+    // value, and a field without /Opt publishes nothing to validate against.
+    bool editable_combo =
+        (term->ff & (1 << 17)) && (term->ff & (1 << 18));
+    if (!editable_combo && value[0] != '\0') {
+        const char **options = NULL;
+        size_t option_count = 0;
+        TspdfError err = form_choice_options(ctx, term, &options, &option_count);
+        if (err != TSPDF_OK) return err;
+        if (option_count > 0 &&
+            !form_option_seen(options, option_count, value)) {
+            return TSPDF_ERR_INVALID_ARG;
+        }
+    }
+
     TspdfObj *vstr = form_make_text_string(ctx->a, value);
     if (!vstr) return TSPDF_ERR_ALLOC;
     TspdfError err = form_dict_put(term->field, "V", vstr, ctx->a);

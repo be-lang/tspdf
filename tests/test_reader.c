@@ -5495,10 +5495,13 @@ TEST(test_encrypt_aes128_roundtrip) {
     ASSERT_EQ_INT(err, TSPDF_OK);
     ASSERT_EQ_SIZE(tspdf_reader_page_count(doc2), 3);
 
-    /* Save unencrypted (unlock) */
+    /* Save unencrypted (unlock, explicit opt-out via opts.decrypt) */
+    TspdfSaveOptions unlock_opts = tspdf_save_options_default();
+    unlock_opts.decrypt = true;
     uint8_t *unlocked_buf = NULL;
     size_t unlocked_len = 0;
-    err = tspdf_reader_save_to_memory(doc2, &unlocked_buf, &unlocked_len);
+    err = tspdf_reader_save_to_memory_with_options(doc2, &unlocked_buf,
+                                                   &unlocked_len, &unlock_opts);
     ASSERT_EQ_INT(err, TSPDF_OK);
     ASSERT(bytes_contains(unlocked_buf, unlocked_len, "(Page 1)"));
 
@@ -5556,9 +5559,14 @@ TEST(test_reencrypt_opened_encrypted_decrypts_source_streams) {
     TspdfReader *reopened = tspdf_reader_open_with_password(new_enc, new_enc_len, "newpass", &err);
     ASSERT(reopened != NULL);
 
+    // Plain saves preserve encryption by default; the explicit decrypt
+    // opt-out exposes the plaintext this test checks.
+    TspdfSaveOptions unlock_opts = tspdf_save_options_default();
+    unlock_opts.decrypt = true;
     uint8_t *unlocked = NULL;
     size_t unlocked_len = 0;
-    err = tspdf_reader_save_to_memory(reopened, &unlocked, &unlocked_len);
+    err = tspdf_reader_save_to_memory_with_options(reopened, &unlocked,
+                                                   &unlocked_len, &unlock_opts);
     ASSERT_EQ_INT(err, TSPDF_OK);
     ASSERT(bytes_contains(unlocked, unlocked_len, "(Page 1)"));
 
@@ -5610,15 +5618,28 @@ TEST(test_manipulate_encrypted) {
     ASSERT(extracted != NULL);
     ASSERT_EQ_SIZE(tspdf_reader_page_count(extracted), 1);
 
+    // The extract inherits the source's encryption, so a plain save stays
+    // locked under the same password...
     uint8_t *out = NULL;
     size_t out_len = 0;
     err = tspdf_reader_save_to_memory(extracted, &out, &out_len);
     ASSERT_EQ_INT(err, TSPDF_OK);
-    ASSERT(bytes_contains(out, out_len, "(Page 1)"));
+    ASSERT(!bytes_contains(out, out_len, "(Page 1)"));
 
-    TspdfReader *doc3 = tspdf_reader_open(out, out_len, &err);
+    TspdfReader *doc3 = tspdf_reader_open_with_password(out, out_len, "test", &err);
     ASSERT(doc3 != NULL);
     ASSERT_EQ_SIZE(tspdf_reader_page_count(doc3), 1);
+
+    // ...and opts.decrypt unlocks the extract.
+    TspdfSaveOptions unlock_opts = tspdf_save_options_default();
+    unlock_opts.decrypt = true;
+    uint8_t *plain = NULL;
+    size_t plain_len = 0;
+    err = tspdf_reader_save_to_memory_with_options(extracted, &plain,
+                                                   &plain_len, &unlock_opts);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(bytes_contains(plain, plain_len, "(Page 1)"));
+    free(plain);
 
     tspdf_reader_destroy(doc3);
     free(out);
@@ -5792,10 +5813,13 @@ TEST(test_phase3_full_pipeline) {
     ASSERT(doc2 != NULL);
     ASSERT_EQ_SIZE(tspdf_reader_page_count(doc2), 3);
 
-    // Save unencrypted
+    // Save unencrypted (explicit opt-out; plain saves preserve encryption)
+    TspdfSaveOptions unlock_opts = tspdf_save_options_default();
+    unlock_opts.decrypt = true;
     uint8_t *out = NULL;
     size_t out_len = 0;
-    err = tspdf_reader_save_to_memory(doc2, &out, &out_len);
+    err = tspdf_reader_save_to_memory_with_options(doc2, &out, &out_len,
+                                                   &unlock_opts);
     ASSERT_EQ_INT(err, TSPDF_OK);
 
     // Final reopen
@@ -7803,6 +7827,9 @@ TEST(test_recompress_encrypted_source_roundtrip) {
 
     TspdfSaveOptions opts = tspdf_save_options_default();
     opts.recompress_streams = true;
+    // Saves preserve encryption by default (where recompression is skipped);
+    // this test targets the decrypt+recompress combination.
+    opts.decrypt = true;
     uint8_t *out = NULL;
     size_t out_len = 0;
     err = tspdf_reader_save_to_memory_with_options(enc_doc, &out, &out_len, &opts);
@@ -10545,14 +10572,16 @@ TEST(test_attach_encrypted_roundtrip) {
     ASSERT(memcmp(bytes, att_payload, blen) == 0);
     free(bytes);
 
-    // And an extract of the encrypted document still carries it.
+    // And an extract of the encrypted document still carries it. The extract
+    // inherits the source's crypt, so its save stays encrypted under the
+    // same password.
     size_t pages[] = {0};
     TspdfReader *result = tspdf_reader_extract(re, pages, 1, &err);
     ASSERT(result != NULL);
     uint8_t *out = NULL;
     size_t out_len = 0;
     ASSERT_EQ_INT(tspdf_reader_save_to_memory(result, &out, &out_len), TSPDF_OK);
-    TspdfReader *re2 = tspdf_reader_open(out, out_len, &err);
+    TspdfReader *re2 = tspdf_reader_open_with_password(out, out_len, "pw", &err);
     ASSERT(re2 != NULL);
     ASSERT_EQ_INT(tspdf_reader_attachment_get(re2, "secret.bin", &bytes, &blen), TSPDF_OK);
     ASSERT_EQ_SIZE(blen, sizeof(att_payload));
@@ -11438,6 +11467,122 @@ TEST(test_form_fill_choice) {
     const TspdfFormFieldInfo *city = form_find(fields, count, "city");
     ASSERT(city != NULL);
     ASSERT(city->value && strcmp(city->value, "Oslo") == 0);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(doc);
+}
+
+// A non-editable choice field only accepts its /Opt export values: filling
+// anything else is rejected the same way an unknown checkbox state is.
+TEST(test_form_fill_choice_rejects_non_option) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/form_fields.pdf", &err);
+    ASSERT(doc != NULL);
+
+    // "city" is a plain combo (/Ff Combo only) with /Opt Berlin/Paris/Oslo.
+    err = tspdf_reader_form_fill(doc, "city", "Atlantis", false);
+    ASSERT_EQ_INT(err, TSPDF_ERR_INVALID_ARG);
+
+    // A listed option and the empty string (clear the value) still work.
+    err = tspdf_reader_form_fill(doc, "city", "Paris", false);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    err = tspdf_reader_form_fill(doc, "city", "", false);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    tspdf_reader_destroy(doc);
+}
+
+// An editable combo (/Ff Combo|Edit) legally takes free text.
+TEST(test_form_fill_editable_combo_accepts_free_text) {
+    TspdfError err;
+    TspdfReader *doc =
+        tspdf_reader_open_file("tests/data/form_combo_edit.pdf", &err);
+    ASSERT(doc != NULL);
+
+    err = tspdf_reader_form_fill(doc, "nickname", "Zaphod", false);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *out = NULL;
+    TspdfReader *re = form_reopen(doc, &out);
+    ASSERT(re != NULL);
+    TspdfFormFieldInfo *fields = NULL;
+    size_t count = 0;
+    err = tspdf_reader_form_fields(re, &fields, &count);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    const TspdfFormFieldInfo *nick = form_find(fields, count, "nickname");
+    ASSERT(nick != NULL);
+    ASSERT(nick->value && strcmp(nick->value, "Zaphod") == 0);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(doc);
+}
+
+// Saving a document that was opened with a password must keep it encrypted:
+// the original /Encrypt dictionary and /ID are carried over, so the original
+// password still opens the output (and no password does not).
+TEST(test_form_fill_encrypted_save_preserves_encryption) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file_with_password(
+        "tests/data/form_fields_enc.pdf", "secret", &err);
+    ASSERT(doc != NULL);
+
+    err = tspdf_reader_form_fill(doc, "name", "Bob", false);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    // Without a password the saved bytes must not open...
+    TspdfError open_err;
+    TspdfReader *plain = tspdf_reader_open(out, out_len, &open_err);
+    ASSERT(plain == NULL);
+    ASSERT_EQ_INT(open_err, TSPDF_ERR_ENCRYPTED);
+
+    // ...and the original password must, with the new value visible.
+    TspdfReader *re =
+        tspdf_reader_open_with_password(out, out_len, "secret", &err);
+    ASSERT(re != NULL);
+    TspdfFormFieldInfo *fields = NULL;
+    size_t count = 0;
+    err = tspdf_reader_form_fields(re, &fields, &count);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    const TspdfFormFieldInfo *name = form_find(fields, count, "name");
+    ASSERT(name != NULL);
+    ASSERT(name->value && strcmp(name->value, "Bob") == 0);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(doc);
+}
+
+// The explicit opt-out: TspdfSaveOptions.decrypt writes plaintext (this is
+// what `tspdf decrypt` uses).
+TEST(test_save_decrypt_option_writes_plaintext) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file_with_password(
+        "tests/data/form_fields_enc.pdf", "secret", &err);
+    ASSERT(doc != NULL);
+
+    TspdfSaveOptions opts = tspdf_save_options_default();
+    opts.decrypt = true;
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory_with_options(doc, &out, &out_len, &opts);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    TspdfFormFieldInfo *fields = NULL;
+    size_t count = 0;
+    err = tspdf_reader_form_fields(re, &fields, &count);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    const TspdfFormFieldInfo *name = form_find(fields, count, "name");
+    ASSERT(name != NULL);
+    ASSERT(name->value && strcmp(name->value, "Ada") == 0);
 
     tspdf_reader_destroy(re);
     free(out);
@@ -12480,6 +12625,10 @@ int main(void) {
     RUN(test_form_fill_checkbox_states);
     RUN(test_form_fill_radio_sets_widget_as);
     RUN(test_form_fill_choice);
+    RUN(test_form_fill_choice_rejects_non_option);
+    RUN(test_form_fill_editable_combo_accepts_free_text);
+    RUN(test_form_fill_encrypted_save_preserves_encryption);
+    RUN(test_save_decrypt_option_writes_plaintext);
     RUN(test_form_fill_unknown_name_errors);
     RUN(test_form_fill_readonly_requires_force);
     RUN(test_form_flatten_fixture);

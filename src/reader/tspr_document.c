@@ -313,6 +313,12 @@ static TspdfReader *open_internal(const uint8_t *data, size_t len,
             if (err) *err = password ? TSPDF_ERR_BAD_PASSWORD : TSPDF_ERR_ENCRYPTED;
             return NULL;
         }
+
+        // Keep the (still raw — resolved before crypt init) source /Encrypt
+        // dict so saves can preserve the document's encryption verbatim.
+        doc->crypt->src_encrypt_dict = encrypt_dict;
+        doc->crypt->src_encrypt_num =
+            encrypt->type == TSPDF_OBJ_REF ? encrypt->ref.num : 0;
     }
 
     // 8. Resolve /Root catalog from trailer

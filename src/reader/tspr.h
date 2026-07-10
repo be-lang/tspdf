@@ -147,7 +147,10 @@ TspdfReader *tspdf_reader_resize_to(TspdfReader *doc, const size_t *pages,
                                     TspdfError *err);
 TspdfReader *tspdf_reader_merge(TspdfReader **docs, size_t count, TspdfError *err);
 
-// Save
+// Save. A document opened with a password stays encrypted: the output reuses
+// the source's /Encrypt dictionary, file key and /ID, so the original user
+// and owner passwords keep working. Use TspdfSaveOptions.decrypt (or
+// tspdf_reader_save_encrypted with new passwords) to change that.
 TspdfError tspdf_reader_save(TspdfReader *doc, const char *path);
 TspdfError tspdf_reader_save_to_memory(TspdfReader *doc, uint8_t **out, size_t *out_len);
 
@@ -194,6 +197,13 @@ typedef struct {
                                // is smaller), and write the xref as a compressed stream
     bool strip_metadata;       // Remove Info dict and XMP metadata
     bool update_producer;      // Set /Producer to "tspdf" (default true)
+    bool decrypt;              // Write an encrypted source unencrypted. By
+                               // default a document opened with a password is
+                               // saved with its ORIGINAL encryption (same
+                               // /Encrypt dictionary, file key and /ID, so
+                               // the original passwords keep working); this
+                               // flag is the explicit opt-out used by
+                               // `tspdf decrypt`.
 } TspdfSaveOptions;
 
 TspdfSaveOptions tspdf_save_options_default(void);

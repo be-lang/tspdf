@@ -5,6 +5,8 @@
 #                       (/Red /Blue, value /Red), combobox "city", and a
 #                       nested text field "a.b" (parent /T (a), kid /T (b)).
 #   form_fields_enc.pdf the same document encrypted (AES-128, user pw "secret")
+#   form_combo_edit.pdf one page: editable combobox "nickname" (/Ff Combo|Edit,
+#                       options Ann/Bob) — free text must be accepted there.
 #
 # Run from the repo root:
 #   uv run --python 3.12 --with pymupdf==1.23.26 python tests/data/gen_form_fixtures.py
@@ -135,5 +137,21 @@ def build():
     print("wrote tests/data/form_fields.pdf and form_fields_enc.pdf")
 
 
+def build_combo_edit():
+    # Separate fixture so the main form_fields.pdf field count stays stable.
+    doc = fitz.open()
+    page = doc.new_page(width=W, height=H)
+    page.insert_text((72, 80), "tspdf editable combo fixture", fontsize=14)
+    add_combobox(page, "nickname", (72, 100, 220, 120), ["Ann", "Bob"], "Ann")
+    # pymupdf only sets the Combo bit (18); add Edit (bit 19) by hand.
+    for w in page.widgets():
+        if w.field_name == "nickname":
+            doc.xref_set_key(w.xref, "Ff", str((1 << 17) | (1 << 18)))
+    doc.save("tests/data/form_combo_edit.pdf")
+    doc.close()
+    print("wrote tests/data/form_combo_edit.pdf")
+
+
 if __name__ == "__main__":
     build()
+    build_combo_edit()

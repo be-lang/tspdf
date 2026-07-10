@@ -202,6 +202,10 @@ tspdf encrypt report.pdf --password "secret" --bits 256 -o locked-256.pdf
 tspdf decrypt locked.pdf --password "secret" -o unlocked.pdf
 ```
 
+Editing an encrypted PDF (`form fill`, `bookmark add`, `stamp`, ...) with
+`--password` keeps the output encrypted with the same passwords. Use
+`decrypt` to remove the password.
+
 ## Convert images to PDF
 
 ```bash
