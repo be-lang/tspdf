@@ -7600,6 +7600,184 @@ TEST(test_text_trailing_spaces_trimmed) {
     free(pdf);
 }
 
+// --- Layout-preserving extraction (tspdf_reader_page_text_layout) ---
+
+// Line `n` (0-based) of `text` copied into `buf`; false if absent.
+static bool text_line(const char *text, size_t n, char *buf, size_t buf_size) {
+    const char *p = text;
+    for (size_t i = 0; i < n; i++) {
+        p = strchr(p, '\n');
+        if (!p) return false;
+        p++;
+    }
+    const char *end = strchr(p, '\n');
+    size_t len = end ? (size_t)(end - p) : strlen(p);
+    if (len + 1 > buf_size) return false;
+    memcpy(buf, p, len);
+    buf[len] = '\0';
+    return true;
+}
+
+TEST(test_text_layout_two_columns) {
+    // Two columns drawn out of visual order (right column of row 1 first).
+    // Layout mode must re-order by x, keep both cells of a row on one line
+    // separated by a run of spaces, and align the columns across rows.
+    // Plain mode must stay in content-stream order, byte-identical.
+    size_t len = 0;
+    char *pdf = make_text_pdf(TEXT_HELV_FONT,
+        "BT /F1 12 Tf 300 700 Td (XXX) Tj ET "
+        "BT /F1 12 Tf 72 700 Td (AAA) Tj ET "
+        "BT /F1 12 Tf 72 686 Td (BBB) Tj ET "
+        "BT /F1 12 Tf 300 686 Td (YYY) Tj ET", &len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    const char *plain = tspdf_reader_page_text(doc, 0, &err);
+    ASSERT(plain != NULL);
+    ASSERT_EQ_STR(plain, "XXX AAA\nBBB YYY\n");
+
+    const char *text = tspdf_reader_page_text_layout(doc, 0, &err);
+    ASSERT(text != NULL);
+    char l1[256], l2[256];
+    ASSERT(text_line(text, 0, l1, sizeof(l1)));
+    ASSERT(text_line(text, 1, l2, sizeof(l2)));
+    const char *a = strstr(l1, "AAA");
+    const char *x = strstr(l1, "XXX");
+    const char *b = strstr(l2, "BBB");
+    const char *y = strstr(l2, "YYY");
+    ASSERT(a && x && b && y);
+    ASSERT(a < x);                       // re-ordered left-to-right
+    ASSERT(x - a >= 3 + 5);              // a real gap, not one space
+    ASSERT_EQ_SIZE((size_t)(x - l1), (size_t)(y - l2)); // columns align
+    ASSERT_EQ_SIZE((size_t)(a - l1), (size_t)(b - l2));
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_text_layout_table_grid) {
+    // 3x2 table: three columns, two rows. Every column must start at the
+    // same character offset in both rows.
+    size_t len = 0;
+    char *pdf = make_text_pdf(TEXT_HELV_FONT,
+        "BT /F1 12 Tf 72 700 Td (Name) Tj ET "
+        "BT /F1 12 Tf 252 700 Td (Qty) Tj ET "
+        "BT /F1 12 Tf 432 700 Td (Price) Tj ET "
+        "BT /F1 12 Tf 72 680 Td (Apple) Tj ET "
+        "BT /F1 12 Tf 252 680 Td (3) Tj ET "
+        "BT /F1 12 Tf 432 680 Td (1.50) Tj ET", &len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    const char *text = tspdf_reader_page_text_layout(doc, 0, &err);
+    ASSERT(text != NULL);
+    char r1[512], r2[512];
+    ASSERT(text_line(text, 0, r1, sizeof(r1)));
+    ASSERT(text_line(text, 1, r2, sizeof(r2)));
+    const char *qty = strstr(r1, "Qty");
+    const char *price = strstr(r1, "Price");
+    const char *three = strstr(r2, "3");
+    const char *val = strstr(r2, "1.50");
+    ASSERT(strstr(r1, "Name") == r1);
+    ASSERT(strstr(r2, "Apple") == r2);
+    ASSERT(qty && price && three && val);
+    ASSERT_EQ_SIZE((size_t)(qty - r1), (size_t)(three - r2));
+    ASSERT_EQ_SIZE((size_t)(price - r1), (size_t)(val - r2));
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_text_layout_y_jitter_merges_line) {
+    // Baselines 0.5pt apart (generator jitter) must land on one line.
+    size_t len = 0;
+    char *pdf = make_text_pdf(TEXT_HELV_FONT,
+        "BT /F1 12 Tf 72 700 Td (Left) Tj ET "
+        "BT /F1 12 Tf 200 699.5 Td (Right) Tj ET", &len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    const char *text = tspdf_reader_page_text_layout(doc, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT(strstr(text, "Left") != NULL);
+    ASSERT(strstr(text, "Right") != NULL);
+    size_t newlines = 0;
+    for (const char *p = text; *p; p++)
+        if (*p == '\n') newlines++;
+    ASSERT_EQ_SIZE(newlines, 1);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_text_layout_blank_lines_bounded) {
+    // A vertical gap beyond ~1.8 line heights becomes one blank line; a huge
+    // gap is capped at two blank lines (never proportional to the distance).
+    size_t len = 0;
+    char *pdf = make_text_pdf(TEXT_HELV_FONT,
+        "BT /F1 12 Tf 72 700 Td (Top) Tj ET "
+        "BT /F1 12 Tf 72 676 Td (Mid) Tj ET "
+        "BT /F1 12 Tf 72 100 Td (Bottom) Tj ET", &len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    const char *text = tspdf_reader_page_text_layout(doc, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT_EQ_STR(text, "Top\n\nMid\n\n\nBottom\n");
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_text_layout_hostile_x_clamped) {
+    // A fragment at x = 1e9 must clamp to the grid width cap instead of
+    // allocating a billion-column line (ASan run guards the allocation).
+    size_t len = 0;
+    char *pdf = make_text_pdf(TEXT_HELV_FONT,
+        "BT /F1 12 Tf 72 700 Td (A) Tj ET "
+        "BT /F1 12 Tf 1000000000 700 Td (B) Tj ET", &len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    const char *text = tspdf_reader_page_text_layout(doc, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT(strstr(text, "A") != NULL);
+    ASSERT(strstr(text, "B") != NULL);
+    ASSERT(strlen(text) < 1200);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_text_layout_empty_page) {
+    size_t len = 0;
+    char *pdf = make_text_pdf(TEXT_HELV_FONT, "", &len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    const char *text = tspdf_reader_page_text_layout(doc, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT_EQ_STR(text, "");
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_text_layout_page_out_of_range) {
+    size_t len = 0;
+    char *pdf = make_text_pdf(TEXT_HELV_FONT, "", &len);
+    ASSERT(pdf != NULL);
+    TspdfError err = TSPDF_OK;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    const char *text = tspdf_reader_page_text_layout(doc, 5, &err);
+    ASSERT(text == NULL);
+    ASSERT_EQ_INT(err, TSPDF_ERR_PAGE_RANGE);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
 // ============================================================
 // Doc trees (feat/doctrees): outlines + AcroForm across merge/extract
 // ============================================================
@@ -8971,6 +9149,15 @@ int main(void) {
     RUN(test_text_malformed_content_no_crash);
     RUN(test_text_ligatures_folded_to_ascii);
     RUN(test_text_trailing_spaces_trimmed);
+
+    printf("\n  Layout-preserving text extraction:\n");
+    RUN(test_text_layout_two_columns);
+    RUN(test_text_layout_table_grid);
+    RUN(test_text_layout_y_jitter_merges_line);
+    RUN(test_text_layout_blank_lines_bounded);
+    RUN(test_text_layout_hostile_x_clamped);
+    RUN(test_text_layout_empty_page);
+    RUN(test_text_layout_page_out_of_range);
 
     printf("\n  Doc trees (outlines/AcroForm across merge/extract):\n");
     RUN(test_merge_preserves_outlines);

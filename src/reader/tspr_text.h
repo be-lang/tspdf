@@ -22,6 +22,10 @@ typedef struct {
 const char *tspdf_reader_page_text_stats(TspdfReader *doc, size_t page_index,
                                          TspdfTextStats *stats, TspdfError *err);
 
+// Same contract as tspdf_reader_page_text_layout (tspr.h) plus stats.
+const char *tspdf_reader_page_text_layout_stats(TspdfReader *doc, size_t page_index,
+                                                TspdfTextStats *stats, TspdfError *err);
+
 #ifdef __cplusplus
 }
 #endif

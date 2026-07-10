@@ -28,6 +28,10 @@
 // alone lets a small file with many compressed streams demand N x 128 MB;
 // past this limit extraction proceeds with what is already loaded.
 #define TEXT_CONTENT_MAX ((size_t)256 << 20)
+// Layout-mode character grid width. Column indexes derived from device-space
+// x are clamped here so a hostile x=1e9 pads at most this many spaces
+// instead of allocating by coordinate.
+#define LAYOUT_MAX_COLS 1000
 
 // --- Matrices (PDF row-vector convention: [a b 0; c d 0; e f 1]) ---
 
@@ -272,6 +276,17 @@ typedef struct TextFont {
 
 // --- Extraction context / graphics state ---
 
+// Layout mode: one record per shown string run. The text bytes live in
+// ctx->out (which serves as the fragment pool instead of the final output);
+// geometry is device space.
+typedef struct {
+    size_t off, len;   // byte range in ctx->out
+    double x, y;       // left edge and baseline
+    double w;          // width (>= 0)
+    double em;         // font size in device units
+    size_t seq;        // content-stream order (stable sort tie-break)
+} TextFrag;
+
 typedef struct {
     TspdfReader *doc;
     TspdfParser rp;          // object resolution (doc arena, persists in cache)
@@ -282,6 +297,9 @@ typedef struct {
     size_t glyphs, replacements;
     bool have_last;
     double last_x, last_y, last_em;
+    bool layout;             // collect fragments instead of emitting inline
+    TextFrag *frags;         // scratch-arena, doubling
+    size_t nfrags, frag_cap;
     const TspdfObj *form_stack[TEXT_MAX_DEPTH]; // cycle guard, indexed by depth
 } TextCtx;
 
@@ -898,9 +916,40 @@ static void tx_device_state(const TextGS *gs, double *x, double *y,
     *sx = sxv;
 }
 
+// Record a layout-mode fragment: text bytes [off, out.len) shown from device
+// x0 to x1 on baseline y. Non-finite geometry (hostile matrices) is dropped;
+// the glyphs still counted toward stats but never placed.
+static void tx_frag_push(TextCtx *ctx, size_t off, double x0, double x1,
+                         double y, double em) {
+    size_t len = ctx->out.len - off;
+    if (len == 0) return;
+    if (!isfinite(x0) || !isfinite(x1) || !isfinite(y)) return;
+    if (ctx->nfrags >= ctx->frag_cap) {
+        size_t new_cap = ctx->frag_cap == 0 ? 64 : ctx->frag_cap * 2;
+        TextFrag *nv = (TextFrag *)tspdf_arena_alloc(&ctx->scratch,
+                                                     new_cap * sizeof(TextFrag));
+        if (!nv) return;
+        if (ctx->frags && ctx->nfrags)
+            memcpy(nv, ctx->frags, ctx->nfrags * sizeof(TextFrag));
+        ctx->frags = nv;
+        ctx->frag_cap = new_cap;
+    }
+    TextFrag *f = &ctx->frags[ctx->nfrags];
+    f->off = off;
+    f->len = len;
+    f->x = x0 < x1 ? x0 : x1;
+    f->y = y;
+    f->w = fabs(x1 - x0);
+    f->em = isfinite(em) && em > 0 ? em : 0;
+    f->seq = ctx->nfrags;
+    ctx->nfrags++;
+}
+
 // Compare the run start against the previous run end: y-jump beyond 0.3 em
 // emits a newline, an x-gap wider than ~half a space emits a space.
+// Layout mode skips both heuristics: spacing comes from fragment geometry.
 static void tx_pre_run(TextCtx *ctx, const TextGS *gs) {
+    if (ctx->layout) return;
     double x, y, em, sx;
     tx_device_state(gs, &x, &y, &em, &sx);
     if (ctx->have_last && ctx->out.len > 0) {
@@ -922,6 +971,7 @@ static void tx_pre_run(TextCtx *ctx, const TextGS *gs) {
 }
 
 static void tx_post_run(TextCtx *ctx, const TextGS *gs) {
+    if (ctx->layout) return;
     double x, y, em, sx;
     tx_device_state(gs, &x, &y, &em, &sx);
     ctx->last_x = x;
@@ -939,6 +989,13 @@ static void tx_show_string(TextCtx *ctx, TextGS *gs, const TspdfObj *str) {
     const uint8_t *b = str->string.data;
     size_t n = str->string.len;
     double adv = 0;
+
+    double run_x = 0, run_y = 0, run_em = 0, run_sx = 0;
+    size_t run_off = 0;
+    if (ctx->layout) {
+        tx_device_state(gs, &run_x, &run_y, &run_em, &run_sx);
+        run_off = ctx->out.len;
+    }
 
     if (f->is_cid) {
         for (size_t i = 0; i < n; i += 2) {
@@ -973,6 +1030,12 @@ static void tx_show_string(TextCtx *ctx, TextGS *gs, const TspdfObj *str) {
         }
     }
     gs->tm = tx_mul(tx_translate(adv, 0), gs->tm);
+
+    if (ctx->layout) {
+        double end_x, end_y, end_em, end_sx;
+        tx_device_state(gs, &end_x, &end_y, &end_em, &end_sx);
+        tx_frag_push(ctx, run_off, run_x, end_x, run_y, run_em);
+    }
 }
 
 // --- Interpreter ---
@@ -1167,7 +1230,7 @@ static void tx_interpret(TextCtx *ctx, const uint8_t *data, size_t len,
                     } else if (el->type == TSPDF_OBJ_INT ||
                                el->type == TSPDF_OBJ_REAL) {
                         double v = tx_obj_num(el);
-                        if (-v > thr) tx_space(ctx);
+                        if (!ctx->layout && -v > thr) tx_space(ctx);
                         gs->tm = tx_mul(tx_translate(-v / 1000.0 * gs->size, 0),
                                         gs->tm);
                     }
@@ -1209,10 +1272,165 @@ static void tx_interpret(TextCtx *ctx, const uint8_t *data, size_t len,
     }
 }
 
+// --- Layout assembly (fragments -> character grid) ---
+
+static size_t tx_utf8_chars(const uint8_t *s, size_t n) {
+    size_t c = 0;
+    for (size_t i = 0; i < n; i++)
+        if ((s[i] & 0xC0) != 0x80) c++;
+    return c;
+}
+
+// Sort keys: baseline y descending (top of page first), then x ascending,
+// then content order — deterministic under qsort's instability.
+static int frag_cmp_y(const void *a, const void *b) {
+    const TextFrag *fa = (const TextFrag *)a, *fb = (const TextFrag *)b;
+    if (fa->y > fb->y) return -1;
+    if (fa->y < fb->y) return 1;
+    if (fa->x < fb->x) return -1;
+    if (fa->x > fb->x) return 1;
+    return fa->seq < fb->seq ? -1 : fa->seq > fb->seq ? 1 : 0;
+}
+
+static int frag_cmp_x(const void *a, const void *b) {
+    const TextFrag *fa = (const TextFrag *)a, *fb = (const TextFrag *)b;
+    if (fa->x < fb->x) return -1;
+    if (fa->x > fb->x) return 1;
+    return fa->seq < fb->seq ? -1 : fa->seq > fb->seq ? 1 : 0;
+}
+
+typedef struct { double adv; size_t chars; } AdvSample;
+
+static int adv_cmp(const void *a, const void *b) {
+    double da = ((const AdvSample *)a)->adv, db = ((const AdvSample *)b)->adv;
+    return da < db ? -1 : da > db ? 1 : 0;
+}
+
+// Grid cell width: the character-weighted median of each fragment's average
+// advance (device-space width / character count). Robust against a few huge
+// or zero-width outliers; computed per page, never hardcoded.
+static double tx_layout_char_width(TextCtx *ctx) {
+    AdvSample *s = (AdvSample *)tspdf_arena_alloc(&ctx->scratch,
+                                                  ctx->nfrags * sizeof(AdvSample));
+    double fallback_em = 0;
+    size_t n = 0, total = 0;
+    for (size_t i = 0; i < ctx->nfrags; i++) {
+        const TextFrag *f = &ctx->frags[i];
+        if (f->em > fallback_em) fallback_em = f->em;
+        size_t chars = tx_utf8_chars(ctx->out.data + f->off, f->len);
+        if (!s || chars == 0 || f->w <= 0 || !isfinite(f->w)) continue;
+        double adv = f->w / (double)chars;
+        if (adv <= 0 || !isfinite(adv)) continue;
+        s[n].adv = adv;
+        s[n].chars = chars;
+        n++;
+        total += chars;
+    }
+    double cw;
+    if (n > 0) {
+        qsort(s, n, sizeof(AdvSample), adv_cmp);
+        size_t half = (total + 1) / 2, cum = 0, i = 0;
+        for (; i + 1 < n; i++) {
+            cum += s[i].chars;
+            if (cum >= half) break;
+        }
+        cw = s[i].adv;
+    } else {
+        cw = fallback_em > 0 ? 0.5 * fallback_em : 6.0;
+    }
+    if (!(cw >= 0.1)) cw = 0.1;      // also catches NaN
+    if (cw > 1e6) cw = 1e6;
+    return cw;
+}
+
+// Place fragments on a character grid, top line first:
+//   line   = fragments whose baselines agree within ~em/3 (y jitter)
+//   column = round((x - page_min_x) / char_width), clamped to the grid cap
+// Fragments in a line go left to right; padding spaces carry them to their
+// column, with at least one space kept between separated fragments and a
+// single space when fragments overlap. Vertical gaps beyond ~1.8 line
+// heights become blank lines (at most 2). Result is appended to `dst`.
+static void tx_layout_assemble(TextCtx *ctx, TspdfBuffer *dst) {
+    size_t n = ctx->nfrags;
+    if (n == 0) return;
+    TextFrag *frags = ctx->frags;
+    qsort(frags, n, sizeof(TextFrag), frag_cmp_y);
+
+    double cw = tx_layout_char_width(ctx);
+    double min_x = frags[0].x;
+    for (size_t i = 1; i < n; i++)
+        if (frags[i].x < min_x) min_x = frags[i].x;
+
+    double prev_y = 0, prev_em = 0;
+    bool have_prev = false;
+    size_t li = 0;
+    while (li < n) {
+        double line_y = frags[li].y;
+        double line_em = frags[li].em;
+        size_t lj = li + 1;
+        while (lj < n) {
+            double em = frags[lj].em > line_em ? frags[lj].em : line_em;
+            double tol = em > 0 ? em / 3.0 : 2.0;
+            if (line_y - frags[lj].y > tol) break;
+            if (frags[lj].em > line_em) line_em = frags[lj].em;
+            lj++;
+        }
+        qsort(frags + li, lj - li, sizeof(TextFrag), frag_cmp_x);
+
+        if (have_prev) {
+            double lh = prev_em > line_em ? prev_em : line_em;
+            if (lh > 0) {
+                double gap = prev_y - line_y;
+                if (gap > 1.8 * lh)
+                    tspdf_buffer_append(dst, gap > 3.2 * lh ? "\n\n" : "\n",
+                                        gap > 3.2 * lh ? 2 : 1);
+            }
+        }
+
+        size_t line_start = dst->len;
+        size_t cur_col = 0;
+        double cur_end = 0;
+        for (size_t k = li; k < lj; k++) {
+            const TextFrag *f = &frags[k];
+            double rel = (f->x - min_x) / cw;
+            size_t col = rel <= 0 ? 0
+                       : rel >= (double)(LAYOUT_MAX_COLS - 1) ? LAYOUT_MAX_COLS - 1
+                       : (size_t)(rel + 0.5);
+            size_t pad;
+            if (k == li) {
+                pad = col;
+            } else {
+                double gap = f->x - cur_end;
+                if (gap >= 0.3 * cw)
+                    pad = col > cur_col ? col - cur_col : 1; // keep a real gap
+                else if (gap > -cw)
+                    pad = 0;                                 // contiguous run
+                else
+                    pad = 1;                                 // overlap: merge
+            }
+            if (pad > LAYOUT_MAX_COLS) pad = LAYOUT_MAX_COLS;
+            for (size_t sp = 0; sp < pad; sp++)
+                tspdf_buffer_append_byte(dst, ' ');
+            tspdf_buffer_append(dst, ctx->out.data + f->off, f->len);
+            cur_col += pad + tx_utf8_chars(ctx->out.data + f->off, f->len);
+            double end = f->x + f->w;
+            if (k == li || end > cur_end) cur_end = end;
+        }
+        while (dst->len > line_start && dst->data[dst->len - 1] == ' ')
+            dst->len--;
+        tspdf_buffer_append_byte(dst, '\n');
+
+        have_prev = true;
+        prev_y = line_y;
+        prev_em = line_em;
+        li = lj;
+    }
+}
+
 // --- Public API ---
 
-const char *tspdf_reader_page_text_stats(TspdfReader *doc, size_t page_index,
-                                         TspdfTextStats *stats, TspdfError *err) {
+static const char *tx_page_text(TspdfReader *doc, size_t page_index, bool layout,
+                                TspdfTextStats *stats, TspdfError *err) {
     if (stats) {
         stats->glyphs = 0;
         stats->replacements = 0;
@@ -1229,6 +1447,7 @@ const char *tspdf_reader_page_text_stats(TspdfReader *doc, size_t page_index,
     TextCtx ctx;
     memset(&ctx, 0, sizeof(ctx));
     ctx.doc = doc;
+    ctx.layout = layout;
     tspdf_parser_init(&ctx.rp, doc->data, doc->data_len, &doc->arena);
     ctx.scratch = tspdf_arena_create(65536);
     if (!ctx.scratch.first) {
@@ -1250,9 +1469,18 @@ const char *tspdf_reader_page_text_stats(TspdfReader *doc, size_t page_index,
         tx_interpret(&ctx, content.data, content.len, &gs, 0);
     tspdf_buffer_destroy(&content);
 
-    tx_trim_line_end(&ctx);
-    if (ctx.out.len > 0 && ctx.out.data[ctx.out.len - 1] != '\n')
-        tspdf_buffer_append_byte(&ctx.out, '\n');
+    if (layout) {
+        // ctx.out held the fragment pool; assemble the grid and swap it in.
+        TspdfBuffer assembled = tspdf_buffer_create(ctx.out.len + 256);
+        if (!ctx.out.error) tx_layout_assemble(&ctx, &assembled);
+        else assembled.error = true;
+        tspdf_buffer_destroy(&ctx.out);
+        ctx.out = assembled;
+    } else {
+        tx_trim_line_end(&ctx);
+        if (ctx.out.len > 0 && ctx.out.data[ctx.out.len - 1] != '\n')
+            tspdf_buffer_append_byte(&ctx.out, '\n');
+    }
 
     char *result = NULL;
     if (!ctx.out.error) {
@@ -1277,7 +1505,22 @@ const char *tspdf_reader_page_text_stats(TspdfReader *doc, size_t page_index,
     return result;
 }
 
+const char *tspdf_reader_page_text_stats(TspdfReader *doc, size_t page_index,
+                                         TspdfTextStats *stats, TspdfError *err) {
+    return tx_page_text(doc, page_index, false, stats, err);
+}
+
 const char *tspdf_reader_page_text(TspdfReader *doc, size_t page_index,
                                    TspdfError *err) {
-    return tspdf_reader_page_text_stats(doc, page_index, NULL, err);
+    return tx_page_text(doc, page_index, false, NULL, err);
+}
+
+const char *tspdf_reader_page_text_layout_stats(TspdfReader *doc, size_t page_index,
+                                                TspdfTextStats *stats, TspdfError *err) {
+    return tx_page_text(doc, page_index, true, stats, err);
+}
+
+const char *tspdf_reader_page_text_layout(TspdfReader *doc, size_t page_index,
+                                          TspdfError *err) {
+    return tx_page_text(doc, page_index, true, NULL, err);
 }
