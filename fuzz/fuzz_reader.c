@@ -70,6 +70,19 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         if (sub) tspdf_reader_destroy(sub);
     }
 
+    // AcroForm field enumeration walks the /Fields + widget tree; attachment
+    // enumeration walks the /Names /EmbeddedFiles number tree — both parse
+    // attacker-shaped structures with their own cycle budgets.
+    TspdfFormFieldInfo *fields = NULL;
+    size_t field_count = 0;
+    (void)tspdf_reader_form_fields(doc, &fields, &field_count);
+
+    TspdfAttachmentInfo *atts = NULL;
+    size_t att_count = 0;
+    if (tspdf_reader_attachments(doc, &atts, &att_count) == TSPDF_OK) {
+        free(atts);
+    }
+
     // Round-trip through the serializer to fuzz the write path over parsed,
     // possibly-degenerate object graphs.
     uint8_t *out = NULL;
