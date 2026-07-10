@@ -42,6 +42,7 @@ tspdf stamp doc.pdf --stamp approved.pdf -o stamped.pdf
 tspdf nup 2 slides.pdf -o handout.pdf
 tspdf pagenum doc.pdf -o numbered.pdf
 tspdf compress doc.pdf -o smaller.pdf
+tspdf compress --lossy scan.pdf -o small.pdf
 tspdf text doc.pdf -o doc.txt
 tspdf metadata doc.pdf
 tspdf attach add doc.pdf data.csv -o with-files.pdf

@@ -194,6 +194,46 @@ uint8_t *tspdf_content_rewrite(const uint8_t *stream, size_t len,
 TspdfError tspdf_stream_decode(TspdfObj *stream_dict, const uint8_t *raw_data,
                                size_t raw_len, uint8_t **out_data, size_t *out_len);
 
+// --- Lossy image recompression internals (tspr_lossy.c) ---
+
+// Box-filter downsample (arbitrary ratios >= 1, per channel, exact edge
+// weights). src is sw*sh*comps interleaved 8-bit pixels, dst dw*dh*comps.
+// dw/dh must not exceed sw/sh (this never upsamples). Returns false on bad
+// arguments or allocation failure, leaving dst untouched.
+bool tspdf_lossy_box_downsample(const uint8_t *src, uint32_t sw, uint32_t sh,
+                                int comps, uint8_t *dst, uint32_t dw, uint32_t dh);
+
+// True when every RGB pixel has max(|R-G|,|R-B|,|G-B|) <= 8 (all pixels are
+// checked; no sampling).
+bool tspdf_lossy_rgb_is_gray(const uint8_t *rgb, size_t npix);
+
+// BT.601-style integer luma: (77R + 150G + 29B + 128) >> 8.
+void tspdf_lossy_rgb_to_gray(const uint8_t *rgb, size_t npix, uint8_t *out);
+
+// Decide the downsample target for a w*h image rendered at w_pt x h_pt
+// points. Returns true (and the target pixel size) only when the image has
+// more than 1.3x the pixels needed at target_dpi; never upsamples.
+bool tspdf_lossy_target_dims(uint32_t w, uint32_t h, double w_pt, double h_pt,
+                             int target_dpi, uint32_t *dw, uint32_t *dh);
+
+// Keep-the-original rule: replace only when the new stored stream is at
+// least 10% smaller than the old one.
+bool tspdf_lossy_worth_replacing(size_t old_stored, size_t new_stored);
+
+// One drawn image XObject with its largest rendered size in points (the
+// placement needing the most pixels), from walking every page's content
+// streams (CTM tracking through q/Q/cm, recursing into Form XObjects).
+typedef struct {
+    uint32_t obj_num;
+    double w_pt, h_pt;
+} TspdfLossyPlacement;
+
+// Scan all pages for image XObject placements. *out is malloc'd (caller
+// frees); *count 0 with *out NULL when no image is drawn. Images with any
+// unmeasurable placement (q/Q nesting too deep to track) are excluded.
+TspdfError tspdf_lossy_scan_placements(TspdfReader *doc,
+                                       TspdfLossyPlacement **out, size_t *count);
+
 // --- New object registration ---
 
 uint32_t tspdf_register_new_obj(TspdfReader *doc, TspdfObj *obj);

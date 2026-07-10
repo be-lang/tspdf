@@ -99,6 +99,7 @@ src/reader/tspr_resources.c
 src/reader/tspr_annot.c
 src/reader/tspr_form.c
 src/reader/tspr_text.c
+src/reader/tspr_lossy.c
 src/crypto/md5.c
 src/crypto/sha256.c
 src/crypto/sha512.c

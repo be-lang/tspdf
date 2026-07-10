@@ -431,6 +431,31 @@ typedef struct {
 TspdfReader *tspdf_reader_nup(TspdfReader *src, const TspdfNupOptions *opts,
                               TspdfError *err);
 
+// --- Lossy image recompression ---
+
+typedef struct {
+    size_t images_recompressed; // raster images downsampled + JPEG re-encoded
+    size_t images_skipped;      // drawn raster images examined but left as-is
+    size_t bytes_before;        // stored (encoded) bytes of recompressed images
+    size_t bytes_after;         // their new stored bytes
+} TspdfLossyStats;
+
+// Downsample and JPEG-re-encode the document's raster images in place, for
+// `tspdf compress --lossy`. Eligible images are 8-bit /DeviceRGB or
+// /DeviceGray XObjects stored as plain FlateDecode (PNG/TIFF predictors
+// honored) or baseline DCTDecode, at least 65536 pixels, without
+// /SMask//Mask//ImageMask or a non-default /Decode. Each image's rendered
+// size is measured by walking the page content streams (CTM tracking, Form
+// XObjects included); the placement needing the most pixels wins, and the
+// image is only rewritten when it carries more than 1.3x the pixels needed
+// at target_dpi AND the re-encoded stream is at least 10% smaller than the
+// original stored stream. RGB images whose pixels are all near-gray
+// (max channel delta <= 8) are converted to /DeviceGray. Images never drawn
+// are left alone. quality is 1..100 (JPEG). The document must be saved
+// afterwards for the change to persist; encryption is preserved as usual.
+TspdfError tspdf_reader_lossy_images(TspdfReader *doc, int target_dpi,
+                                     int quality, TspdfLossyStats *stats);
+
 // --- Annotations ---
 
 TspdfError tspdf_page_add_link(TspdfReader *doc, size_t page_index,
