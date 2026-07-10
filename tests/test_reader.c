@@ -6406,6 +6406,129 @@ TEST(test_import_page_xobject_basic) {
     free(src_data);
 }
 
+// First indirect reference number found in an object tree (DFS), or 0. Used
+// to check that two imported forms' /Resources point at the same destination
+// objects (the dedup cache reused them) without caring about resource shape.
+static uint32_t first_ref_num_in(TspdfObj *obj, int depth) {
+    if (!obj || depth > 16) return 0;
+    switch (obj->type) {
+        case TSPDF_OBJ_REF:
+            return obj->ref.num;
+        case TSPDF_OBJ_ARRAY:
+            for (size_t i = 0; i < obj->array.count; i++) {
+                uint32_t n = first_ref_num_in(&obj->array.items[i], depth + 1);
+                if (n) return n;
+            }
+            return 0;
+        case TSPDF_OBJ_DICT:
+            for (size_t i = 0; i < obj->dict.count; i++) {
+                uint32_t n = first_ref_num_in(obj->dict.entries[i].value, depth + 1);
+                if (n) return n;
+            }
+            return 0;
+        default:
+            return 0;
+    }
+}
+
+TEST(test_import_same_source_twice_dedups) {
+    // Repeated imports from the same source into one destination (the nup /
+    // stamp pattern: one import per placement) must reuse already-imported
+    // referenced objects instead of copying them again.
+    size_t src_len = 0, dst_len = 0;
+    uint8_t *src_data = make_stamp_text_pdf("StampText", &src_len);
+    uint8_t *dst_data = make_stamp_text_pdf("BaseText", &dst_len);
+    ASSERT(src_data != NULL);
+    ASSERT(dst_data != NULL);
+
+    TspdfError err;
+    TspdfReader *src = tspdf_reader_open(src_data, src_len, &err);
+    TspdfReader *dst = tspdf_reader_open(dst_data, dst_len, &err);
+    ASSERT(src != NULL);
+    ASSERT(dst != NULL);
+
+    size_t base = dst->new_objs.count;
+    uint32_t x1 = tspdf_reader_import_page_xobject(dst, src, 0, NULL, &err);
+    ASSERT(x1 > 0);
+    size_t after_first = dst->new_objs.count;
+    // First import brings the form plus at least one referenced object (the
+    // font) — otherwise the dedup assertion below would be vacuous.
+    ASSERT(after_first - base >= 2);
+
+    uint32_t x2 = tspdf_reader_import_page_xobject(dst, src, 0, NULL, &err);
+    ASSERT(x2 > 0);
+    ASSERT(x1 != x2);
+    // Every referenced object is a cache hit: only the form itself is new.
+    ASSERT_EQ_INT((int)(dst->new_objs.count - after_first), 1);
+
+    // Both forms' /Resources must reference the SAME destination objects.
+    TspdfObj *form1 = dst->new_objs.objs[x1 - dst->xref.count];
+    TspdfObj *form2 = dst->new_objs.objs[x2 - dst->xref.count];
+    ASSERT(form1 && form1->type == TSPDF_OBJ_STREAM);
+    ASSERT(form2 && form2->type == TSPDF_OBJ_STREAM);
+    uint32_t ref1 = first_ref_num_in(tspdf_dict_get(form1->stream.dict, "Resources"), 0);
+    uint32_t ref2 = first_ref_num_in(tspdf_dict_get(form2->stream.dict, "Resources"), 0);
+    ASSERT(ref1 != 0);
+    ASSERT_EQ_INT((int)ref1, (int)ref2);
+
+    // The deduped result must still save and render both texts.
+    ASSERT_EQ_INT(draw_xobject_on_page(dst, 0, x1, 0.5, 0, 0), TSPDF_OK);
+    ASSERT_EQ_INT(draw_xobject_on_page(dst, 0, x2, 0.5, 200, 200), TSPDF_OK);
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(dst, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    const char *text = tspdf_reader_page_text(re, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT(strstr(text, "StampText") != NULL);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(dst);
+    tspdf_reader_destroy(src);
+    free(dst_data);
+    free(src_data);
+}
+
+TEST(test_import_distinct_readers_not_deduped) {
+    // The cache key includes the source reader pointer: two readers opened
+    // from the same bytes are distinct sources and must NOT share entries
+    // (nothing guarantees their object graphs stay in sync).
+    size_t src_len = 0, dst_len = 0;
+    uint8_t *src_data = make_stamp_text_pdf("StampText", &src_len);
+    uint8_t *dst_data = make_stamp_text_pdf("BaseText", &dst_len);
+    ASSERT(src_data != NULL);
+    ASSERT(dst_data != NULL);
+
+    TspdfError err;
+    TspdfReader *src1 = tspdf_reader_open(src_data, src_len, &err);
+    TspdfReader *src2 = tspdf_reader_open(src_data, src_len, &err);
+    TspdfReader *dst = tspdf_reader_open(dst_data, dst_len, &err);
+    ASSERT(src1 != NULL);
+    ASSERT(src2 != NULL);
+    ASSERT(dst != NULL);
+
+    size_t base = dst->new_objs.count;
+    uint32_t x1 = tspdf_reader_import_page_xobject(dst, src1, 0, NULL, &err);
+    ASSERT(x1 > 0);
+    size_t delta1 = dst->new_objs.count - base;
+    ASSERT(delta1 >= 2);
+
+    uint32_t x2 = tspdf_reader_import_page_xobject(dst, src2, 0, NULL, &err);
+    ASSERT(x2 > 0);
+    size_t delta2 = dst->new_objs.count - base - delta1;
+    // Full copy again: same object count as the first import.
+    ASSERT_EQ_INT((int)delta2, (int)delta1);
+
+    tspdf_reader_destroy(dst);
+    tspdf_reader_destroy(src2);
+    tspdf_reader_destroy(src1);
+    free(dst_data);
+    free(src_data);
+}
+
 TEST(test_import_source_freed_before_save) {
     // The import must be self-contained: destroying the source document (and
     // freeing its buffer) before saving the destination must be safe.
@@ -14229,6 +14352,8 @@ int main(void) {
     printf("\n  Form XObject import:\n");
     RUN(test_end_content_under);
     RUN(test_import_page_xobject_basic);
+    RUN(test_import_same_source_twice_dedups);
+    RUN(test_import_distinct_readers_not_deduped);
     RUN(test_import_source_freed_before_save);
     RUN(test_import_from_encrypted_source);
     RUN(test_import_page_out_of_range);
