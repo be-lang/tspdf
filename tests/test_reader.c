@@ -6012,6 +6012,93 @@ TEST(test_overlay_abort) {
     tspdf_reader_destroy(doc);
 }
 
+// Count how many entries of `dict` carry `key` (duplicate-key detector).
+static size_t dict_key_count(TspdfObj *dict, const char *key) {
+    if (!dict || dict->type != TSPDF_OBJ_DICT) return 0;
+    size_t n = 0;
+    for (size_t i = 0; i < dict->dict.count; i++) {
+        if (strcmp(dict->dict.entries[i].key, key) == 0) n++;
+    }
+    return n;
+}
+
+// Regression: pages whose /Resources is an INDIRECT reference (shared between
+// pages, /Font itself indirect too — the pymupdf/pdfTeX shape). Merging
+// overlay resources used to append a DUPLICATE /Resources key to the page
+// dict, so the original fonts were orphaned and pages rendered near-blank.
+TEST(test_overlay_indirect_shared_resources) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/indirect_resources.pdf", &err);
+    ASSERT(doc != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(doc), 2);
+
+    // One resource owner reused for both pages, like the watermark CLI does:
+    // a font plus an opacity ExtGState.
+    TspdfWriter *res_owner = tspdf_writer_create();
+    const char *font = tspdf_writer_add_builtin_font(res_owner, "Helvetica");
+    const char *gs = tspdf_writer_add_opacity(res_owner, 0.3, 0.3);
+    ASSERT(font != NULL);
+    ASSERT(gs != NULL);
+    for (size_t p = 0; p < 2; p++) {
+        TspdfStream *ov = tspdf_page_begin_content(doc, p);
+        ASSERT(ov != NULL);
+        tspdf_stream_set_opacity(ov, gs);
+        tspdf_stream_begin_text(ov);
+        tspdf_stream_set_font(ov, font, 36.0);
+        tspdf_stream_text_position(ov, 100, 100);
+        tspdf_stream_show_text(ov, "DRAFT");
+        tspdf_stream_end_text(ov);
+        err = tspdf_page_end_content(doc, p, ov, res_owner);
+        ASSERT_EQ_INT(err, TSPDF_OK);
+    }
+    // res_owner stays alive: `font`/`gs` point into it and are used below.
+
+    // The merge must not have appended a second /Resources key.
+    for (size_t p = 0; p < 2; p++) {
+        ASSERT_EQ_SIZE(dict_key_count(doc->pages.pages[p].page_dict, "Resources"), 1);
+    }
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    TspdfReader *doc2 = tspdf_reader_open(out, out_len, &err);
+    ASSERT(doc2 != NULL);
+    for (size_t p = 0; p < 2; p++) {
+        TspdfObj *page_dict = doc2->pages.pages[p].page_dict;
+        TspdfObj *res = test_resolve_ref(doc2, tspdf_dict_get(page_dict, "Resources"));
+        ASSERT(res != NULL);
+        ASSERT_EQ_INT(res->type, TSPDF_OBJ_DICT);
+        ASSERT_EQ_SIZE(dict_key_count(res, "Font"), 1);
+        TspdfObj *fonts = test_resolve_ref(doc2, tspdf_dict_get(res, "Font"));
+        ASSERT(fonts != NULL);
+        ASSERT_EQ_INT(fonts->type, TSPDF_OBJ_DICT);
+        // Original font must survive alongside the overlay font...
+        ASSERT(tspdf_dict_get(fonts, "F1") != NULL);
+        ASSERT(tspdf_dict_get(fonts, font) != NULL);
+        // ...and the shared dict must not accumulate the OTHER page's
+        // additions (each page gets its own copy: exactly F1 + overlay font).
+        ASSERT_EQ_SIZE(fonts->dict.count, 2);
+        // The opacity ExtGState made it in, too.
+        TspdfObj *egs = test_resolve_ref(doc2, tspdf_dict_get(res, "ExtGState"));
+        ASSERT(egs != NULL);
+        ASSERT_EQ_INT(egs->type, TSPDF_OBJ_DICT);
+        ASSERT(tspdf_dict_get(egs, gs) != NULL);
+
+        // Both the original text and the overlay text extract.
+        const char *text = tspdf_reader_page_text(doc2, p, &err);
+        ASSERT(text != NULL);
+        ASSERT(strstr(text, p == 0 ? "Hello page one" : "Hello page two") != NULL);
+        ASSERT(strstr(text, "DRAFT") != NULL);
+    }
+
+    tspdf_reader_destroy(doc2);
+    free(out);
+    tspdf_writer_destroy(res_owner);
+    tspdf_reader_destroy(doc);
+}
+
 // --- Form XObject import (stamp) tests ---
 
 // One-page A4 PDF with `text` drawn in Helvetica, via the writer.
@@ -12322,6 +12409,7 @@ int main(void) {
     RUN(test_overlay_on_specific_page);
     RUN(test_overlay_abort);
     RUN(test_overlay_wraps_unbalanced_content);
+    RUN(test_overlay_indirect_shared_resources);
 
     printf("\n  Form XObject import:\n");
     RUN(test_end_content_under);
