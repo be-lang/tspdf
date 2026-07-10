@@ -19,7 +19,7 @@ static void print_usage(void) {
     printf("  decrypt    Decrypt a password-protected PDF\n");
     printf("  metadata   View or edit PDF metadata\n");
     printf("  info       Print information about a PDF\n");
-    printf("  watermark  Add a text watermark to a PDF\n");
+    printf("  watermark  Add a text or image watermark to a PDF\n");
     printf("  compress   Compress a PDF to reduce file size\n");
     printf("  img2pdf    Convert images (JPEG/PNG) to a PDF\n");
     printf("  qrcode     Generate a QR code PDF\n");
@@ -29,6 +29,7 @@ static void print_usage(void) {
     printf("  pagenum    Stamp page numbers onto a PDF\n");
     printf("  form       List, fill, or flatten PDF form fields\n");
     printf("  attach     Embed, list, extract, or remove file attachments\n");
+    printf("  stamp      Overlay a PDF page onto another PDF's pages\n");
     printf("\n");
     printf("Options:\n");
     printf("  --help, -h     Show this help message\n");
@@ -136,13 +137,40 @@ static void print_command_help(const char *cmd) {
     } else if (strcmp(cmd, "watermark") == 0) {
         printf("Usage: tspdf watermark <input.pdf> -o <output.pdf> --text <text>\n");
         printf("                       [--opacity <0.0-1.0>]\n");
+        printf("       tspdf watermark <input.pdf> -o <output.pdf> --image <logo.png|jpg>\n");
+        printf("                       [--opacity <0.0-1.0>] [--scale <factor>] [--position <pos>]\n");
         printf("\n");
-        printf("Add a diagonal text watermark to all pages of a PDF.\n");
+        printf("Add a watermark to all pages of a PDF: a diagonal text stamp, or an\n");
+        printf("image (PNG or JPEG). --text and --image are mutually exclusive.\n");
         printf("\n");
         printf("Arguments:\n");
         printf("  <input.pdf>         Input PDF file\n");
-        printf("  --text <text>       Watermark text, e.g. \"DRAFT\" (required)\n");
+        printf("  --text <text>       Watermark text, e.g. \"DRAFT\"\n");
+        printf("  --image <file>      Watermark image (PNG or JPEG)\n");
         printf("  --opacity <float>   Opacity from 0.0 (invisible) to 1.0 (opaque), default: 0.3\n");
+        printf("  --scale <factor>    Image size: larger image dimension = scale x the\n");
+        printf("                      smaller page dimension (default: 0.5)\n");
+        printf("  --position <pos>    center (default), tile, top-left, top-right,\n");
+        printf("                      bottom-left, bottom-right\n");
+        printf("  -o <output.pdf>     Output file path (required)\n");
+    } else if (strcmp(cmd, "stamp") == 0) {
+        printf("Usage: tspdf stamp <input.pdf> --stamp <stamp.pdf> -o <output.pdf>\n");
+        printf("                   [--pages <range>] [--under] [--stamp-page N]\n");
+        printf("                   [--password <pass>]\n");
+        printf("\n");
+        printf("Overlay a page of stamp.pdf onto pages of input.pdf (like pdftk\n");
+        printf("stamp / qpdf overlay). The stamp page is scaled to fit each target\n");
+        printf("page, keeping its aspect ratio, and centered.\n");
+        printf("\n");
+        printf("Arguments:\n");
+        printf("  <input.pdf>         Input PDF file\n");
+        printf("  --stamp <stamp.pdf> PDF whose page is stamped onto the input (required)\n");
+        printf("  --stamp-page N      Which page of stamp.pdf to use (default: 1)\n");
+        printf("  --pages <range>     Pages to stamp, e.g. 1-3 or 2,4 (default: all)\n");
+        printf("  --under             Draw the stamp beneath the existing content\n");
+        printf("                      (letterhead/background) instead of on top\n");
+        printf("  --password <pass>   Password for an encrypted input (output is saved\n");
+        printf("                      decrypted; re-encrypt with 'tspdf encrypt')\n");
         printf("  -o <output.pdf>     Output file path (required)\n");
     } else if (strcmp(cmd, "compress") == 0) {
         printf("Usage: tspdf compress <input.pdf> -o <output.pdf>\n");
@@ -324,6 +352,7 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "pagenum") == 0)  return cmd_pagenum(sub_argc, sub_argv);
     if (strcmp(cmd, "form") == 0)     return cmd_form(sub_argc, sub_argv);
     if (strcmp(cmd, "attach") == 0)   return cmd_attach(sub_argc, sub_argv);
+    if (strcmp(cmd, "stamp") == 0)    return cmd_stamp(sub_argc, sub_argv);
 
     fprintf(stderr, "tspdf: unknown command '%s'\n\n", cmd);
     print_usage();

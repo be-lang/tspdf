@@ -5593,6 +5593,514 @@ TEST(test_overlay_abort) {
     tspdf_reader_destroy(doc);
 }
 
+// --- Form XObject import (stamp) tests ---
+
+// One-page A4 PDF with `text` drawn in Helvetica, via the writer.
+static uint8_t *make_stamp_text_pdf(const char *text, size_t *out_len) {
+    TspdfWriter *w = tspdf_writer_create();
+    if (!w) return NULL;
+    const char *font = tspdf_writer_add_builtin_font(w, "Helvetica");
+    TspdfStream *page = tspdf_writer_add_page(w);
+    if (!font || !page) { tspdf_writer_destroy(w); return NULL; }
+    tspdf_stream_begin_text(page);
+    tspdf_stream_set_font(page, font, 24.0);
+    tspdf_stream_text_position(page, 72, 400);
+    tspdf_stream_show_text(page, text);
+    tspdf_stream_end_text(page);
+    uint8_t *data = NULL;
+    *out_len = 0;
+    tspdf_writer_save_to_memory(w, &data, out_len);
+    tspdf_writer_destroy(w);
+    return data;
+}
+
+// Draw an imported form XObject on a page: scale `s`, offset (x, y).
+static TspdfError draw_xobject_on_page(TspdfReader *doc, size_t page_index,
+                                       uint32_t xobj_num, double s, double x, double y) {
+    const char *name = tspdf_page_add_xobject(doc, page_index, xobj_num);
+    if (!name) return TSPDF_ERR_ALLOC;
+    TspdfStream *ov = tspdf_page_begin_content(doc, page_index);
+    if (!ov) return TSPDF_ERR_ALLOC;
+    tspdf_stream_draw_image(ov, name, x, y, s, s);
+    return tspdf_page_end_content(doc, page_index, ov, NULL);
+}
+
+TEST(test_end_content_under) {
+    size_t pdf_len = 0;
+    uint8_t *pdf_data = make_stamp_text_pdf("OriginalText", &pdf_len);
+    ASSERT(pdf_data != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open(pdf_data, pdf_len, &err);
+    ASSERT(doc != NULL);
+
+    TspdfWriter *res_owner = tspdf_writer_create();
+    const char *font = tspdf_writer_add_builtin_font(res_owner, "Helvetica");
+    TspdfStream *under = tspdf_page_begin_content(doc, 0);
+    ASSERT(under != NULL);
+    tspdf_stream_begin_text(under);
+    tspdf_stream_set_font(under, font, 24.0);
+    tspdf_stream_text_position(under, 72, 500);
+    tspdf_stream_show_text(under, "UnderText");
+    tspdf_stream_end_text(under);
+    err = tspdf_page_end_content_under(doc, 0, under, res_owner);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    tspdf_writer_destroy(res_owner);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    TspdfReader *doc2 = tspdf_reader_open(out, out_len, &err);
+    ASSERT(doc2 != NULL);
+    const char *text = tspdf_reader_page_text(doc2, 0, &err);
+    ASSERT(text != NULL);
+    const char *under_pos = strstr(text, "UnderText");
+    const char *orig_pos = strstr(text, "OriginalText");
+    ASSERT(under_pos != NULL);
+    ASSERT(orig_pos != NULL);
+    // Under-content is prepended, so it comes first in content order.
+    ASSERT(under_pos < orig_pos);
+
+    tspdf_reader_destroy(doc2);
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf_data);
+}
+
+TEST(test_import_page_xobject_basic) {
+    size_t src_len = 0, dst_len = 0;
+    uint8_t *src_data = make_stamp_text_pdf("StampText", &src_len);
+    uint8_t *dst_data = make_stamp_text_pdf("BaseText", &dst_len);
+    ASSERT(src_data != NULL);
+    ASSERT(dst_data != NULL);
+
+    TspdfError err;
+    TspdfReader *src = tspdf_reader_open(src_data, src_len, &err);
+    TspdfReader *dst = tspdf_reader_open(dst_data, dst_len, &err);
+    ASSERT(src != NULL);
+    ASSERT(dst != NULL);
+
+    double bbox[4] = {0};
+    uint32_t xnum = tspdf_reader_import_page_xobject(dst, src, 0, bbox, &err);
+    ASSERT(xnum > 0);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    // BBox mirrors the source page MediaBox (A4).
+    ASSERT(bbox[2] > 595.0 && bbox[2] < 596.0);
+    ASSERT(bbox[3] > 841.0 && bbox[3] < 842.0);
+
+    err = draw_xobject_on_page(dst, 0, xnum, 0.5, 50, 50);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(dst, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    const char *text = tspdf_reader_page_text(re, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT(strstr(text, "BaseText") != NULL);
+    ASSERT(strstr(text, "StampText") != NULL);
+    // The form XObject made it into the file.
+    ASSERT(bytes_contains(out, out_len, "/Form"));
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(dst);
+    tspdf_reader_destroy(src);
+    free(dst_data);
+    free(src_data);
+}
+
+TEST(test_import_source_freed_before_save) {
+    // The import must be self-contained: destroying the source document (and
+    // freeing its buffer) before saving the destination must be safe.
+    size_t src_len = 0, dst_len = 0;
+    uint8_t *src_data = make_stamp_text_pdf("StampText", &src_len);
+    uint8_t *dst_data = make_stamp_text_pdf("BaseText", &dst_len);
+    ASSERT(src_data != NULL);
+    ASSERT(dst_data != NULL);
+
+    TspdfError err;
+    TspdfReader *src = tspdf_reader_open(src_data, src_len, &err);
+    TspdfReader *dst = tspdf_reader_open(dst_data, dst_len, &err);
+    ASSERT(src != NULL);
+    ASSERT(dst != NULL);
+
+    uint32_t xnum = tspdf_reader_import_page_xobject(dst, src, 0, NULL, &err);
+    ASSERT(xnum > 0);
+
+    tspdf_reader_destroy(src);
+    free(src_data);
+
+    ASSERT_EQ_INT(draw_xobject_on_page(dst, 0, xnum, 1.0, 0, 0), TSPDF_OK);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(dst, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    const char *text = tspdf_reader_page_text(re, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT(strstr(text, "StampText") != NULL);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(dst);
+    free(dst_data);
+}
+
+TEST(test_import_from_encrypted_source) {
+    size_t plain_len = 0, dst_len = 0;
+    uint8_t *plain = make_stamp_text_pdf("SecretStamp", &plain_len);
+    uint8_t *dst_data = make_stamp_text_pdf("BaseText", &dst_len);
+    ASSERT(plain != NULL);
+    ASSERT(dst_data != NULL);
+
+    TspdfError err;
+    TspdfReader *tmp = tspdf_reader_open(plain, plain_len, &err);
+    ASSERT(tmp != NULL);
+    uint8_t *enc = NULL;
+    size_t enc_len = 0;
+    err = tspdf_reader_save_to_memory_encrypted(tmp, &enc, &enc_len,
+                                                "pw", "pw", 0xFFFFFFFC, 128);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    tspdf_reader_destroy(tmp);
+    free(plain);
+
+    TspdfReader *src = tspdf_reader_open_with_password(enc, enc_len, "pw", &err);
+    TspdfReader *dst = tspdf_reader_open(dst_data, dst_len, &err);
+    ASSERT(src != NULL);
+    ASSERT(dst != NULL);
+
+    uint32_t xnum = tspdf_reader_import_page_xobject(dst, src, 0, NULL, &err);
+    ASSERT(xnum > 0);
+    ASSERT_EQ_INT(draw_xobject_on_page(dst, 0, xnum, 1.0, 0, 0), TSPDF_OK);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(dst, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    const char *text = tspdf_reader_page_text(re, 0, &err);
+    ASSERT(text != NULL);
+    // Stamp content was decrypted during import; the output is not encrypted.
+    ASSERT(strstr(text, "SecretStamp") != NULL);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(dst);
+    tspdf_reader_destroy(src);
+    free(enc);
+    free(dst_data);
+}
+
+TEST(test_import_page_out_of_range) {
+    size_t len = 0;
+    uint8_t *data = make_stamp_text_pdf("X", &len);
+    ASSERT(data != NULL);
+
+    TspdfError err = TSPDF_OK;
+    TspdfReader *doc = tspdf_reader_open(data, len, &err);
+    ASSERT(doc != NULL);
+
+    uint32_t xnum = tspdf_reader_import_page_xobject(doc, doc, 5, NULL, &err);
+    ASSERT_EQ_SIZE((size_t)xnum, 0);
+    ASSERT_EQ_INT(err, TSPDF_ERR_PAGE_RANGE);
+
+    tspdf_reader_destroy(doc);
+    free(data);
+}
+
+// Page with two content streams and an indirect font resource: import must
+// concatenate the streams and deep-copy the referenced font object.
+static char *make_two_stream_page_pdf(size_t *out_len) {
+    char *pdf = (char *)malloc(4096);
+    if (!pdf) return NULL;
+
+    const char *s1 = "BT /F1 24 Tf 72 700 Td (AlphaPart) Tj ET";
+    const char *s2 = "BT /F1 24 Tf 72 650 Td (BetaPart) Tj ET";
+
+    size_t pos = 0;
+    if (!appendf(pdf, 4096, &pos, "%%PDF-1.4\n")) goto fail;
+    size_t obj1 = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")) goto fail;
+    size_t obj2 = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")) goto fail;
+    size_t obj3 = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                 "/Resources << /Font << /F1 6 0 R >> >> "
+                 "/Contents [4 0 R 5 0 R] >>\nendobj\n")) goto fail;
+    size_t obj4 = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "4 0 obj\n<< /Length %zu >>\nstream\n%s\nendstream\nendobj\n",
+                 strlen(s1), s1)) goto fail;
+    size_t obj5 = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "5 0 obj\n<< /Length %zu >>\nstream\n%s\nendstream\nendobj\n",
+                 strlen(s2), s2)) goto fail;
+    size_t obj6 = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "6 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n")) goto fail;
+    size_t xref = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "xref\n0 7\n"
+                 "0000000000 65535 f \n"
+                 "%010zu 00000 n \n%010zu 00000 n \n%010zu 00000 n \n"
+                 "%010zu 00000 n \n%010zu 00000 n \n%010zu 00000 n \n"
+                 "trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n%zu\n%%%%EOF",
+                 obj1, obj2, obj3, obj4, obj5, obj6, xref)) goto fail;
+    *out_len = pos;
+    return pdf;
+fail:
+    free(pdf);
+    return NULL;
+}
+
+TEST(test_import_multi_stream_contents) {
+    size_t src_len = 0;
+    char *src_data = make_two_stream_page_pdf(&src_len);
+    ASSERT(src_data != NULL);
+
+    size_t dst_len = 0;
+    uint8_t *dst_data = make_stamp_text_pdf("BaseText", &dst_len);
+    ASSERT(dst_data != NULL);
+
+    TspdfError err;
+    TspdfReader *src = tspdf_reader_open((const uint8_t *)src_data, src_len, &err);
+    TspdfReader *dst = tspdf_reader_open(dst_data, dst_len, &err);
+    ASSERT(src != NULL);
+    ASSERT(dst != NULL);
+
+    uint32_t xnum = tspdf_reader_import_page_xobject(dst, src, 0, NULL, &err);
+    ASSERT(xnum > 0);
+    ASSERT_EQ_INT(draw_xobject_on_page(dst, 0, xnum, 1.0, 0, 0), TSPDF_OK);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(dst, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    const char *text = tspdf_reader_page_text(re, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT(strstr(text, "AlphaPart") != NULL);
+    ASSERT(strstr(text, "BetaPart") != NULL);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(dst);
+    tspdf_reader_destroy(src);
+    free(dst_data);
+    free(src_data);
+}
+
+// Page whose resources contain a reference cycle (form XObject whose own
+// resources point back at itself). Import must terminate and stay bounded.
+static char *make_cyclic_resources_pdf(size_t *out_len) {
+    char *pdf = (char *)malloc(4096);
+    if (!pdf) return NULL;
+
+    const char *content = "BT /F1 12 Tf 10 10 Td (Cyclic) Tj ET";
+
+    size_t pos = 0;
+    if (!appendf(pdf, 4096, &pos, "%%PDF-1.4\n")) goto fail;
+    size_t obj1 = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")) goto fail;
+    size_t obj2 = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")) goto fail;
+    size_t obj3 = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] "
+                 "/Resources << /XObject << /X1 5 0 R >> /Font << /F1 6 0 R >> >> "
+                 "/Contents 4 0 R >>\nendobj\n")) goto fail;
+    size_t obj4 = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "4 0 obj\n<< /Length %zu >>\nstream\n%s\nendstream\nendobj\n",
+                 strlen(content), content)) goto fail;
+    size_t obj5 = pos;
+    // Form XObject that references itself and the page (cycles both ways).
+    if (!appendf(pdf, 4096, &pos,
+                 "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] "
+                 "/Resources << /XObject << /Self 5 0 R /Page 3 0 R >> >> "
+                 "/Length 0 >>\nstream\n\nendstream\nendobj\n")) goto fail;
+    size_t obj6 = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "6 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n")) goto fail;
+    size_t xref = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "xref\n0 7\n"
+                 "0000000000 65535 f \n"
+                 "%010zu 00000 n \n%010zu 00000 n \n%010zu 00000 n \n"
+                 "%010zu 00000 n \n%010zu 00000 n \n%010zu 00000 n \n"
+                 "trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n%zu\n%%%%EOF",
+                 obj1, obj2, obj3, obj4, obj5, obj6, xref)) goto fail;
+    *out_len = pos;
+    return pdf;
+fail:
+    free(pdf);
+    return NULL;
+}
+
+TEST(test_import_cyclic_resources_bounded) {
+    size_t src_len = 0;
+    char *src_data = make_cyclic_resources_pdf(&src_len);
+    ASSERT(src_data != NULL);
+
+    size_t dst_len = 0;
+    uint8_t *dst_data = make_stamp_text_pdf("BaseText", &dst_len);
+    ASSERT(dst_data != NULL);
+
+    TspdfError err;
+    TspdfReader *src = tspdf_reader_open((const uint8_t *)src_data, src_len, &err);
+    TspdfReader *dst = tspdf_reader_open(dst_data, dst_len, &err);
+    ASSERT(src != NULL);
+    ASSERT(dst != NULL);
+
+    // Must terminate (each source object is imported at most once).
+    uint32_t xnum = tspdf_reader_import_page_xobject(dst, src, 0, NULL, &err);
+    ASSERT(xnum > 0);
+    ASSERT_EQ_INT(draw_xobject_on_page(dst, 0, xnum, 1.0, 0, 0), TSPDF_OK);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(dst, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(dst);
+    tspdf_reader_destroy(src);
+    free(dst_data);
+    free(src_data);
+}
+
+// MediaBox abuse: enormous and degenerate boxes.
+static char *make_mediabox_pdf(const char *mediabox, size_t *out_len) {
+    char *pdf = (char *)malloc(2048);
+    if (!pdf) return NULL;
+
+    size_t pos = 0;
+    if (!appendf(pdf, 2048, &pos, "%%PDF-1.4\n")) goto fail;
+    size_t obj1 = pos;
+    if (!appendf(pdf, 2048, &pos,
+                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")) goto fail;
+    size_t obj2 = pos;
+    if (!appendf(pdf, 2048, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")) goto fail;
+    size_t obj3 = pos;
+    if (!appendf(pdf, 2048, &pos,
+                 "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [%s] >>\nendobj\n",
+                 mediabox)) goto fail;
+    size_t xref = pos;
+    if (!appendf(pdf, 2048, &pos,
+                 "xref\n0 4\n"
+                 "0000000000 65535 f \n"
+                 "%010zu 00000 n \n%010zu 00000 n \n%010zu 00000 n \n"
+                 "trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n%zu\n%%%%EOF",
+                 obj1, obj2, obj3, xref)) goto fail;
+    *out_len = pos;
+    return pdf;
+fail:
+    free(pdf);
+    return NULL;
+}
+
+TEST(test_import_huge_bbox_clamped) {
+    size_t src_len = 0;
+    char *src_data = make_mediabox_pdf("0 0 99999999999 99999999999", &src_len);
+    ASSERT(src_data != NULL);
+
+    size_t dst_len = 0;
+    uint8_t *dst_data = make_stamp_text_pdf("BaseText", &dst_len);
+    ASSERT(dst_data != NULL);
+
+    TspdfError err;
+    TspdfReader *src = tspdf_reader_open((const uint8_t *)src_data, src_len, &err);
+    TspdfReader *dst = tspdf_reader_open(dst_data, dst_len, &err);
+    ASSERT(src != NULL);
+    ASSERT(dst != NULL);
+
+    double bbox[4] = {0};
+    uint32_t xnum = tspdf_reader_import_page_xobject(dst, src, 0, bbox, &err);
+    ASSERT(xnum > 0);
+    ASSERT(bbox[2] <= 1.0e7);
+    ASSERT(bbox[3] <= 1.0e7);
+
+    tspdf_reader_destroy(dst);
+    tspdf_reader_destroy(src);
+    free(dst_data);
+    free(src_data);
+}
+
+TEST(test_import_degenerate_bbox_rejected) {
+    size_t src_len = 0;
+    char *src_data = make_mediabox_pdf("0 0 0 0", &src_len);
+    ASSERT(src_data != NULL);
+
+    size_t dst_len = 0;
+    uint8_t *dst_data = make_stamp_text_pdf("BaseText", &dst_len);
+    ASSERT(dst_data != NULL);
+
+    TspdfError err = TSPDF_OK;
+    TspdfReader *src = tspdf_reader_open((const uint8_t *)src_data, src_len, &err);
+    TspdfReader *dst = tspdf_reader_open(dst_data, dst_len, &err);
+    ASSERT(src != NULL);
+    ASSERT(dst != NULL);
+
+    uint32_t xnum = tspdf_reader_import_page_xobject(dst, src, 0, NULL, &err);
+    ASSERT_EQ_SIZE((size_t)xnum, 0);
+    ASSERT_EQ_INT(err, TSPDF_ERR_INVALID_PDF);
+
+    tspdf_reader_destroy(dst);
+    tspdf_reader_destroy(src);
+    free(dst_data);
+    free(src_data);
+}
+
+TEST(test_add_xobject_unique_names) {
+    size_t src_len = 0, dst_len = 0;
+    uint8_t *src_data = make_stamp_text_pdf("StampText", &src_len);
+    uint8_t *dst_data = make_stamp_text_pdf("BaseText", &dst_len);
+    ASSERT(src_data != NULL);
+    ASSERT(dst_data != NULL);
+
+    TspdfError err;
+    TspdfReader *src = tspdf_reader_open(src_data, src_len, &err);
+    TspdfReader *dst = tspdf_reader_open(dst_data, dst_len, &err);
+    ASSERT(src != NULL);
+    ASSERT(dst != NULL);
+
+    uint32_t xnum = tspdf_reader_import_page_xobject(dst, src, 0, NULL, &err);
+    ASSERT(xnum > 0);
+
+    const char *n1 = tspdf_page_add_xobject(dst, 0, xnum);
+    const char *n2 = tspdf_page_add_xobject(dst, 0, xnum);
+    ASSERT(n1 != NULL);
+    ASSERT(n2 != NULL);
+    ASSERT(strcmp(n1, n2) != 0);
+
+    tspdf_reader_destroy(dst);
+    tspdf_reader_destroy(src);
+    free(dst_data);
+    free(src_data);
+}
+
 // --- Annotation tests ---
 
 TEST(test_add_link_annotation) {
@@ -10382,6 +10890,18 @@ int main(void) {
     RUN(test_overlay_text);
     RUN(test_overlay_on_specific_page);
     RUN(test_overlay_abort);
+
+    printf("\n  Form XObject import:\n");
+    RUN(test_end_content_under);
+    RUN(test_import_page_xobject_basic);
+    RUN(test_import_source_freed_before_save);
+    RUN(test_import_from_encrypted_source);
+    RUN(test_import_page_out_of_range);
+    RUN(test_import_multi_stream_contents);
+    RUN(test_import_cyclic_resources_bounded);
+    RUN(test_import_huge_bbox_clamped);
+    RUN(test_import_degenerate_bbox_rejected);
+    RUN(test_add_xobject_unique_names);
 
     printf("\n  Annotations:\n");
     RUN(test_add_link_annotation);

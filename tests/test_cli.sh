@@ -207,6 +207,114 @@ else
   echo "  SKIP  watermark placement assertions (python3/qpdf not found)"
 fi
 
+# watermark --image
+run_test "watermark --image stamps every page" bash -c "
+  set -e
+  $TSPDF watermark $INPUT --image tests/data/img_rgb.png -o $TMPDIR/wm_img.pdf > /dev/null
+  grep -aq '/Image' $TMPDIR/wm_img.pdf
+  $TSPDF text $TMPDIR/wm_img.pdf --pages 1 | grep -q 'Page 1'
+  $TSPDF text $TMPDIR/wm_img.pdf --pages 3 | grep -q 'Page 3'"
+run_test "watermark --image with alpha PNG keeps soft mask" bash -c "
+  set -e
+  $TSPDF watermark $INPUT --image tests/data/img_rgba.png -o $TMPDIR/wm_rgba.pdf > /dev/null
+  grep -aq '/SMask' $TMPDIR/wm_rgba.pdf"
+run_test "watermark --image JPEG passthrough" bash -c "
+  set -e
+  $TSPDF watermark $INPUT --image examples/test.jpg -o $TMPDIR/wm_jpg.pdf > /dev/null
+  grep -aq '/DCTDecode' $TMPDIR/wm_jpg.pdf"
+run_test "watermark --image tile position" bash -c "
+  set -e
+  $TSPDF watermark $INPUT --image tests/data/img_rgb.png --position tile -o $TMPDIR/wm_tile.pdf > /dev/null
+  $TSPDF text $TMPDIR/wm_tile.pdf --pages 1 | grep -q 'Page 1'"
+run_test "watermark --image corner position" $TSPDF watermark $INPUT --image tests/data/img_rgb.png --position bottom-right -o $TMPDIR/wm_corner.pdf
+run_test "watermark rejects --text with --image" bash -c "! $TSPDF watermark $INPUT --text DRAFT --image tests/data/img_rgb.png -o $TMPDIR/wm_both.pdf > /dev/null 2>&1"
+run_test "watermark requires --text or --image" bash -c "! $TSPDF watermark $INPUT -o $TMPDIR/wm_none.pdf > /dev/null 2>&1"
+run_test "watermark --image rejects bad scale" bash -c "! $TSPDF watermark $INPUT --image tests/data/img_rgb.png --scale 0 -o $TMPDIR/wm_bads.pdf > /dev/null 2>&1"
+run_test "watermark --image rejects unknown position" bash -c "! $TSPDF watermark $INPUT --image tests/data/img_rgb.png --position middle -o $TMPDIR/wm_badp.pdf > /dev/null 2>&1"
+if command -v qpdf > /dev/null 2>&1; then
+  run_test "watermark --image outputs pass qpdf --check" bash -c "
+    qpdf --check $TMPDIR/wm_img.pdf > /dev/null 2>&1 &&
+    qpdf --check $TMPDIR/wm_rgba.pdf > /dev/null 2>&1 &&
+    qpdf --check $TMPDIR/wm_jpg.pdf > /dev/null 2>&1 &&
+    qpdf --check $TMPDIR/wm_tile.pdf > /dev/null 2>&1"
+  # image watermark honors the same /Rotate compensation as the text
+  # watermark: on a /Rotate 90 page the placement runs under a 90-degree
+  # rotation about the page center (350,400) -> cm [0 1 -1 0 750 50].
+  if [ -f "$TMPDIR/wm_box_rot90.pdf" ]; then
+    run_test "watermark --image compensates /Rotate 90" bash -c "
+      set -e
+      $TSPDF watermark $TMPDIR/wm_box_rot90.pdf --image tests/data/img_rgb.png -o $TMPDIR/wm_img_rot.pdf > /dev/null
+      qpdf --qdf --object-streams=disable $TMPDIR/wm_img_rot.pdf $TMPDIR/wm_img_rot.qdf
+      grep -q -- '0 1 -1 0 750 50 cm' $TMPDIR/wm_img_rot.qdf"
+  fi
+else
+  echo "  SKIP  watermark --image qpdf checks (qpdf not found)"
+fi
+
+# stamp: overlay a page of one PDF onto pages of another
+printf '# APPROVED\n' > $TMPDIR/stamp_src.md
+$TSPDF md2pdf $TMPDIR/stamp_src.md -o $TMPDIR/stamp_src.pdf > /dev/null 2>&1
+run_test "stamp onto all pages" bash -c "
+  set -e
+  $TSPDF stamp $INPUT --stamp $TMPDIR/stamp_src.pdf -o $TMPDIR/stamped.pdf > /dev/null
+  $TSPDF text $TMPDIR/stamped.pdf --pages 1 | grep -q APPROVED
+  $TSPDF text $TMPDIR/stamped.pdf --pages 2 | grep -q APPROVED
+  $TSPDF text $TMPDIR/stamped.pdf --pages 3 | grep -q APPROVED
+  $TSPDF text $TMPDIR/stamped.pdf --pages 1 | grep -q 'Page 1'
+  $TSPDF text $TMPDIR/stamped.pdf --pages 3 | grep -q 'Page 3'"
+run_test "stamp --pages 2 stamps only page 2" bash -c "
+  set -e
+  $TSPDF stamp $INPUT --stamp $TMPDIR/stamp_src.pdf -o $TMPDIR/stamped_p2.pdf --pages 2 > /dev/null
+  ! $TSPDF text $TMPDIR/stamped_p2.pdf --pages 1 | grep -q APPROVED
+  $TSPDF text $TMPDIR/stamped_p2.pdf --pages 2 | grep -q APPROVED
+  ! $TSPDF text $TMPDIR/stamped_p2.pdf --pages 3 | grep -q APPROVED"
+# stamp content is appended (drawn on top), so it comes after the original
+# text in content order; --under prepends it.
+run_test "stamp draws over by default, under with --under" bash -c "
+  set -e
+  $TSPDF stamp $INPUT --stamp $TMPDIR/stamp_src.pdf -o $TMPDIR/stamped_over.pdf > /dev/null
+  $TSPDF stamp $INPUT --stamp $TMPDIR/stamp_src.pdf --under -o $TMPDIR/stamped_under.pdf > /dev/null
+  over=\$($TSPDF text $TMPDIR/stamped_over.pdf --pages 1)
+  under=\$($TSPDF text $TMPDIR/stamped_under.pdf --pages 1)
+  printf '%s\n' \"\$over\"  | head -1 | grep -q 'Page 1'
+  printf '%s\n' \"\$under\" | head -1 | grep -q 'APPROVED'
+  printf '%s\n' \"\$under\" | grep -q 'Page 1'"
+run_test "stamp --stamp-page selects the stamp page" bash -c "
+  set -e
+  printf '# SECONDMARK\n' > $TMPDIR/stamp_src2.md
+  $TSPDF md2pdf $TMPDIR/stamp_src2.md -o $TMPDIR/stamp_src2.pdf > /dev/null
+  $TSPDF merge $TMPDIR/stamp_src.pdf $TMPDIR/stamp_src2.pdf -o $TMPDIR/stamp_2pg.pdf > /dev/null
+  $TSPDF stamp $INPUT --stamp $TMPDIR/stamp_2pg.pdf --stamp-page 2 -o $TMPDIR/stamped_sp2.pdf > /dev/null
+  $TSPDF text $TMPDIR/stamped_sp2.pdf --pages 1 | grep -q SECONDMARK
+  ! $TSPDF text $TMPDIR/stamped_sp2.pdf --pages 1 | grep -q APPROVED"
+run_test "stamp encrypted input with --password" bash -c "
+  set -e
+  $TSPDF encrypt $INPUT --password sec -o $TMPDIR/stamp_enc_in.pdf > /dev/null
+  $TSPDF stamp $TMPDIR/stamp_enc_in.pdf --password sec --stamp $TMPDIR/stamp_src.pdf -o $TMPDIR/stamped_enc.pdf > /dev/null
+  $TSPDF text $TMPDIR/stamped_enc.pdf --pages 1 | grep -q APPROVED"
+run_test "stamp source with image resources" bash -c "
+  set -e
+  printf '# LOGOMARK\n\n![logo](%s/tests/data/img_rgb.png)\n' $(pwd) > $TMPDIR/stamp_img.md
+  $TSPDF md2pdf $TMPDIR/stamp_img.md -o $TMPDIR/stamp_img.pdf > /dev/null
+  $TSPDF stamp $INPUT --stamp $TMPDIR/stamp_img.pdf -o $TMPDIR/stamped_img.pdf > /dev/null
+  $TSPDF text $TMPDIR/stamped_img.pdf --pages 2 | grep -q LOGOMARK
+  grep -aq '/Image' $TMPDIR/stamped_img.pdf"
+run_test "stamp missing --stamp errors" bash -c "! $TSPDF stamp $INPUT -o $TMPDIR/stamp_miss.pdf > /dev/null 2>&1"
+run_test "stamp rejects --stamp-page 0" bash -c "! $TSPDF stamp $INPUT --stamp $TMPDIR/stamp_src.pdf --stamp-page 0 -o $TMPDIR/stamp_sp0.pdf > /dev/null 2>&1"
+run_test "stamp rejects out-of-range --stamp-page" bash -c "! $TSPDF stamp $INPUT --stamp $TMPDIR/stamp_src.pdf --stamp-page 9 -o $TMPDIR/stamp_sp9.pdf > /dev/null 2>&1"
+run_test "stamp rejects out-of-range --pages" bash -c "! $TSPDF stamp $INPUT --stamp $TMPDIR/stamp_src.pdf --pages 7 -o $TMPDIR/stamp_p7.pdf > /dev/null 2>&1"
+run_test "stamp help mentions --under" bash -c "$TSPDF help stamp | grep -q -- '--under'"
+run_test "stamp flag-first ordering (flags before input)" $TSPDF stamp --stamp $TMPDIR/stamp_src.pdf -o $TMPDIR/stamped_ff.pdf $INPUT
+if command -v qpdf > /dev/null 2>&1; then
+  run_test "stamp outputs pass qpdf --check" bash -c "
+    qpdf --check $TMPDIR/stamped.pdf > /dev/null 2>&1 &&
+    qpdf --check $TMPDIR/stamped_under.pdf > /dev/null 2>&1 &&
+    qpdf --check $TMPDIR/stamped_img.pdf > /dev/null 2>&1 &&
+    qpdf --check $TMPDIR/stamped_enc.pdf > /dev/null 2>&1"
+else
+  echo "  SKIP  stamp qpdf --check (qpdf not found)"
+fi
+
 # compress
 run_test "compress" $TSPDF compress $INPUT -o $TMPDIR/compressed.pdf
 # flag-first ordering: -o output must not be swallowed as input
@@ -519,7 +627,7 @@ run_test "help" $TSPDF --help
 run_test "version" $TSPDF --version
 run_test "help merge" $TSPDF help merge
 run_test "help serve shows command-specific usage" bash -c "$TSPDF help serve 2>/dev/null | grep -q 'Usage: tspdf serve'"
-run_test "top-level help describes text-only watermark" bash -c "$TSPDF --help 2>/dev/null | grep -E '^  watermark[[:space:]]+Add a text watermark'"
+run_test "top-level help describes text or image watermark" bash -c "$TSPDF --help 2>/dev/null | grep -E '^  watermark[[:space:]]+Add a text or image watermark'"
 
 # serve --port validation: out-of-range and non-numeric ports must error out
 # (non-zero exit) rather than silently binding a truncated/garbage port.

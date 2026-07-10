@@ -108,6 +108,7 @@ TSPR_SOURCES = \
 	$(SRCDIR)/reader/tspr_attach.c \
 	$(SRCDIR)/reader/tspr_metadata.c \
 	$(SRCDIR)/reader/tspr_content.c \
+	$(SRCDIR)/reader/tspr_import.c \
 	$(SRCDIR)/reader/tspr_resources.c \
 	$(SRCDIR)/reader/tspr_annot.c \
 	$(SRCDIR)/reader/tspr_form.c \
@@ -143,6 +144,7 @@ CLI_SOURCES = \
 	cli/cmd_pagenum.c \
 	cli/cmd_form.c \
 	cli/cmd_attach.c \
+	cli/cmd_stamp.c \
 	cli/server.c
 
 CLI_TARGET = $(BUILDDIR)/tspdf

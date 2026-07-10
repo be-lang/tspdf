@@ -26,6 +26,7 @@ Reader — parse, transform, save existing PDFs (`<tspdf/reader/tspr.h>`):
 - `tspdf_reader_merge` — combine documents into a new, self-contained one
 - `tspdf_reader_save` / `tspdf_reader_save_to_memory` / `tspdf_reader_save_encrypted` — write out (optionally RC4/AES encrypted)
 - `tspdf_reader_page_text` — extract a page's text as UTF-8
+- `tspdf_reader_import_page_xobject` / `tspdf_page_add_xobject` — wrap another document's page as a form XObject and draw it on pages (what `tspdf stamp` uses); the import is self-contained, so the source document may be destroyed right after
 - `tspdf_reader_pdf_version` / `tspdf_reader_encryption_info` / `tspdf_reader_has_outlines` / `tspdf_reader_has_acroform` — document facts
 - `tspdf_reader_destroy` — free a document and everything it returned
 

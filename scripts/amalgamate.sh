@@ -88,6 +88,7 @@ src/reader/tspr_doctree.c
 src/reader/tspr_attach.c
 src/reader/tspr_metadata.c
 src/reader/tspr_content.c
+src/reader/tspr_import.c
 src/reader/tspr_resources.c
 src/reader/tspr_annot.c
 src/reader/tspr_form.c

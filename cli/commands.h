@@ -26,6 +26,12 @@ int collect_positional(int argc, char **argv, const char **out, int out_max);
 // First page index in pages[] that is >= total, or total if none is.
 size_t first_out_of_range(const size_t *pages, size_t count, size_t total);
 
+// Concat a rotation by `rot` degrees CCW about (cx, cy) into a content
+// stream — compensates a page-level /Rotate so drawing reads upright as
+// viewed. No-op for rot == 0. Defined in cmd_stamp.c.
+struct TspdfStream;
+void tspdf_cli_emit_rotate_compensation(struct TspdfStream *s, int rot, double cx, double cy);
+
 // Command entry points (argc/argv shifted past the subcommand name)
 int cmd_merge(int argc, char **argv);
 int cmd_split(int argc, char **argv);
@@ -46,5 +52,6 @@ int cmd_text(int argc, char **argv);
 int cmd_pagenum(int argc, char **argv);
 int cmd_form(int argc, char **argv);
 int cmd_attach(int argc, char **argv);
+int cmd_stamp(int argc, char **argv);
 
 #endif

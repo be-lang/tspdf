@@ -257,6 +257,27 @@ TspdfError tspdf_reader_attachment_add(TspdfReader *doc, const char *name,
 // Remove the attachment stored under `name`. TSPDF_ERR_NOT_FOUND when no
 // attachment has that name.
 TspdfError tspdf_reader_attachment_remove(TspdfReader *doc, const char *name);
+// --- Page import (stamping) ---
+
+// Wrap a page of `src` as a /Form XObject in `dst`: the source page's content
+// stream(s) become the XObject stream, its /Resources are deep-copied (the
+// whole referenced object graph is imported), and BBox is the source page
+// MediaBox. The result is self-contained: `src` may be destroyed immediately
+// after this call, before `dst` is saved. Encrypted sources are decrypted
+// during the copy. BBox coordinates are clamped to +/-1e7.
+//
+// Returns the new object number in `dst` (use tspdf_page_add_xobject to
+// reference it from a page), or 0 on failure with *err set. out_bbox
+// (optional) receives the XObject BBox [x0 y0 x1 y1].
+uint32_t tspdf_reader_import_page_xobject(TspdfReader *dst, TspdfReader *src,
+                                          size_t src_page_index, double out_bbox[4],
+                                          TspdfError *err);
+
+// Register an XObject (e.g. from tspdf_reader_import_page_xobject) in a
+// page's /Resources under a fresh name. Returns the name to use with the Do
+// operator (owned by the reader, valid until destroy), or NULL on failure.
+const char *tspdf_page_add_xobject(TspdfReader *doc, size_t page_index,
+                                   uint32_t xobj_num);
 
 // --- Annotations ---
 

@@ -21,6 +21,12 @@ TspdfError tspdf_page_end_content(TspdfReader *doc, size_t page_index,
                                  TspdfStream *stream, TspdfWriter *resource_owner);
 void tspdf_page_abort_content(TspdfStream *stream);
 
+// Like tspdf_page_end_content, but the drawing goes UNDER the page's existing
+// content: the new stream (wrapped in q..Q) is prepended to /Contents instead
+// of appended, so the original content paints on top of it.
+TspdfError tspdf_page_end_content_under(TspdfReader *doc, size_t page_index,
+                                        TspdfStream *stream, TspdfWriter *resource_owner);
+
 #ifdef __cplusplus
 }
 #endif
