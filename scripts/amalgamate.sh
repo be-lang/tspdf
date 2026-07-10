@@ -53,6 +53,7 @@ src/crypto/sha512.h
 src/crypto/rc4.h
 src/crypto/aes.h
 src/image/png_decoder.h
+src/image/jpeg_codec.h
 src/qr/qr_encode.h
 src/util/pdftext.h
 src/util/pdfdate.h
@@ -76,6 +77,7 @@ src/font/ttf_parser.c
 src/font/font_subset.c
 src/layout/layout.c
 src/image/jpeg_embed.c
+src/image/jpeg_codec.c
 src/image/png_decoder.c
 src/compress/deflate.c
 src/qr/qr_encode.c
