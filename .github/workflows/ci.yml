@@ -93,7 +93,7 @@ jobs:
       # path disabled so the ARM soft path stays green too — no rebuild.
       - name: Crypto suite on the soft AES path (macOS, TSPDF_NO_AESHW=1)
         if: runner.os == 'macOS'
-        run: TSPDF_NO_AESHW=1 ./build/test_crypto
+        run: TSPDF_NO_AESHW=1 make test-crypto
 
       - name: Verify static library + asset embedding
         run: |
