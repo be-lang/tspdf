@@ -88,6 +88,7 @@ src/reader/tspr_crypt.c
 src/reader/tspr_document.c
 src/reader/tspr_doctree.c
 src/reader/tspr_attach.c
+src/reader/tspr_bookmark.c
 src/reader/tspr_metadata.c
 src/reader/tspr_content.c
 src/reader/tspr_import.c

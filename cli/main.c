@@ -29,6 +29,7 @@ static void print_usage(void) {
     printf("  pagenum    Stamp page numbers onto a PDF\n");
     printf("  form       List, fill, or flatten PDF form fields\n");
     printf("  attach     Embed, list, extract, or remove file attachments\n");
+    printf("  bookmark   List, add, import, or clear PDF outlines (bookmarks)\n");
     printf("  stamp      Overlay a PDF page onto another PDF's pages\n");
     printf("\n");
     printf("Options:\n");
@@ -294,6 +295,29 @@ static void print_command_help(const char *cmd) {
         printf("  remove --name <name>   Attachment to remove\n");
         printf("  --password <pass>      Password for encrypted PDFs (or --password-file)\n");
         printf("  -o <output.pdf>        Output file path (required for add/remove)\n");
+    } else if (strcmp(cmd, "bookmark") == 0) {
+        printf("Usage: tspdf bookmark list <input.pdf> [--json]\n");
+        printf("       tspdf bookmark add <input.pdf> --title <text> --page <N> [--level <L>] -o <output.pdf>\n");
+        printf("       tspdf bookmark import <input.pdf> --from <toc.txt|-> -o <output.pdf>\n");
+        printf("       tspdf bookmark clear <input.pdf> -o <output.pdf>\n");
+        printf("\n");
+        printf("Edit the outline (bookmarks) of an existing PDF.\n");
+        printf("\n");
+        printf("The TOC file for import has one entry per line, TAB-separated:\n");
+        printf("  LEVEL<TAB>PAGE<TAB>TITLE\n");
+        printf("LEVEL is the 1-based nesting depth (level 1 = top; no jumps > 1),\n");
+        printf("PAGE is the 1-based page number. Blank lines and '#' comments are\n");
+        printf("ignored. This is exactly what `bookmark list` prints, so a listing\n");
+        printf("can be edited and re-imported.\n");
+        printf("\n");
+        printf("Arguments:\n");
+        printf("  list --json            Machine-readable listing (title/level/page)\n");
+        printf("  add --title <text>     Bookmark title to append\n");
+        printf("  add --page <N>         Target page (1-based)\n");
+        printf("  add --level <L>        Nesting level (1-based, default 1)\n");
+        printf("  import --from <file>   TOC file to import (- reads stdin)\n");
+        printf("  --password <pass>      Password for encrypted PDFs (or --password-file)\n");
+        printf("  -o <output.pdf>        Output file (required for add/import/clear)\n");
     } else {
         /* Unknown command — fall back to general help */
         print_usage();
@@ -352,6 +376,7 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "pagenum") == 0)  return cmd_pagenum(sub_argc, sub_argv);
     if (strcmp(cmd, "form") == 0)     return cmd_form(sub_argc, sub_argv);
     if (strcmp(cmd, "attach") == 0)   return cmd_attach(sub_argc, sub_argv);
+    if (strcmp(cmd, "bookmark") == 0) return cmd_bookmark(sub_argc, sub_argv);
     if (strcmp(cmd, "stamp") == 0)    return cmd_stamp(sub_argc, sub_argv);
 
     fprintf(stderr, "tspdf: unknown command '%s'\n\n", cmd);

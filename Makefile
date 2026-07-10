@@ -146,6 +146,7 @@ CLI_SOURCES = \
 	cli/cmd_pagenum.c \
 	cli/cmd_form.c \
 	cli/cmd_attach.c \
+	cli/cmd_bookmark.c \
 	cli/cmd_stamp.c \
 	cli/server.c
 
