@@ -7,6 +7,8 @@ on 0.x, the CLI is considered stable but the low-level C API may still change.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-11
+
 ### Added
 - `form fill` / `form flatten`: values with characters outside WinAnsi (CJK,
   Greek, ...) now render in the generated appearances instead of `?`. A
