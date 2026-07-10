@@ -350,6 +350,28 @@ static TspdfError dt_copy_key(TspdfObj *copy, TspdfObj *item, const char *key,
     return dt_dict_put(copy, key, vcopy, a);
 }
 
+// Copy `key` from an outline item, resolving an indirect value to its target
+// first and inlining it (pdfTeX stores /Title as an indirect string). A ref
+// that does not resolve is dropped rather than copied dangling — the
+// serializer must never be handed a reference to an object that will not
+// exist in the output. Streams stay behind for the same reason (Title/C/F
+// are never legitimately streams).
+static TspdfError dt_copy_key_resolved(DtCtx *ctx, TspdfObj *copy,
+                                       TspdfObj *item, const char *key) {
+    TspdfObj *val = tspdf_dict_get(item, key);
+    if (!val) return TSPDF_OK;
+    if (val->type == TSPDF_OBJ_REF) {
+        val = dt_resolve(ctx->doc, ctx->parser, val);
+        if (!val || val->type == TSPDF_OBJ_STREAM ||
+            val->type == TSPDF_OBJ_REF) {
+            return TSPDF_OK;
+        }
+    }
+    TspdfObj *vcopy = tspdf_obj_deep_copy(val, ctx->arena);
+    if (!vcopy) return TSPDF_ERR_ALLOC;
+    return dt_dict_put(copy, key, vcopy, ctx->arena);
+}
+
 // Walk one sibling chain, pruning recursively. Survivor numbers append to
 // `survivors`; kept items are rebuilt and installed into doc->obj_cache at
 // their own number (so /Parent refs from children keep resolving). The
@@ -403,9 +425,9 @@ static TspdfError dt_prune_outline_level(DtCtx *ctx, TspdfObj *first_val,
                 free(kids.nums);
                 return TSPDF_ERR_ALLOC;
             }
-            err = dt_copy_key(copy, item, "Title", ctx->arena);
-            if (err == TSPDF_OK) err = dt_copy_key(copy, item, "C", ctx->arena);
-            if (err == TSPDF_OK) err = dt_copy_key(copy, item, "F", ctx->arena);
+            err = dt_copy_key_resolved(ctx, copy, item, "Title");
+            if (err == TSPDF_OK) err = dt_copy_key_resolved(ctx, copy, item, "C");
+            if (err == TSPDF_OK) err = dt_copy_key_resolved(ctx, copy, item, "F");
             if (err == TSPDF_OK && flat) {
                 err = dt_dict_put(copy, "Dest", flat, ctx->arena);
             }
@@ -884,10 +906,20 @@ static TspdfError dt_attach_page_labels(TspdfReader *doc, TspdfArena *arena,
 
 // --- merge entry points ---
 
-// Resolve the outline items of one level into the source cache; dest arrays
-// and actions get their streams self-contained. /SE and /Parent are not
-// walked (/SE would pull the structure tree; parents are covered by the
-// level walk itself).
+// Keys of an outline item that the level walk itself covers (First) or that
+// must not be pulled into the copy set: /SE would drag in the whole structure
+// tree, and /Parent//Prev//Next//Last are the very chain being walked.
+static bool dt_outline_structural_key(const char *key) {
+    return strcmp(key, "First") == 0 || strcmp(key, "Last") == 0 ||
+           strcmp(key, "Next") == 0 || strcmp(key, "Prev") == 0 ||
+           strcmp(key, "Parent") == 0 || strcmp(key, "SE") == 0;
+}
+
+// Resolve the outline items of one level into the source cache. Every
+// non-structural value is resolved too (so indirect /Title strings — the
+// pdfTeX/hyperref pattern — plus dest arrays, actions, /C, /F land in the
+// cache and get copied by the merge loop), with their streams made
+// self-contained.
 static void dt_prepare_outline_level(TspdfReader *src, TspdfParser *parser,
                                      bool *visited, TspdfObj *first_val,
                                      int depth, size_t *budget) {
@@ -902,17 +934,11 @@ static void dt_prepare_outline_level(TspdfReader *src, TspdfParser *parser,
         if (!item || item->type != TSPDF_OBJ_DICT) break;
         visited[num] = true;
 
-        TspdfObj *dest = tspdf_dict_get(item, "Dest");
-        if (dest) {
-            tspdf_reader_make_streams_self_contained(dest, src->data, src->data_len,
-                src->obj_cache, &src->xref, parser, src->crypt, visited,
-                src->xref.count);
-        }
-        TspdfObj *action = tspdf_dict_get(item, "A");
-        if (action) {
-            tspdf_reader_make_streams_self_contained(action, src->data, src->data_len,
-                src->obj_cache, &src->xref, parser, src->crypt, visited,
-                src->xref.count);
+        for (size_t i = 0; i < item->dict.count; i++) {
+            if (dt_outline_structural_key(item->dict.entries[i].key)) continue;
+            tspdf_reader_make_streams_self_contained(item->dict.entries[i].value,
+                src->data, src->data_len, src->obj_cache, &src->xref, parser,
+                src->crypt, visited, src->xref.count);
         }
 
         dt_prepare_outline_level(src, parser, visited,

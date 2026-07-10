@@ -12603,6 +12603,194 @@ TEST(test_bookmark_set_large_bounded) {
     free(pdf);
 }
 
+// tests/data/indirect_title.pdf: two pages; outline "Alpha" -> p1 (child
+// "Alpha Sub" -> p2, whose /Dest array is also indirect), "Beta" -> p2.
+// Every /Title is an indirect string object (the pdfTeX/hyperref pattern).
+TEST(test_bookmark_list_indirect_title) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/indirect_title.pdf", &err);
+    ASSERT(doc != NULL);
+
+    TspdfBookmarkInfo *bm = NULL;
+    size_t n = 0;
+    err = tspdf_reader_bookmarks(doc, &bm, &n);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_SIZE(n, 3);
+
+    ASSERT_EQ_STR(bm[0].title, "Alpha");
+    ASSERT_EQ_INT(bm[0].level, 1);
+    ASSERT_EQ_SIZE(bm[0].page_index, 0);
+
+    ASSERT_EQ_STR(bm[1].title, "Alpha Sub");
+    ASSERT_EQ_INT(bm[1].level, 2);
+    ASSERT_EQ_SIZE(bm[1].page_index, 1);
+
+    ASSERT_EQ_STR(bm[2].title, "Beta");
+    ASSERT_EQ_INT(bm[2].level, 1);
+    ASSERT_EQ_SIZE(bm[2].page_index, 1);
+
+    tspdf_reader_destroy(doc);
+}
+
+// The `bookmark add` flow: enumerate, append one entry, set the whole list
+// back. Indirect titles must survive (they used to come back as "" and make
+// set_bookmarks fail with TSPDF_ERR_INVALID_ARG).
+TEST(test_bookmark_add_preserves_indirect_titles) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/indirect_title.pdf", &err);
+    ASSERT(doc != NULL);
+
+    TspdfBookmarkInfo *bm = NULL;
+    size_t n = 0;
+    err = tspdf_reader_bookmarks(doc, &bm, &n);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_SIZE(n, 3);
+
+    TspdfBookmarkEntry *entries =
+        (TspdfBookmarkEntry *)calloc(n + 1, sizeof(TspdfBookmarkEntry));
+    ASSERT(entries != NULL);
+    for (size_t i = 0; i < n; i++) {
+        entries[i].title = bm[i].title;
+        entries[i].level = bm[i].level;
+        entries[i].page_index = bm[i].page_index;
+    }
+    entries[n].title = "Appendix";
+    entries[n].level = 1;
+    entries[n].page_index = 0;
+    err = tspdf_reader_set_bookmarks(doc, entries, n + 1);
+    free(entries);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    err = tspdf_reader_bookmarks(re, &bm, &n);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_SIZE(n, 4);
+    ASSERT_EQ_STR(bm[0].title, "Alpha");
+    ASSERT_EQ_STR(bm[1].title, "Alpha Sub");
+    ASSERT_EQ_STR(bm[2].title, "Beta");
+    ASSERT_EQ_STR(bm[3].title, "Appendix");
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(doc);
+}
+
+// Merging documents whose outline titles are indirect strings must copy the
+// referenced string objects too. The old code kept the /Title N 0 R ref but
+// never copied object N, and the serializer then emitted an in-use xref entry
+// with offset 0 for it (qpdf --check warnings, blank titles in viewers).
+TEST(test_merge_copies_indirect_outline_strings) {
+    TspdfError err;
+    TspdfReader *doc_a = tspdf_reader_open_file("tests/data/indirect_title.pdf", &err);
+    TspdfReader *doc_b = tspdf_reader_open_file("tests/data/indirect_title.pdf", &err);
+    ASSERT(doc_a != NULL && doc_b != NULL);
+
+    TspdfReader *docs[] = {doc_a, doc_b};
+    TspdfReader *merged = tspdf_reader_merge(docs, 2, &err);
+    ASSERT(merged != NULL);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(merged, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    // No in-use classic xref entry may carry offset 0.
+    ASSERT(!bytes_contains(out, out_len, "0000000000 00000 n"));
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(re), 4);
+
+    TspdfBookmarkInfo *bm = NULL;
+    size_t n = 0;
+    err = tspdf_reader_bookmarks(re, &bm, &n);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_SIZE(n, 6);
+    ASSERT_EQ_STR(bm[0].title, "Alpha");
+    ASSERT_EQ_STR(bm[1].title, "Alpha Sub");
+    ASSERT_EQ_STR(bm[2].title, "Beta");
+    ASSERT_EQ_STR(bm[3].title, "Alpha");
+    ASSERT_EQ_STR(bm[4].title, "Alpha Sub");
+    ASSERT_EQ_STR(bm[5].title, "Beta");
+    ASSERT_EQ_SIZE(bm[3].page_index, 2);
+    ASSERT_EQ_SIZE(bm[4].page_index, 3);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(merged);
+    tspdf_reader_destroy(doc_a);
+    tspdf_reader_destroy(doc_b);
+}
+
+// One-page PDF whose catalog references object 5, but the xref entry for 5 is
+// marked in-use pointing at garbage bytes that do not parse as an object.
+static char *ser_make_dangling_inuse_pdf(size_t *out_len) {
+    char *pdf = (char *)malloc(4096);
+    if (!pdf) return NULL;
+    size_t pos = 0;
+    size_t off[6] = {0};
+    if (!appendf(pdf, 4096, &pos, "%%PDF-1.4\n")) goto fail;
+    off[1] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Lang 5 0 R >>\nendobj\n")) goto fail;
+    off[2] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")) goto fail;
+    off[3] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n")) goto fail;
+    off[4] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "4 0 obj\n<< >>\nendobj\n")) goto fail;
+    off[5] = pos;  // in-use entry pointing at bytes that are not an object
+    if (!appendf(pdf, 4096, &pos, "%% not an object, just junk bytes\n")) goto fail;
+    size_t xref = pos;
+    if (!appendf(pdf, 4096, &pos, "xref\n0 6\n0000000000 65535 f \n")) goto fail;
+    for (int i = 1; i <= 5; i++) {
+        if (!appendf(pdf, 4096, &pos, "%010zu 00000 n \n", off[i])) goto fail;
+    }
+    if (!appendf(pdf, 4096, &pos,
+                 "trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n%zu\n%%%%EOF", xref)) goto fail;
+    *out_len = pos;
+    return pdf;
+fail:
+    free(pdf);
+    return NULL;
+}
+
+// Serializer safety net: an object that cannot be materialized must become a
+// FREE xref entry, never an in-use (type 1) entry with offset 0.
+TEST(test_serialize_never_writes_inuse_offset_zero) {
+    size_t len = 0;
+    char *pdf = ser_make_dangling_inuse_pdf(&len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    // A classic-table in-use entry with offset 0 is exactly this line.
+    ASSERT(!bytes_contains(out, out_len, "0000000000 00000 n"));
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(re), 1);
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
 // Resolve `obj` if it is an indirect ref, using the reopened reader.
 static TspdfObj *flat_resolve(TspdfReader *doc, TspdfObj *obj) {
     if (!obj || obj->type != TSPDF_OBJ_REF) return obj;
@@ -13029,6 +13217,10 @@ int main(void) {
     RUN(test_bookmark_list_then_set_stable);
     RUN(test_bookmark_list_cyclic_bounded);
     RUN(test_bookmark_set_large_bounded);
+    RUN(test_bookmark_list_indirect_title);
+    RUN(test_bookmark_add_preserves_indirect_titles);
+    RUN(test_merge_copies_indirect_outline_strings);
+    RUN(test_serialize_never_writes_inuse_offset_zero);
 
     printf("\n%d tests, %d passed, %d failed\n",
            tests_run, tests_passed, tests_failed);
