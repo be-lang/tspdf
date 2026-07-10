@@ -8907,6 +8907,68 @@ fail:
     return NULL;
 }
 
+// A field that lists itself in /Kids. Because the self-reference resolves to
+// a node with /T, a naive walker treats it as an interior node and recurses,
+// re-appending its own name each level ("self.self.self...") until the budget
+// drains. It must instead appear exactly once.
+static char *form_make_self_kid_pdf(size_t *out_len) {
+    char *pdf = (char *)malloc(4096);
+    if (!pdf) return NULL;
+    size_t pos = 0;
+    size_t off[8] = {0};
+
+    if (!appendf(pdf, 4096, &pos, "%%PDF-1.4\n")) goto fail;
+    off[1] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R "
+                 "/AcroForm << /Fields [3 0 R] >> >>\nendobj\n")) goto fail;
+    off[2] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [4 0 R] /Count 1 >>\nendobj\n")) goto fail;
+    off[3] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "3 0 obj\n<< /FT /Tx /T (self) /Kids [3 0 R] >>\nendobj\n")) goto fail;
+    off[4] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n")) goto fail;
+
+    size_t xref = pos;
+    if (!appendf(pdf, 4096, &pos, "xref\n0 5\n0000000000 65535 f \n")) goto fail;
+    for (int i = 1; i <= 4; i++) {
+        if (!appendf(pdf, 4096, &pos, "%010zu 00000 n \n", off[i])) goto fail;
+    }
+    if (!appendf(pdf, 4096, &pos,
+                 "trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n%zu\n%%%%EOF",
+                 xref)) goto fail;
+    *out_len = pos;
+    return pdf;
+fail:
+    free(pdf);
+    return NULL;
+}
+
+TEST(test_form_fields_self_kid_listed_once) {
+    size_t len = 0;
+    char *pdf = form_make_self_kid_pdf(&len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    TspdfFormFieldInfo *fields = NULL;
+    size_t count = 0;
+    err = tspdf_reader_form_fields(doc, &fields, &count);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    // The self-referential field is terminal; it lists exactly once as "self",
+    // not stacked "self.self..." names.
+    ASSERT_EQ_SIZE(count, 1);
+    ASSERT(form_find(fields, count, "self") != NULL);
+
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
 TEST(test_form_fields_cyclic_kids_bounded) {
     size_t len = 0;
     char *pdf = form_make_cyclic_kids_pdf(&len);
@@ -9287,6 +9349,82 @@ TEST(test_form_fill_readonly_requires_force) {
     ASSERT(locked->value && strcmp(locked->value, "forced") == 0);
 
     tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+// Text field whose /DA carries a hostile font name laced with PDF delimiters:
+// "/Bad(Font)Name 12 Tf". The generated appearance stream must not let those
+// delimiters reach the content-stream Tf operand, and the sanitized name it
+// emits must match the key it registers in the appearance /Resources /Font.
+static char *form_make_evil_da_pdf(size_t *out_len) {
+    char *pdf = (char *)malloc(4096);
+    if (!pdf) return NULL;
+    size_t pos = 0;
+    size_t off[8] = {0};
+
+    if (!appendf(pdf, 4096, &pos, "%%PDF-1.4\n")) goto fail;
+    off[1] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R "
+                 "/AcroForm << /Fields [3 0 R] >> >>\nendobj\n")) goto fail;
+    off[2] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [4 0 R] /Count 1 >>\nendobj\n")) goto fail;
+    off[3] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "3 0 obj\n<< /FT /Tx /T (evil) /Type /Annot /Subtype /Widget "
+                 "/Rect [10 10 200 30] /DA (/Bad\\(Font\\)Name 12 Tf) "
+                 "/P 4 0 R >>\nendobj\n")) goto fail;
+    off[4] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                 "/Annots [3 0 R] >>\nendobj\n")) goto fail;
+
+    size_t xref = pos;
+    if (!appendf(pdf, 4096, &pos, "xref\n0 5\n0000000000 65535 f \n")) goto fail;
+    for (int i = 1; i <= 4; i++) {
+        if (!appendf(pdf, 4096, &pos, "%010zu 00000 n \n", off[i])) goto fail;
+    }
+    if (!appendf(pdf, 4096, &pos,
+                 "trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n%zu\n%%%%EOF",
+                 xref)) goto fail;
+    *out_len = pos;
+    return pdf;
+fail:
+    free(pdf);
+    return NULL;
+}
+
+TEST(test_form_fill_text_da_font_name_sanitized) {
+    size_t len = 0;
+    char *pdf = form_make_evil_da_pdf(&len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    err = tspdf_reader_form_fill(doc, "evil", "hi", false);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    // The sanitized DA font is BadFontName (delimiters stripped). It must
+    // appear both as the content-stream Tf operand and as the appearance
+    // /Resources /Font key -- and they must be identical, so a strict renderer
+    // resolves the font.
+    ASSERT(bytes_contains(out, out_len, "/BadFontName 12.00 Tf"));
+    ASSERT(bytes_contains(out, out_len, "/Font << /BadFontName "));
+
+    // No PDF delimiter from the hostile /DA reaches the content Tf token: the
+    // serializer-escaped form "/Bad#28Font#29Name" (which would desync from
+    // the content name) must never appear.
+    ASSERT(!bytes_contains(out, out_len, "/Bad#28Font"));
+
     free(out);
     tspdf_reader_destroy(doc);
     free(pdf);
@@ -9676,8 +9814,10 @@ int main(void) {
     RUN(test_form_fields_encrypted);
     RUN(test_form_fields_writer_roundtrip);
     RUN(test_form_fields_cyclic_kids_bounded);
+    RUN(test_form_fields_self_kid_listed_once);
     RUN(test_form_fields_adversarial_no_crash);
     RUN(test_form_fill_text_value_and_appearance);
+    RUN(test_form_fill_text_da_font_name_sanitized);
     RUN(test_form_fill_text_nonascii_roundtrip);
     RUN(test_form_fill_checkbox_states);
     RUN(test_form_fill_radio_sets_widget_as);

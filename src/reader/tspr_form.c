@@ -202,12 +202,18 @@ static void form_walk(FormCtx *ctx, TspdfObj *field_val, const char *prefix,
                                   tspdf_dict_get(field, "Kids"));
     if (kids && kids->type != TSPDF_OBJ_ARRAY) kids = NULL;
 
-    // A kid with /T is a child field -> this node is interior.
+    // A kid with /T is a child field -> this node is interior. A kid that
+    // refers back to this same object is self-referential (not a real child):
+    // treating it as interior would recurse and re-append this node's name
+    // at every level until the budget drains, so skip it.
     bool has_child_fields = false;
     if (kids) {
         for (size_t i = 0; i < kids->array.count && !has_child_fields; i++) {
-            TspdfObj *kid = form_resolve(ctx->doc, &ctx->parser,
-                                         &kids->array.items[i]);
+            TspdfObj *kref = &kids->array.items[i];
+            if (num && kref->type == TSPDF_OBJ_REF && kref->ref.num == num) {
+                continue;
+            }
+            TspdfObj *kid = form_resolve(ctx->doc, &ctx->parser, kref);
             if (kid && kid->type == TSPDF_OBJ_DICT && tspdf_dict_get(kid, "T")) {
                 has_child_fields = true;
             }
@@ -681,6 +687,25 @@ static void form_parse_da(const TspdfObj *da, char *font, size_t font_sz,
     }
 }
 
+// Reduce a parsed /DA font name to a safe subset ([A-Za-z0-9]) in place. The
+// /DA string is untrusted: a hostile name like "/Bad(Font)Name" would inject
+// PDF delimiters into the content-stream Tf operand and desync it from the
+// serializer-escaped /Resources /Font key. Stripping to alphanumerics keeps
+// the content token and the resource key identical and delimiter-free. Falls
+// back to "Helv" when nothing survives.
+static void form_sanitize_font_name(char *name) {
+    size_t o = 0;
+    for (size_t i = 0; name[i]; i++) {
+        unsigned char c = (unsigned char)name[i];
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9')) {
+            name[o++] = (char)c;
+        }
+    }
+    name[o] = '\0';
+    if (o == 0) snprintf(name, 5, "Helv");
+}
+
 // --- appearance stream generation (text fields) ---
 
 // Grow-append for the content buffer (malloc'd, caller frees).
@@ -756,6 +781,9 @@ static TspdfError form_set_text_appearance(FormCtx *ctx, TspdfObj *widget,
                           tspdf_dict_get(ctx->acroform, "DA"));
     }
     form_parse_da(da, da_font, sizeof(da_font), &size);
+    // Untrusted /DA: reduce the font name to a delimiter-free subset before it
+    // is used for both the content Tf token and the /Resources /Font key.
+    form_sanitize_font_name(da_font);
     if (size <= 0) {
         size = h * 0.62;                 // auto-size: fit the rect height
         if (size > 12) size = 12;
@@ -1199,6 +1227,11 @@ TspdfError tspdf_reader_form_flatten(TspdfReader *doc) {
         if (err == TSPDF_OK && content.len > 0) {
             // Build the resource additions and merge them into the page,
             // rewriting our operator names on collision.
+            //
+            // M3 (known, benign): every flattened page that draws text points
+            // its /TspdfFf font at the same shared font object (font_num). That
+            // is a little /Resources bloat when many pages are flattened, but
+            // it renders correctly; not worth per-page duplication.
             TspdfObj *new_res = form_obj_new(a, TSPDF_OBJ_DICT);
             if (!new_res) err = TSPDF_ERR_ALLOC;
             if (err == TSPDF_OK && used_font) {
