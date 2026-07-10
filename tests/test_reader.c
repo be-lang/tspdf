@@ -11067,6 +11067,62 @@ TEST(test_form_flatten_writer_checkbox_fallback) {
     free(pdf);
 }
 
+// Resolve `obj` if it is an indirect ref, using the reopened reader.
+static TspdfObj *flat_resolve(TspdfReader *doc, TspdfObj *obj) {
+    if (!obj || obj->type != TSPDF_OBJ_REF) return obj;
+    TspdfParser parser;
+    tspdf_parser_init(&parser, doc->data, doc->data_len, &doc->arena);
+    if (obj->ref.num < doc->xref.count) {
+        return tspdf_xref_resolve(&doc->xref, &parser, obj->ref.num,
+                                  doc->obj_cache, doc->crypt);
+    }
+    return NULL;
+}
+
+// Count entries in a page's /Resources /Font sub-dict (0 when absent).
+static size_t flat_page_font_count(TspdfReader *doc, size_t page) {
+    TspdfObj *pd = tspdf_reader_get_page(doc, page)->page_dict;
+    TspdfObj *res = flat_resolve(doc, tspdf_dict_get(pd, "Resources"));
+    if (!res || res->type != TSPDF_OBJ_DICT) return 0;
+    TspdfObj *font = flat_resolve(doc, tspdf_dict_get(res, "Font"));
+    if (!font || font->type != TSPDF_OBJ_DICT) return 0;
+    return font->dict.count;
+}
+
+// Two pages that share one indirect /Resources must, after flatten, each end
+// up with their OWN additions only. Merging into the shared dict once per page
+// would accumulate every page's font key on every page (finding M3).
+TEST(test_form_flatten_shared_resources_not_accumulated) {
+    TspdfError err;
+    TspdfReader *doc =
+        tspdf_reader_open_file("tests/data/form_shared_resources.pdf", &err);
+    ASSERT(doc != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(doc), 2);
+
+    err = tspdf_reader_form_flatten(doc);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *out = NULL;
+    TspdfReader *re = form_reopen(doc, &out);
+    ASSERT(re != NULL);
+
+    // Each page: the original /Helv plus its own /TspdfFf == 2 entries. The
+    // pre-fix bug leaked the other page's key in too (Helv + TspdfFf +
+    // TspdfFf_2 == 3).
+    ASSERT_EQ_SIZE(flat_page_font_count(re, 0), 2);
+    ASSERT_EQ_SIZE(flat_page_font_count(re, 1), 2);
+
+    // Both field values must still render on their own page.
+    const char *t0 = tspdf_reader_page_text(re, 0, &err);
+    const char *t1 = tspdf_reader_page_text(re, 1, &err);
+    ASSERT(t0 && strstr(t0, "Alpha") != NULL);
+    ASSERT(t1 && strstr(t1, "Beta") != NULL);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(doc);
+}
+
 int main(void) {
     printf("tspr reader tests:\n");
 
@@ -11390,6 +11446,7 @@ int main(void) {
     RUN(test_form_flatten_fixture);
     RUN(test_form_flatten_no_form_noop);
     RUN(test_form_flatten_writer_checkbox_fallback);
+    RUN(test_form_flatten_shared_resources_not_accumulated);
 
 
     printf("\n%d tests, %d passed, %d failed\n",

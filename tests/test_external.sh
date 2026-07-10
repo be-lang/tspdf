@@ -285,6 +285,23 @@ if [ "$HAVE_QPDF" -eq 1 ]; then
     fi
 fi
 
+# Two pages sharing one indirect /Resources must not accumulate each other's
+# font key on flatten (finding M3): each page's /Font gets only its own /TspdfFf.
+"$TSPDF" form flatten tests/data/form_shared_resources.pdf \
+    -o "$TMPDIR/form_shared_flat.pdf" > /dev/null 2>&1
+reader_check "form flatten (shared resources)" "$TMPDIR/form_shared_flat.pdf"
+if [ "$HAVE_QPDF" -eq 1 ]; then
+    dup=$(qpdf --qdf --object-streams=disable "$TMPDIR/form_shared_flat.pdf" - 2>/dev/null \
+            | grep -c 'TspdfFf_2')
+    if [ "$dup" -eq 0 ]; then
+        echo "  PASS  form flatten shared /Resources not accumulated (no TspdfFf_2)"
+        pass=$((pass + 1))
+    else
+        echo "  FAIL  form flatten shared /Resources accumulated ($dup TspdfFf_2 keys)"
+        fail=$((fail + 1))
+    fi
+fi
+
 # --- Attachments: qpdf interop in both directions ---
 
 echo ""

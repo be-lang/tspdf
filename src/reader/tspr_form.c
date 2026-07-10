@@ -1002,6 +1002,41 @@ TspdfError tspdf_reader_form_fill(TspdfReader *doc, const char *name,
 
 // --- flatten ---
 
+// Shallow-copy a dict into a fresh arena dict (new entries array, same values).
+static TspdfObj *form_shallow_copy_dict(TspdfArena *a, const TspdfObj *src) {
+    TspdfObj *copy = form_obj_new(a, TSPDF_OBJ_DICT);
+    if (!copy) return NULL;
+    if (src->dict.count == 0) return copy;
+    TspdfDictEntry *entries = (TspdfDictEntry *)tspdf_arena_alloc(
+        a, src->dict.count * sizeof(TspdfDictEntry));
+    if (!entries) return NULL;
+    memcpy(entries, src->dict.entries, src->dict.count * sizeof(TspdfDictEntry));
+    copy->dict.entries = entries;
+    copy->dict.count = src->dict.count;
+    return copy;
+}
+
+// Per-page copy of a resolved /Resources dict for merging. When two pages
+// share one indirect /Resources, merging into it once per page would make
+// each page accumulate the others' additions (finding M3). Copy the top dict
+// and the sub-dicts the merge mutates (/Font /XObject /ExtGState) so a page
+// gets only its own additions; other categories stay shared by reference.
+static TspdfObj *form_copy_resources_for_merge(TspdfArena *a, TspdfReader *doc,
+                                               TspdfParser *parser,
+                                               const TspdfObj *src) {
+    TspdfObj *copy = form_shallow_copy_dict(a, src);
+    if (!copy) return NULL;
+    static const char *cats[] = {"Font", "XObject", "ExtGState"};
+    for (size_t c = 0; c < sizeof(cats) / sizeof(cats[0]); c++) {
+        TspdfObj *sub = form_resolve(doc, parser, tspdf_dict_get(copy, cats[c]));
+        if (!sub || sub->type != TSPDF_OBJ_DICT) continue;
+        TspdfObj *sub_copy = form_shallow_copy_dict(a, sub);
+        if (!sub_copy) return NULL;
+        if (form_dict_put(copy, cats[c], sub_copy, a) != TSPDF_OK) return NULL;
+    }
+    return copy;
+}
+
 // Append the value text of a widget to the page content buffer, clipped to
 // the widget rect. Uses the shared flattening font (see form_flatten_font).
 static void form_flatten_draw_text(FormCtx *ctx, TspdfBuffer *content,
@@ -1257,13 +1292,19 @@ TspdfError tspdf_reader_form_flatten(TspdfReader *doc) {
                 // tspdf_resources_merge treats a non-dict /Resources value as
                 // absent and would append a duplicate key: pages often carry
                 // /Resources as an indirect ref, so inline the resolved dict
-                // first (drop the entry when the ref dangles).
+                // first (drop the entry when the ref dangles). The ref may be
+                // shared between pages, so inline a per-page COPY — merging into
+                // the shared dict once per page would make each page accumulate
+                // every page's additions (finding M3).
                 TspdfObj *page_dict = doc->pages.pages[p].page_dict;
                 TspdfObj *res_val = tspdf_dict_get(page_dict, "Resources");
                 if (res_val && res_val->type == TSPDF_OBJ_REF) {
                     TspdfObj *res = form_resolve(doc, &ctx.parser, res_val);
                     if (res && res->type == TSPDF_OBJ_DICT) {
-                        err = form_dict_put(page_dict, "Resources", res, a);
+                        TspdfObj *res_copy = form_copy_resources_for_merge(
+                            a, doc, &ctx.parser, res);
+                        if (!res_copy) err = TSPDF_ERR_ALLOC;
+                        else err = form_dict_put(page_dict, "Resources", res_copy, a);
                     } else {
                         form_dict_remove(page_dict, "Resources");
                     }
