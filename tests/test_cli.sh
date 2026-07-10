@@ -2373,6 +2373,48 @@ else
   echo "  SKIP  form qpdf conformance checks (qpdf not installed)"
 fi
 
+# info --json: page dimensions must be JSON numbers (not strings); page_sizes
+# is a single [w,h] for a uniform document and an array of [w,h] for a mixed one.
+if command -v python3 > /dev/null 2>&1; then
+  run_test "info --json emits numeric page_sizes (uniform + mixed)" python3 - << PYEOF
+import json, subprocess, struct
+
+# Uniform: every page the same -> page_sizes is one [w,h] of numbers.
+out = subprocess.run(["$TSPDF", "info", "$INPUT", "--json"],
+                     capture_output=True, check=True).stdout
+d = json.loads(out)
+ps = d["page_sizes"]
+assert isinstance(ps, list) and len(ps) == 2, ps
+assert all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in ps), ps
+
+# Mixed: two differently sized pages -> array of [w,h] pairs, all numeric.
+def obj(n, body): return b"%d 0 obj\n" % n + body + b"\nendobj\n"
+objs = {
+ 1: b"<< /Type /Catalog /Pages 2 0 R >>",
+ 2: b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+ 3: b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] >>",
+ 4: b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 500] >>",
+}
+buf = b"%PDF-1.4\n"; offs = {}
+for n in sorted(objs):
+    offs[n] = len(buf); buf += obj(n, objs[n])
+xp = len(buf); mx = max(objs)
+buf += b"xref\n0 %d\n0000000000 65535 f \n" % (mx + 1)
+for n in range(1, mx + 1): buf += b"%010d 00000 n \n" % offs[n]
+buf += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF" % (mx + 1, xp)
+open("$TMPDIR/mixed.pdf", "wb").write(buf)
+
+out = subprocess.run(["$TSPDF", "info", "$TMPDIR/mixed.pdf", "--json"],
+                     capture_output=True, check=True).stdout
+d = json.loads(out)
+ps = d["page_sizes"]
+assert isinstance(ps, list) and len(ps) == 2 and all(isinstance(p, list) for p in ps), ps
+assert ps == [[200.0, 300.0], [400.0, 500.0]], ps
+PYEOF
+else
+  echo "  SKIP  info --json numeric page_sizes (python3 not found)"
+fi
+
 # `make amalgamation` generates build/amalgamation/tspdf.{c,h} and proves them:
 # standalone -Werror compile, link + run examples/minimal.c against them, and
 # qpdf --check on the produced PDF (inside the make target, when qpdf exists).
