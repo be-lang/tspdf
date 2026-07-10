@@ -80,6 +80,23 @@ tspdf stamp report.pdf --stamp letterhead.pdf --under -o out.pdf
 tspdf stamp report.pdf --stamp marks.pdf --stamp-page 2 --pages 1 -o out.pdf
 ```
 
+## Place multiple pages per sheet (N-up)
+
+```bash
+# 2 slides per page for a handout
+tspdf nup 2 slides.pdf -o handout.pdf
+
+# 4-up with a border around each page and a 12pt gap, on letter paper
+tspdf nup 4 report.pdf --frame --gap 12 --page-size letter -o report-4up.pdf
+
+# 6-up landscape of a page range
+tspdf nup 6 deck.pdf --pages 1-12 --landscape -o deck-6up.pdf
+```
+
+N is one of 2, 4, 6, 8, 9, 16. Each page is scaled to fit its cell, keeping
+its aspect ratio, in reading order. Bookmarks, forms, and annotations are not
+carried over.
+
 ## Extract text
 
 ```bash

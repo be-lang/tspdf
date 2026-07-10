@@ -243,6 +243,13 @@ reader_check "stamp" "$TMPDIR/stamp.pdf"
 "$TSPDF" stamp "$INPUT" --stamp "$TMPDIR/stamp_src.pdf" --under -o "$TMPDIR/stamp_under.pdf" > /dev/null 2>&1
 reader_check "stamp --under" "$TMPDIR/stamp_under.pdf"
 
+# 2-up of a 3-page doc = 2 sheets (last sheet has one empty cell).
+"$TSPDF" nup 2 "$INPUT" -o "$TMPDIR/nup2.pdf" > /dev/null 2>&1
+reader_check "nup 2" "$TMPDIR/nup2.pdf"
+
+"$TSPDF" nup 4 "$INPUT" --frame --gap 10 --page-size letter -o "$TMPDIR/nup4.pdf" > /dev/null 2>&1
+reader_check "nup 4 --frame --gap" "$TMPDIR/nup4.pdf"
+
 "$TSPDF" compress "$INPUT"                 -o "$TMPDIR/compress.pdf" > /dev/null 2>&1
 reader_check "compress" "$TMPDIR/compress.pdf"
 

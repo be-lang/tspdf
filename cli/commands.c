@@ -141,6 +141,7 @@ static const char *const VALUE_FLAGS[] = {
     "--start",
     "--font-size",
     "--page-size",
+    "--gap",
     "--bind",
     "--desc",
     "--name",
