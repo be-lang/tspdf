@@ -797,11 +797,11 @@ run_test "compress" $TSPDF compress $INPUT -o $TMPDIR/compressed.pdf
 # flag-first ordering: -o output must not be swallowed as input
 run_test "compress flag-first ordering (-o before input)" $TSPDF compress -o $TMPDIR/compressed_ff.pdf $INPUT
 
-# compress must not re-inflate an already-well-compressed FlateDecode stream:
-# round-tripping such a stream costs CPU and never shrinks it (often grows it).
-# Build a PDF whose content stream is a large payload already stored as
-# FlateDecode (compressed size above the skip floor), then assert the compressed
-# stream bytes are preserved verbatim and the file still reopens.
+# compress keeps whichever encoding of a FlateDecode stream is smaller: a
+# re-encoded stream is only written when it actually shrinks (the best-effort
+# deflate level can beat zlib-9), never grows. Build a PDF whose content
+# stream is a large zlib-9 payload, then assert the stream never grew and the
+# file still reopens.
 if command -v python3 > /dev/null 2>&1; then
   python3 -c "
 import zlib, random, sys
@@ -830,17 +830,21 @@ out += b'trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n' % (len(o
 open(sys.argv[1], 'wb').write(out)
 " "$TMPDIR/bigflate.pdf"
   run_test "compress runs on already-compressed stream" $TSPDF compress "$TMPDIR/bigflate.pdf" -o "$TMPDIR/bigflate_out.pdf"
-  run_test "compress preserves already-well-compressed stream bytes" python3 - "$TMPDIR/bigflate.pdf" "$TMPDIR/bigflate_out.pdf" << 'PYEOF'
-import re, sys
+  run_test "compress never grows an already-well-compressed stream" python3 - "$TMPDIR/bigflate.pdf" "$TMPDIR/bigflate_out.pdf" << 'PYEOF'
+import re, sys, zlib
 def stream_bytes(p):
     d = open(p, "rb").read()
-    m = re.search(rb"/Filter /FlateDecode >>\nstream\n(.*?)\nendstream", d, re.DOTALL)
+    m = re.search(rb"/Filter /FlateDecode.*?>>\nstream\n(.*?)\nendstream", d, re.DOTALL)
     return m.group(1) if m else None
 a = stream_bytes(sys.argv[1])
 b = stream_bytes(sys.argv[2])
 assert a is not None and b is not None, "stream not found"
-# The well-compressed stream must be kept verbatim, not re-inflated.
-assert a == b, "stream was needlessly re-encoded (%d -> %d bytes)" % (len(a), len(b))
+# Keep-if-smaller: a differing stream must be a strictly smaller encoding of
+# the exact same payload; an equal-or-larger re-encode must keep the original.
+assert len(b) <= len(a), "stream grew (%d -> %d bytes)" % (len(a), len(b))
+if a != b:
+    assert len(b) < len(a), "same-size stream was needlessly re-encoded"
+    assert zlib.decompress(b) == zlib.decompress(a), "payload changed"
 PYEOF
   run_test "compress output reopens cleanly (round-trip)" $TSPDF info "$TMPDIR/bigflate_out.pdf"
 else

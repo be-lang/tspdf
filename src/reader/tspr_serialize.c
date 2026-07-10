@@ -592,6 +592,49 @@ static bool stream_dict_type_is(TspdfObj *obj, const char *type_name) {
            strcmp((const char *)type_val->string.data, type_name) == 0;
 }
 
+// Image XObjects get the fast deflate level during recompression: their
+// Flate payloads (PNG-style, usually predictor-coded) gain almost nothing
+// from the slow best-effort search, and scan-heavy files would otherwise
+// dominate `tspdf compress` wall time for no size benefit.
+static bool stream_is_image(TspdfObj *dict) {
+    TspdfObj *st = tspdf_dict_get(dict, "Subtype");
+    return st && st->type == TSPDF_OBJ_NAME &&
+           strcmp((const char *)st->string.data, "Image") == 0;
+}
+
+// True when the /Filter chain consists only of lossless byte filters our
+// decoder can round-trip AND rewriting it as a bare /FlateDecode can win:
+// either it contains a non-Flate "armor" stage (ASCIIHex/ASCII85/RunLength/
+// LZW — those cost 25%+, hex doubles) or it is an array form like
+// [/FlateDecode] (common in generator output; re-encoding normalizes it and
+// applies the best-effort level). A bare FlateDecode NAME (with or without
+// predictor params) is handled by the cheaper re-flate branch instead — the
+// predictor usually helps compression, so full-decode-and-replace would
+// only burn time to then keep the original.
+static bool filter_chain_is_strippable(TspdfObj *filter) {
+    if (!filter) return false;
+    size_t count = filter->type == TSPDF_OBJ_ARRAY ? filter->array.count : 1;
+    if (filter->type != TSPDF_OBJ_NAME && filter->type != TSPDF_OBJ_ARRAY) return false;
+    bool has_armor = false;
+    for (size_t i = 0; i < count; i++) {
+        TspdfObj *name = filter->type == TSPDF_OBJ_NAME ? filter : &filter->array.items[i];
+        if (!name || name->type != TSPDF_OBJ_NAME) return false;
+        const char *f = (const char *)name->string.data;
+        if (strcmp(f, "FlateDecode") == 0 || strcmp(f, "Fl") == 0) {
+            continue;
+        }
+        if (strcmp(f, "ASCIIHexDecode") == 0 || strcmp(f, "AHx") == 0 ||
+            strcmp(f, "ASCII85Decode") == 0 || strcmp(f, "A85") == 0 ||
+            strcmp(f, "RunLengthDecode") == 0 || strcmp(f, "RL") == 0 ||
+            strcmp(f, "LZWDecode") == 0 || strcmp(f, "LZW") == 0) {
+            has_armor = true;
+            continue;
+        }
+        return false;  // lossy or unknown filter: leave the stream verbatim
+    }
+    return has_armor || filter->type == TSPDF_OBJ_ARRAY;
+}
+
 static uint16_t source_object_gen(TspdfReader *doc, uint32_t obj_num) {
     if (!doc || obj_num >= doc->xref.count) {
         return 0;
@@ -678,22 +721,30 @@ static TspdfError write_stream_obj_with_options(TspdfBuffer *buf, TspdfObj *obj,
     const uint8_t *stream_data = stream.data;
     size_t stream_len = stream.len;
 
-    // Recompression. Both branches keep whichever encoding is smaller, so a
+    // Recompression. Every branch keeps whichever encoding is smaller, so a
     // stream never grows: an already-well-compressed stream stays verbatim.
+    // The size-focused best-effort deflate level is used throughout —
+    // `tspdf compress` is the only recompress_streams caller.
     uint8_t *recompressed = NULL;
     size_t recomp_len = 0;
-    bool add_flate_filter = false;
+    bool add_flate_filter = false;    // append /Filter /FlateDecode
+    bool replace_filter = false;      // drop original /Filter + /DecodeParms too
     if (opts->recompress_streams && !stream_dict_type_is(obj, "XRef")) {
         TspdfObj *filter = tspdf_dict_get(dict, "Filter");
+        bool is_image = stream_is_image(dict);
         if (filter && filter->type == TSPDF_OBJ_NAME &&
             strcmp((char *)filter->string.data, "FlateDecode") == 0) {
-            // Existing Flate stream: inflate + re-deflate and keep the smaller
-            // encoding. This recovers streams stored at a low compression
-            // level (or as raw stored blocks) regardless of their size.
+            // Flate stream (predictor params, if any, are preserved since
+            // the re-encoded bytes are the same predicted bytes): inflate +
+            // re-deflate and keep the smaller encoding. This recovers
+            // streams stored at a low compression level (or as raw stored
+            // blocks) regardless of their size.
             size_t dec_len = 0;
             uint8_t *decompressed = deflate_decompress(stream_data, stream_len, &dec_len);
             if (decompressed) {
-                recompressed = deflate_compress(decompressed, dec_len, &recomp_len);
+                recompressed = is_image
+                    ? deflate_compress(decompressed, dec_len, &recomp_len)
+                    : deflate_compress_best(decompressed, dec_len, &recomp_len);
                 free(decompressed);
                 if (recompressed && recomp_len < stream_len) {
                     stream_data = recompressed;
@@ -709,12 +760,10 @@ static TspdfError write_stream_obj_with_options(TspdfBuffer *buf, TspdfObj *obj,
                    !tspdf_dict_get(dict, "DP") &&
                    !is_xmp_metadata(obj)) {
             // Stream stored with no filter at all: deflate it and add the
-            // /Filter entry if that shrinks it. Streams with a non-Flate
-            // filter (DCTDecode etc.) are already compressed and stay
-            // untouched, as do XMP metadata streams (kept uncompressed for
-            // PDF/A-style scanning) and anything with external-file or
-            // decode-parameter entries.
-            recompressed = deflate_compress(stream_data, stream_len, &recomp_len);
+            // /Filter entry if that shrinks it. XMP metadata streams stay
+            // uncompressed (PDF/A-style scanning), as does anything with
+            // external-file or decode-parameter entries.
+            recompressed = deflate_compress_best(stream_data, stream_len, &recomp_len);
             if (recompressed && recomp_len < stream_len) {
                 stream_data = recompressed;
                 stream_len = recomp_len;
@@ -722,6 +771,32 @@ static TspdfError write_stream_obj_with_options(TspdfBuffer *buf, TspdfObj *obj,
             } else {
                 free(recompressed);
                 recompressed = NULL;
+            }
+        } else if (filter_chain_is_strippable(filter) &&
+                   !tspdf_dict_get(dict, "FFilter")) {
+            // ASCII/RunLength/LZW armor (possibly stacked on Flate): decode
+            // the chain fully and re-encode as plain Flate when that is
+            // smaller, replacing the whole /Filter (+/DecodeParms) — hex
+            // doubles the bytes, ASCII85 adds 25%. Lossy/unknown filters
+            // never reach here (see filter_chain_is_strippable), and a
+            // failed decode keeps the stream verbatim.
+            uint8_t *decoded = NULL;
+            size_t dec_len = 0;
+            if (tspdf_stream_decode(dict, stream_data, stream_len,
+                                    &decoded, &dec_len) == TSPDF_OK) {
+                recompressed = is_image
+                    ? deflate_compress(decoded, dec_len, &recomp_len)
+                    : deflate_compress_best(decoded, dec_len, &recomp_len);
+                free(decoded);
+                if (recompressed && recomp_len < stream_len) {
+                    stream_data = recompressed;
+                    stream_len = recomp_len;
+                    add_flate_filter = true;
+                    replace_filter = true;
+                } else {
+                    free(recompressed);
+                    recompressed = NULL;
+                }
             }
         }
     }
@@ -731,6 +806,13 @@ static TspdfError write_stream_obj_with_options(TspdfBuffer *buf, TspdfObj *obj,
     tspdf_buffer_append_str(buf, "<< ");
     for (size_t i = 0; i < dict->dict.count; i++) {
         const char *key = dict->dict.entries[i].key;
+        if (replace_filter && (strcmp(key, "Filter") == 0 ||
+                               strcmp(key, "DecodeParms") == 0 ||
+                               strcmp(key, "DP") == 0)) {
+            // The stream bytes were re-encoded as plain Flate; the original
+            // filter chain (and its parameters) no longer applies.
+            continue;
+        }
         if (strcmp(key, "Length") == 0) {
             if (wrote_length) {
                 continue;
@@ -807,12 +889,13 @@ typedef struct {
     TspdfBuffer body;          // concatenated object bodies
     TspdfCrypt *crypt;         // non-NULL: encrypt flushed streams whole
     bool enabled;
+    bool best;                 // best-effort deflate (size-focused saves)
 } ObjStmWriter;
 
 static bool objstm_writer_init(ObjStmWriter *w, TspdfBuffer *out, size_t *offsets,
                                uint32_t *objstm_of, uint32_t *objstm_idx,
                                uint32_t first_objstm_num, bool enabled,
-                               TspdfCrypt *crypt) {
+                               TspdfCrypt *crypt, bool best) {
     memset(w, 0, sizeof(*w));
     w->out = out;
     w->offsets = offsets;
@@ -821,6 +904,7 @@ static bool objstm_writer_init(ObjStmWriter *w, TspdfBuffer *out, size_t *offset
     w->next_objstm_num = first_objstm_num;
     w->enabled = enabled;
     w->crypt = crypt;
+    w->best = best;
     if (enabled) {
         w->header = tspdf_buffer_create(1024);
         w->body = tspdf_buffer_create(16384);
@@ -849,7 +933,8 @@ static TspdfError objstm_writer_flush(ObjStmWriter *w) {
     memcpy(raw + first, w->body.data, w->body.len);
 
     size_t comp_len = 0;
-    uint8_t *comp = deflate_compress(raw, raw_len, &comp_len);
+    uint8_t *comp = w->best ? deflate_compress_best(raw, raw_len, &comp_len)
+                            : deflate_compress(raw, raw_len, &comp_len);
 
     // Pick the smaller encoding, then (for encrypted saves) encrypt the whole
     // chosen payload with this container's own object key — member strings
@@ -1424,7 +1509,7 @@ TspdfError tspdf_serialize_with_options(TspdfReader *doc, uint8_t **out_buf, siz
     ObjStmWriter stm_writer;
     bool stm_writer_ok = objstm_writer_init(&stm_writer, &buf, offsets, objstm_of,
                                             objstm_idx, total_objects + 1, use_objstm,
-                                            NULL);
+                                            NULL, opts->recompress_streams);
     if (!offsets || scratch.error || !stm_writer_ok ||
         (use_objstm && (!objstm_of || !objstm_idx))) {
         objstm_writer_destroy(&stm_writer);
@@ -1980,7 +2065,7 @@ TspdfError tspdf_serialize_encrypted(TspdfReader *doc, TspdfCrypt *crypt,
     ObjStmWriter stm_writer;
     bool stm_writer_ok = objstm_writer_init(&stm_writer, &buf, offsets, objstm_of,
                                             objstm_idx, total_objects + 1, use_objstm,
-                                            crypt);
+                                            crypt, false);
     if (!offsets || scratch.error || !stm_writer_ok ||
         (use_objstm && (!objstm_of || !objstm_idx))) {
         objstm_writer_destroy(&stm_writer);

@@ -55,7 +55,11 @@ Encrypt a PDF with a password.
 Decrypt a password-protected PDF.
 .TP
 .B metadata
-View or edit PDF metadata.
+View or edit PDF metadata. Encrypted files need
+.B \-\-password
+(or
+.BR \-\-password\-file );
+edited output keeps the original encryption.
 .TP
 .B info
 Print information about a PDF.

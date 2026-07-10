@@ -16,8 +16,21 @@ on 0.x, the CLI is considered stable but the low-level C API may still change.
   ICC/Indexed color, progressive JPEG input) passes through untouched.
   Without `--lossy`, compress output is unchanged. C API:
   `tspdf_reader_lossy_images`.
+- `tspdf metadata` accepts `--password`/`--password-file` to view and edit
+  encrypted files; edited output keeps the original encryption.
 
 ### Changed
+- `tspdf compress` output got smaller. A new best-effort deflate level
+  (zlib-9-class, used only by compress) plus re-encoding of
+  ASCII85/ASCIIHex/LZW-armored streams as plain Flate beat qpdf on all four
+  benchmark files, e.g. a 125-page text PDF: 280 KB before, 223 KB now
+  (qpdf: 224 KB).
+- Saving a file that uses object streams re-packs them instead of unpacking
+  every object (cropping f1040.pdf: 460 KB before, 216 KB now). Classic files
+  are written classic as before. Encrypted saves re-pack too.
+- `nup` and `stamp` reuse resources already imported into the output instead
+  of copying them once per sheet: 4-up of a 2.2 MB paper is 2.1 MB, down
+  from 3.2 MB.
 - Saving a document opened with a password now keeps it encrypted (same
   passwords and permissions), matching qpdf. This covers form fill/flatten,
   bookmark, attach, stamp, nup, metadata, rotate, and the C API; `tspdf
@@ -49,6 +62,9 @@ on 0.x, the CLI is considered stable but the low-level C API may still change.
   rotated (/Rotate 90/270) pages.
 - Re-encrypting a file with new passwords no longer embeds the old /Encrypt
   dictionary (old password verifiers) as an orphan object.
+- Metadata written into encrypted files was stored as plaintext; readers
+  decrypt Info strings unconditionally, so poppler showed garbage (blank
+  titles). Info strings are now encrypted like every other string.
 
 ## [0.3.0] - 2026-07-10
 
