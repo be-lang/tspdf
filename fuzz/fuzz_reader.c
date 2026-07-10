@@ -91,6 +91,13 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         free(out);
     }
 
+    // The lossy image pass decodes untrusted Flate- and DCT-encoded image
+    // pixels, walks content streams with CTM tracking (incl. Form XObject
+    // recursion), and rewrites stream objects in place. Run it before the
+    // compress-style save so the serializer also sees rewritten streams.
+    TspdfLossyStats lossy_stats;
+    (void)tspdf_reader_lossy_images(doc, 72, 40, &lossy_stats);
+
     // The compress path is a distinct serializer: reachability GC, stream
     // re-deflation, object-stream packing, and the right-sized xref stream.
     TspdfSaveOptions opts = tspdf_save_options_default();

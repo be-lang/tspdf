@@ -2766,6 +2766,156 @@ else
   echo "  SKIP  info --json numeric page_sizes (python3 not found)"
 fi
 
+# --- compress --lossy ---
+# Fixtures are committed (regenerate with tests/data/gen_lossy_fixtures.py).
+# Helper: extract the largest image XObject stream of a PDF; prints
+# "FILTER WIDTH HEIGHT COLORSPACE" and optionally dumps the raw bytes.
+cat > "$TMPDIR/imgstream.py" <<'PYEOF'
+import re, sys
+data = open(sys.argv[1], 'rb').read()
+out = sys.argv[2] if len(sys.argv) > 2 else None
+best = None
+for m in re.finditer(rb'stream\r?\n', data):
+    start = data.rfind(b'obj', 0, m.start())
+    if start < 0:
+        continue
+    d = data[start:m.start()]
+    if b'/Subtype' not in d or b'/Image' not in d:
+        continue
+    lengths = re.findall(rb'/Length\s+(\d+)', d)
+    if not lengths:
+        continue
+    n = int(lengths[-1])
+    body = data[m.end():m.end() + n]
+    if best is None or len(body) > len(best[0]):
+        f = re.search(rb'/Filter\s*/(\w+)', d)
+        w = re.findall(rb'/Width\s+(\d+)', d)
+        h = re.findall(rb'/Height\s+(\d+)', d)
+        cs = re.search(rb'/ColorSpace\s*/(\w+)', d)
+        best = (body, f.group(1).decode() if f else '-',
+                int(w[-1]) if w else 0, int(h[-1]) if h else 0,
+                cs.group(1).decode() if cs else '-')
+assert best is not None, 'no image stream found'
+print(best[1], best[2], best[3], best[4])
+if out:
+    open(out, 'wb').write(best[0])
+PYEOF
+# Helper: assert a ppm render is nonblank (has more than one pixel value).
+cat > "$TMPDIR/nonblank.py" <<'PYEOF'
+import sys
+d = open(sys.argv[1], 'rb').read().split(b'\n', 3)[3]
+assert len(set(d)) > 1, 'blank page'
+PYEOF
+
+LOSSY_IN=tests/data/lossy_scan.pdf
+if command -v python3 >/dev/null 2>&1 && [ -f "$LOSSY_IN" ]; then
+  run_test "compress --lossy shrinks a 600-dpi scan > 60%" bash -c '
+    set -e
+    "'"$TSPDF"'" compress --lossy '"$LOSSY_IN"' -o "'"$TMPDIR"'/lossy_out.pdf"
+    in=$(stat -c %s '"$LOSSY_IN"')
+    out=$(stat -c %s "'"$TMPDIR"'/lossy_out.pdf")
+    [ $((out * 10)) -lt $((in * 4)) ]'
+
+  run_test "compress --lossy converts the image to DCTDecode" bash -c '
+    set -e
+    info=$(python3 "'"$TMPDIR"'/imgstream.py" "'"$TMPDIR"'/lossy_out.pdf")
+    case "$info" in DCTDecode\ *) ;; *) echo "got: $info"; exit 1;; esac'
+
+  run_test "compress --lossy keeps the text page extractable" bash -c '
+    "'"$TSPDF"'" text "'"$TMPDIR"'/lossy_out.pdf" | grep -q "Lossy fixture text page"'
+
+  if command -v qpdf >/dev/null 2>&1; then
+    run_test "compress --lossy output passes qpdf --check" \
+      qpdf --check "$TMPDIR/lossy_out.pdf"
+  else
+    echo "  SKIP  compress --lossy qpdf --check (qpdf not found)"
+  fi
+
+  if command -v pdftoppm >/dev/null 2>&1; then
+    run_test "compress --lossy output renders both pages nonblank" bash -c '
+      set -e
+      pdftoppm -r 30 "'"$TMPDIR"'/lossy_out.pdf" "'"$TMPDIR"'/lossy_pg"
+      python3 "'"$TMPDIR"'/nonblank.py" "'"$TMPDIR"'/lossy_pg-1.ppm"
+      python3 "'"$TMPDIR"'/nonblank.py" "'"$TMPDIR"'/lossy_pg-2.ppm"'
+  else
+    echo "  SKIP  compress --lossy render check (pdftoppm not found)"
+  fi
+
+  MUTOOL=/tmp/tspdf-bench/mupdf/usr/bin/mutool
+  if [ -x "$MUTOOL" ]; then
+    run_test "compress --lossy output renders in mutool" bash -c '
+      LD_LIBRARY_PATH=/tmp/tspdf-bench/mupdf/usr/lib '"$MUTOOL"' draw -F ppm \
+        -o /dev/null "'"$TMPDIR"'/lossy_out.pdf" 2>/dev/null'
+  fi
+
+  run_test "compress --lossy downsamples a 600-dpi DCT image" bash -c '
+    set -e
+    "'"$TSPDF"'" compress --lossy tests/data/lossy_scan_dct.pdf -o "'"$TMPDIR"'/lossy_dct_out.pdf"
+    info=$(python3 "'"$TMPDIR"'/imgstream.py" "'"$TMPDIR"'/lossy_dct_out.pdf")
+    set -- $info
+    [ "$1" = DCTDecode ] && [ "$2" -lt 360 ] && [ "$2" -ge 80 ]
+    "'"$TSPDF"'" info "'"$TMPDIR"'/lossy_dct_out.pdf" > /dev/null'
+
+  run_test "compress --lossy passes a progressive JPEG through byte-identical" bash -c '
+    set -e
+    "'"$TSPDF"'" compress --lossy tests/data/lossy_progressive.pdf -o "'"$TMPDIR"'/lossy_prog_out.pdf"
+    python3 "'"$TMPDIR"'/imgstream.py" tests/data/lossy_progressive.pdf "'"$TMPDIR"'/prog_in.bin" > /dev/null
+    python3 "'"$TMPDIR"'/imgstream.py" "'"$TMPDIR"'/lossy_prog_out.pdf" "'"$TMPDIR"'/prog_out.bin" > /dev/null
+    cmp -s "'"$TMPDIR"'/prog_in.bin" "'"$TMPDIR"'/prog_out.bin"'
+
+  run_test "compress --lossy leaves an /SMask image untouched" bash -c '
+    set -e
+    "'"$TSPDF"'" compress --lossy tests/data/lossy_smask.pdf -o "'"$TMPDIR"'/lossy_smask_out.pdf"
+    python3 "'"$TMPDIR"'/imgstream.py" tests/data/lossy_smask.pdf "'"$TMPDIR"'/smask_in.bin" > /dev/null
+    python3 "'"$TMPDIR"'/imgstream.py" "'"$TMPDIR"'/lossy_smask_out.pdf" "'"$TMPDIR"'/smask_out.bin" > /dev/null
+    cmp -s "'"$TMPDIR"'/smask_in.bin" "'"$TMPDIR"'/smask_out.bin"'
+
+  run_test "compress --lossy leaves an already-low-dpi image untouched" bash -c '
+    set -e
+    "'"$TSPDF"'" compress --lossy tests/data/lossy_lowdpi.pdf -o "'"$TMPDIR"'/lossy_low_out.pdf"
+    python3 "'"$TMPDIR"'/imgstream.py" tests/data/lossy_lowdpi.pdf "'"$TMPDIR"'/low_in.bin" > /dev/null
+    python3 "'"$TMPDIR"'/imgstream.py" "'"$TMPDIR"'/lossy_low_out.pdf" "'"$TMPDIR"'/low_out.bin" > /dev/null
+    cmp -s "'"$TMPDIR"'/low_in.bin" "'"$TMPDIR"'/low_out.bin"'
+
+  run_test "compress without --lossy never touches image pixels" bash -c '
+    set -e
+    "'"$TSPDF"'" compress '"$LOSSY_IN"' -o "'"$TMPDIR"'/lossless_out.pdf"
+    python3 "'"$TMPDIR"'/imgstream.py" '"$LOSSY_IN"' "'"$TMPDIR"'/ll_in.bin" > /dev/null
+    python3 "'"$TMPDIR"'/imgstream.py" "'"$TMPDIR"'/lossless_out.pdf" "'"$TMPDIR"'/ll_out.bin" > /dev/null
+    cmp -s "'"$TMPDIR"'/ll_in.bin" "'"$TMPDIR"'/ll_out.bin"'
+
+  run_test "compress --image-quality 30 is smaller than the default" bash -c '
+    set -e
+    "'"$TSPDF"'" compress --lossy --image-quality 30 tests/data/lossy_scan_dct.pdf -o "'"$TMPDIR"'/lossy_q30.pdf"
+    q30=$(stat -c %s "'"$TMPDIR"'/lossy_q30.pdf")
+    dflt=$(stat -c %s "'"$TMPDIR"'/lossy_dct_out.pdf")
+    [ "$q30" -lt "$dflt" ]'
+
+  run_test "compress rejects invalid lossy flag values" bash -c '
+    ! "'"$TSPDF"'" compress --lossy --image-quality 0 '"$LOSSY_IN"' -o "'"$TMPDIR"'/x.pdf" 2>/dev/null || exit 1
+    ! "'"$TSPDF"'" compress --lossy --image-quality 101 '"$LOSSY_IN"' -o "'"$TMPDIR"'/x.pdf" 2>/dev/null || exit 1
+    ! "'"$TSPDF"'" compress --lossy --image-dpi 0 '"$LOSSY_IN"' -o "'"$TMPDIR"'/x.pdf" 2>/dev/null || exit 1
+    ! "'"$TSPDF"'" compress --lossy --image-dpi abc '"$LOSSY_IN"' -o "'"$TMPDIR"'/x.pdf" 2>/dev/null || exit 1
+    ! "'"$TSPDF"'" compress --image-dpi 150 '"$LOSSY_IN"' -o "'"$TMPDIR"'/x.pdf" 2>/dev/null || exit 1
+    ! "'"$TSPDF"'" compress --image-quality 50 '"$LOSSY_IN"' -o "'"$TMPDIR"'/x.pdf" 2>/dev/null || exit 1'
+
+  if command -v qpdf >/dev/null 2>&1; then
+    run_test "compress --lossy keeps an encrypted input encrypted" bash -c '
+      set -e
+      qpdf --encrypt "" ownersecret 256 -- '"$LOSSY_IN"' "'"$TMPDIR"'/lossy_enc.pdf"
+      "'"$TSPDF"'" compress --lossy "'"$TMPDIR"'/lossy_enc.pdf" -o "'"$TMPDIR"'/lossy_enc_out.pdf"
+      qpdf --is-encrypted "'"$TMPDIR"'/lossy_enc_out.pdf"
+      qpdf --check "'"$TMPDIR"'/lossy_enc_out.pdf" > /dev/null
+      in=$(stat -c %s "'"$TMPDIR"'/lossy_enc.pdf")
+      out=$(stat -c %s "'"$TMPDIR"'/lossy_enc_out.pdf")
+      [ "$out" -lt $((in / 2)) ]'
+  else
+    echo "  SKIP  compress --lossy encrypted roundtrip (qpdf not found)"
+  fi
+else
+  echo "  SKIP  compress --lossy tests (python3 or fixtures missing)"
+fi
+
 # `make amalgamation` generates build/amalgamation/tspdf.{c,h} and proves them:
 # standalone -Werror compile, link + run examples/minimal.c against them, and
 # qpdf --check on the produced PDF (inside the make target, when qpdf exists).

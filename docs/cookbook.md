@@ -142,7 +142,16 @@ tspdf text report.pdf --pages 1-3 -o report.txt
 
 ```bash
 tspdf compress report.pdf -o smaller.pdf
+
+# scans and photo-heavy files: also downsample images and re-encode as JPEG
+tspdf compress --lossy scan.pdf -o small.pdf
+
+# tune it (defaults: 150 dpi, quality 75)
+tspdf compress --lossy --image-dpi 100 --image-quality 60 scan.pdf -o tiny.pdf
 ```
+
+`--lossy` reduces image quality. Images with transparency, unusual color
+spaces, or already at or below the target dpi are left alone.
 
 ## Read or update metadata
 

@@ -7,6 +7,16 @@ on 0.x, the CLI is considered stable but the low-level C API may still change.
 
 ## [Unreleased]
 
+### Added
+- `tspdf compress --lossy`: downsample oversized photos/scans to a target
+  resolution (`--image-dpi`, default 150) and re-encode them as JPEG
+  (`--image-quality`, default 75), using a from-scratch baseline JPEG codec.
+  Rendered image sizes are measured from the page content streams, near-gray
+  RGB scans are converted to grayscale, and anything unusual (transparency,
+  ICC/Indexed color, progressive JPEG input) passes through untouched.
+  Without `--lossy`, compress output is unchanged. C API:
+  `tspdf_reader_lossy_images`.
+
 ### Changed
 - Saving a document opened with a password now keeps it encrypted (same
   passwords and permissions), matching qpdf. This covers form fill/flatten,
