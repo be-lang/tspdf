@@ -11194,6 +11194,29 @@ TEST(test_bookmark_clear) {
     tspdf_reader_destroy(doc);
 }
 
+// clear also strips a stale /PageMode /UseOutlines from the catalog.
+TEST(test_bookmark_clear_drops_pagemode_useoutlines) {
+    size_t len = 0;
+    char *pdf = make_catalog_features_pdf(&len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    err = tspdf_reader_clear_bookmarks(doc);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(!bytes_contains(out, out_len, "/UseOutlines"));
+
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
 // set with count 0 clears as well.
 TEST(test_bookmark_set_empty_clears) {
     TspdfError err;
@@ -11639,6 +11662,7 @@ int main(void) {
     RUN(test_bookmark_set_nonascii_title_roundtrip);
     RUN(test_bookmark_set_validation_errors);
     RUN(test_bookmark_clear);
+    RUN(test_bookmark_clear_drops_pagemode_useoutlines);
     RUN(test_bookmark_set_empty_clears);
     RUN(test_bookmark_list_then_set_stable);
     RUN(test_bookmark_list_cyclic_bounded);

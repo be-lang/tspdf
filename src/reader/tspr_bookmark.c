@@ -325,7 +325,7 @@ TspdfError tspdf_reader_clear_bookmarks(TspdfReader *doc) {
     bm_dict_drop(catalog, "Outlines");
     // /PageMode /UseOutlines would leave the viewer opening an empty panel.
     TspdfObj *pm = tspdf_dict_get(catalog, "PageMode");
-    if (pm && pm->type == TSPDF_OBJ_NAME && pm->string.len == 12 &&
+    if (pm && pm->type == TSPDF_OBJ_NAME && pm->string.len == 11 &&
         memcmp(pm->string.data, "UseOutlines", 11) == 0) {
         bm_dict_drop(catalog, "PageMode");
     }
