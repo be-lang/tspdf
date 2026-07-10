@@ -8526,6 +8526,99 @@ TEST(test_text_xgap_emits_space) {
     free(pdf);
 }
 
+// Font body for a TeX-style subset font whose /Widths start past the space
+// glyph (FirstChar 40): code 32 has no width entry, so the space width is
+// unknown. All listed glyphs are 500/1000 wide.
+static const char *make_no_space_font(char *buf, size_t cap) {
+    size_t pos = 0;
+    appendf(buf, cap, &pos,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /ABCDEF+FakeItalic "
+            "/Encoding /WinAnsiEncoding /FirstChar 40 /LastChar 122 /Widths [");
+    for (int i = 40; i <= 122; i++) appendf(buf, cap, &pos, "500 ");
+    appendf(buf, cap, &pos, "] >>");
+    return buf;
+}
+
+#define TEXT_TWO_FONT_RES "<< /Font << /F1 4 0 R /F2 5 0 R >> >>"
+
+TEST(test_text_tj_kern_space_missing_space_glyph) {
+    // TeX-generated PDFs encode inter-word spaces as -250-ish TJ kerns and
+    // often subset the space glyph away (FirstChar > 32). A 0.25 em kern
+    // must still produce a space; a small -30 kerning tweak must not.
+    char font[4096];
+    size_t len = 0;
+    char *pdf = make_text_pdf_full(
+        TEXT_TWO_FONT_RES, TEXT_HELV_FONT,
+        make_no_space_font(font, sizeof(font)), NULL,
+        "BT /F2 10 Tf 72 700 Td [(arXiv)-250(preprint)-30(s)] TJ ET", &len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    const char *text = tspdf_reader_page_text(doc, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT_EQ_STR(text, "arXiv preprints\n");
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_text_font_switch_gap_space) {
+    // Font change at a word boundary (roman -> italic math, TeX style): the
+    // x-gap between runs is a normal ~0.25 em word space, and the italic
+    // font has no space-width data. A space must be inserted. The roman
+    // comma that follows the italic run with no gap must stay glued.
+    // Helvetica "values of" at 10pt is 40.02 wide (ends at 112.02); the /F2
+    // run starts at 114.5 => 2.48 gap (~0.25 em). "d" is 500/1000 wide, so
+    // it ends at 119.5 where the comma resumes with zero gap.
+    char font[4096];
+    size_t len = 0;
+    char *pdf = make_text_pdf_full(
+        TEXT_TWO_FONT_RES, TEXT_HELV_FONT,
+        make_no_space_font(font, sizeof(font)), NULL,
+        "BT /F1 10 Tf 1 0 0 1 72 700 Tm (values of) Tj "
+        "/F2 10 Tf 1 0 0 1 114.5 700 Tm (d) Tj "
+        "/F1 10 Tf 1 0 0 1 119.5 700 Tm (,) Tj ET", &len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    const char *text = tspdf_reader_page_text(doc, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT_EQ_STR(text, "values of d,\n");
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_text_font_switch_bogus_space_width) {
+    // TeX math fonts (cmmi) have a real glyph at code 32 with a wide width
+    // (651/1000) — it is not a space. That width must not raise the run-gap
+    // threshold above a normal 0.25 em word space, or a font switch into
+    // math glues words ("of dk"). Same geometry as the gap test above, but
+    // /F2 declares FirstChar 32 with a 651-wide code-32 glyph.
+    char font[4096];
+    size_t pos = 0;
+    appendf(font, sizeof(font), &pos,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /GHIJKL+FakeCMMI "
+            "/Encoding /WinAnsiEncoding /FirstChar 32 /LastChar 122 /Widths [651 ");
+    for (int i = 33; i <= 122; i++) appendf(font, sizeof(font), &pos, "500 ");
+    appendf(font, sizeof(font), &pos, "] >>");
+    size_t len = 0;
+    char *pdf = make_text_pdf_full(
+        TEXT_TWO_FONT_RES, TEXT_HELV_FONT, font, NULL,
+        "BT /F1 10 Tf 1 0 0 1 72 700 Tm (values of) Tj "
+        "/F2 10 Tf 1 0 0 1 114.5 700 Tm (d) Tj "
+        "/F1 10 Tf 1 0 0 1 119.5 700 Tm (,) Tj ET", &len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    const char *text = tspdf_reader_page_text(doc, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT_EQ_STR(text, "values of d,\n");
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
 TEST(test_text_tounicode_bfchar_bfrange) {
     // ToUnicode beats /Encoding: bfchar (incl. multi-unit ligature target),
     // offset-form bfrange, and array-form bfrange.
@@ -12495,6 +12588,9 @@ int main(void) {
     RUN(test_text_tj_kerning_spacing);
     RUN(test_text_multiline_td_tstar);
     RUN(test_text_xgap_emits_space);
+    RUN(test_text_tj_kern_space_missing_space_glyph);
+    RUN(test_text_font_switch_gap_space);
+    RUN(test_text_font_switch_bogus_space_width);
     RUN(test_text_tounicode_bfchar_bfrange);
     RUN(test_text_tounicode_null_cp_skipped);
     RUN(test_text_tounicode_wide_range_with_point_fixes);
