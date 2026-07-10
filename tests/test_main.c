@@ -6,10 +6,13 @@
 
 #include "test_framework.h"
 
+#include <math.h>
+
 #include "../src/util/buffer.h"
 #include "../src/util/arena.h"
 #include "../src/compress/deflate.h"
 #include "../src/image/png_decoder.h"
+#include "../src/image/jpeg_codec.h"
 #include "../src/pdf/pdf_base14.h"
 #include "../src/layout/layout.h"
 #include "../src/pdf/tspdf_writer.h"
@@ -2742,6 +2745,429 @@ TEST(test_pdf_date_garbage_rejected) {
 }
 
 // ============================================================
+// JPEG codec (src/image/jpeg_codec.c)
+// ============================================================
+//
+// Decoder tests compare against Pillow/libjpeg-turbo output committed as
+// tests/data/jpg_*.raw (see tests/data/gen_jpeg_fixtures.py). Bounds:
+//   * 4:4:4 (no upsampling): max per-channel delta <= 2. Our float IDCT and
+//     libjpeg's integer islow IDCT each round within +/-1 of the exact DCT,
+//     and the YCbCr->RGB conversion multiplies the Cb error by up to 1.772,
+//     so 2 is the honest bound for independent implementations.
+//   * subsampled (4:2:2/4:2:0/4:4:0): mean absolute error <= 2.0 plus a loose
+//     max-delta cap. We clone libjpeg's "fancy" triangular upsampler, but
+//     upsampler variants and edge handling legitimately differ between
+//     decoders, so bitwise agreement near edges is not a fair requirement.
+
+static uint8_t *test_jpeg_read_file(const char *path, size_t *out_len) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (n <= 0) { fclose(f); return NULL; }
+    uint8_t *buf = (uint8_t *)malloc((size_t)n);
+    if (!buf || fread(buf, 1, (size_t)n, f) != (size_t)n) {
+        free(buf);
+        fclose(f);
+        return NULL;
+    }
+    fclose(f);
+    *out_len = (size_t)n;
+    return buf;
+}
+
+// Decode tests/data/<name>.jpg with our decoder and diff it against the
+// committed PIL dump tests/data/<name>.raw. Returns false on any I/O or
+// decode failure; on success fills the max per-channel delta and the MAE.
+static bool test_jpeg_diff_fixture(const char *name, int exp_w, int exp_h,
+                                   int exp_comp, int *max_delta, double *mae) {
+    char path[128];
+    snprintf(path, sizeof(path), "tests/data/%s.jpg", name);
+    size_t jpg_len;
+    uint8_t *jpg = test_jpeg_read_file(path, &jpg_len);
+    if (!jpg) return false;
+    snprintf(path, sizeof(path), "tests/data/%s.raw", name);
+    size_t raw_len;
+    uint8_t *raw = test_jpeg_read_file(path, &raw_len);
+    if (!raw) { free(jpg); return false; }
+
+    TspdfArena arena = tspdf_arena_create(1 << 20);
+    TspdfRawImage img;
+    bool ok = tspdf_jpeg_decode(jpg, jpg_len, &arena, &img);
+    free(jpg);
+    if (!ok || img.width != exp_w || img.height != exp_h ||
+        img.components != exp_comp ||
+        raw_len != (size_t)exp_w * exp_h * exp_comp) {
+        free(raw);
+        tspdf_arena_destroy(&arena);
+        return false;
+    }
+    long sum = 0;
+    int maxd = 0;
+    for (size_t i = 0; i < raw_len; i++) {
+        int d = (int)img.pixels[i] - (int)raw[i];
+        if (d < 0) d = -d;
+        if (d > maxd) maxd = d;
+        sum += d;
+    }
+    *max_delta = maxd;
+    *mae = (double)sum / (double)raw_len;
+    free(raw);
+    tspdf_arena_destroy(&arena);
+    return true;
+}
+
+static double test_jpeg_psnr(const uint8_t *a, const uint8_t *b, size_t n) {
+    double se = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        double d = (double)a[i] - (double)b[i];
+        se += d * d;
+    }
+    if (se == 0.0) return 99.0;
+    return 10.0 * log10(255.0 * 255.0 * (double)n / se);
+}
+
+// Deterministic photo-like RGB content: smooth waves + mild LCG noise (same
+// spirit as the fixture generator; no hard edges, non-trivial AC energy).
+static void test_jpeg_fill_photo(uint8_t *px, int w, int h) {
+    uint32_t seed = 20250701;
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            seed = seed * 1103515245u + 12345u;
+            int n = (int)((seed >> 16) & 7);
+            int r = (int)(96 + 80 * sin(x * 0.11) + 40 * cos(y * 0.07)) + n;
+            int g = (int)(120 + 60 * sin((x + y) * 0.05)) + (n >> 1);
+            int b = (int)(128 + 90 * cos(x * 0.04 + y * 0.09)) + n;
+            uint8_t *p = px + ((size_t)y * w + x) * 3;
+            p[0] = (uint8_t)(r < 0 ? 0 : (r > 255 ? 255 : r));
+            p[1] = (uint8_t)(g < 0 ? 0 : (g > 255 ? 255 : g));
+            p[2] = (uint8_t)(b < 0 ? 0 : (b > 255 ? 255 : b));
+        }
+    }
+}
+
+TEST(test_jpeg_decode_gray_gradient_matches_pil) {
+    int maxd;
+    double mae;
+    ASSERT(test_jpeg_diff_fixture("jpg_gray_grad", 64, 48, 1, &maxd, &mae));
+    ASSERT(maxd <= 2);
+}
+
+TEST(test_jpeg_decode_gray_noise_matches_pil) {
+    int maxd;
+    double mae;
+    ASSERT(test_jpeg_diff_fixture("jpg_gray_noise", 64, 48, 1, &maxd, &mae));
+    ASSERT(maxd <= 2);
+}
+
+TEST(test_jpeg_decode_rgb_444_matches_pil) {
+    int maxd;
+    double mae;
+    ASSERT(test_jpeg_diff_fixture("jpg_rgb_444", 64, 48, 3, &maxd, &mae));
+    ASSERT(maxd <= 2);
+}
+
+TEST(test_jpeg_decode_rgb_422_matches_pil) {
+    int maxd;
+    double mae;
+    ASSERT(test_jpeg_diff_fixture("jpg_rgb_422", 64, 48, 3, &maxd, &mae));
+    ASSERT(mae <= 2.0);
+    ASSERT(maxd <= 16);
+}
+
+TEST(test_jpeg_decode_rgb_420_matches_pil) {
+    int maxd;
+    double mae;
+    ASSERT(test_jpeg_diff_fixture("jpg_rgb_420", 64, 48, 3, &maxd, &mae));
+    ASSERT(mae <= 2.0);
+    ASSERT(maxd <= 16);
+}
+
+TEST(test_jpeg_decode_rgb_420_odd_dims_matches_pil) {
+    // 61x37: partial MCUs on the right and bottom edges.
+    int maxd;
+    double mae;
+    ASSERT(test_jpeg_diff_fixture("jpg_rgb_420_odd", 61, 37, 3, &maxd, &mae));
+    ASSERT(mae <= 2.0);
+    ASSERT(maxd <= 16);
+}
+
+TEST(test_jpeg_decode_rgb_1x2_vertical_matches_pil) {
+    // 4:4:0 (Y 1x2, chroma vertically subsampled), emitted by cjpeg.
+    int maxd;
+    double mae;
+    ASSERT(test_jpeg_diff_fixture("jpg_rgb_1x2", 64, 48, 3, &maxd, &mae));
+    ASSERT(mae <= 2.0);
+    ASSERT(maxd <= 16);
+}
+
+TEST(test_jpeg_decode_restart_markers) {
+    // Same image as jpg_rgb_420 but with DRI=2 and RSTn every 2 MCUs.
+    int maxd;
+    double mae;
+    ASSERT(test_jpeg_diff_fixture("jpg_rgb_restart", 64, 48, 3, &maxd, &mae));
+    ASSERT(mae <= 2.0);
+    ASSERT(maxd <= 16);
+}
+
+TEST(test_jpeg_decode_flat_blocks) {
+    int maxd;
+    double mae;
+    ASSERT(test_jpeg_diff_fixture("jpg_rgb_flat", 64, 48, 3, &maxd, &mae));
+    ASSERT(mae <= 2.0);
+    ASSERT(maxd <= 16);
+}
+
+TEST(test_jpeg_decode_rejects_progressive) {
+    size_t len;
+    uint8_t *jpg = test_jpeg_read_file("tests/data/jpg_progressive.jpg", &len);
+    ASSERT(jpg != NULL);
+    TspdfArena arena = tspdf_arena_create(1 << 16);
+    TspdfRawImage img;
+    ASSERT(!tspdf_jpeg_decode(jpg, len, &arena, &img));
+    free(jpg);
+    tspdf_arena_destroy(&arena);
+}
+
+TEST(test_jpeg_decode_rejects_malformed) {
+    TspdfArena arena = tspdf_arena_create(1 << 16);
+    TspdfRawImage img;
+    // Empty / too short / not a JPEG.
+    ASSERT(!tspdf_jpeg_decode(NULL, 0, &arena, &img));
+    ASSERT(!tspdf_jpeg_decode((const uint8_t *)"\xff\xd8", 2, &arena, &img));
+    ASSERT(!tspdf_jpeg_decode((const uint8_t *)"\x89PNG\r\n\x1a\n", 8, &arena, &img));
+    // SOI + EOI with no frame.
+    ASSERT(!tspdf_jpeg_decode((const uint8_t *)"\xff\xd8\xff\xd9", 4, &arena, &img));
+    // Truncated valid file: every prefix must fail cleanly, not crash.
+    size_t len;
+    uint8_t *jpg = test_jpeg_read_file("tests/data/jpg_rgb_420.jpg", &len);
+    ASSERT(jpg != NULL);
+    for (size_t cut = 0; cut < len; cut += 37) {
+        tspdf_arena_reset(&arena);
+        ASSERT(!tspdf_jpeg_decode(jpg, cut, &arena, &img));
+    }
+    free(jpg);
+    tspdf_arena_destroy(&arena);
+}
+
+TEST(test_jpeg_decode_fuzz_mutations_no_crash) {
+    // 500 deterministic random corruptions of a valid stream (xorshift32,
+    // fixed seed — never time()). Every call must return, true or false,
+    // without hanging or faulting; `make test-asan` runs this instrumented.
+    size_t len;
+    uint8_t *orig = test_jpeg_read_file("tests/data/jpg_rgb_420.jpg", &len);
+    ASSERT(orig != NULL);
+    uint8_t *mut = (uint8_t *)malloc(len);
+    ASSERT(mut != NULL);
+    TspdfArena arena = tspdf_arena_create(1 << 20);
+    uint32_t s = 0x1234567u;
+    for (int iter = 0; iter < 500; iter++) {
+        memcpy(mut, orig, len);
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        int nmut = 1 + (int)(s % 8);
+        for (int m = 0; m < nmut; m++) {
+            s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+            size_t at = s % len;
+            s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+            mut[at] = (uint8_t)s;
+        }
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        size_t use_len = (iter % 5 == 0) ? (s % len) + 1 : len;
+        tspdf_arena_reset(&arena);
+        TspdfRawImage img;
+        (void)tspdf_jpeg_decode(mut, use_len, &arena, &img);
+    }
+    free(mut);
+    free(orig);
+    tspdf_arena_destroy(&arena);
+    ASSERT(true);
+}
+
+TEST(test_jpeg_encode_deterministic) {
+    enum { W = 40, H = 32 };
+    uint8_t *px = (uint8_t *)malloc((size_t)W * H * 3);
+    ASSERT(px != NULL);
+    test_jpeg_fill_photo(px, W, H);
+    TspdfRawImage img = { W, H, 3, px };
+    TspdfArena arena = tspdf_arena_create(1 << 20);
+    uint8_t *out1, *out2;
+    size_t len1, len2;
+    ASSERT(tspdf_jpeg_encode(&img, 75, &arena, &out1, &len1));
+    ASSERT(tspdf_jpeg_encode(&img, 75, &arena, &out2, &len2));
+    ASSERT_EQ_SIZE(len1, len2);
+    ASSERT(memcmp(out1, out2, len1) == 0);
+    free(px);
+    tspdf_arena_destroy(&arena);
+}
+
+TEST(test_jpeg_encode_roundtrip_photo_q75) {
+    // Photo-like content at q75, 4:2:0: encode with our encoder, decode with
+    // our decoder. >30dB is the standard "visually fine lossy" bar.
+    enum { W = 128, H = 96 };
+    uint8_t *px = (uint8_t *)malloc((size_t)W * H * 3);
+    ASSERT(px != NULL);
+    test_jpeg_fill_photo(px, W, H);
+    TspdfRawImage img = { W, H, 3, px };
+    TspdfArena arena = tspdf_arena_create(1 << 20);
+    uint8_t *jpg;
+    size_t jpg_len;
+    ASSERT(tspdf_jpeg_encode(&img, 75, &arena, &jpg, &jpg_len));
+    ASSERT(jpg_len > 0 && jpg_len < (size_t)W * H * 3); // actually compresses
+    TspdfRawImage dec;
+    ASSERT(tspdf_jpeg_decode(jpg, jpg_len, &arena, &dec));
+    ASSERT_EQ_INT(dec.width, W);
+    ASSERT_EQ_INT(dec.height, H);
+    ASSERT_EQ_INT(dec.components, 3);
+    double psnr = test_jpeg_psnr(px, dec.pixels, (size_t)W * H * 3);
+    ASSERT(psnr > 30.0);
+    free(px);
+    tspdf_arena_destroy(&arena);
+}
+
+TEST(test_jpeg_encode_roundtrip_gradient_q95) {
+    // Smooth gradients at q95 must round-trip nearly exactly (>40dB).
+    enum { W = 96, H = 80 };
+    uint8_t *px = (uint8_t *)malloc((size_t)W * H * 3);
+    ASSERT(px != NULL);
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            uint8_t *p = px + ((size_t)y * W + x) * 3;
+            p[0] = (uint8_t)(40 + x);
+            p[1] = (uint8_t)(60 + y);
+            p[2] = (uint8_t)(200 - (x + y) / 2);
+        }
+    }
+    TspdfRawImage img = { W, H, 3, px };
+    TspdfArena arena = tspdf_arena_create(1 << 20);
+    uint8_t *jpg;
+    size_t jpg_len;
+    ASSERT(tspdf_jpeg_encode(&img, 95, &arena, &jpg, &jpg_len));
+    TspdfRawImage dec;
+    ASSERT(tspdf_jpeg_decode(jpg, jpg_len, &arena, &dec));
+    double psnr = test_jpeg_psnr(px, dec.pixels, (size_t)W * H * 3);
+    ASSERT(psnr > 40.0);
+    free(px);
+    tspdf_arena_destroy(&arena);
+}
+
+TEST(test_jpeg_encode_roundtrip_gray) {
+    enum { W = 80, H = 64 };
+    uint8_t *px = (uint8_t *)malloc((size_t)W * H);
+    ASSERT(px != NULL);
+    uint32_t seed = 424242;
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            seed = seed * 1103515245u + 12345u;
+            int v = 128 + (int)(60 * sin(x * 0.13 + y * 0.06)) +
+                    (int)((seed >> 16) & 15);
+            px[(size_t)y * W + x] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
+        }
+    }
+    TspdfRawImage img = { W, H, 1, px };
+    TspdfArena arena = tspdf_arena_create(1 << 20);
+    uint8_t *jpg;
+    size_t jpg_len;
+    ASSERT(tspdf_jpeg_encode(&img, 85, &arena, &jpg, &jpg_len));
+    TspdfRawImage dec;
+    ASSERT(tspdf_jpeg_decode(jpg, jpg_len, &arena, &dec));
+    ASSERT_EQ_INT(dec.components, 1);
+    double psnr = test_jpeg_psnr(px, dec.pixels, (size_t)W * H);
+    ASSERT(psnr > 32.0);
+    free(px);
+    tspdf_arena_destroy(&arena);
+}
+
+TEST(test_jpeg_encode_odd_dimensions) {
+    // Non-multiple-of-16 dims exercise the padding path on both axes.
+    enum { W = 61, H = 37 };
+    uint8_t *px = (uint8_t *)malloc((size_t)W * H * 3);
+    ASSERT(px != NULL);
+    test_jpeg_fill_photo(px, W, H);
+    TspdfRawImage img = { W, H, 3, px };
+    TspdfArena arena = tspdf_arena_create(1 << 20);
+    uint8_t *jpg;
+    size_t jpg_len;
+    ASSERT(tspdf_jpeg_encode(&img, 75, &arena, &jpg, &jpg_len));
+    TspdfRawImage dec;
+    ASSERT(tspdf_jpeg_decode(jpg, jpg_len, &arena, &dec));
+    ASSERT_EQ_INT(dec.width, W);
+    ASSERT_EQ_INT(dec.height, H);
+    double psnr = test_jpeg_psnr(px, dec.pixels, (size_t)W * H * 3);
+    ASSERT(psnr > 28.0);
+    free(px);
+    tspdf_arena_destroy(&arena);
+}
+
+TEST(test_jpeg_encode_rejects_bad_args) {
+    uint8_t px[16 * 16 * 3] = {0};
+    TspdfRawImage img = { 16, 16, 3, px };
+    TspdfArena arena = tspdf_arena_create(1 << 16);
+    uint8_t *out;
+    size_t out_len;
+    ASSERT(!tspdf_jpeg_encode(NULL, 75, &arena, &out, &out_len));
+    ASSERT(!tspdf_jpeg_encode(&img, 0, &arena, &out, &out_len));
+    ASSERT(!tspdf_jpeg_encode(&img, 101, &arena, &out, &out_len));
+    img.components = 2;
+    ASSERT(!tspdf_jpeg_encode(&img, 75, &arena, &out, &out_len));
+    img.components = 3;
+    img.width = 0;
+    ASSERT(!tspdf_jpeg_encode(&img, 75, &arena, &out, &out_len));
+    img.width = 16;
+    img.pixels = NULL;
+    ASSERT(!tspdf_jpeg_encode(&img, 75, &arena, &out, &out_len));
+    tspdf_arena_destroy(&arena);
+}
+
+TEST(test_jpeg_encode_external_decoder_oracle) {
+    // Decode our encoder's output with an independent real-world decoder
+    // (djpeg, libjpeg-turbo) and hold it to the same >30dB bar. This is what
+    // proves PDF viewers will render the recompressed images. Skipped when
+    // djpeg is not installed (test-time-only tool, zero-dependency promise).
+    if (system("command -v djpeg > /dev/null 2>&1") != 0) {
+        SKIP("djpeg not installed");
+    }
+    enum { W = 128, H = 96 };
+    uint8_t *px = (uint8_t *)malloc((size_t)W * H * 3);
+    ASSERT(px != NULL);
+    test_jpeg_fill_photo(px, W, H);
+    TspdfRawImage img = { W, H, 3, px };
+    TspdfArena arena = tspdf_arena_create(1 << 20);
+    uint8_t *jpg;
+    size_t jpg_len;
+    ASSERT(tspdf_jpeg_encode(&img, 75, &arena, &jpg, &jpg_len));
+    const char *jpg_path = "/tmp/tspdf_test_enc_oracle.jpg";
+    const char *ppm_path = "/tmp/tspdf_test_enc_oracle.ppm";
+    FILE *f = fopen(jpg_path, "wb");
+    ASSERT(f != NULL);
+    ASSERT(fwrite(jpg, 1, jpg_len, f) == jpg_len);
+    fclose(f);
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "djpeg -ppm -outfile %s %s 2>/dev/null",
+             ppm_path, jpg_path);
+    ASSERT(system(cmd) == 0);
+    f = fopen(ppm_path, "rb");
+    ASSERT(f != NULL);
+    int pw = 0, ph = 0, pmax = 0;
+    ASSERT(fscanf(f, "P6 %d %d %d", &pw, &ph, &pmax) == 3);
+    ASSERT(fgetc(f) == '\n');
+    ASSERT_EQ_INT(pw, W);
+    ASSERT_EQ_INT(ph, H);
+    ASSERT_EQ_INT(pmax, 255);
+    uint8_t *dec = (uint8_t *)malloc((size_t)W * H * 3);
+    ASSERT(dec != NULL);
+    ASSERT(fread(dec, 1, (size_t)W * H * 3, f) == (size_t)W * H * 3);
+    fclose(f);
+    remove(jpg_path);
+    remove(ppm_path);
+    double psnr = test_jpeg_psnr(px, dec, (size_t)W * H * 3);
+    ASSERT(psnr > 30.0);
+    free(dec);
+    free(px);
+    tspdf_arena_destroy(&arena);
+}
+
+// ============================================================
 // Main
 // ============================================================
 
@@ -2897,6 +3323,27 @@ int main(void) {
     RUN(test_pdf_date_partial_fields_default);
     RUN(test_pdf_date_odd_zones);
     RUN(test_pdf_date_garbage_rejected);
+
+    printf("\n  JPEG codec:\n");
+    RUN(test_jpeg_decode_gray_gradient_matches_pil);
+    RUN(test_jpeg_decode_gray_noise_matches_pil);
+    RUN(test_jpeg_decode_rgb_444_matches_pil);
+    RUN(test_jpeg_decode_rgb_422_matches_pil);
+    RUN(test_jpeg_decode_rgb_420_matches_pil);
+    RUN(test_jpeg_decode_rgb_420_odd_dims_matches_pil);
+    RUN(test_jpeg_decode_rgb_1x2_vertical_matches_pil);
+    RUN(test_jpeg_decode_restart_markers);
+    RUN(test_jpeg_decode_flat_blocks);
+    RUN(test_jpeg_decode_rejects_progressive);
+    RUN(test_jpeg_decode_rejects_malformed);
+    RUN(test_jpeg_decode_fuzz_mutations_no_crash);
+    RUN(test_jpeg_encode_deterministic);
+    RUN(test_jpeg_encode_roundtrip_photo_q75);
+    RUN(test_jpeg_encode_roundtrip_gradient_q95);
+    RUN(test_jpeg_encode_roundtrip_gray);
+    RUN(test_jpeg_encode_odd_dimensions);
+    RUN(test_jpeg_encode_rejects_bad_args);
+    RUN(test_jpeg_encode_external_decoder_oracle);
 
     printf("\n  QR encoder:\n");
     RUN(test_qr_ecc_table_consistent);
