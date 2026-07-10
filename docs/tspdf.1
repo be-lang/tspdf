@@ -98,11 +98,15 @@ limits which pages are stamped.
 .B compress
 Compress a PDF to reduce file size.
 .B \-\-lossy
-additionally downsamples oversized photos/scans and re\-encodes them as JPEG;
+additionally downsamples oversized photos/scans and re\-encodes them as JPEG,
+and black\-and\-white scans as CCITT G4;
 .B \-\-image\-dpi
-sets the target resolution (default 150) and
+sets the target resolution for photos (default 150),
 .B \-\-image\-quality
-the JPEG quality 1\-100 (default 75). Without
+the JPEG quality 1\-100 (default 75), and
+.B \-\-mono\-dpi
+the target for black\-and\-white images (default 300 \- text needs more dpi
+than photos to stay legible). Without
 .B \-\-lossy
 no image is altered.
 .TP

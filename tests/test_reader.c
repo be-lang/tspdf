@@ -13,6 +13,7 @@
 #include "../src/compress/deflate.h"
 #include "../src/util/arena.h"
 #include "../src/image/jpeg_codec.h"
+#include "../src/image/ccitt_codec.h"
 
 static bool bytes_contains(const uint8_t *haystack, size_t haystack_len, const char *needle) {
     if (!haystack || !needle) {
@@ -13392,14 +13393,15 @@ TEST(test_lossy_ctm_scan_placements) {
     ASSERT(!tspdf_lossy_target_dims(800, 600, 200.0, 150.0, 300, &dw, &dh));
 }
 
-// Build a one-page PDF whose sole image is `w`x`h`, 8-bit, colorspace name
-// `cs` ("DeviceGray"/"DeviceRGB"), with raw stream bytes `img` (img_len) and
-// extra image-dict text `img_extra` (filters, masks, ...). The image is
-// drawn at `w_pt` x `h_pt` points. Binary-safe (streams may contain \0).
-static uint8_t *lossy_make_image_pdf(const uint8_t *img, size_t img_len,
-                                     const char *img_extra, int w, int h,
-                                     const char *cs, double w_pt, double h_pt,
-                                     size_t *out_len) {
+// Build a one-page PDF whose sole image is `w`x`h`, `bpc` bits per
+// component, colorspace name `cs` ("DeviceGray"/"DeviceRGB"), with raw
+// stream bytes `img` (img_len) and extra image-dict text `img_extra`
+// (filters, masks, ...). The image is drawn at `w_pt` x `h_pt` points.
+// Binary-safe (streams may contain \0).
+static uint8_t *lossy_make_image_pdf_bpc(const uint8_t *img, size_t img_len,
+                                         const char *img_extra, int w, int h,
+                                         int bpc, const char *cs, double w_pt,
+                                         double h_pt, size_t *out_len) {
     char content[128];
     snprintf(content, sizeof(content), "q %.2f 0 0 %.2f 10 10 cm /Im1 Do Q",
              w_pt, h_pt);
@@ -13428,8 +13430,8 @@ static uint8_t *lossy_make_image_pdf(const uint8_t *img, size_t img_len,
          "/Resources << /XObject << /Im1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n");
     off[4] = pos;
     LPUT("4 0 obj\n<< /Type /XObject /Subtype /Image /Width %d /Height %d "
-         "/ColorSpace /%s /BitsPerComponent 8 %s /Length %zu >>\nstream\n",
-         w, h, cs, img_extra ? img_extra : "", img_len);
+         "/ColorSpace /%s /BitsPerComponent %d %s /Length %zu >>\nstream\n",
+         w, h, cs, bpc, img_extra ? img_extra : "", img_len);
     if (pos + img_len > cap) goto fail;
     memcpy(pdf + pos, img, img_len);
     pos += img_len;
@@ -13451,6 +13453,15 @@ static uint8_t *lossy_make_image_pdf(const uint8_t *img, size_t img_len,
 fail:
     free(pdf);
     return NULL;
+}
+
+// 8-bit convenience wrapper (most lossy tests).
+static uint8_t *lossy_make_image_pdf(const uint8_t *img, size_t img_len,
+                                     const char *img_extra, int w, int h,
+                                     const char *cs, double w_pt, double h_pt,
+                                     size_t *out_len) {
+    return lossy_make_image_pdf_bpc(img, img_len, img_extra, w, h, 8, cs,
+                                    w_pt, h_pt, out_len);
 }
 
 // Fetch the (single) image object dict of a doc built by
@@ -13512,7 +13523,7 @@ TEST(test_lossy_predictor15_flate_image_recompressed) {
     ASSERT(doc != NULL);
 
     TspdfLossyStats st = {0};
-    err = tspdf_reader_lossy_images(doc, 150, 75, &st);
+    err = tspdf_reader_lossy_images(doc, 150, 75, 300, &st);
     ASSERT_EQ_INT(err, TSPDF_OK);
     ASSERT_EQ_SIZE(st.images_recompressed, 1);
     ASSERT_EQ_SIZE(st.images_skipped, 0);
@@ -13599,7 +13610,7 @@ TEST(test_lossy_rgb_near_gray_converts_to_devicegray) {
     ASSERT(doc != NULL);
 
     TspdfLossyStats st = {0};
-    ASSERT_EQ_INT(tspdf_reader_lossy_images(doc, 150, 75, &st), TSPDF_OK);
+    ASSERT_EQ_INT(tspdf_reader_lossy_images(doc, 150, 75, 300, &st), TSPDF_OK);
     ASSERT_EQ_SIZE(st.images_recompressed, 1);
 
     TspdfObj *img_obj = lossy_get_image_obj(doc);
@@ -13632,7 +13643,7 @@ TEST(test_lossy_skips_low_dpi_smask_and_small) {
     TspdfReader *doc = tspdf_reader_open(pdf, len, &err);
     ASSERT(doc != NULL);
     TspdfLossyStats st = {0};
-    ASSERT_EQ_INT(tspdf_reader_lossy_images(doc, 150, 75, &st), TSPDF_OK);
+    ASSERT_EQ_INT(tspdf_reader_lossy_images(doc, 150, 75, 300, &st), TSPDF_OK);
     ASSERT_EQ_SIZE(st.images_recompressed, 0);
     ASSERT_EQ_SIZE(st.images_skipped, 1);
     TspdfObj *img_obj = lossy_get_image_obj(doc);
@@ -13649,7 +13660,7 @@ TEST(test_lossy_skips_low_dpi_smask_and_small) {
     doc = tspdf_reader_open(pdf, len, &err);
     ASSERT(doc != NULL);
     memset(&st, 0, sizeof(st));
-    ASSERT_EQ_INT(tspdf_reader_lossy_images(doc, 150, 75, &st), TSPDF_OK);
+    ASSERT_EQ_INT(tspdf_reader_lossy_images(doc, 150, 75, 300, &st), TSPDF_OK);
     ASSERT_EQ_SIZE(st.images_recompressed, 0);
     tspdf_reader_destroy(doc);
     free(pdf);
@@ -13671,7 +13682,7 @@ TEST(test_lossy_skips_low_dpi_smask_and_small) {
         doc = tspdf_reader_open(pdf, len, &err);
         ASSERT(doc != NULL);
         memset(&st, 0, sizeof(st));
-        ASSERT_EQ_INT(tspdf_reader_lossy_images(doc, 150, 75, &st), TSPDF_OK);
+        ASSERT_EQ_INT(tspdf_reader_lossy_images(doc, 150, 75, 300, &st), TSPDF_OK);
         ASSERT_EQ_SIZE(st.images_recompressed, 0);
         tspdf_reader_destroy(doc);
         free(pdf);
@@ -13792,7 +13803,7 @@ TEST(test_lossy_deep_q_nesting_measured_at_outer_ctm) {
     // 512 px over 500 pt is ~74 dpi, well under the 150-dpi target: the
     // lossy pass must leave the image alone, never shrink it.
     TspdfLossyStats st = {0};
-    ASSERT_EQ_INT(tspdf_reader_lossy_images(doc, 150, 75, &st), TSPDF_OK);
+    ASSERT_EQ_INT(tspdf_reader_lossy_images(doc, 150, 75, 300, &st), TSPDF_OK);
     ASSERT_EQ_SIZE(st.images_recompressed, 0);
     TspdfObj *img_obj = lossy_get_image_obj(doc);
     ASSERT(img_obj != NULL);
@@ -13842,7 +13853,7 @@ TEST(test_lossy_gstate_overflow_skips_image) {
 
     // And the lossy pass leaves the stream byte-for-byte in place.
     TspdfLossyStats st = {0};
-    ASSERT_EQ_INT(tspdf_reader_lossy_images(doc, 150, 75, &st), TSPDF_OK);
+    ASSERT_EQ_INT(tspdf_reader_lossy_images(doc, 150, 75, 300, &st), TSPDF_OK);
     ASSERT_EQ_SIZE(st.images_recompressed, 0);
     TspdfObj *img_obj = lossy_get_image_obj(doc);
     ASSERT(img_obj != NULL);
@@ -13865,13 +13876,419 @@ TEST(test_lossy_invalid_args_rejected) {
     ASSERT(doc != NULL);
 
     TspdfLossyStats st = {0};
-    ASSERT_EQ_INT(tspdf_reader_lossy_images(doc, 0, 75, &st), TSPDF_ERR_INVALID_ARG);
-    ASSERT_EQ_INT(tspdf_reader_lossy_images(doc, 150, 0, &st), TSPDF_ERR_INVALID_ARG);
-    ASSERT_EQ_INT(tspdf_reader_lossy_images(doc, 150, 101, &st), TSPDF_ERR_INVALID_ARG);
-    ASSERT_EQ_INT(tspdf_reader_lossy_images(NULL, 150, 75, &st), TSPDF_ERR_INVALID_ARG);
+    ASSERT_EQ_INT(tspdf_reader_lossy_images(doc, 0, 75, 300, &st), TSPDF_ERR_INVALID_ARG);
+    ASSERT_EQ_INT(tspdf_reader_lossy_images(doc, 150, 0, 300, &st), TSPDF_ERR_INVALID_ARG);
+    ASSERT_EQ_INT(tspdf_reader_lossy_images(doc, 150, 101, 300, &st), TSPDF_ERR_INVALID_ARG);
+    ASSERT_EQ_INT(tspdf_reader_lossy_images(doc, 150, 75, 0, &st), TSPDF_ERR_INVALID_ARG);
+    ASSERT_EQ_INT(tspdf_reader_lossy_images(NULL, 150, 75, 300, &st), TSPDF_ERR_INVALID_ARG);
 
     tspdf_reader_destroy(doc);
     free(pdf);
+}
+
+// --- Bilevel (1-bpc) lossy path ---
+
+TEST(test_lossy_bilevel_downsample_threshold) {
+    // 4x2 -> 2x1: each dest pixel is a 4x2... no, 2x2 window per dest.
+    // Window 0 holds two black of four (tie -> black); window 1 none.
+    uint8_t src[8] = {0, 255, 255, 255,
+                      0, 255, 255, 255};
+    uint8_t dst[2] = {9, 9};
+    ASSERT(tspdf_lossy_bilevel_downsample(src, 4, 2, dst, 2, 1));
+    ASSERT_EQ_INT(dst[0], 0);    // 2/4 black: tie goes to black
+    ASSERT_EQ_INT(dst[1], 255);  // 0/4 black
+
+    // Majority white wins when black is under half.
+    uint8_t src2[8] = {0, 255, 255, 255,
+                       255, 255, 255, 255};
+    ASSERT(tspdf_lossy_bilevel_downsample(src2, 4, 2, dst, 2, 1));
+    ASSERT_EQ_INT(dst[0], 255);  // 1/4 black
+    ASSERT_EQ_INT(dst[1], 255);
+
+    // Fractional 3 -> 2: floor boundaries give windows [0,1) and [1,3).
+    uint8_t src3[3] = {0, 0, 255};
+    uint8_t dst3[2] = {9, 9};
+    ASSERT(tspdf_lossy_bilevel_downsample(src3, 3, 1, dst3, 2, 1));
+    ASSERT_EQ_INT(dst3[0], 0);  // window {0}: black
+    ASSERT_EQ_INT(dst3[1], 0);  // window {0,255}: tie -> black
+
+    // Bad arguments.
+    ASSERT(!tspdf_lossy_bilevel_downsample(NULL, 4, 2, dst, 2, 1));
+    ASSERT(!tspdf_lossy_bilevel_downsample(src, 0, 2, dst, 2, 1));
+    ASSERT(!tspdf_lossy_bilevel_downsample(src, 4, 2, dst, 0, 1));
+}
+
+// Text-like bilevel page, deterministic: word-ish blobs of vertical strokes
+// whose edges random-walk +-1 per scanline, like glyph outlines at scan
+// resolution. The walk matters: perfectly straight strokes make adjacent
+// rows identical, and then deflate (row-copy LZ matches) beats G4 and the
+// keep-original rule correctly declines to convert — the opposite of real
+// scans, whose edges wiggle.
+static uint8_t *lossy_mono_text_pixels(int w, int h) {
+    uint8_t *px = (uint8_t *)malloc((size_t)w * h);
+    if (!px) return NULL;
+    memset(px, 255, (size_t)w * h);
+    uint32_t lcg = 12345;
+#define MONO_RND() ((lcg = lcg * 1664525u + 1013904223u) >> 16)
+    for (int y0 = 6; y0 + 12 < h; y0 += 15) {
+        for (int x0 = 6; x0 + 24 < w; x0 += 26) {
+            int ww = 14 + (int)(MONO_RND() % 8);
+            for (int s = 0; s < 3; s++) {  // three strokes per "word"
+                int e0 = x0 + s * (ww / 3);
+                int e1 = e0 + 2 + (int)(MONO_RND() % 3);
+                for (int yy = y0; yy < y0 + 10; yy++) {
+                    e0 += (int)(MONO_RND() % 3) - 1;
+                    e1 += (int)(MONO_RND() % 3) - 1;
+                    if (e0 < x0) e0 = x0;
+                    if (e1 <= e0) e1 = e0 + 1;
+                    if (e1 > x0 + ww) e1 = x0 + ww;
+                    for (int xx = e0; xx < e1 && xx < w; xx++)
+                        px[(size_t)yy * w + xx] = 0;
+                }
+            }
+        }
+    }
+#undef MONO_RND
+    return px;
+}
+
+// Pack 0/255 pixels into 1-bpp rows, MSB first, bit 1 = white (the sample
+// value /DeviceGray shows as white under the default /Decode).
+static uint8_t *lossy_mono_pack(const uint8_t *px, int w, int h, size_t *out_len) {
+    size_t stride = ((size_t)w + 7) / 8;
+    uint8_t *out = (uint8_t *)calloc(stride, (size_t)h);
+    if (!out) return NULL;
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++)
+            if (px[(size_t)y * w + x] >= 128)
+                out[(size_t)y * stride + x / 8] |= (uint8_t)(0x80 >> (x % 8));
+    *out_len = stride * (size_t)h;
+    return out;
+}
+
+// Decode the (rewritten) image object's G4 stream and check dimensions.
+static bool lossy_mono_check_g4(TspdfReader *doc, int exp_w, int exp_h,
+                                uint8_t **out_px) {
+    TspdfObj *img_obj = lossy_get_image_obj(doc);
+    if (!img_obj || img_obj->type != TSPDF_OBJ_STREAM) return false;
+    TspdfObj *d = img_obj->stream.dict;
+    TspdfObj *filter = tspdf_dict_get(d, "Filter");
+    if (!filter || filter->type != TSPDF_OBJ_NAME ||
+        strcmp((const char *)filter->string.data, "CCITTFaxDecode") != 0)
+        return false;
+    TspdfObj *wobj = tspdf_dict_get(d, "Width");
+    TspdfObj *hobj = tspdf_dict_get(d, "Height");
+    TspdfObj *bobj = tspdf_dict_get(d, "BitsPerComponent");
+    if (!wobj || wobj->integer != exp_w) return false;
+    if (!hobj || hobj->integer != exp_h) return false;
+    if (!bobj || bobj->integer != 1) return false;
+    TspdfObj *parms = tspdf_dict_get(d, "DecodeParms");
+    if (!parms || parms->type != TSPDF_OBJ_DICT) return false;
+    TspdfObj *k = tspdf_dict_get(parms, "K");
+    TspdfObj *cols = tspdf_dict_get(parms, "Columns");
+    if (!k || k->integer != -1) return false;
+    if (!cols || cols->integer != exp_w) return false;
+    if (!img_obj->stream.self_contained || !img_obj->stream.data) return false;
+
+    TspdfCcittParams p;
+    tspdf_ccitt_params_default(&p);
+    p.k = -1;
+    p.columns = exp_w;
+    p.rows = exp_h;
+    TspdfArena a = tspdf_arena_create(1 << 20);
+    TspdfCcittBitmap bm;
+    bool ok = tspdf_ccitt_decode(img_obj->stream.data, img_obj->stream.len,
+                                 &p, &a, &bm) &&
+              bm.width == exp_w && bm.height == exp_h;
+    if (ok && out_px) {
+        *out_px = (uint8_t *)malloc((size_t)exp_w * exp_h);
+        if (*out_px) memcpy(*out_px, bm.pixels, (size_t)exp_w * exp_h);
+        else ok = false;
+    }
+    tspdf_arena_destroy(&a);
+    return ok;
+}
+
+TEST(test_lossy_mono_flate_downsampled_to_g4) {
+    // 512x512 1-bpc flate "scan" drawn at 1x1 inch = 512 dpi; at mono
+    // target 300 it must shrink to 300x300 and come out as CCITT G4.
+    enum { W = 512, H = 512 };
+    uint8_t *px = lossy_mono_text_pixels(W, H);
+    ASSERT(px != NULL);
+    size_t packed_len = 0;
+    uint8_t *packed = lossy_mono_pack(px, W, H, &packed_len);
+    ASSERT(packed != NULL);
+    size_t comp_len = 0;
+    uint8_t *comp = deflate_compress(packed, packed_len, &comp_len);
+    free(packed);
+    ASSERT(comp != NULL);
+
+    size_t len = 0;
+    uint8_t *pdf = lossy_make_image_pdf_bpc(comp, comp_len, "/Filter /FlateDecode",
+                                            W, H, 1, "DeviceGray", 72.0, 72.0, &len);
+    free(comp);
+    ASSERT(pdf != NULL);
+
+    TspdfError err = TSPDF_OK;
+    TspdfReader *doc = tspdf_reader_open(pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    TspdfLossyStats st = {0};
+    ASSERT_EQ_INT(tspdf_reader_lossy_images(doc, 150, 75, 300, &st), TSPDF_OK);
+    ASSERT_EQ_SIZE(st.images_recompressed, 1);
+    ASSERT_EQ_SIZE(st.images_mono, 1);
+    ASSERT_EQ_SIZE(st.images_skipped, 0);
+    ASSERT(st.bytes_after < st.bytes_before);
+
+    uint8_t *out_px = NULL;
+    ASSERT(lossy_mono_check_g4(doc, 300, 300, &out_px));
+    // The downsampled page must still be text-shaped: both colors present,
+    // black in a plausible band (the source is ~15-30% black).
+    size_t black = 0;
+    for (size_t i = 0; i < 300u * 300u; i++)
+        if (out_px[i] == 0) black++;
+    ASSERT(black > 300u * 300u / 20 && black < 300u * 300u / 2);
+    free(out_px);
+
+    // Round-trips through the compress-style save.
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    TspdfSaveOptions opts = tspdf_save_options_default();
+    opts.strip_unused_objects = true;
+    opts.recompress_streams = true;
+    ASSERT_EQ_INT(tspdf_reader_save_to_memory_with_options(doc, &out, &out_len, &opts), TSPDF_OK);
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(re), 1);
+    tspdf_reader_destroy(re);
+    free(out);
+
+    tspdf_reader_destroy(doc);
+    free(pdf);
+    free(px);
+}
+
+TEST(test_lossy_mono_flate_reencoded_1to1_below_target) {
+    // A 1-bpc flate image already at target dpi is still converted to G4
+    // (when >= 10% smaller) — without downsampling, so the pixels must
+    // round-trip exactly.
+    enum { W = 300, H = 300 };
+    uint8_t *px = lossy_mono_text_pixels(W, H);
+    ASSERT(px != NULL);
+    size_t packed_len = 0;
+    uint8_t *packed = lossy_mono_pack(px, W, H, &packed_len);
+    ASSERT(packed != NULL);
+    size_t comp_len = 0;
+    // Compress level: deflate_compress is whatever the library does; the
+    // text bitmap G4-encodes far below the flate size either way.
+    uint8_t *comp = deflate_compress(packed, packed_len, &comp_len);
+    free(packed);
+    ASSERT(comp != NULL);
+
+    size_t len = 0;
+    uint8_t *pdf = lossy_make_image_pdf_bpc(comp, comp_len, "/Filter /FlateDecode",
+                                            W, H, 1, "DeviceGray", 72.0, 72.0, &len);
+    free(comp);
+    ASSERT(pdf != NULL);
+
+    TspdfError err = TSPDF_OK;
+    TspdfReader *doc = tspdf_reader_open(pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    TspdfLossyStats st = {0};
+    ASSERT_EQ_INT(tspdf_reader_lossy_images(doc, 150, 75, 300, &st), TSPDF_OK);
+    ASSERT_EQ_SIZE(st.images_recompressed, 1);
+    ASSERT_EQ_SIZE(st.images_mono, 1);
+
+    uint8_t *out_px = NULL;
+    ASSERT(lossy_mono_check_g4(doc, W, H, &out_px));
+    ASSERT(memcmp(out_px, px, (size_t)W * H) == 0);  // 1:1: bit-exact
+    free(out_px);
+
+    tspdf_reader_destroy(doc);
+    free(pdf);
+    free(px);
+}
+
+TEST(test_lossy_mono_ccitt_downsampled) {
+    // A 600-dpi G4 image (600x600 at 1x1 inch) must be downsampled to
+    // 300x300 and stay CCITT.
+    enum { W = 600, H = 600 };
+    uint8_t *px = lossy_mono_text_pixels(W, H);
+    ASSERT(px != NULL);
+    TspdfArena enc_arena = tspdf_arena_create(1 << 20);
+    uint8_t *g4 = NULL;
+    size_t g4_len = 0;
+    ASSERT(tspdf_ccitt_encode_g4(px, W, H, &enc_arena, &g4, &g4_len));
+
+    size_t len = 0;
+    uint8_t *pdf = lossy_make_image_pdf_bpc(
+        g4, g4_len,
+        "/Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 600 /Rows 600 >>",
+        W, H, 1, "DeviceGray", 72.0, 72.0, &len);
+    tspdf_arena_destroy(&enc_arena);
+    ASSERT(pdf != NULL);
+
+    TspdfError err = TSPDF_OK;
+    TspdfReader *doc = tspdf_reader_open(pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    TspdfLossyStats st = {0};
+    ASSERT_EQ_INT(tspdf_reader_lossy_images(doc, 150, 75, 300, &st), TSPDF_OK);
+    ASSERT_EQ_SIZE(st.images_recompressed, 1);
+    ASSERT_EQ_SIZE(st.images_mono, 1);
+    ASSERT(st.bytes_after < st.bytes_before);
+
+    uint8_t *out_px = NULL;
+    ASSERT(lossy_mono_check_g4(doc, 300, 300, &out_px));
+    // 600 -> 300 is an exact 2:1 majority vote of a stroke pattern: the
+    // result must still contain both colors.
+    bool has_black = false, has_white = false;
+    for (size_t i = 0; i < 300u * 300u; i++) {
+        if (out_px[i] == 0) has_black = true;
+        else has_white = true;
+    }
+    ASSERT(has_black && has_white);
+    free(out_px);
+
+    tspdf_reader_destroy(doc);
+    free(pdf);
+    free(px);
+}
+
+TEST(test_lossy_mono_ccitt_passthrough_below_target) {
+    // A CCITT image at or below 1.3x the mono target passes through
+    // byte-identical: 360x360 at 1x1 inch = 360 dpi <= 1.3 * 300.
+    enum { W = 360, H = 360 };
+    uint8_t *px = lossy_mono_text_pixels(W, H);
+    ASSERT(px != NULL);
+    TspdfArena enc_arena = tspdf_arena_create(1 << 20);
+    uint8_t *g4 = NULL;
+    size_t g4_len = 0;
+    ASSERT(tspdf_ccitt_encode_g4(px, W, H, &enc_arena, &g4, &g4_len));
+
+    size_t len = 0;
+    uint8_t *pdf = lossy_make_image_pdf_bpc(
+        g4, g4_len,
+        "/Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 360 /Rows 360 >>",
+        W, H, 1, "DeviceGray", 72.0, 72.0, &len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err = TSPDF_OK;
+    TspdfReader *doc = tspdf_reader_open(pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    TspdfLossyStats st = {0};
+    ASSERT_EQ_INT(tspdf_reader_lossy_images(doc, 150, 75, 300, &st), TSPDF_OK);
+    ASSERT_EQ_SIZE(st.images_recompressed, 0);
+    ASSERT_EQ_SIZE(st.images_mono, 0);
+    ASSERT_EQ_SIZE(st.images_skipped, 1);
+
+    // Untouched: dict still 360 wide, stream not rewritten in place.
+    TspdfObj *img_obj = lossy_get_image_obj(doc);
+    ASSERT(img_obj != NULL && img_obj->type == TSPDF_OBJ_STREAM);
+    ASSERT(!img_obj->stream.self_contained);
+    TspdfObj *wobj = tspdf_dict_get(img_obj->stream.dict, "Width");
+    ASSERT(wobj && wobj->integer == 360);
+    // ... and the raw stream bytes in the source are the original G4.
+    ASSERT_EQ_SIZE((size_t)img_obj->stream.raw_len, g4_len);
+    ASSERT(memcmp(doc->data + img_obj->stream.raw_offset, g4, g4_len) == 0);
+
+    tspdf_arena_destroy(&enc_arena);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+    free(px);
+}
+
+TEST(test_lossy_mono_noise_keeps_original) {
+    // Random bit noise: G4 re-encoding is (much) larger than the deflated
+    // original, so the keep-unless-10%-smaller rule must leave it alone.
+    enum { W = 300, H = 300 };
+    uint8_t *px = (uint8_t *)malloc((size_t)W * H);
+    ASSERT(px != NULL);
+    uint32_t lcg = 777;
+    for (size_t i = 0; i < (size_t)W * H; i++) {
+        lcg = lcg * 1664525u + 1013904223u;
+        px[i] = (lcg >> 24) & 1 ? 255 : 0;
+    }
+    size_t packed_len = 0;
+    uint8_t *packed = lossy_mono_pack(px, W, H, &packed_len);
+    ASSERT(packed != NULL);
+    size_t comp_len = 0;
+    uint8_t *comp = deflate_compress(packed, packed_len, &comp_len);
+    free(packed);
+    ASSERT(comp != NULL);
+
+    size_t len = 0;
+    // 300x300 at 1x1 inch = 300 dpi -> 1:1 G4 attempt, which loses to flate.
+    uint8_t *pdf = lossy_make_image_pdf_bpc(comp, comp_len, "/Filter /FlateDecode",
+                                            W, H, 1, "DeviceGray", 72.0, 72.0, &len);
+    free(comp);
+    ASSERT(pdf != NULL);
+
+    TspdfError err = TSPDF_OK;
+    TspdfReader *doc = tspdf_reader_open(pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    TspdfLossyStats st = {0};
+    ASSERT_EQ_INT(tspdf_reader_lossy_images(doc, 150, 75, 300, &st), TSPDF_OK);
+    ASSERT_EQ_SIZE(st.images_recompressed, 0);
+    ASSERT_EQ_SIZE(st.images_skipped, 1);
+    TspdfObj *img_obj = lossy_get_image_obj(doc);
+    ASSERT(img_obj != NULL);
+    TspdfObj *filter = tspdf_dict_get(img_obj->stream.dict, "Filter");
+    ASSERT(filter && strcmp((const char *)filter->string.data, "FlateDecode") == 0);
+
+    tspdf_reader_destroy(doc);
+    free(pdf);
+    free(px);
+}
+
+TEST(test_lossy_mono_imagemask_and_nondefault_decode_excluded) {
+    enum { W = 512, H = 512 };
+    uint8_t *px = lossy_mono_text_pixels(W, H);
+    ASSERT(px != NULL);
+    TspdfArena enc_arena = tspdf_arena_create(1 << 20);
+    uint8_t *g4 = NULL;
+    size_t g4_len = 0;
+    ASSERT(tspdf_ccitt_encode_g4(px, W, H, &enc_arena, &g4, &g4_len));
+    free(px);
+
+    // /ImageMask true stays excluded, exactly like the 8-bit path.
+    size_t len = 0;
+    uint8_t *pdf = lossy_make_image_pdf_bpc(
+        g4, g4_len,
+        "/ImageMask true /Filter /CCITTFaxDecode "
+        "/DecodeParms << /K -1 /Columns 512 /Rows 512 >>",
+        W, H, 1, "DeviceGray", 72.0, 72.0, &len);
+    ASSERT(pdf != NULL);
+    TspdfError err = TSPDF_OK;
+    TspdfReader *doc = tspdf_reader_open(pdf, len, &err);
+    ASSERT(doc != NULL);
+    TspdfLossyStats st = {0};
+    ASSERT_EQ_INT(tspdf_reader_lossy_images(doc, 150, 75, 300, &st), TSPDF_OK);
+    ASSERT_EQ_SIZE(st.images_recompressed, 0);
+    ASSERT_EQ_SIZE(st.images_skipped, 1);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+
+    // A non-default /Decode ([1 0], the common CCITT inversion) is passed
+    // through untouched — conservative, same as the 8-bit path.
+    pdf = lossy_make_image_pdf_bpc(
+        g4, g4_len,
+        "/Decode [1 0] /Filter /CCITTFaxDecode "
+        "/DecodeParms << /K -1 /Columns 512 /Rows 512 >>",
+        W, H, 1, "DeviceGray", 72.0, 72.0, &len);
+    ASSERT(pdf != NULL);
+    doc = tspdf_reader_open(pdf, len, &err);
+    ASSERT(doc != NULL);
+    memset(&st, 0, sizeof(st));
+    ASSERT_EQ_INT(tspdf_reader_lossy_images(doc, 150, 75, 300, &st), TSPDF_OK);
+    ASSERT_EQ_SIZE(st.images_recompressed, 0);
+    ASSERT_EQ_SIZE(st.images_skipped, 1);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+    tspdf_arena_destroy(&enc_arena);
 }
 
 int main(void) {
@@ -14271,6 +14688,13 @@ int main(void) {
     RUN(test_lossy_deep_q_nesting_measured_at_outer_ctm);
     RUN(test_lossy_gstate_overflow_skips_image);
     RUN(test_lossy_invalid_args_rejected);
+    RUN(test_lossy_bilevel_downsample_threshold);
+    RUN(test_lossy_mono_flate_downsampled_to_g4);
+    RUN(test_lossy_mono_flate_reencoded_1to1_below_target);
+    RUN(test_lossy_mono_ccitt_downsampled);
+    RUN(test_lossy_mono_ccitt_passthrough_below_target);
+    RUN(test_lossy_mono_noise_keeps_original);
+    RUN(test_lossy_mono_imagemask_and_nondefault_decode_excluded);
 
     printf("\n%d tests, %d passed, %d failed\n",
            tests_run, tests_passed, tests_failed);

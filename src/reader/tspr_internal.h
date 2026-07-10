@@ -203,6 +203,15 @@ TspdfError tspdf_stream_decode(TspdfObj *stream_dict, const uint8_t *raw_data,
 bool tspdf_lossy_box_downsample(const uint8_t *src, uint32_t sw, uint32_t sh,
                                 int comps, uint8_t *dst, uint32_t dw, uint32_t dh);
 
+// Bilevel box downsample: src is sw*sh bytes of 0/255 pixels; each dst
+// pixel is the box average of its source window re-thresholded at 50%,
+// with ties going to black so thin strokes keep their weight. Windows use
+// integer floor boundaries (x0 = x*sw/dw, x1 = (x+1)*sw/dw), which
+// partition the source exactly. Never upsamples. Returns false on bad
+// arguments.
+bool tspdf_lossy_bilevel_downsample(const uint8_t *src, uint32_t sw, uint32_t sh,
+                                    uint8_t *dst, uint32_t dw, uint32_t dh);
+
 // True when every RGB pixel has max(|R-G|,|R-B|,|G-B|) <= 8 (all pixels are
 // checked; no sampling).
 bool tspdf_lossy_rgb_is_gray(const uint8_t *rgb, size_t npix);

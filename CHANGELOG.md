@@ -16,6 +16,11 @@ on 0.x, the CLI is considered stable but the low-level C API may still change.
   ICC/Indexed color, progressive JPEG input) passes through untouched.
   Without `--lossy`, compress output is unchanged. C API:
   `tspdf_reader_lossy_images`.
+- `compress --lossy` now also recompresses black-and-white images (scanned
+  books): 1-bit CCITT fax or Flate images are downsampled to `--mono-dpi`
+  (default 300; text needs more dpi than photos to stay readable) and
+  re-encoded as CCITT G4 with a from-scratch G3/G4 codec. Originals are kept
+  unless the new stream is at least 10% smaller.
 
 ### Changed
 - Saving a document opened with a password now keeps it encrypted (same

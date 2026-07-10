@@ -156,6 +156,7 @@ static const char *const VALUE_FLAGS[] = {
     "--factor",
     "--image-dpi",
     "--image-quality",
+    "--mono-dpi",
 };
 
 static bool is_value_flag(const char *arg) {

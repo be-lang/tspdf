@@ -2,8 +2,10 @@
 // drawn image XObject, work out how large it actually renders (walking the
 // content streams with full CTM tracking, including Form XObjects), then
 // downsample oversized 8-bit RGB/Gray images with a box filter and re-encode
-// them as baseline JPEG (src/image/jpeg_codec.c). Conservative by design:
-// anything unusual (Indexed/ICC color, masks, multi-filter chains,
+// them as baseline JPEG (src/image/jpeg_codec.c), and downsample oversized
+// 1-bit gray images (CCITT fax or Flate) with a threshold box filter and
+// re-encode them as CCITT G4 (src/image/ccitt_codec.c). Conservative by
+// design: anything unusual (Indexed/ICC color, masks, multi-filter chains,
 // progressive JPEG input, non-default /Decode) passes through untouched, and
 // the original stream is kept unless the new one is at least 10% smaller.
 //
@@ -27,6 +29,7 @@
 
 #include "tspr_internal.h"
 #include "../image/jpeg_codec.h"
+#include "../image/ccitt_codec.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -121,6 +124,64 @@ bool tspdf_lossy_box_downsample(const uint8_t *src, uint32_t sw, uint32_t sh,
 
     free(hacc);
     free(acc);
+    return true;
+}
+
+bool tspdf_lossy_bilevel_downsample(const uint8_t *src, uint32_t sw, uint32_t sh,
+                                    uint8_t *dst, uint32_t dw, uint32_t dh) {
+    if (!src || !dst || sw == 0 || sh == 0 || dw == 0 || dh == 0) return false;
+    if (dw > sw) dw = sw;  // never upsample
+    if (dh > sh) dh = sh;
+
+    // Integer floor boundaries x0(x) = x*sw/dw partition the source exactly
+    // (x1 of column x equals x0 of column x+1; nonempty because sw >= dw),
+    // so every source pixel is counted once. Box-average-then-threshold,
+    // i.e. majority vote per window; ties go to black so single-pixel
+    // strokes survive a 2:1 downsample instead of washing out
+    // (Ghostscript's mono downsampling makes the same call).
+    //
+    // Single pass over the source: a precomputed source-column -> dest-
+    // column map (the inverse of the floor boundaries) feeds per-band
+    // black-count accumulators, flushed whenever the dest row completes.
+    uint32_t *map = (uint32_t *)malloc((size_t)sw * sizeof(uint32_t));
+    uint64_t *acc = (uint64_t *)calloc(dw, sizeof(uint64_t));
+    uint64_t *colw = (uint64_t *)calloc(dw, sizeof(uint64_t));
+    if (!map || !acc || !colw) {
+        free(map);
+        free(acc);
+        free(colw);
+        return false;
+    }
+    for (uint32_t sx = 0; sx < sw; sx++) {
+        map[sx] = (uint32_t)((((uint64_t)sx + 1) * dw - 1) / sw);
+        colw[map[sx]]++;
+    }
+
+    uint32_t band_rows = 0;
+    uint32_t cur_dy = 0;
+    for (uint32_t sy = 0; sy < sh; sy++) {
+        uint32_t dy = (uint32_t)((((uint64_t)sy + 1) * dh - 1) / sh);
+        if (dy != cur_dy) {  // flush the finished dest row
+            uint8_t *out = dst + (size_t)cur_dy * dw;
+            for (uint32_t x = 0; x < dw; x++) {
+                out[x] = (2 * acc[x] >= colw[x] * band_rows) ? 0 : 255;
+                acc[x] = 0;
+            }
+            cur_dy = dy;
+            band_rows = 0;
+        }
+        const uint8_t *row = src + (size_t)sy * sw;
+        for (uint32_t sx = 0; sx < sw; sx++)
+            acc[map[sx]] += row[sx] < 128;
+        band_rows++;
+    }
+    uint8_t *out = dst + (size_t)cur_dy * dw;
+    for (uint32_t x = 0; x < dw; x++)
+        out[x] = (2 * acc[x] >= colw[x] * band_rows) ? 0 : 255;
+
+    free(map);
+    free(acc);
+    free(colw);
     return true;
 }
 
@@ -746,21 +807,252 @@ static bool lossy_rewrite_dict(TspdfReader *doc, TspdfObj *dict,
     return true;
 }
 
+static bool lossy_dict_bool_default(LossyCtx *ctx, TspdfObj *dict,
+                                    const char *key, bool def) {
+    TspdfObj *o = lossy_resolve(ctx, tspdf_dict_get(dict, key));
+    if (o && o->type == TSPDF_OBJ_BOOL) return o->boolean;
+    return def;
+}
+
+// The stream's /DecodeParms (or /DP) as a dict, unwrapping a one-element
+// array (parallel to a one-element /Filter array). NULL when absent or not
+// a dict.
+static TspdfObj *lossy_decode_parms(LossyCtx *ctx, TspdfObj *dict) {
+    TspdfObj *p = lossy_resolve(ctx, tspdf_dict_get(dict, "DecodeParms"));
+    if (!p) p = lossy_resolve(ctx, tspdf_dict_get(dict, "DP"));
+    if (p && p->type == TSPDF_OBJ_ARRAY) {
+        if (p->array.count != 1) return NULL;
+        p = lossy_resolve(ctx, &p->array.items[0]);
+    }
+    return p && p->type == TSPDF_OBJ_DICT ? p : NULL;
+}
+
+// Rebuild the image dict for a re-encoded G4 bilevel image: keep unrelated
+// entries, replace the size/colorspace/filter family with the CCITT set
+// (/K -1, default /BlackIs1 — the decoded gray values are re-encoded in the
+// canonical polarity regardless of the source's /BlackIs1).
+static bool lossy_rewrite_dict_g4(TspdfReader *doc, TspdfObj *dict,
+                                  uint32_t dw, uint32_t dh, size_t g4_len) {
+    TspdfArena *a = &doc->arena;
+    size_t kept = 0;
+    static const char *replaced[] = {
+        "Filter", "DecodeParms", "DP", "Width", "Height",
+        "ColorSpace", "Decode", "Length", "BitsPerComponent", NULL,
+    };
+
+    TspdfDictEntry *entries = (TspdfDictEntry *)tspdf_arena_alloc_zero(
+        a, (dict->dict.count + 7) * sizeof(TspdfDictEntry));
+    if (!entries) return false;
+
+    for (size_t i = 0; i < dict->dict.count; i++) {
+        const char *key = dict->dict.entries[i].key;
+        bool skip = false;
+        for (int r = 0; replaced[r]; r++) {
+            if (strcmp(key, replaced[r]) == 0) {
+                skip = true;
+                break;
+            }
+        }
+        if (skip) continue;
+        entries[kept++] = dict->dict.entries[i];
+    }
+
+    // /DecodeParms << /K -1 /Columns dw /Rows dh >>
+    TspdfObj *parms = (TspdfObj *)tspdf_arena_alloc_zero(a, sizeof(TspdfObj));
+    TspdfDictEntry *pe = (TspdfDictEntry *)tspdf_arena_alloc_zero(
+        a, 3 * sizeof(TspdfDictEntry));
+    if (!parms || !pe) return false;
+    struct {
+        const char *key;
+        TspdfObj *val;
+    } padd[3] = {
+        {"K", lossy_make_int(a, -1)},
+        {"Columns", lossy_make_int(a, dw)},
+        {"Rows", lossy_make_int(a, dh)},
+    };
+    for (int i = 0; i < 3; i++) {
+        if (!padd[i].val) return false;
+        size_t klen = strlen(padd[i].key);
+        char *k = (char *)tspdf_arena_alloc(a, klen + 1);
+        if (!k) return false;
+        memcpy(k, padd[i].key, klen + 1);
+        pe[i].key = k;
+        pe[i].value = padd[i].val;
+    }
+    parms->type = TSPDF_OBJ_DICT;
+    parms->dict.entries = pe;
+    parms->dict.count = 3;
+
+    struct {
+        const char *key;
+        TspdfObj *val;
+    } add[7] = {
+        {"Width", lossy_make_int(a, dw)},
+        {"Height", lossy_make_int(a, dh)},
+        {"ColorSpace", lossy_make_name(a, "DeviceGray")},
+        {"BitsPerComponent", lossy_make_int(a, 1)},
+        {"Filter", lossy_make_name(a, "CCITTFaxDecode")},
+        {"DecodeParms", parms},
+        {"Length", lossy_make_int(a, (int64_t)g4_len)},
+    };
+    for (int i = 0; i < 7; i++) {
+        if (!add[i].val) return false;
+        size_t klen = strlen(add[i].key);
+        char *k = (char *)tspdf_arena_alloc(a, klen + 1);
+        if (!k) return false;
+        memcpy(k, add[i].key, klen + 1);
+        entries[kept].key = k;
+        entries[kept].value = add[i].val;
+        kept++;
+    }
+
+    dict->dict.entries = entries;
+    dict->dict.count = kept;
+    return true;
+}
+
+// Examine one drawn 1-bit /DeviceGray image (CCITT or Flate) and re-encode
+// it as downsampled G4 when eligible and worthwhile. Returns true when the
+// stream was replaced. `w`/`h`/`filter` were validated by the caller.
+static bool lossy_process_mono_image(LossyCtx *ctx, TspdfObj *obj,
+                                     uint32_t obj_num, uint32_t w, uint32_t h,
+                                     const char *filter, double w_pt,
+                                     double h_pt, int mono_dpi,
+                                     TspdfLossyStats *stats) {
+    TspdfReader *doc = ctx->doc;
+    TspdfObj *dict = obj->stream.dict;
+
+    bool is_ccitt = strcmp(filter, "CCITTFaxDecode") == 0;
+    bool is_flate = strcmp(filter, "FlateDecode") == 0;
+    if (!is_ccitt && !is_flate) return false;
+    if ((uint64_t)w * h > LOSSY_MAX_PIXEL_BYTES) return false;
+    if (!lossy_decode_is_default(ctx, dict, 1)) return false;
+
+    // Downsample decision. A CCITT image at or below 1.3x the target dpi
+    // passes through byte-identical; a Flate one is still worth re-encoding
+    // 1:1 (G4 usually beats deflate on scans) under the 10%-smaller rule.
+    uint32_t dw = 0, dh = 0;
+    if (!tspdf_lossy_target_dims(w, h, w_pt, h_pt, mono_dpi, &dw, &dh)) {
+        if (is_ccitt) return false;
+        dw = w;
+        dh = h;
+    }
+
+    uint8_t *owned = NULL;
+    size_t stored_len = 0;
+    const uint8_t *stored = lossy_raw_stream(doc, obj, obj_num, &stored_len, &owned);
+    if (!stored || stored_len == 0) {
+        free(owned);
+        return false;
+    }
+
+    TspdfArena work = tspdf_arena_create(1 << 20);
+    uint8_t *pixels = NULL;        // w*h bytes, 0 = black
+    uint8_t *flate_pixels = NULL;  // malloc'd (flate path)
+    bool ok = false;
+
+    if (is_ccitt) {
+        TspdfObj *parms = lossy_decode_parms(ctx, dict);
+        TspdfCcittParams cp;
+        tspdf_ccitt_params_default(&cp);
+        if (parms) {
+            int64_t v;
+            if (lossy_dict_int(ctx, parms, "K", &v)) cp.k = (int)v;
+            if (lossy_dict_int(ctx, parms, "Columns", &v)) cp.columns = (int)v;
+            cp.black_is_1 = lossy_dict_bool_default(ctx, parms, "BlackIs1", false);
+            cp.encoded_byte_align =
+                lossy_dict_bool_default(ctx, parms, "EncodedByteAlign", false);
+            cp.end_of_line = lossy_dict_bool_default(ctx, parms, "EndOfLine", false);
+            cp.end_of_block = lossy_dict_bool_default(ctx, parms, "EndOfBlock", true);
+        }
+        // The image dict's /Width//Height are authoritative; a /Columns
+        // mismatch is a malformed image we leave alone.
+        if (cp.columns != (int)w) {
+            tspdf_arena_destroy(&work);
+            free(owned);
+            return false;
+        }
+        cp.rows = (int)h;
+        TspdfCcittBitmap bm = {0};
+        if (tspdf_ccitt_decode(stored, stored_len, &cp, &work, &bm) &&
+            bm.width == (int)w && bm.height == (int)h) {
+            pixels = bm.pixels;
+            ok = true;
+        }
+    } else {
+        // 1-bit Flate: packed rows, MSB first; sample 1 = white under the
+        // default /Decode [0 1] (checked above).
+        size_t plen = 0;
+        size_t stride = ((size_t)w + 7) / 8;
+        if (tspdf_stream_decode(dict, stored, stored_len, &flate_pixels, &plen) ==
+                TSPDF_OK &&
+            plen >= stride * h) {
+            uint8_t *px = (uint8_t *)tspdf_arena_alloc(&work, (size_t)w * h);
+            if (px) {
+                for (uint32_t y = 0; y < h; y++) {
+                    const uint8_t *row = flate_pixels + (size_t)y * stride;
+                    uint8_t *out = px + (size_t)y * w;
+                    for (uint32_t x = 0; x < w; x++)
+                        out[x] = (row[x >> 3] >> (7 - (x & 7))) & 1 ? 255 : 0;
+                }
+                pixels = px;
+                ok = true;
+            }
+        }
+    }
+
+    bool replaced = false;
+    if (ok) {
+        uint8_t *down = pixels;
+        if (dw != w || dh != h) {
+            down = (uint8_t *)tspdf_arena_alloc(&work, (size_t)dw * dh);
+            if (!down || !tspdf_lossy_bilevel_downsample(pixels, w, h, down, dw, dh))
+                down = NULL;
+        }
+        uint8_t *g4 = NULL;
+        size_t g4_len = 0;
+        if (down &&
+            tspdf_ccitt_encode_g4(down, (int)dw, (int)dh, &work, &g4, &g4_len) &&
+            tspdf_lossy_worth_replacing(stored_len, g4_len)) {
+            uint8_t *copy = (uint8_t *)malloc(g4_len);
+            if (copy && lossy_rewrite_dict_g4(doc, dict, dw, dh, g4_len)) {
+                memcpy(copy, g4, g4_len);
+                free(obj->stream.data);  // drop any cached decode
+                obj->stream.data = copy;
+                obj->stream.len = g4_len;
+                obj->stream.self_contained = true;
+                stats->bytes_before += stored_len;
+                stats->bytes_after += g4_len;
+                stats->images_mono++;
+                replaced = true;
+            } else {
+                free(copy);
+            }
+        }
+    }
+
+    free(flate_pixels);
+    tspdf_arena_destroy(&work);
+    free(owned);
+    return replaced;
+}
+
 // Examine one drawn image XObject and re-encode it when eligible and
 // worthwhile. Returns true when the stream was replaced.
 static bool lossy_process_image(LossyCtx *ctx, uint32_t obj_num,
                                 double w_pt, double h_pt, int target_dpi,
-                                int quality, TspdfLossyStats *stats) {
+                                int quality, int mono_dpi,
+                                TspdfLossyStats *stats) {
     TspdfReader *doc = ctx->doc;
     TspdfObj *obj = tspdf_xref_resolve(&doc->xref, &ctx->rp, obj_num,
                                        doc->obj_cache, doc->crypt);
     if (!obj || obj->type != TSPDF_OBJ_STREAM) return false;
     TspdfObj *dict = obj->stream.dict;
 
-    // Eligibility gates: 8-bit DeviceRGB/DeviceGray, no masks, default
-    // decode, big enough to matter, single Flate or DCT filter.
+    // Shared eligibility gates: no masks (ImageMask true stays excluded),
+    // sane dimensions, big enough to matter.
     int64_t bpc = 0, w64 = 0, h64 = 0;
-    if (!lossy_dict_int(ctx, dict, "BitsPerComponent", &bpc) || bpc != 8) return false;
+    if (!lossy_dict_int(ctx, dict, "BitsPerComponent", &bpc)) return false;
     if (lossy_dict_is_true(ctx, dict, "ImageMask")) return false;
     if (tspdf_dict_get(dict, "SMask") || tspdf_dict_get(dict, "Mask")) return false;
     if (!lossy_dict_int(ctx, dict, "Width", &w64) ||
@@ -769,6 +1061,17 @@ static bool lossy_process_image(LossyCtx *ctx, uint32_t obj_num,
     if (w64 <= 0 || h64 <= 0 || w64 > INT32_MAX || h64 > INT32_MAX) return false;
     uint32_t w = (uint32_t)w64, h = (uint32_t)h64;
     if ((uint64_t)w * h < 65536) return false;  // too small to matter
+
+    if (bpc == 1) {
+        // Bilevel path: 1-bit /DeviceGray, CCITT or Flate, re-encoded G4.
+        LossyColorSpace mcs = lossy_colorspace(ctx, dict);
+        if (mcs != LOSSY_CS_GRAY) return false;
+        const char *mf = lossy_single_filter(ctx, dict);
+        if (!mf) return false;
+        return lossy_process_mono_image(ctx, obj, obj_num, w, h, mf, w_pt, h_pt,
+                                        mono_dpi, stats);
+    }
+    if (bpc != 8) return false;
 
     LossyColorSpace cs = lossy_colorspace(ctx, dict);
     if (cs == LOSSY_CS_NONE) return false;
@@ -873,10 +1176,11 @@ static bool lossy_process_image(LossyCtx *ctx, uint32_t obj_num,
 }
 
 TspdfError tspdf_reader_lossy_images(TspdfReader *doc, int target_dpi,
-                                     int quality, TspdfLossyStats *stats) {
+                                     int quality, int mono_dpi,
+                                     TspdfLossyStats *stats) {
     TspdfLossyStats local = {0};
     if (stats) *stats = local;
-    if (!doc || target_dpi <= 0 || quality < 1 || quality > 100)
+    if (!doc || target_dpi <= 0 || quality < 1 || quality > 100 || mono_dpi <= 0)
         return TSPDF_ERR_INVALID_ARG;
 
     TspdfLossyPlacement *placements = NULL;
@@ -892,7 +1196,8 @@ TspdfError tspdf_reader_lossy_images(TspdfReader *doc, int target_dpi,
 
     for (size_t i = 0; i < n; i++) {
         if (lossy_process_image(&ctx, placements[i].obj_num, placements[i].w_pt,
-                                placements[i].h_pt, target_dpi, quality, &local)) {
+                                placements[i].h_pt, target_dpi, quality,
+                                mono_dpi, &local)) {
             local.images_recompressed++;
             doc->modified = true;
         } else {
