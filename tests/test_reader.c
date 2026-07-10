@@ -13,6 +13,7 @@
 #include "../src/compress/deflate.h"
 #include "../src/util/arena.h"
 #include "../src/image/jpeg_codec.h"
+#include "../src/crypto/md5.h"
 
 static bool bytes_contains(const uint8_t *haystack, size_t haystack_len, const char *needle) {
     if (!haystack || !needle) {
@@ -10696,6 +10697,84 @@ TEST(test_attach_add_save_reopen_roundtrip) {
     free(buf);
 }
 
+// attachment_add_ex records the file metadata Acrobat expects: /Subtype
+// (MIME) on the embedded stream, and /Params with /Size, /ModDate (from the
+// given Unix time) and an MD5 /CheckSum of the contents.
+TEST(test_attach_add_ex_params_subtype_checksum) {
+    size_t src_len = 0;
+    uint8_t *src = dt_writer_pdf(1, false, false, "AX", "Helvetica", &src_len);
+    ASSERT(src != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open(src, src_len, &err);
+    ASSERT(doc != NULL);
+
+    // 1700000000 = 2023-11-14 22:13:20 UTC.
+    err = tspdf_reader_attachment_add_ex(doc, "notes.txt", att_payload,
+                                         sizeof(att_payload), "notes",
+                                         "text/plain", 1700000000LL);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    tspdf_reader_destroy(doc);
+    free(src);
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+
+    // The enumerator reports the MIME type and decoded size.
+    TspdfAttachmentInfo *infos = NULL;
+    size_t count = 0;
+    ASSERT_EQ_INT(tspdf_reader_attachments(re, &infos, &count), TSPDF_OK);
+    ASSERT_EQ_SIZE(count, 1);
+    ASSERT(infos[0].mime != NULL);
+    ASSERT_EQ_STR(infos[0].mime, "text/plain");
+    ASSERT_EQ_SIZE(infos[0].size, sizeof(att_payload));
+
+    // Raw structure: /Names -> /EmbeddedFiles -> Filespec -> /EF /F stream.
+    TspdfObj *names = dt_catalog_get(re, "Names");
+    ASSERT(names && names->type == TSPDF_OBJ_DICT);
+    TspdfObj *ef_root = dt_get(re, names, "EmbeddedFiles");
+    ASSERT(ef_root && ef_root->type == TSPDF_OBJ_DICT);
+    TspdfObj *pairs = dt_get(re, ef_root, "Names");
+    ASSERT(pairs && pairs->type == TSPDF_OBJ_ARRAY && pairs->array.count == 2);
+    TspdfObj *fs = test_resolve_ref(re, &pairs->array.items[1]);
+    ASSERT(fs && fs->type == TSPDF_OBJ_DICT);
+    TspdfObj *ef = dt_get(re, fs, "EF");
+    ASSERT(ef && ef->type == TSPDF_OBJ_DICT);
+    TspdfObj *stream = test_resolve_ref(re, tspdf_dict_get(ef, "F"));
+    ASSERT(stream && stream->type == TSPDF_OBJ_STREAM);
+
+    ASSERT(dt_str_eq(tspdf_dict_get(stream->stream.dict, "Subtype"), "text/plain"));
+    TspdfObj *params = test_resolve_ref(re, tspdf_dict_get(stream->stream.dict,
+                                                           "Params"));
+    ASSERT(params && params->type == TSPDF_OBJ_DICT);
+    TspdfObj *size = tspdf_dict_get(params, "Size");
+    ASSERT(size && size->type == TSPDF_OBJ_INT);
+    ASSERT_EQ_SIZE((size_t)size->integer, sizeof(att_payload));
+    ASSERT(dt_str_eq(tspdf_dict_get(params, "ModDate"), "D:20231114221320Z"));
+
+    uint8_t digest[16];
+    md5_hash(att_payload, sizeof(att_payload), digest);
+    TspdfObj *cks = tspdf_dict_get(params, "CheckSum");
+    ASSERT(cks && cks->type == TSPDF_OBJ_STRING && cks->string.len == 16);
+    ASSERT(memcmp(cks->string.data, digest, 16) == 0);
+
+    // The bytes still round-trip.
+    uint8_t *bytes = NULL;
+    size_t blen = 0;
+    ASSERT_EQ_INT(tspdf_reader_attachment_get(re, "notes.txt", &bytes, &blen),
+                  TSPDF_OK);
+    ASSERT_EQ_SIZE(blen, sizeof(att_payload));
+    ASSERT(memcmp(bytes, att_payload, blen) == 0);
+    free(bytes);
+
+    tspdf_reader_destroy(re);
+    free(out);
+}
+
 TEST(test_attach_flat_tree_keys_sorted) {
     size_t src_len = 0;
     uint8_t *src = dt_writer_pdf(1, false, false, "AT", "Helvetica", &src_len);
@@ -12629,11 +12708,11 @@ TEST(test_bookmark_set_three_level_roundtrip) {
     ASSERT(doc != NULL);
 
     TspdfBookmarkEntry entries[] = {
-        {"Chapter 1", 1, 0, 0, false},
-        {"Section 1.1", 2, 1, 0, false},
-        {"Subsection 1.1.1", 3, 1, 0, false},
-        {"Section 1.2", 2, 2, 0, false},
-        {"Chapter 2", 1, 2, 0, false},
+        {"Chapter 1", 1, 0, 0, false, NULL},
+        {"Section 1.1", 2, 1, 0, false, NULL},
+        {"Subsection 1.1.1", 3, 1, 0, false, NULL},
+        {"Section 1.2", 2, 2, 0, false, NULL},
+        {"Chapter 2", 1, 2, 0, false, NULL},
     };
     err = tspdf_reader_set_bookmarks(doc, entries, 5);
     ASSERT_EQ_INT(err, TSPDF_OK);
@@ -12688,7 +12767,7 @@ TEST(test_bookmark_set_nonascii_title_roundtrip) {
     ASSERT(doc != NULL);
 
     const char *title = "Caf\xC3\xA9 \xE2\x86\x92 \xF0\x9F\x93\x84";  // "Café → 📄"
-    TspdfBookmarkEntry entries[] = {{title, 1, 0, 0, false}};
+    TspdfBookmarkEntry entries[] = {{title, 1, 0, 0, false, NULL}};
     err = tspdf_reader_set_bookmarks(doc, entries, 1);
     ASSERT_EQ_INT(err, TSPDF_OK);
 
@@ -12724,19 +12803,19 @@ TEST(test_bookmark_set_validation_errors) {
     ASSERT(doc != NULL);
 
     // First entry must be level 1.
-    TspdfBookmarkEntry e_lvl2first[] = {{"X", 2, 0, 0, false}};
+    TspdfBookmarkEntry e_lvl2first[] = {{"X", 2, 0, 0, false, NULL}};
     ASSERT_EQ_INT(tspdf_reader_set_bookmarks(doc, e_lvl2first, 1), TSPDF_ERR_INVALID_ARG);
 
     // Level jump 1 -> 3.
-    TspdfBookmarkEntry e_jump[] = {{"A", 1, 0, 0, false}, {"B", 3, 0, 0, false}};
+    TspdfBookmarkEntry e_jump[] = {{"A", 1, 0, 0, false, NULL}, {"B", 3, 0, 0, false, NULL}};
     ASSERT_EQ_INT(tspdf_reader_set_bookmarks(doc, e_jump, 2), TSPDF_ERR_INVALID_ARG);
 
     // Empty title.
-    TspdfBookmarkEntry e_empty[] = {{"", 1, 0, 0, false}};
+    TspdfBookmarkEntry e_empty[] = {{"", 1, 0, 0, false, NULL}};
     ASSERT_EQ_INT(tspdf_reader_set_bookmarks(doc, e_empty, 1), TSPDF_ERR_INVALID_ARG);
 
     // Page out of range (only 3 pages: indices 0-2).
-    TspdfBookmarkEntry e_page[] = {{"A", 1, 9, 0, false}};
+    TspdfBookmarkEntry e_page[] = {{"A", 1, 9, 0, false, NULL}};
     ASSERT_EQ_INT(tspdf_reader_set_bookmarks(doc, e_page, 1), TSPDF_ERR_PAGE_RANGE);
 
     tspdf_reader_destroy(doc);
@@ -12985,6 +13064,230 @@ TEST(test_bookmark_add_preserves_indirect_titles) {
     tspdf_reader_destroy(re);
     free(out);
     tspdf_reader_destroy(doc);
+}
+
+// A 3-page PDF whose outline carries rich data: an /XYZ dest with scroll
+// position and zoom, a /FitH dest, a URI /A action, a /C color, /F flags,
+// and a collapsed node (negative /Count).
+static char *bm_make_rich_outline_pdf(size_t *out_len) {
+    const size_t cap = 8192;
+    char *pdf = (char *)malloc(cap);
+    if (!pdf) return NULL;
+    size_t pos = 0;
+    size_t off[10] = {0};
+    if (!appendf(pdf, cap, &pos, "%%PDF-1.4\n")) goto fail;
+    off[1] = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Outlines 6 0 R >>\nendobj\n")) goto fail;
+    off[2] = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>\nendobj\n")) goto fail;
+    for (int i = 0; i < 3; i++) {
+        off[3 + i] = pos;
+        if (!appendf(pdf, cap, &pos,
+                     "%d 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+                     3 + i)) goto fail;
+    }
+    off[6] = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "6 0 obj\n<< /Type /Outlines /First 7 0 R /Last 9 0 R /Count 2 >>\nendobj\n")) goto fail;
+    off[7] = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "7 0 obj\n<< /Title (Alpha) /Parent 6 0 R /Next 9 0 R /First 8 0 R "
+                 "/Last 8 0 R /Count -1 /Dest [3 0 R /XYZ 72 700.5 1.5] "
+                 "/C [1 0 0] /F 2 >>\nendobj\n")) goto fail;
+    off[8] = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "8 0 obj\n<< /Title (Alpha Sub) /Parent 7 0 R /Dest [4 0 R /FitH 500] >>\nendobj\n")) goto fail;
+    off[9] = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "9 0 obj\n<< /Title (Beta) /Parent 6 0 R /Prev 7 0 R "
+                 "/A << /S /URI /URI (https://example.com/x) >> >>\nendobj\n")) goto fail;
+    size_t xref = pos;
+    if (!appendf(pdf, cap, &pos, "xref\n0 10\n0000000000 65535 f \n")) goto fail;
+    for (int i = 1; i <= 9; i++) {
+        if (!appendf(pdf, cap, &pos, "%010zu 00000 n \n", off[i])) goto fail;
+    }
+    if (!appendf(pdf, cap, &pos,
+                 "trailer\n<< /Size 10 /Root 1 0 R >>\nstartxref\n%zu\n%%%%EOF", xref)) goto fail;
+    *out_len = pos;
+    return pdf;
+fail:
+    free(pdf);
+    return NULL;
+}
+
+// The add flow on a rich outline: pre-existing /Dest arrays (XYZ with scroll
+// position and zoom, FitH), /A actions, /C color, /F flags and collapsed
+// state (negative /Count) survive verbatim via TspdfBookmarkEntry.keep; only
+// the NEW entry gets a synthesized destination.
+TEST(test_bookmark_add_preserves_rich_dests) {
+    size_t len = 0;
+    char *pdf = bm_make_rich_outline_pdf(&len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    TspdfBookmarkInfo *bm = NULL;
+    size_t n = 0;
+    err = tspdf_reader_bookmarks(doc, &bm, &n);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_SIZE(n, 3);
+    ASSERT(!bm[0].open);                          // Alpha collapsed (Count -1)
+    ASSERT(bm[0].node != NULL);                   // preservation handle
+    ASSERT_EQ_SIZE(bm[2].page_index, (size_t)-1); // URI action: no page
+
+    TspdfBookmarkEntry entries[4];
+    memset(entries, 0, sizeof(entries));
+    for (size_t i = 0; i < n; i++) {
+        entries[i].title = bm[i].title;
+        entries[i].level = bm[i].level;
+        entries[i].page_index = bm[i].page_index;
+        entries[i].keep = bm[i].node;
+    }
+    entries[3].title = "Appendix";
+    entries[3].level = 1;
+    entries[3].page_index = 2;
+    err = tspdf_reader_set_bookmarks(doc, entries, 4);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+
+    TspdfBookmarkInfo *bm2 = NULL;
+    size_t n2 = 0;
+    err = tspdf_reader_bookmarks(re, &bm2, &n2);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_SIZE(n2, 4);
+    ASSERT_EQ_STR(bm2[3].title, "Appendix");
+    ASSERT(!bm2[0].open);                         // still collapsed
+    ASSERT_EQ_SIZE(bm2[0].page_index, 0);         // XYZ dest still resolves
+
+    // Raw structure: Alpha keeps its /XYZ dest, color, flags and collapse.
+    TspdfObj *root = dt_catalog_get(re, "Outlines");
+    ASSERT(root != NULL && root->type == TSPDF_OBJ_DICT);
+    TspdfObj *rc = tspdf_dict_get(root, "Count");
+    ASSERT(rc && rc->type == TSPDF_OBJ_INT);
+    ASSERT_EQ_INT((int)rc->integer, 3);  // Alpha collapsed: its child is hidden
+
+    TspdfObj *alpha = dt_get(re, root, "First");
+    ASSERT(alpha && dt_str_eq(tspdf_dict_get(alpha, "Title"), "Alpha"));
+    TspdfObj *dest = dt_get(re, alpha, "Dest");
+    ASSERT(dest && dest->type == TSPDF_OBJ_ARRAY && dest->array.count == 5);
+    ASSERT(dest->array.items[0].type == TSPDF_OBJ_REF);
+    ASSERT(dt_str_eq(&dest->array.items[1], "XYZ"));
+    ASSERT(dest->array.items[2].type == TSPDF_OBJ_INT &&
+           dest->array.items[2].integer == 72);
+    ASSERT(dest->array.items[3].type == TSPDF_OBJ_REAL &&
+           dest->array.items[3].real == 700.5);
+    ASSERT(dest->array.items[4].type == TSPDF_OBJ_REAL &&
+           dest->array.items[4].real == 1.5);
+    TspdfObj *color = dt_get(re, alpha, "C");
+    ASSERT(color && color->type == TSPDF_OBJ_ARRAY && color->array.count == 3);
+    ASSERT(color->array.items[0].type == TSPDF_OBJ_INT &&
+           color->array.items[0].integer == 1);
+    TspdfObj *flags = dt_get(re, alpha, "F");
+    ASSERT(flags && flags->type == TSPDF_OBJ_INT && flags->integer == 2);
+    TspdfObj *acnt = dt_get(re, alpha, "Count");
+    ASSERT(acnt && acnt->type == TSPDF_OBJ_INT);
+    ASSERT_EQ_INT((int)acnt->integer, -1);
+
+    // Alpha Sub keeps its /FitH dest.
+    TspdfObj *sub = dt_get(re, alpha, "First");
+    ASSERT(sub && dt_str_eq(tspdf_dict_get(sub, "Title"), "Alpha Sub"));
+    TspdfObj *sdest = dt_get(re, sub, "Dest");
+    ASSERT(sdest && sdest->type == TSPDF_OBJ_ARRAY && sdest->array.count == 3);
+    ASSERT(dt_str_eq(&sdest->array.items[1], "FitH"));
+    ASSERT(sdest->array.items[2].type == TSPDF_OBJ_INT &&
+           sdest->array.items[2].integer == 500);
+
+    // Beta keeps its URI /A action and gains no synthesized /Dest.
+    TspdfObj *beta = dt_get(re, alpha, "Next");
+    ASSERT(beta && dt_str_eq(tspdf_dict_get(beta, "Title"), "Beta"));
+    ASSERT(tspdf_dict_get(beta, "Dest") == NULL);
+    TspdfObj *act = dt_get(re, beta, "A");
+    ASSERT(act && act->type == TSPDF_OBJ_DICT);
+    ASSERT(dt_str_eq(tspdf_dict_get(act, "S"), "URI"));
+    ASSERT(dt_str_eq(tspdf_dict_get(act, "URI"), "https://example.com/x"));
+
+    // The new entry gets the usual [page /Fit] destination.
+    TspdfObj *app = dt_get(re, beta, "Next");
+    ASSERT(app && dt_str_eq(tspdf_dict_get(app, "Title"), "Appendix"));
+    TspdfObj *adest = dt_get(re, app, "Dest");
+    ASSERT(adest && adest->type == TSPDF_OBJ_ARRAY && adest->array.count == 2);
+    ASSERT(dt_str_eq(&adest->array.items[1], "Fit"));
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+// A 1-page PDF whose catalog carries an XMP /Metadata stream.
+static char *md_make_xmp_pdf(size_t *out_len) {
+    const char *xmp =
+        "<?xpacket begin=\"\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>"
+        "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"></x:xmpmeta>"
+        "<?xpacket end=\"w\"?>";
+    const size_t cap = 4096;
+    char *pdf = (char *)malloc(cap);
+    if (!pdf) return NULL;
+    size_t pos = 0;
+    size_t off[5] = {0};
+    if (!appendf(pdf, cap, &pos, "%%PDF-1.4\n")) goto fail;
+    off[1] = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Metadata 4 0 R >>\nendobj\n")) goto fail;
+    off[2] = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")) goto fail;
+    off[3] = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n")) goto fail;
+    off[4] = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "4 0 obj\n<< /Type /Metadata /Subtype /XML /Length %zu >>\n"
+                 "stream\n%s\nendstream\nendobj\n", strlen(xmp), xmp)) goto fail;
+    size_t xref = pos;
+    if (!appendf(pdf, cap, &pos, "xref\n0 5\n0000000000 65535 f \n")) goto fail;
+    for (int i = 1; i <= 4; i++) {
+        if (!appendf(pdf, cap, &pos, "%010zu 00000 n \n", off[i])) goto fail;
+    }
+    if (!appendf(pdf, cap, &pos,
+                 "trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n%zu\n%%%%EOF", xref)) goto fail;
+    *out_len = pos;
+    return pdf;
+fail:
+    free(pdf);
+    return NULL;
+}
+
+// tspdf_reader_has_xmp_metadata: true only when the catalog carries an XMP
+// metadata stream (used by the CLI to warn that Info edits leave XMP stale).
+TEST(test_metadata_xmp_detected) {
+    size_t len = 0;
+    char *pdf = md_make_xmp_pdf(&len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    ASSERT(tspdf_reader_has_xmp_metadata(doc));
+    tspdf_reader_destroy(doc);
+    free(pdf);
+
+    char *plain = bm_make_three_page_pdf(&len);
+    ASSERT(plain != NULL);
+    doc = tspdf_reader_open((const uint8_t *)plain, len, &err);
+    ASSERT(doc != NULL);
+    ASSERT(!tspdf_reader_has_xmp_metadata(doc));
+    tspdf_reader_destroy(doc);
+    free(plain);
 }
 
 // Merging documents whose outline titles are indirect strings must copy the
@@ -14201,6 +14504,7 @@ int main(void) {
 
     printf("\n  Embedded file attachments:\n");
     RUN(test_attach_add_save_reopen_roundtrip);
+    RUN(test_attach_add_ex_params_subtype_checksum);
     RUN(test_attach_flat_tree_keys_sorted);
     RUN(test_attach_add_replaces_same_name);
     RUN(test_attach_remove);
@@ -14255,6 +14559,8 @@ int main(void) {
     RUN(test_bookmark_set_large_bounded);
     RUN(test_bookmark_list_indirect_title);
     RUN(test_bookmark_add_preserves_indirect_titles);
+    RUN(test_bookmark_add_preserves_rich_dests);
+    RUN(test_metadata_xmp_detected);
     RUN(test_merge_copies_indirect_outline_strings);
     RUN(test_serialize_never_writes_inuse_offset_zero);
 

@@ -196,6 +196,11 @@ const char *tspdf_reader_get_producer(const TspdfReader *doc);
 const char *tspdf_reader_get_creation_date(const TspdfReader *doc);
 const char *tspdf_reader_get_mod_date(const TspdfReader *doc);
 
+// True when the document carries an XMP metadata stream (catalog /Metadata).
+// The Info-dict setters below do not update XMP, so callers can use this to
+// warn that viewers preferring XMP may show stale values after an edit.
+bool tspdf_reader_has_xmp_metadata(TspdfReader *doc);
+
 // Metadata setters (pass NULL to remove a field)
 void tspdf_reader_set_title(TspdfReader *doc, const char *value);
 void tspdf_reader_set_author(TspdfReader *doc, const char *value);
@@ -325,6 +330,16 @@ TspdfError tspdf_reader_attachment_add(TspdfReader *doc, const char *name,
                                        const uint8_t *data, size_t len,
                                        const char *desc);
 
+// Like tspdf_reader_attachment_add, with explicit file metadata: `mime`
+// becomes the embedded stream's /Subtype (NULL omits it) and `mod_time_unix`
+// (seconds since the Unix epoch, e.g. the source file's mtime) becomes the
+// /Params /ModDate (0 uses the current time). Every added attachment also
+// records /Params /Size and an MD5 /CheckSum of the contents.
+TspdfError tspdf_reader_attachment_add_ex(TspdfReader *doc, const char *name,
+                                          const uint8_t *data, size_t len,
+                                          const char *desc, const char *mime,
+                                          int64_t mod_time_unix);
+
 // Remove the attachment stored under `name`. TSPDF_ERR_NOT_FOUND when no
 // attachment has that name.
 TspdfError tspdf_reader_attachment_remove(TspdfReader *doc, const char *name);
@@ -336,6 +351,10 @@ typedef struct {
     int level;              // nesting depth, 1 = top level
     size_t page_index;      // 0-based target page; SIZE_MAX if unresolved
     bool open;              // item shown expanded (its /Count >= 0)
+    const void *node;       // handle to the source outline item; pass it as
+                            // TspdfBookmarkEntry.keep so a rewrite preserves
+                            // the item's destination/appearance verbatim.
+                            // Owned by the reader (valid until destroy).
 } TspdfBookmarkInfo;
 
 // Enumerate the document's outline as a flat, pre-order list (parents before
@@ -356,6 +375,12 @@ typedef struct {
     size_t page_index;      // 0-based target page
     double y;               // /XYZ top coordinate when has_y
     bool has_y;
+    const void *keep;       // optional TspdfBookmarkInfo.node handle: carry
+                            // the original item's /Dest or /A (any view type),
+                            // /C color, /F flags and open/collapsed state over
+                            // verbatim instead of synthesizing a destination.
+                            // page_index/y are ignored (and page_index may be
+                            // SIZE_MAX) when set. NULL for new entries.
 } TspdfBookmarkEntry;
 
 // Replace the whole outline tree with `entries`. Levels must start at 1 and

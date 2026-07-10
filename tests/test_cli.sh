@@ -2916,6 +2916,182 @@ else
   echo "  SKIP  compress --lossy tests (python3 or fixtures missing)"
 fi
 
+# --- fit & finish: rich outline preservation, XMP notice, attachment
+# metadata, split --no-attachments, stamp password files ---
+
+# metadata: a one-line stderr notice when an XMP stream is present (the Info
+# edit leaves it stale), and silence when there is none.
+if [ -f tests/data/xmp_meta.pdf ]; then
+  run_test "metadata --set warns about stale XMP metadata" bash -c '
+    set -e
+    "'"$TSPDF"'" metadata tests/data/xmp_meta.pdf --set title=NewTitle -o "'"$TMPDIR"'/xmp_out.pdf" 2> "'"$TMPDIR"'/xmp_err.txt"
+    grep -q "XMP metadata present and not updated" "'"$TMPDIR"'/xmp_err.txt"'
+  run_test "metadata --set stays quiet without XMP metadata" bash -c '
+    set -e
+    "'"$TSPDF"'" metadata '"$INPUT"' --set title=NewTitle -o "'"$TMPDIR"'/noxmp_out.pdf" 2> "'"$TMPDIR"'/noxmp_err.txt"
+    ! grep -q "XMP metadata" "'"$TMPDIR"'/noxmp_err.txt"'
+else
+  echo "  SKIP  metadata XMP notice (tests/data/xmp_meta.pdf missing)"
+fi
+
+if command -v qpdf >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+  # attach add: /Subtype from the extension map, /Params with the real size,
+  # the source file's mtime as /ModDate, and an MD5 /CheckSum.
+  cat > $TMPDIR/check_attach_params.py << 'PYEOF'
+import hashlib, json, os, subprocess, sys, time
+pdf, src, mime = sys.argv[1], sys.argv[2], sys.argv[3]
+d = json.loads(subprocess.check_output(["qpdf", "--json=2", pdf]))
+found = None
+for v in d["qpdf"][1].values():
+    if isinstance(v, dict) and "stream" in v:
+        sd = v["stream"].get("dict", {})
+        if sd.get("/Type") == "/EmbeddedFile":
+            found = sd
+assert found, "no /EmbeddedFile stream"
+assert found.get("/Subtype") == "/" + mime, found.get("/Subtype")
+params = found.get("/Params", {})
+data = open(src, "rb").read()
+assert params.get("/Size") == len(data), params
+assert params.get("/CheckSum") == "b:" + hashlib.md5(data).hexdigest(), params
+mt = time.gmtime(int(os.path.getmtime(src)))
+expect = "u:D:%04d%02d%02d%02d%02d%02dZ" % mt[:6]
+assert params.get("/ModDate") == expect, (params.get("/ModDate"), expect)
+PYEOF
+  printf 'attachment payload for params test\n' > $TMPDIR/params.txt
+
+  run_test "attach add records mime, size, mtime and MD5 checksum" bash -c '
+    set -e
+    "'"$TSPDF"'" attach add '"$INPUT"' "'"$TMPDIR"'/params.txt" -o "'"$TMPDIR"'/att_params.pdf"
+    qpdf --check "'"$TMPDIR"'/att_params.pdf" > /dev/null
+    python3 "'"$TMPDIR"'/check_attach_params.py" "'"$TMPDIR"'/att_params.pdf" "'"$TMPDIR"'/params.txt" "text/plain"
+    "'"$TSPDF"'" attach list --json "'"$TMPDIR"'/att_params.pdf" | grep -q "\"mime\":\"text/plain\""
+    mkdir -p "'"$TMPDIR"'/att_x"
+    "'"$TSPDF"'" attach extract "'"$TMPDIR"'/att_params.pdf" --name params.txt -o "'"$TMPDIR"'/att_x"
+    cmp -s "'"$TMPDIR"'/params.txt" "'"$TMPDIR"'/att_x/params.txt"'
+
+  run_test "attach add --mime overrides the extension map" bash -c '
+    set -e
+    "'"$TSPDF"'" attach add '"$INPUT"' "'"$TMPDIR"'/params.txt" --mime application/x-custom -o "'"$TMPDIR"'/att_mime.pdf"
+    qpdf --check "'"$TMPDIR"'/att_mime.pdf" > /dev/null
+    python3 "'"$TMPDIR"'/check_attach_params.py" "'"$TMPDIR"'/att_mime.pdf" "'"$TMPDIR"'/params.txt" "application/x-custom"
+    "'"$TSPDF"'" attach list --json "'"$TMPDIR"'/att_mime.pdf" | grep -q "application/x-custom"'
+
+  # split: attachments are copied to every part by default; --no-attachments
+  # drops them from burst and --pages outputs alike.
+  run_test "split copies attachments into every part by default" bash -c '
+    set -e
+    "'"$TSPDF"'" split "'"$TMPDIR"'/att_params.pdf" -o "'"$TMPDIR"'/sp.pdf"
+    for f in "'"$TMPDIR"'/sp-001.pdf" "'"$TMPDIR"'/sp-002.pdf" "'"$TMPDIR"'/sp-003.pdf"; do
+      n=$("'"$TSPDF"'" attach list "$f" | wc -l | tr -d "[:space:]")
+      [ "$n" = "1" ]
+      qpdf --check "$f" > /dev/null
+    done'
+
+  run_test "split --no-attachments drops embedded files from every part" bash -c '
+    set -e
+    "'"$TSPDF"'" split "'"$TMPDIR"'/att_params.pdf" --no-attachments -o "'"$TMPDIR"'/spn.pdf"
+    for f in "'"$TMPDIR"'/spn-001.pdf" "'"$TMPDIR"'/spn-002.pdf" "'"$TMPDIR"'/spn-003.pdf"; do
+      n=$("'"$TSPDF"'" attach list "$f" | wc -l | tr -d "[:space:]")
+      [ "$n" = "0" ]
+      qpdf --check "$f" > /dev/null
+    done
+    "'"$TSPDF"'" split "'"$TMPDIR"'/att_params.pdf" --pages 1-2 --no-attachments -o "'"$TMPDIR"'/spp.pdf"
+    n=$("'"$TSPDF"'" attach list "'"$TMPDIR"'/spp.pdf" | wc -l | tr -d "[:space:]")
+    [ "$n" = "0" ]
+    qpdf --check "'"$TMPDIR"'/spp.pdf" > /dev/null'
+
+  # bookmark: adding to a rich outline (XYZ scroll/zoom dests, color, flags,
+  # collapse) must keep every pre-existing item byte-comparable in qpdf
+  # --json; only the new entry gets a synthesized [page /Fit] dest.
+  if [ -f tests/data/rich_outline.pdf ]; then
+    cat > $TMPDIR/check_rich_outline.py << 'PYEOF'
+import json, subprocess, sys
+before, after = sys.argv[1], sys.argv[2]
+added_titles = sys.argv[3:]
+def load(path):
+    d = json.loads(subprocess.check_output(["qpdf", "--json=2", path]))
+    sigs = []
+    def walk(items, level):
+        for it in items:
+            sigs.append((level, it["title"], it.get("destpageposfrom1"),
+                         it["dest"][1:], it["open"]))
+            walk(it.get("kids", []), level + 1)
+    walk(d["outlines"], 1)
+    style = {}
+    for v in d["qpdf"][1].values():
+        val = v.get("value") if isinstance(v, dict) else None
+        if isinstance(val, dict) and "/Title" in val and "/Parent" in val:
+            style[val["/Title"]] = (val.get("/C"), val.get("/F"),
+                                    isinstance(val.get("/Count"), int)
+                                    and val["/Count"] < 0)
+    return sigs, style
+a_sigs, a_style = load(before)
+b_sigs, b_style = load(after)
+assert b_sigs[:len(a_sigs)] == a_sigs, (a_sigs, b_sigs)
+assert len(b_sigs) == len(a_sigs) + len(added_titles), b_sigs
+assert [t[1] for t in b_sigs[len(a_sigs):]] == added_titles, b_sigs
+for k, v in a_style.items():
+    assert b_style.get(k) == v, (k, v, b_style.get(k))
+PYEOF
+    run_test "bookmark add preserves rich dests, color, flags and collapse" bash -c '
+      set -e
+      "'"$TSPDF"'" bookmark add tests/data/rich_outline.pdf --title "Appendix" --page 1 -o "'"$TMPDIR"'/rich_add.pdf"
+      qpdf --check "'"$TMPDIR"'/rich_add.pdf" > /dev/null
+      python3 "'"$TMPDIR"'/check_rich_outline.py" tests/data/rich_outline.pdf "'"$TMPDIR"'/rich_add.pdf" "Appendix"'
+
+    run_test "bookmark import --append keeps the existing outline" bash -c '
+      set -e
+      printf "1\t2\tAdded One\n2\t3\tAdded Sub\n" > "'"$TMPDIR"'/append_toc.txt"
+      "'"$TSPDF"'" bookmark import tests/data/rich_outline.pdf --from "'"$TMPDIR"'/append_toc.txt" --append -o "'"$TMPDIR"'/rich_append.pdf"
+      qpdf --check "'"$TMPDIR"'/rich_append.pdf" > /dev/null
+      n=$("'"$TSPDF"'" bookmark list "'"$TMPDIR"'/rich_append.pdf" | wc -l | tr -d "[:space:]")
+      [ "$n" = "5" ]
+      python3 "'"$TMPDIR"'/check_rich_outline.py" tests/data/rich_outline.pdf "'"$TMPDIR"'/rich_append.pdf" "Added One" "Added Sub"'
+
+    if command -v uv >/dev/null 2>&1; then
+      cat > $TMPDIR/check_rich_toc.py << 'PYEOF'
+import sys
+import pymupdf
+def toc(path):
+    out = []
+    for lvl, title, page, info in pymupdf.open(path).get_toc(simple=False):
+        info = dict(info)
+        info.pop("xref", None)  # object numbers legitimately change
+        out.append((lvl, title, page, info))
+    return out
+a = toc(sys.argv[1])
+b = toc(sys.argv[2])
+assert b[:len(a)] == a, (a, b)
+assert len(b) == len(a) + 1 and b[-1][1] == "Appendix", b
+PYEOF
+      run_test "bookmark add leaves pymupdf get_toc unchanged apart from addition" bash -c '
+        set -e
+        "'"$TSPDF"'" bookmark add tests/data/rich_outline.pdf --title "Appendix" --page 1 -o "'"$TMPDIR"'/rich_toc.pdf"
+        uv run --python 3.12 --with pymupdf python "'"$TMPDIR"'/check_rich_toc.py" tests/data/rich_outline.pdf "'"$TMPDIR"'/rich_toc.pdf"'
+    else
+      echo "  SKIP  bookmark pymupdf get_toc check (uv not found)"
+    fi
+  else
+    echo "  SKIP  bookmark rich outline tests (tests/data/rich_outline.pdf missing)"
+  fi
+
+  # stamp: --password-file/--stamp-password-file keep passwords out of argv.
+  run_test "stamp reads passwords from files" bash -c '
+    set -e
+    "'"$TSPDF"'" encrypt '"$INPUT"' -o "'"$TMPDIR"'/st_enc_in.pdf" --password insecret
+    "'"$TSPDF"'" encrypt tests/data/one_page.pdf -o "'"$TMPDIR"'/st_enc_stamp.pdf" --password stsecret
+    printf "insecret\n" > "'"$TMPDIR"'/st_pw1.txt"
+    printf "stsecret\n" > "'"$TMPDIR"'/st_pw2.txt"
+    "'"$TSPDF"'" stamp "'"$TMPDIR"'/st_enc_in.pdf" --stamp "'"$TMPDIR"'/st_enc_stamp.pdf" --password-file "'"$TMPDIR"'/st_pw1.txt" --stamp-password-file "'"$TMPDIR"'/st_pw2.txt" -o "'"$TMPDIR"'/st_out.pdf"
+    qpdf --password=insecret --check "'"$TMPDIR"'/st_out.pdf" > /dev/null'
+
+  run_test "stamp hints at --password-file on encrypted input" bash -c '
+    ! "'"$TSPDF"'" stamp "'"$TMPDIR"'/st_enc_in.pdf" --stamp tests/data/one_page.pdf -o "'"$TMPDIR"'/st_fail.pdf" < /dev/null 2> "'"$TMPDIR"'/st_err.txt"
+    grep -q "password-file" "'"$TMPDIR"'/st_err.txt"'
+else
+  echo "  SKIP  attach/split/bookmark/stamp fit-and-finish tests (qpdf or python3 not found)"
+fi
+
 # `make amalgamation` generates build/amalgamation/tspdf.{c,h} and proves them:
 # standalone -Werror compile, link + run examples/minimal.c against them, and
 # qpdf --check on the produced PDF (inside the make target, when qpdf exists).

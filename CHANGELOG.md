@@ -16,6 +16,16 @@ on 0.x, the CLI is considered stable but the low-level C API may still change.
   ICC/Indexed color, progressive JPEG input) passes through untouched.
   Without `--lossy`, compress output is unchanged. C API:
   `tspdf_reader_lossy_images`.
+- `tspdf bookmark import --append`: add the imported TOC after the existing
+  outline instead of replacing it.
+- `tspdf split --no-attachments`: drop embedded files from the outputs (by
+  default every part gets a copy of each attachment).
+- `tspdf attach add` records each file's size, modification time, an MD5
+  checksum, and a MIME type from the file extension (`--mime` overrides);
+  `attach list --json` reports the type. C API:
+  `tspdf_reader_attachment_add_ex`.
+- `tspdf stamp` accepts `--password-file` and `--stamp-password-file`, so
+  passwords for encrypted inputs and stamp files stay out of argv.
 
 ### Changed
 - Saving a document opened with a password now keeps it encrypted (same
@@ -28,6 +38,11 @@ on 0.x, the CLI is considered stable but the low-level C API may still change.
   --json` failures now emit a JSON error object instead of plain text.
 
 ### Fixed
+- `bookmark add` (and `import --append`) rewrote every existing outline entry
+  to a plain page destination; scroll position/zoom, other view types,
+  actions, colors, styles, and collapsed state are now preserved.
+- `metadata --set/--clear` silently left an XMP metadata stream stale; it now
+  prints a notice, since viewers preferring XMP may show the old values.
 - `watermark` and `pagenum` corrupted pages whose /Resources is an indirect
   reference (common in pdfTeX and PyMuPDF output): a duplicate /Resources key
   made strict viewers drop the page's fonts.

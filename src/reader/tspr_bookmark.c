@@ -222,6 +222,7 @@ static void bm_walk_level(TspdfReader *doc, TspdfParser *parser, TspdfObj *catal
         info.page_index = bm_resolve_dest(doc, parser, catalog,
                                           bm_item_dest(doc, parser, item));
         info.open = open;
+        info.node = item;   // preservation handle for TspdfBookmarkEntry.keep
         if (!bm_info_push(out, info)) return;
 
         bm_walk_level(doc, parser, catalog, tspdf_dict_get(item, "First"),
@@ -454,6 +455,49 @@ static TspdfObj *bm_dest_array(TspdfArena *a, uint32_t page_num,
     return arr;
 }
 
+// Carry a preserved item's destination and appearance keys over verbatim:
+// /Dest (any view type, explicit or named), /A actions, /C color and /F
+// flags. Indirect values are resolved and inlined (the same treatment
+// indirect /Title strings get); a value that resolves to a stream keeps the
+// original reference instead, since streams cannot be written inline.
+static TspdfError bm_copy_kept(TspdfReader *doc, TspdfParser *parser,
+                               TspdfObj *src, TspdfObj *item) {
+    static const char *const keys[] = {"Dest", "A", "C", "F"};
+    for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
+        TspdfObj *raw = tspdf_dict_get(src, keys[k]);
+        if (!raw) continue;
+        TspdfObj *val = tspdf_doctree_resolve(doc, parser, raw);
+        if (!val || val->type == TSPDF_OBJ_STREAM) val = raw;
+        TspdfError err = tspdf_obj_dict_put(item, keys[k], val, &doc->arena);
+        if (err != TSPDF_OK) return err;
+    }
+    return TSPDF_OK;
+}
+
+// Whether a preserved item was stored collapsed (negative /Count).
+static bool bm_kept_open(TspdfReader *doc, TspdfParser *parser, TspdfObj *src) {
+    TspdfObj *cnt = tspdf_doctree_resolve(doc, parser,
+                                          tspdf_dict_get(src, "Count"));
+    return !(cnt && cnt->type == TSPDF_OBJ_INT && cnt->integer < 0);
+}
+
+// Number of outline entries visible under entry `i` when it is open: each
+// direct child counts one, plus that child's own visible subtree when the
+// child is open (ISO 32000-1 Table 152 /Count semantics). Recursion depth is
+// bounded by the maximum nesting level (127).
+static int64_t bm_visible_count(const TspdfBookmarkEntry *entries,
+                                const bool *open, size_t count, size_t i) {
+    int64_t vis = 0;
+    int base = entries[i].level;
+    for (size_t j = i + 1; j < count && entries[j].level > base; j++) {
+        if (entries[j].level == base + 1) {
+            vis++;
+            if (open[j]) vis += bm_visible_count(entries, open, count, j);
+        }
+    }
+    return vis;
+}
+
 TspdfError tspdf_reader_set_bookmarks(TspdfReader *doc,
                                       const TspdfBookmarkEntry *entries,
                                       size_t count) {
@@ -464,15 +508,19 @@ TspdfError tspdf_reader_set_bookmarks(TspdfReader *doc,
     size_t npages = doc->pages.count;
 
     // Validate the flat list: levels start at 1, never jump up by >1, titles
-    // are non-empty, pages are in range.
+    // are non-empty, pages are in range. Preserved entries (keep set) take
+    // their destination from the original item, so their page_index may be
+    // SIZE_MAX (e.g. a URI action) and their title empty.
     int prev_level = 0;
     for (size_t i = 0; i < count; i++) {
         const TspdfBookmarkEntry *e = &entries[i];
         if (e->level < 1) return TSPDF_ERR_INVALID_ARG;
         if (i == 0 && e->level != 1) return TSPDF_ERR_INVALID_ARG;
         if (e->level > prev_level + 1) return TSPDF_ERR_INVALID_ARG;
-        if (!e->title || e->title[0] == '\0') return TSPDF_ERR_INVALID_ARG;
-        if (e->page_index >= npages) return TSPDF_ERR_PAGE_RANGE;
+        if (!e->title || (e->title[0] == '\0' && !e->keep)) {
+            return TSPDF_ERR_INVALID_ARG;
+        }
+        if (!e->keep && e->page_index >= npages) return TSPDF_ERR_PAGE_RANGE;
         prev_level = e->level;
     }
 
@@ -514,7 +562,13 @@ TspdfError tspdf_reader_set_bookmarks(TspdfReader *doc,
     // (or the root at level 1). Deeper stack slots are cleared when a
     // shallower entry appears so a stale deep item is never treated as parent.
     uint32_t *parent_of = (uint32_t *)malloc(count * sizeof(uint32_t));
-    if (!parent_of) { free(nums); return TSPDF_ERR_ALLOC; }
+    // open[i]: shown expanded. New entries are always open; preserved entries
+    // keep their stored collapse state (negative /Count).
+    bool *open = (bool *)malloc(count * sizeof(bool));
+    if (!parent_of || !open) {
+        free(open); free(parent_of); free(nums);
+        return TSPDF_ERR_ALLOC;
+    }
     {
         uint32_t stack[128] = {0};
         for (size_t i = 0; i < count; i++) {
@@ -523,25 +577,36 @@ TspdfError tspdf_reader_set_bookmarks(TspdfReader *doc,
             if (parent_of[i] == 0) parent_of[i] = root_num;  // defensive
             stack[L] = nums[i];
             for (int k = L + 1; k < 128; k++) stack[k] = 0;
+            open[i] = entries[i].keep
+                ? bm_kept_open(doc, &parser, (TspdfObj *)entries[i].keep)
+                : true;
         }
     }
 
-    // First pass: title, destination, and parent for every item.
+    // First pass: title, destination, and parent for every item. Preserved
+    // entries carry their original /Dest//A//C//F over verbatim; new entries
+    // get a synthesized destination.
     for (size_t i = 0; i < count && err == TSPDF_OK; i++) {
         const TspdfBookmarkEntry *e = &entries[i];
         uint32_t self = nums[i];
         TspdfObj *item = doc->new_objs.objs[self - doc->xref.count];
 
         TspdfObj *title = bm_title_obj(a, e->title);
-        uint32_t page_num = (uint32_t)doc->pages.pages[e->page_index].obj_num;
-        TspdfObj *dest = bm_dest_array(a, page_num, e->has_y, e->y);
         TspdfObj *pref = bm_obj_ref(a, parent_of[i]);
-        if (!title || !dest || !pref) { err = TSPDF_ERR_ALLOC; break; }
+        if (!title || !pref) { err = TSPDF_ERR_ALLOC; break; }
         err = tspdf_obj_dict_put(item, "Title", title, a);
-        if (err == TSPDF_OK) err = tspdf_obj_dict_put(item, "Dest", dest, a);
         if (err == TSPDF_OK) err = tspdf_obj_dict_put(item, "Parent", pref, a);
+        if (err != TSPDF_OK) break;
+        if (e->keep) {
+            err = bm_copy_kept(doc, &parser, (TspdfObj *)e->keep, item);
+        } else {
+            uint32_t page_num = (uint32_t)doc->pages.pages[e->page_index].obj_num;
+            TspdfObj *dest = bm_dest_array(a, page_num, e->has_y, e->y);
+            if (!dest) { err = TSPDF_ERR_ALLOC; break; }
+            err = tspdf_obj_dict_put(item, "Dest", dest, a);
+        }
     }
-    if (err != TSPDF_OK) { free(parent_of); free(nums); return err; }
+    if (err != TSPDF_OK) { free(open); free(parent_of); free(nums); return err; }
 
     // Second pass: wire /Prev//Next (same-parent siblings) and
     // /First//Last//Count (children whose parent is this entry).
@@ -571,22 +636,21 @@ TspdfError tspdf_reader_set_bookmarks(TspdfReader *doc,
         if (err != TSPDF_OK) break;
 
         // Children: first and last entries whose parent is `self`, plus the
-        // count of visible descendants (all descendants, since every item we
-        // write is open).
+        // number of descendants visible when this item is open. A collapsed
+        // item stores that count negated (ISO 32000-1 Table 152).
         size_t first_child = count, last_child = count;
-        int64_t descendants = 0;
         for (size_t j = i + 1; j < count; j++) {
             if (entries[j].level <= entries[i].level) break;  // left the subtree
-            descendants++;
             if (parent_of[j] == self) {
                 if (first_child == count) first_child = j;
                 last_child = j;
             }
         }
         if (first_child != count) {
+            int64_t vis = bm_visible_count(entries, open, count, i);
             TspdfObj *fref = bm_obj_ref(a, nums[first_child]);
             TspdfObj *lref = bm_obj_ref(a, nums[last_child]);
-            TspdfObj *cnt = bm_obj_int(a, descendants);
+            TspdfObj *cnt = bm_obj_int(a, open[i] ? vis : -vis);
             if (!fref || !lref || !cnt) { err = TSPDF_ERR_ALLOC; break; }
             err = tspdf_obj_dict_put(item, "First", fref, a);
             if (err == TSPDF_OK) err = tspdf_obj_dict_put(item, "Last", lref, a);
@@ -595,21 +659,27 @@ TspdfError tspdf_reader_set_bookmarks(TspdfReader *doc,
     }
 
     free(parent_of);
-    if (err != TSPDF_OK) { free(nums); return err; }
+    if (err != TSPDF_OK) { free(open); free(nums); return err; }
 
-    // Build the /Outlines root over the top-level items.
+    // Build the /Outlines root over the top-level items. Its /Count is the
+    // total number of visible items: every top-level entry plus the visible
+    // subtrees of the open ones (collapsed subtrees stay hidden).
     size_t top_first = count, top_last = count;
+    int64_t top_visible = 0;
     for (size_t i = 0; i < count; i++) {
         if (entries[i].level == 1) {
             if (top_first == count) top_first = i;
             top_last = i;
+            top_visible += 1;
+            if (open[i]) top_visible += bm_visible_count(entries, open, count, i);
         }
     }
+    free(open);
     TspdfObj *root = doc->new_objs.objs[root_num - doc->xref.count];
     TspdfObj *type = bm_obj_name(a, "Outlines");
     TspdfObj *fref = bm_obj_ref(a, nums[top_first]);
     TspdfObj *lref = bm_obj_ref(a, nums[top_last]);
-    TspdfObj *cnt = bm_obj_int(a, (int64_t)count);  // all items open/visible
+    TspdfObj *cnt = bm_obj_int(a, top_visible);
     if (!type || !fref || !lref || !cnt) { free(nums); return TSPDF_ERR_ALLOC; }
     err = tspdf_obj_dict_put(root, "Type", type, a);
     if (err == TSPDF_OK) err = tspdf_obj_dict_put(root, "First", fref, a);
