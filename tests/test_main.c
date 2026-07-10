@@ -15,6 +15,7 @@
 #include "../src/pdf/tspdf_writer.h"
 #include "../src/tspdf_error.h"
 #include "../src/qr/qr_encode.h"
+#include "../src/util/pdfdate.h"
 
 // ============================================================
 // TspdfBuffer tests
@@ -2592,6 +2593,88 @@ TEST(test_qr_golden_grids) {
 }
 
 // ============================================================
+// PDF date formatting
+// ============================================================
+
+// Expect `raw` to parse and format exactly as `want`.
+static void expect_pdf_date(const char *raw, const char *want) {
+    char out[64];
+    if (!tspdf_format_pdf_date(raw, out, sizeof(out))) {
+        printf("FAIL\n    pdf date \"%s\": parser rejected it\n", raw);
+        tests_failed++;
+        _test_failed = true;
+        return;
+    }
+    if (strcmp(out, want) != 0) {
+        printf("FAIL\n    pdf date \"%s\": got \"%s\" want \"%s\"\n",
+               raw, out, want);
+        tests_failed++;
+        _test_failed = true;
+    }
+}
+
+TEST(test_pdf_date_full_forms) {
+    expect_pdf_date("D:20131031140150+04'00'", "2013-10-31 14:01:50 +04:00");
+    expect_pdf_date("D:20131031140150-08'00'", "2013-10-31 14:01:50 -08:00");
+    expect_pdf_date("D:20131031140150Z", "2013-10-31 14:01:50 UTC");
+    expect_pdf_date("D:20131031140150", "2013-10-31 14:01:50");
+    // The D: prefix is recommended but not required by the spec.
+    expect_pdf_date("20131031140150Z", "2013-10-31 14:01:50 UTC");
+}
+
+TEST(test_pdf_date_partial_fields_default) {
+    // Every field after the year is optional and defaults per the spec.
+    expect_pdf_date("D:2013", "2013-01-01 00:00:00");
+    expect_pdf_date("D:201310", "2013-10-01 00:00:00");
+    expect_pdf_date("D:20131031", "2013-10-31 00:00:00");
+    expect_pdf_date("D:2013103114", "2013-10-31 14:00:00");
+    expect_pdf_date("D:201310311401", "2013-10-31 14:01:00");
+    // Missing seconds with a zone.
+    expect_pdf_date("D:201310311401+04'00'", "2013-10-31 14:01:00 +04:00");
+}
+
+TEST(test_pdf_date_odd_zones) {
+    // Zone hour without minutes; with unterminated minutes; without the
+    // spec's apostrophes entirely (+HHMM, a common producer malformation).
+    expect_pdf_date("D:20131031140150+04'", "2013-10-31 14:01:50 +04:00");
+    expect_pdf_date("D:20131031140150+04", "2013-10-31 14:01:50 +04:00");
+    expect_pdf_date("D:20131031140150+04'30", "2013-10-31 14:01:50 +04:30");
+    expect_pdf_date("D:20131031140150-0530", "2013-10-31 14:01:50 -05:30");
+}
+
+TEST(test_pdf_date_garbage_rejected) {
+    char out[64];
+    static const char *bad[] = {
+        "",
+        "D:",
+        "D:13",                        // 2-digit year
+        "D:2013103",                   // dangling half field
+        "D:20131031140150+",           // sign without hours
+        "D:20131031140150+4'00'",      // 1-digit zone hour
+        "D:20131031140150+25'00'",     // zone hour out of range
+        "D:20131399140150",            // month 13, day 99
+        "D:20131031246099",            // hour 24, second 99
+        "D:20131031140150Zjunk",       // trailing garbage after Z
+        "D:20131031140150+04'00'x",    // trailing garbage after zone
+        "not a date",
+        "D:yyyymmdd",
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        if (tspdf_format_pdf_date(bad[i], out, sizeof(out))) {
+            printf("FAIL\n    pdf date \"%s\": accepted (got \"%s\"), "
+                   "expected rejection\n", bad[i], out);
+            tests_failed++;
+            _test_failed = true;
+            return;
+        }
+    }
+    // Output buffer too small must fail rather than truncate silently.
+    char tiny[8];
+    ASSERT(!tspdf_format_pdf_date("D:20131031140150Z", tiny, sizeof(tiny)));
+    ASSERT(!tspdf_format_pdf_date(NULL, out, sizeof(out)));
+}
+
+// ============================================================
 // Main
 // ============================================================
 
@@ -2741,6 +2824,12 @@ int main(void) {
 
     printf("\n  Save-to-memory byte identity (wasm):\n");
     RUN(test_writer_save_to_memory_matches_file);
+
+    printf("\n  PDF date formatting:\n");
+    RUN(test_pdf_date_full_forms);
+    RUN(test_pdf_date_partial_fields_default);
+    RUN(test_pdf_date_odd_zones);
+    RUN(test_pdf_date_garbage_rejected);
 
     printf("\n  QR encoder:\n");
     RUN(test_qr_ecc_table_consistent);

@@ -1,11 +1,23 @@
 #include "commands.h"
 #include "../include/tspdf.h"
+#include "../src/util/pdfdate.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 static void print_field(const char *label, const char *value) {
     if (value) printf("%-16s%s\n", label, value);
+}
+
+// Dates print human-readable ("2013-10-31 14:01:50 +04:00"); a value that
+// is not a well-formed PDF date prints as-is.
+static void print_date_field(const char *label, const char *value) {
+    if (!value) return;
+    char human[64];
+    if (tspdf_format_pdf_date(value, human, sizeof(human)))
+        printf("%-16s%s\n", label, human);
+    else
+        printf("%-16s%s\n", label, value);
 }
 
 int cmd_metadata(int argc, char **argv) {
@@ -51,8 +63,8 @@ int cmd_metadata(int argc, char **argv) {
         print_field("Keywords:", tspdf_reader_get_keywords(doc));
         print_field("Creator:", tspdf_reader_get_creator(doc));
         print_field("Producer:", tspdf_reader_get_producer(doc));
-        print_field("Created:", tspdf_reader_get_creation_date(doc));
-        print_field("Modified:", tspdf_reader_get_mod_date(doc));
+        print_date_field("Created:", tspdf_reader_get_creation_date(doc));
+        print_date_field("Modified:", tspdf_reader_get_mod_date(doc));
         tspdf_reader_destroy(doc);
         return 0;
     }
