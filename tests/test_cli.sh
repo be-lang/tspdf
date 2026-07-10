@@ -88,6 +88,118 @@ run_test "info flags absent outlines and AcroForm" bash -c "
   echo \"\$out\" | grep -qE '^Outlines:[[:space:]]+no$'
   echo \"\$out\" | grep -qE '^AcroForm:[[:space:]]+no$'"
 
+# info: encryption permissions, JSON error objects, CropBox (needs python3 for
+# JSON validation and for crafting fixtures)
+if command -v python3 > /dev/null 2>&1; then
+  # Encrypted fixture allowing only print and copy: /P = 0xFFFFF0C0 | bit3 |
+  # bit5 = 0xFFFFF0D4 = -3884 as the signed value written to the file.
+  $TSPDF encrypt $INPUT -o $TMPDIR/enc_perm.pdf --password pw --permissions print,copy > /dev/null 2>&1
+
+  run_test "info text reports permissions on encrypted file" bash -c "
+    $TSPDF info --password pw $TMPDIR/enc_perm.pdf | grep -qE '^Permissions:[[:space:]]+print, copy \(P=-3884\)$'"
+
+  cat > $TMPDIR/check_info_perms.py << 'PYEOF'
+import json, sys
+d = json.load(sys.stdin)
+assert d["encrypted"] is True, d
+assert d["permissions"] == ["print", "copy"], d.get("permissions")
+assert d["permissions_raw"] == -3884, d.get("permissions_raw")
+PYEOF
+  run_test "info --json reports permissions on encrypted file" bash -c "
+    $TSPDF info --json --password pw $TMPDIR/enc_perm.pdf | python3 $TMPDIR/check_info_perms.py"
+
+  run_test "info --json permissions are null when unencrypted" bash -c "
+    $TSPDF info --json $INPUT | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d[\"permissions\"] is None and d[\"permissions_raw\"] is None'"
+
+  if command -v qpdf > /dev/null 2>&1; then
+    # Semantics cross-check: qpdf decodes the same /P bits (copy = qpdf's
+    # \"extract for any purpose\", extract = \"extract for accessibility\").
+    run_test "info permissions agree with qpdf --show-encryption" bash -c "
+      set -e
+      out=\$(qpdf --password=pw --show-encryption $TMPDIR/enc_perm.pdf)
+      echo \"\$out\" | grep -q -- 'P = -3884'
+      echo \"\$out\" | grep -q 'print low resolution: allowed'
+      echo \"\$out\" | grep -q 'extract for any purpose: allowed'
+      echo \"\$out\" | grep -q 'extract for accessibility: not allowed'
+      echo \"\$out\" | grep -q 'modify other: not allowed'
+      echo \"\$out\" | grep -q 'modify annotations: not allowed'"
+  fi
+
+  run_test "info --json wrong password emits JSON error with nonzero exit" bash -c "
+    out=\$($TSPDF info --json --password wrong $TMPDIR/enc_perm.pdf 2>/dev/null); rc=\$?
+    [ \$rc -ne 0 ] || exit 1
+    echo \"\$out\" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert \"error\" in d and d[\"encrypted\"] is True'"
+
+  run_test "info --json missing file emits JSON error with nonzero exit" bash -c "
+    out=\$($TSPDF info --json $TMPDIR/no_such_file.pdf 2>/dev/null); rc=\$?
+    [ \$rc -ne 0 ] || exit 1
+    echo \"\$out\" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert \"error\" in d'"
+
+  run_test "info --json missing input argument emits JSON error" bash -c "
+    out=\$($TSPDF info --json 2>/dev/null); rc=\$?
+    [ \$rc -ne 0 ] || exit 1
+    echo \"\$out\" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert \"error\" in d'"
+
+  run_test "info shows CropBox when present" bash -c "
+    set -e
+    $TSPDF crop $INPUT -o $TMPDIR/cropped_info.pdf --box 100,100,400,500 > /dev/null
+    $TSPDF info $TMPDIR/cropped_info.pdf | grep -q 'CropBox 300.0 x 400.0 pt'"
+
+  run_test "info --json reports crop_sizes" bash -c "
+    $TSPDF info --json $TMPDIR/cropped_info.pdf | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d[\"crop_sizes\"] == [300.0, 400.0], d[\"crop_sizes\"]'"
+
+  run_test "info --json crop_sizes null when no CropBox" bash -c "
+    $TSPDF info --json $INPUT | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d[\"crop_sizes\"] is None'"
+fi
+
+# scale: /Rotate-aware orientation, verified by actual rendering dimensions.
+# A portrait-stored page with /Rotate 90 is VIEWED landscape; scaling --to a4
+# must keep the viewed orientation (a4 landscape), not flip it to portrait.
+if command -v python3 > /dev/null 2>&1 && command -v pdftoppm > /dev/null 2>&1; then
+  python3 - $TMPDIR/rot90.pdf << 'PYEOF'
+import sys
+objs = [
+    b'<< /Type /Catalog /Pages 2 0 R >>',
+    b'<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    b'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Rotate 90 /Contents 4 0 R >>',
+]
+content = b'0 0 100 50 re f\n50 700 200 60 re f\n'
+out = bytearray(b'%PDF-1.4\n')
+offs = []
+for i, body in enumerate(objs, 1):
+    offs.append(len(out))
+    out += (b'%d 0 obj\n' % i) + body + b'\nendobj\n'
+offs.append(len(out))
+out += b'4 0 obj\n<< /Length %d >>\nstream\n' % len(content) + content + b'endstream\nendobj\n'
+xref = len(out)
+n = len(offs) + 1
+out += b'xref\n0 %d\n' % n + b'0000000000 65535 f \n'
+for o in offs:
+    out += b'%010d 00000 n \n' % o
+out += b'trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n' % (n, xref)
+open(sys.argv[1], 'wb').write(bytes(out))
+PYEOF
+  cat > $TMPDIR/check_png_dims.py << 'PYEOF'
+import struct, sys
+w, h = struct.unpack(">II", open(sys.argv[1], "rb").read()[16:24])
+ew, eh = int(sys.argv[2]), int(sys.argv[3])
+assert abs(w - ew) <= 1 and abs(h - eh) <= 1, (w, h, ew, eh)
+PYEOF
+  run_test "scale --to a4 keeps a /Rotate 90 page viewed landscape" bash -c "
+    set -e
+    pdftoppm -r 72 -png $TMPDIR/rot90.pdf $TMPDIR/rot90_src
+    python3 $TMPDIR/check_png_dims.py $TMPDIR/rot90_src-1.png 792 612
+    $TSPDF scale $TMPDIR/rot90.pdf -o $TMPDIR/rot90_a4.pdf --to a4 > /dev/null
+    pdftoppm -r 72 -png $TMPDIR/rot90_a4.pdf $TMPDIR/rot90_a4
+    python3 $TMPDIR/check_png_dims.py $TMPDIR/rot90_a4-1.png 842 595"
+
+  run_test "scale --to a4 keeps portrait pages portrait" bash -c "
+    set -e
+    $TSPDF scale $INPUT -o $TMPDIR/portrait_a4.pdf --to a4 > /dev/null
+    pdftoppm -r 72 -png -f 1 -l 1 $TMPDIR/portrait_a4.pdf $TMPDIR/portrait_a4
+    python3 $TMPDIR/check_png_dims.py $TMPDIR/portrait_a4-1.png 595 842"
+fi
+
 # split
 run_test "split pages 1-2" $TSPDF split $INPUT --pages 1-2 -o $TMPDIR/split.pdf
 run_test "split result has exactly 2 pages (info output)" bash -c "$TSPDF info $TMPDIR/split.pdf | grep -qE '^Pages:[[:space:]]*2$'"

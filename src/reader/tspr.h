@@ -60,6 +60,8 @@ typedef struct {
     uint32_t obj_num;
     TspdfObj *page_dict;
     double media_box[4];    // [x0, y0, x1, y1]
+    double crop_box[4];     // [x0, y0, x1, y1]; only valid when has_crop_box
+    bool has_crop_box;      // page has an own or inherited /CropBox
     double user_unit;       // page user-space scale factor, default 1.0
     int rotate;             // 0, 90, 180, 270
 } TspdfReaderPage;
@@ -89,6 +91,13 @@ const char *tspdf_reader_pdf_version(const TspdfReader *doc);
 // or "AES-256"; *revision is the /R value (2-6).
 bool tspdf_reader_encryption_info(const TspdfReader *doc, int *revision,
                                   const char **algorithm);
+
+// The raw /P user-access permission flags of an encrypted document, as stored
+// in the encryption dictionary (bit positions per ISO 32000-1 Table 22; print
+// it as a signed 32-bit value to match what the file and other tools show).
+// Returns false (output untouched) if the document is not encrypted.
+bool tspdf_reader_encryption_permissions(const TspdfReader *doc,
+                                         uint32_t *permissions);
 
 // Catalog presence flags: document outline (bookmarks) and AcroForm.
 bool tspdf_reader_has_outlines(const TspdfReader *doc);
@@ -137,11 +146,13 @@ TspdfReader *tspdf_reader_scale(TspdfReader *doc, const size_t *pages,
 
 // Resize the given pages to a target media size (target_w x target_h, in
 // points). Each page's content is uniformly scaled to fit the target while
-// preserving aspect ratio and centered, and the /MediaBox becomes
-// [0 0 target_w target_h]; any /CropBox is dropped (it no longer applies).
-// For a page whose /Rotate is 90 or 270 the target dimensions are matched in
-// the viewed orientation, so the page still fits upright. Non-positive target
-// dimensions yield TSPDF_ERR_INVALID_ARG. Returns a new document.
+// preserving aspect ratio and centered; any /CropBox is dropped (it no
+// longer applies). The page as VIEWED (i.e. after applying /Rotate, which is
+// kept) becomes the target size oriented to match the source's viewed
+// orientation: a page viewed landscape comes out target-landscape, a page
+// viewed portrait comes out target-portrait, so orientation is preserved and
+// content is never clipped. Non-positive target dimensions yield
+// TSPDF_ERR_INVALID_ARG. Returns a new document.
 TspdfReader *tspdf_reader_resize_to(TspdfReader *doc, const size_t *pages,
                                     size_t count, double target_w, double target_h,
                                     TspdfError *err);
