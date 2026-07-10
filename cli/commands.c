@@ -125,6 +125,7 @@ static const char *const VALUE_FLAGS[] = {
     "--text",
     "--opacity",
     "--set",
+    "--clear",
     "--title",
     "--subtitle",
     "--port",

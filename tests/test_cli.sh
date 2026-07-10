@@ -155,6 +155,31 @@ run_test "metadata set" $TSPDF metadata $INPUT --set title="Test Title" --set au
 run_test "metadata flag-first ordering (-o/--set before input)" $TSPDF metadata -o $TMPDIR/meta_ff.pdf --set title="FF" $INPUT
 run_test "metadata flag-first applied the title" bash -c "$TSPDF metadata $TMPDIR/meta_ff.pdf | grep -qi 'FF'"
 
+# metadata --set producer and --clear
+run_test "metadata set producer" bash -c "
+  set -e
+  $TSPDF metadata $INPUT --set producer='Custom Producer' -o $TMPDIR/meta_prod.pdf > /dev/null
+  $TSPDF metadata $TMPDIR/meta_prod.pdf | grep -q '^Producer:.*Custom Producer'"
+run_test "metadata clear title removes the field" bash -c "
+  set -e
+  $TSPDF metadata $TMPDIR/meta.pdf --clear title -o $TMPDIR/meta_noclear.pdf > /dev/null
+  ! $TSPDF metadata $TMPDIR/meta_noclear.pdf | grep -q '^Title:'"
+run_test "metadata clear rejects unknown keys" bash -c "! $TSPDF metadata $INPUT --clear bogus -o $TMPDIR/meta_bad.pdf > /dev/null 2>&1"
+run_test "metadata clear requires -o" bash -c "! $TSPDF metadata $INPUT --clear title > /dev/null 2>&1"
+if command -v qpdf > /dev/null 2>&1; then
+  # Verify against the actual Info dict through qpdf --qdf, not just our
+  # own view path: set producer must survive the writer's update_producer
+  # default, and a cleared title must be absent from the dict.
+  run_test "metadata set/clear verified via qpdf --qdf" bash -c "
+    set -e
+    $TSPDF metadata $TMPDIR/meta.pdf --set producer='Oracle Producer' --clear title -o $TMPDIR/meta_qdf.pdf > /dev/null
+    qpdf --qdf $TMPDIR/meta_qdf.pdf $TMPDIR/meta_qdf.qdf
+    grep -aq '/Producer (Oracle Producer)' $TMPDIR/meta_qdf.qdf
+    ! grep -aq '/Title' $TMPDIR/meta_qdf.qdf"
+else
+  echo "  SKIP  metadata qpdf --qdf assertions (qpdf not found)"
+fi
+
 # metadata prints PDF dates human-readable (D:YYYYMMDDHHmmSS -> ISO-ish);
 # meta.pdf just got a fresh ModDate from the --set save above.
 run_test "metadata prints dates human-readable" bash -c "$TSPDF metadata $TMPDIR/meta.pdf | grep -qE '^Modified:[[:space:]]+[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\$'"
