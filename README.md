@@ -21,6 +21,9 @@ make install PREFIX=~/.local        # user-local; or `sudo make install` for /us
 
 Or grab a prebuilt binary from the [releases](https://github.com/be-lang/tspdf/releases) page.
 
+With Homebrew: `brew install be-lang/tap/tspdf`. On Arch, build the
+[PKGBUILD](packaging/aur/PKGBUILD) with `makepkg -si`.
+
 Uninstall with `make uninstall PREFIX=~/.local`.
 
 ## Command line
