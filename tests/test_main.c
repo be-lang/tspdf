@@ -2347,39 +2347,50 @@ TEST(test_writer_save_to_memory_matches_file) {
 // QR encoder
 // ============================================================
 
-// Byte-mode character capacity at level M per ISO/IEC 18004 Table 7,
+// Byte-mode character capacity per level per ISO/IEC 18004 Table 7,
 // cross-checked against segno at dev time (the smallest version segno
 // picks for a payload of exactly this length is the same version).
-static const int qr_expected_char_capacity[] = {
-    0, 14, 26, 42, 62, 84, 106, 122, 152, 180, 213, 251,
+static const int qr_expected_char_capacity[4][12] = {
+    [QR_EC_L] = {0, 17, 32, 53, 78, 106, 134, 154, 192, 230, 271, 321},
+    [QR_EC_M] = {0, 14, 26, 42, 62, 84, 106, 122, 152, 180, 213, 251},
+    [QR_EC_Q] = {0, 11, 20, 32, 46, 60, 74, 86, 108, 130, 151, 177},
+    [QR_EC_H] = {0, 7, 14, 24, 34, 44, 58, 64, 84, 98, 119, 137},
 };
 
 TEST(test_qr_ecc_table_consistent) {
-    // Every row of the level-M block table must satisfy
+    // Every row of every level's block table must satisfy
     // blocks x (data + ec) == total codewords for the version, and the
     // derived character capacity must match ISO 18004 Table 7.
     ASSERT(qr_max_version() >= 10);
     ASSERT(qr_max_version() + 1 <=
-           (int)(sizeof(qr_expected_char_capacity) / sizeof(int)));
-    for (int v = 1; v <= qr_max_version(); v++) {
-        int total, ec, b1, d1, b2, d2;
-        ASSERT_EQ_INT(qr_ecc_block_info(v, &total, &ec, &b1, &d1, &b2, &d2), 0);
-        ASSERT(b1 >= 1);
-        ASSERT_EQ_INT(b1 * (d1 + ec) + b2 * (d2 + ec), total);
-        // Group 2 blocks, when present, carry exactly one more data codeword.
-        if (b2 > 0) ASSERT_EQ_INT(d2, d1 + 1);
-        // Total codewords for a version is fixed by the module count:
-        // it must match the ISO totals independent of the block split.
-        static const int totals[] = {0, 26, 44, 70, 100, 134, 172,
-                                     196, 242, 292, 346, 404};
-        ASSERT_EQ_INT(total, totals[v]);
-        int data_cw = b1 * d1 + b2 * d2;
-        int cc_bits = (v <= 9) ? 8 : 16;
-        int capacity = (data_cw * 8 - 4 - cc_bits) / 8;
-        ASSERT_EQ_INT(capacity, qr_expected_char_capacity[v]);
+           (int)(sizeof(qr_expected_char_capacity[0]) / sizeof(int)));
+    static const QrEcLevel levels[] = {QR_EC_L, QR_EC_M, QR_EC_Q, QR_EC_H};
+    for (size_t li = 0; li < 4; li++) {
+        QrEcLevel level = levels[li];
+        for (int v = 1; v <= qr_max_version(); v++) {
+            int total, ec, b1, d1, b2, d2;
+            ASSERT_EQ_INT(qr_ecc_block_info(v, level, &total, &ec, &b1, &d1,
+                                            &b2, &d2), 0);
+            ASSERT(b1 >= 1);
+            ASSERT_EQ_INT(b1 * (d1 + ec) + b2 * (d2 + ec), total);
+            // Group 2 blocks, when present, carry exactly one more data
+            // codeword.
+            if (b2 > 0) ASSERT_EQ_INT(d2, d1 + 1);
+            // Total codewords for a version is fixed by the module count:
+            // it must match the ISO totals independent of the block split.
+            static const int totals[] = {0, 26, 44, 70, 100, 134, 172,
+                                         196, 242, 292, 346, 404};
+            ASSERT_EQ_INT(total, totals[v]);
+            int data_cw = b1 * d1 + b2 * d2;
+            int cc_bits = (v <= 9) ? 8 : 16;
+            int capacity = (data_cw * 8 - 4 - cc_bits) / 8;
+            ASSERT_EQ_INT(capacity, qr_expected_char_capacity[level][v]);
+        }
     }
-    ASSERT_EQ_INT(qr_ecc_block_info(0, 0, 0, 0, 0, 0, 0), -1);
-    ASSERT_EQ_INT(qr_ecc_block_info(qr_max_version() + 1, 0, 0, 0, 0, 0, 0), -1);
+    ASSERT_EQ_INT(qr_ecc_block_info(0, QR_EC_M, 0, 0, 0, 0, 0, 0), -1);
+    ASSERT_EQ_INT(qr_ecc_block_info(qr_max_version() + 1, QR_EC_M,
+                                    0, 0, 0, 0, 0, 0), -1);
+    ASSERT_EQ_INT(qr_ecc_block_info(1, (QrEcLevel)4, 0, 0, 0, 0, 0, 0), -1);
 }
 
 TEST(test_qr_rs_known_vector) {
@@ -2421,40 +2432,60 @@ TEST(test_qr_version_info_bits) {
 }
 
 TEST(test_qr_version_selection_boundaries) {
-    // Smallest version is chosen by the byte-mode character capacity at M.
-    struct { int len; int size; } cases[] = {
-        {14, 21},   // v1 max
-        {15, 25},   // spills to v2
-        {42, 29},   // v3 max
-        {43, 33},   // spills to v4
-        {213, 57},  // v10 max
-        {214, 61},  // spills to v11
-        {251, 61},  // v11 max
+    // Smallest version is chosen by the byte-mode character capacity at
+    // the requested level (default M).
+    struct { int len; int size; QrEcLevel level; } cases[] = {
+        {14, 21, QR_EC_M},   // v1 max
+        {15, 25, QR_EC_M},   // spills to v2
+        {42, 29, QR_EC_M},   // v3 max
+        {43, 33, QR_EC_M},   // spills to v4
+        {213, 57, QR_EC_M},  // v10 max
+        {214, 61, QR_EC_M},  // spills to v11
+        {251, 61, QR_EC_M},  // v11 max
+        {17, 21, QR_EC_L},   // v1 max at L (more room than M)
+        {18, 25, QR_EC_L},   // spills to v2
+        {321, 61, QR_EC_L},  // v11 max at L
+        {11, 21, QR_EC_Q},   // v1 max at Q
+        {12, 25, QR_EC_Q},   // spills to v2
+        {7, 21, QR_EC_H},    // v1 max at H (least room)
+        {8, 25, QR_EC_H},    // spills to v2
+        {137, 61, QR_EC_H},  // v11 max at H
     };
-    char buf[300];
+    char buf[400];
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         memset(buf, 'a', (size_t)cases[i].len);
         buf[cases[i].len] = '\0';
-        QrCode *qr = qr_encode(buf);
+        QrCode *qr = qr_encode_level(buf, cases[i].level);
         ASSERT(qr != NULL);
         ASSERT_EQ_INT(qr->size, cases[i].size);
         qr_free(qr);
     }
     memset(buf, 'a', 252);
     buf[252] = '\0';
-    ASSERT(qr_encode(buf) == NULL);  // beyond v11 capacity
+    ASSERT(qr_encode(buf) == NULL);   // beyond v11 capacity at M
+    memset(buf, 'a', 138);
+    buf[138] = '\0';
+    ASSERT(qr_encode_level(buf, QR_EC_H) == NULL);  // beyond v11 at H
+    memset(buf, 'a', 322);
+    buf[322] = '\0';
+    ASSERT(qr_encode_level(buf, QR_EC_L) == NULL);  // beyond v11 at L
+    ASSERT(qr_encode_level("x", (QrEcLevel)4) == NULL);  // bad level
 }
 
 /*
  * Golden module grids. Each row is a bitmap with bit c = column c
- * (1 = dark). Generated from this encoder after the correctness fixes and
- * decode-verified with OpenCV (cv2.QRCodeDetector) at dev time: every grid
- * below decoded back to its exact payload. They pin the whole pipeline —
- * version selection, data encoding, RS interleaving, matrix layout, format
- * and version info, mask choice — so any behavior change shows up here.
+ * (1 = dark). Generated from this encoder and decode-verified at dev time
+ * (OpenCV cv2.QRCodeDetector for the level-M grids, zxing-cpp for the
+ * L/H grids): every grid below decoded back to its exact payload. In
+ * addition, full-capacity payloads at every version and level were
+ * byte-identical to segno's canonical matrices. The grids pin the whole
+ * pipeline — version selection, data encoding, RS interleaving, matrix
+ * layout, format and version info, mask choice — so any behavior change
+ * shows up here.
  */
 typedef struct {
     const char *payload;
+    QrEcLevel level;
     int size;
     const uint64_t rows[61];
 } QrGolden;
@@ -2462,13 +2493,13 @@ typedef struct {
 static const QrGolden qr_goldens[] = {
     { /* len 10, version 1 */
       "https://ex",
-      21,
+      QR_EC_M, 21,
         { 0x1fc37f, 0x105141, 0x174a5d, 0x17555d, 0x17465d, 0x104641, 0x1fd57f, 0x500,
           0x1a44ed, 0x1ff792, 0x1a31cc, 0xa90b3, 0x134cc1, 0x16100, 0x1017f, 0x17b941,
           0x52e5d, 0x8e55d, 0x48f5d, 0x11d841, 0x73d7f } },
     { /* len 30, version 3 */
       "https://example.org/p/abcdefgh",
-      29,
+      QR_EC_M, 29,
         { 0x1fcd387f, 0x105bd141, 0x1749785d, 0x1744e65d, 0x175c555d, 0x10482241,
           0x1fd5557f, 0xb6600, 0x902d855, 0x1252c03b, 0x1dc62262, 0x9369914,
           0x1a7b0ed3, 0x1263a0b4, 0x1ba1de7d, 0xab37996, 0x1a72ced0, 0x1672cca2,
@@ -2476,7 +2507,7 @@ static const QrGolden qr_goldens[] = {
           0x9f3c95d, 0x532ce5d, 0x138b295d, 0x85ec041, 0x199bd17f } },
     { /* len 60, version 4 */
       "https://example.org/p/abcdefghijabcdefghijabcdefghijabcdefgh",
-      33,
+      QR_EC_M, 33,
         { 0x1fcad2e7f, 0x10505f841, 0x17561235d, 0x17542d75d, 0x1749ea55d, 0x105628341,
           0x1fd55557f, 0x1a88f00, 0x7c5a687d, 0x16cbd198c, 0xd2769ef4, 0xf63d5c1c,
           0x3bca8ef3, 0x1c4bd5d85, 0x9e75a0ef, 0x67610799, 0x11b0afdf6, 0x16cad730c,
@@ -2486,7 +2517,7 @@ static const QrGolden qr_goldens[] = {
     { /* len 116, version 7 */
       "https://example.org/p/abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij"
       "abcdefghijabcdefghijabcdefghijabcd",
-      45,
+      QR_EC_M, 45,
         { 0x1fd26229c47f, 0x10499dd8bc41, 0x174b5c0c555d, 0x1758a577d35d,
           0x175c6bf8cd5d, 0x10429d12ab41, 0x1fd55555557f, 0x17f107500, 0x7c0cffb907d,
           0x1919f30d1235, 0x8f4072f5df0, 0x7a77d02728c, 0x1002e3ee715d, 0x143962404280,
@@ -2500,7 +2531,7 @@ static const QrGolden qr_goldens[] = {
     { /* len 150, version 8 */
       "https://example.org/p/abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij"
       "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefgh",
-      49,
+      QR_EC_M, 49,
         { 0x1fd107a0e4c7f, 0x105c69c6bd041, 0x175853a71d35d, 0x174bea5a8535d,
           0x17438e7e25d5d, 0x104468c481141, 0x1fd555555557f, 0x1a31c40b900,
           0x7ddec7f29a7d, 0x639f30882b4, 0x191d68dec00c4, 0x90a77a01288f,
@@ -2518,7 +2549,7 @@ static const QrGolden qr_goldens[] = {
       "https://example.org/p/abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij"
       "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij"
       "abcdefghijabcdefghijabcdefghijabcdefgh",
-      57,
+      QR_EC_M, 57,
         { 0x1fcee38fbebf07f, 0x104a9c7050cfe41, 0x174f1e2ddda115d, 0x1748c7e02112d5d,
           0x17487a0fdff3d5d, 0x104787e47abe741, 0x1fd55555555557f, 0x1581471db100,
           0x7c0e38fc3dc27d, 0x1639f29f1858093, 0xcdc0d68d467c7c, 0xfbf7a16268663a,
@@ -2541,7 +2572,7 @@ static const QrGolden qr_goldens[] = {
       "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij"
       "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij"
       "abcdefgh",
-      61,
+      QR_EC_M, 61,
         { 0x1fdb8f2965949e7f, 0x1059e056a8fe1a41, 0x175c15c0e599d55d,
           0x1757e81b1be8515d, 0x174f17a1f55f3f5d, 0x1045f05718d34141,
           0x1fd555555555557f, 0x1c53a315431b00, 0x7d9ea5ff279da7d, 0x7e28e396c362480,
@@ -2562,12 +2593,48 @@ static const QrGolden qr_goldens[] = {
           0x1ffde01bfa0c9ccf, 0x3131f391db02d00, 0x1d5568c753ed687f,
           0x11015c115977f41, 0x1ffbca39fa5d5f5d, 0x117a8e39fdd1ad5d,
           0x12e570569bfd0f5d, 0x10f877c11f842641, 0x1c05ac5ee25b9d7f } },
+    { /* len 230, level L, version 9 (2x116 data codewords per block — the
+       * largest blocks in the supported range; they would have overflowed
+       * the level-M-era 64-byte block buffers). */
+      "https://example.org/p/abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij"
+      "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij"
+      "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefgh",
+      QR_EC_L, 53,
+        { 0x1fc6a97be8507f, 0x104e5f06b74b41, 0x1749c363f68c5d, 0x17565c8c17bd5d,
+          0x174620ffe8485d, 0x1045d691652741, 0x1fd5555555557f, 0xda751ae0e00,
+          0xab03aff17b5df, 0x150f20f9684a93, 0xe8df042fc57e, 0xa61817bd0bd33,
+          0xdb43aa417becd, 0x188eb87de842b2, 0x7f1d6807dba7e, 0x100da75b8026bc,
+          0x792589c17a84d, 0x152fb878685022, 0x378df06065dc2, 0xa798103b2cc05,
+          0x59658c597b75f, 0x1c0f21fde84d0c, 0x5e84602743067, 0x18cfa743e2552d,
+          0x5f47ebf97a3ff, 0x151e31f1685b12, 0x550de95199d54, 0xb1181118db31e,
+          0x5f07eff17bdf0, 0x1fe7b97ce85d92, 0x780461b2ea7ca, 0xffc360046621,
+          0x46618cb17b556, 0x11f7a964e84f1a, 0x391d69d1005e8, 0xbfda1056fc3b3,
+          0x1c561c8b97bac1, 0x1fde30fce85fa0, 0x788461a37436d, 0xb5fc363f6968c,
+          0x4303ef3178ce6, 0x198e20ece801b4, 0x501d69808b07b, 0x1beda742c9e886,
+          0x5f03aff1784c8, 0x1b1ea971684900, 0x3585f15afa77f, 0x131fc371d0e241,
+          0xff25c9f17f95d, 0x1836b87268455d, 0x17e9d68565535d, 0xb15a75a2e1341,
+          0x462588597dd7f } },
+    { /* len 60, level H, version 7 (4x13 + 1x14: a single group-2 block,
+       * plus level-H format info bits and v7 version info blocks). */
+      "https://example.org/p/abcdefghijabcdefghijabcdefghijabcdefgh",
+      QR_EC_H, 45,
+        { 0x1fd0ec3de97f, 0x104a14cca341, 0x174ac221875d, 0x17580d36265d,
+          0x175cf5f7565d, 0x10421f12d141, 0x1fd55555557f, 0x1d6d11db00,
+          0x1ce4e3fb535c, 0x113be613929e, 0x8ce853bf751, 0x1f950c4d33a2,
+          0x804df2134f0, 0x11b8736247ae, 0xde48ec921f0, 0x7e32da6ffa2, 0xa609e63c2c8,
+          0x1330a47b9cbe, 0xc6e431f9a4b, 0x7d954823b07, 0x1f2f5f9a7fd,
+          0x17184b1de717, 0xf577d5cd95c, 0x7106b121d18, 0x19f5c5f4d3f9,
+          0x101929155927, 0xdbfb29e627e, 0xf4d5d633e1a, 0x1104ff705d55,
+          0x142139c12826, 0xeb6e5eee74a, 0x164b738fd185, 0x9b289dd6973,
+          0x161bc282ac8d, 0xdb62222b350, 0x1ecb19489d1e, 0x3f6e7f21e59,
+          0x1f1991119700, 0xf57df5ae27f, 0xd11eb188641, 0x19f8c7fca95d,
+          0x1f80eb1cd35d, 0x7edbe8c55d, 0x6062b655e41, 0x9f2737f3c7f } },
 };
 
 TEST(test_qr_golden_grids) {
     for (size_t g = 0; g < sizeof(qr_goldens) / sizeof(qr_goldens[0]); g++) {
         const QrGolden *gd = &qr_goldens[g];
-        QrCode *qr = qr_encode(gd->payload);
+        QrCode *qr = qr_encode_level(gd->payload, gd->level);
         ASSERT(qr != NULL);
         ASSERT_EQ_INT(qr->size, gd->size);
         for (int r = 0; r < qr->size; r++) {

@@ -10,12 +10,24 @@ typedef struct {
     int size;         /* dimension (21 for version 1, 25 for version 2, etc.) */
 } QrCode;
 
+/* Error correction level (ISO/IEC 18004): L recovers ~7% of codewords,
+ * M ~15%, Q ~25%, H ~30%. Higher levels shrink the data capacity. */
+typedef enum {
+    QR_EC_L = 0,
+    QR_EC_M = 1,
+    QR_EC_Q = 2,
+    QR_EC_H = 3,
+} QrEcLevel;
+
 /*
  * Encode text into a QR code using byte mode, ECC level M.
  * Returns NULL on failure (text too long or allocation error).
  * Caller must free the result with qr_free().
  */
 QrCode *qr_encode(const char *text);
+
+/* Same as qr_encode with an explicit error correction level. */
+QrCode *qr_encode_level(const char *text, QrEcLevel level);
 
 /* Free a QR code returned by qr_encode(). */
 void qr_free(QrCode *qr);
@@ -28,10 +40,12 @@ void qr_free(QrCode *qr);
  */
 
 /*
- * ECC block structure for `version` at level M. Returns 0 on success,
- * -1 if the version is out of range. Any output pointer may be NULL.
+ * ECC block structure for `version` at `level`. Returns 0 on success,
+ * -1 if the version or level is out of range. Any output pointer may be
+ * NULL.
  */
-int qr_ecc_block_info(int version, int *total_cw, int *ecc_per_block,
+int qr_ecc_block_info(int version, QrEcLevel level,
+                      int *total_cw, int *ecc_per_block,
                       int *blocks_g1, int *data_g1,
                       int *blocks_g2, int *data_g2);
 

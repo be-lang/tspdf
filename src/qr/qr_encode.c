@@ -1,7 +1,7 @@
 /*
  * qr_encode.c — Minimal QR code encoder.
  * Written from scratch for the tspdf project.
- * Implements QR Code Model 2, byte mode, ECC level M, versions 1-11.
+ * Implements QR Code Model 2, byte mode, ECC levels L/M/Q/H, versions 1-11.
  * No external dependencies.
  *
  * Implements the core QR code standard (ISO/IEC 18004) steps:
@@ -24,32 +24,13 @@
 #define MAX_MODULES 61  /* version 11: 17 + 4*11 = 61 */
 
 /*
- * Character capacity in bytes for byte mode, ECC level M, versions 1-11
- * (ISO/IEC 18004:2015, Table 7). This is the number of payload characters
- * that fit after the mode indicator and character count, NOT the number of
- * data codewords — that is derived from ECC_INFO_M below.
- */
-static const int DATA_CAPACITY_M[MAX_VERSION + 1] = {
-    0,   /* version 0 doesn't exist */
-    14,  /* version 1 */
-    26,  /* version 2 */
-    42,  /* version 3 */
-    62,  /* version 4 */
-    84,  /* version 5 */
-    106, /* version 6 */
-    122, /* version 7 */
-    152, /* version 8 */
-    180, /* version 9 */
-    213, /* version 10 */
-    251, /* version 11 */
-};
-
-/*
- * Total codewords and ECC block structure per version (ECC level M).
+ * Total codewords and ECC block structure per version and level.
  * Fields: total_cw, ecc_per_block, blocks_g1, data_per_block_g1,
  *         blocks_g2, data_per_block_g2
  *
- * Source: ISO/IEC 18004:2015, Table 9
+ * Source: ISO/IEC 18004:2015, Table 9; every row cross-checked against
+ * segno's tables at dev time (blocks x (data + ec) == total codewords,
+ * and the derived byte-mode character capacity matches Table 7).
  */
 typedef struct {
     int total_cw;
@@ -60,20 +41,80 @@ typedef struct {
     int data_g2;
 } EccInfo;
 
-static const EccInfo ECC_INFO_M[MAX_VERSION + 1] = {
-    {  0,  0, 0,  0, 0,  0}, /* v0 placeholder */
-    { 26, 10, 1, 16, 0,  0}, /* v1 */
-    { 44, 16, 1, 28, 0,  0}, /* v2 */
-    { 70, 26, 1, 44, 0,  0}, /* v3 */
-    {100, 18, 2, 32, 0,  0}, /* v4 */
-    {134, 24, 2, 43, 0,  0}, /* v5 */
-    {172, 16, 4, 27, 0,  0}, /* v6 */
-    {196, 18, 4, 31, 0,  0}, /* v7 */
-    {242, 22, 2, 38, 2, 39}, /* v8 */
-    {292, 22, 3, 36, 2, 37}, /* v9 */
-    {346, 26, 4, 43, 1, 44}, /* v10 */
-    {404, 30, 1, 50, 4, 51}, /* v11 */
+static const EccInfo ECC_INFO[4][MAX_VERSION + 1] = {
+    [QR_EC_L] = {
+        {  0,  0, 0,   0, 0,  0}, /* v0 placeholder */
+        { 26,  7, 1,  19, 0,  0}, /* v1 */
+        { 44, 10, 1,  34, 0,  0}, /* v2 */
+        { 70, 15, 1,  55, 0,  0}, /* v3 */
+        {100, 20, 1,  80, 0,  0}, /* v4 */
+        {134, 26, 1, 108, 0,  0}, /* v5 */
+        {172, 18, 2,  68, 0,  0}, /* v6 */
+        {196, 20, 2,  78, 0,  0}, /* v7 */
+        {242, 24, 2,  97, 0,  0}, /* v8 */
+        {292, 30, 2, 116, 0,  0}, /* v9 */
+        {346, 18, 2,  68, 2, 69}, /* v10 */
+        {404, 20, 4,  81, 0,  0}, /* v11 */
+    },
+    [QR_EC_M] = {
+        {  0,  0, 0,  0, 0,  0}, /* v0 placeholder */
+        { 26, 10, 1, 16, 0,  0}, /* v1 */
+        { 44, 16, 1, 28, 0,  0}, /* v2 */
+        { 70, 26, 1, 44, 0,  0}, /* v3 */
+        {100, 18, 2, 32, 0,  0}, /* v4 */
+        {134, 24, 2, 43, 0,  0}, /* v5 */
+        {172, 16, 4, 27, 0,  0}, /* v6 */
+        {196, 18, 4, 31, 0,  0}, /* v7 */
+        {242, 22, 2, 38, 2, 39}, /* v8 */
+        {292, 22, 3, 36, 2, 37}, /* v9 */
+        {346, 26, 4, 43, 1, 44}, /* v10 */
+        {404, 30, 1, 50, 4, 51}, /* v11 */
+    },
+    [QR_EC_Q] = {
+        {  0,  0, 0,  0, 0,  0}, /* v0 placeholder */
+        { 26, 13, 1, 13, 0,  0}, /* v1 */
+        { 44, 22, 1, 22, 0,  0}, /* v2 */
+        { 70, 18, 2, 17, 0,  0}, /* v3 */
+        {100, 26, 2, 24, 0,  0}, /* v4 */
+        {134, 18, 2, 15, 2, 16}, /* v5 */
+        {172, 24, 4, 19, 0,  0}, /* v6 */
+        {196, 18, 2, 14, 4, 15}, /* v7 */
+        {242, 22, 4, 18, 2, 19}, /* v8 */
+        {292, 20, 4, 16, 4, 17}, /* v9 */
+        {346, 24, 6, 19, 2, 20}, /* v10 */
+        {404, 28, 4, 22, 4, 23}, /* v11 */
+    },
+    [QR_EC_H] = {
+        {  0,  0, 0,  0, 0,  0}, /* v0 placeholder */
+        { 26, 17, 1,  9, 0,  0}, /* v1 */
+        { 44, 28, 1, 16, 0,  0}, /* v2 */
+        { 70, 22, 2, 13, 0,  0}, /* v3 */
+        {100, 16, 4,  9, 0,  0}, /* v4 */
+        {134, 22, 2, 11, 2, 12}, /* v5 */
+        {172, 28, 4, 15, 0,  0}, /* v6 */
+        {196, 26, 4, 13, 1, 14}, /* v7 */
+        {242, 26, 4, 14, 2, 15}, /* v8 */
+        {292, 24, 4, 12, 4, 13}, /* v9 */
+        {346, 28, 6, 15, 2, 16}, /* v10 */
+        {404, 24, 3, 12, 8, 13}, /* v11 */
+    },
 };
+
+/*
+ * Byte-mode character capacity, derived from the block structure: data
+ * bits minus the 4-bit mode indicator and the character count field.
+ * Matches ISO/IEC 18004:2015 Table 7 for every version/level (the
+ * terminator may be truncated when the data fills the symbol, so it does
+ * not reserve space). Returns 0 for out-of-range arguments.
+ */
+static int data_capacity(int version, QrEcLevel level) {
+    if (version < 1 || version > MAX_VERSION ||
+        (int)level < 0 || (int)level > 3) return 0;
+    const EccInfo *ei = &ECC_INFO[level][version];
+    int data_cw = ei->blocks_g1 * ei->data_g1 + ei->blocks_g2 * ei->data_g2;
+    int cc_bits = (version <= 9) ? 8 : 16;
+    return (data_cw * 8 - 4 - cc_bits) / 8;
+}
 
 /* Alignment pattern centers for versions 1-11 (version 1 has none) */
 /* Each row: list of centers terminated by -1 */
@@ -176,11 +217,12 @@ static void bb_append(BitBuf *bb, unsigned int value, int bits)
 }
 
 /*
- * Encode `text` into a codeword sequence for the given version using byte mode,
- * ECC level M. Returns number of data codewords written, or -1 on error.
+ * Encode `text` into a codeword sequence for the given version/block
+ * structure using byte mode. Returns number of data codewords written,
+ * or -1 on error.
  */
 static int encode_data(const char *text, int text_len, int version,
-                        uint8_t *out, int out_size)
+                        const EccInfo *ei, uint8_t *out, int out_size)
 {
     BitBuf bb;
     memset(&bb, 0, sizeof(bb));
@@ -198,10 +240,9 @@ static int encode_data(const char *text, int text_len, int version,
 
     /*
      * Number of data codewords, derived from the ECC block structure
-     * (NOT the character capacity table, which is smaller by the
+     * (NOT the character capacity, which is smaller by the
      * mode + character count header).
      */
-    const EccInfo *ei = &ECC_INFO_M[version];
     int total_data_cw = ei->blocks_g1 * ei->data_g1 + ei->blocks_g2 * ei->data_g2;
     int total_bits    = total_data_cw * 8;
     if (bb.bit_len > total_bits) return -1;
@@ -230,20 +271,23 @@ static int encode_data(const char *text, int text_len, int version,
 
 /*
  * Build the full interleaved codeword sequence (data + ECC) for the given
- * version. Returns total number of codewords written.
+ * block structure. Returns total number of codewords written.
  */
 static int build_codewords(const uint8_t *data_cw, int data_cw_count,
-                             int version, uint8_t *out, int out_size)
+                             const EccInfo *ei, uint8_t *out, int out_size)
 {
     (void)data_cw_count; /* block sizes are determined from the ECC table */
-    const EccInfo *ei = &ECC_INFO_M[version];
     int total_blocks = ei->blocks_g1 + ei->blocks_g2;
-    if (total_blocks == 0) return -1;
+    if (total_blocks == 0 || total_blocks > 16) return -1;
 
-    /* Allocate block data and ECC */
-    uint8_t block_data[32][64]; /* max 32 blocks, 64 cw each */
-    uint8_t block_ecc[32][64];
-    int     block_len[32];
+    /* Block data and ECC. Maxima over the v1-11 tables: 11 blocks (H v11),
+     * 116 data codewords per block (L v9), 30 EC codewords per block. */
+    uint8_t block_data[16][128];
+    uint8_t block_ecc[16][64];
+    int     block_len[16];
+    if (ei->data_g1 > 128 || ei->data_g2 > 128 || ei->ecc_per_block > 64) {
+        return -1;
+    }
 
     int pos = 0;
     for (int i = 0; i < total_blocks; i++) {
@@ -448,19 +492,19 @@ static void place_version_info(Matrix *m, int version)
 }
 
 /*
- * Format information string for ECC level M (bits 14-13 = 00 after XOR).
- * ECC level M indicator bits: 00
- * mask bits: 3 bits (0-7)
- * The 15-bit format string = (ECC_level << 13) | (mask << 10) | BCH(10 bits)
- *
- * We precompute all 8 format strings for ECC level M.
+ * Format information string: 2 ECC level indicator bits, 3 mask bits,
+ * then a BCH(15,5) remainder, XORed with the fixed mask.
+ * Level indicator bits (ISO/IEC 18004 Table 12): L=01 M=00 Q=11 H=10 —
+ * cross-checked against segno's level constants at dev time.
  * BCH generator: x^10 + x^8 + x^5 + x^4 + x^2 + x + 1 (0x537)
  * XOR mask: 101010000010010 = 0x5412
  */
-static uint16_t format_string_M(int mask)
+static uint16_t format_string(QrEcLevel level, int mask)
 {
-    /* Data bits: ECC level M = 00, mask pattern = mask (3 bits) */
-    uint32_t data = (0x00 << 3) | (uint32_t)mask; /* 5 bits */
+    static const uint32_t level_bits[4] = {
+        [QR_EC_L] = 0x1, [QR_EC_M] = 0x0, [QR_EC_Q] = 0x3, [QR_EC_H] = 0x2,
+    };
+    uint32_t data = (level_bits[level] << 3) | (uint32_t)mask; /* 5 bits */
     /* Calculate BCH(15,5) remainder */
     uint32_t g = 0x537; /* generator: x^10+x^8+x^5+x^4+x^2+x+1 */
     uint32_t rem = data << 10;
@@ -473,9 +517,9 @@ static uint16_t format_string_M(int mask)
     return fmt;
 }
 
-static void place_format_info(Matrix *m, int mask)
+static void place_format_info(Matrix *m, QrEcLevel level, int mask)
 {
-    uint16_t fmt = format_string_M(mask);
+    uint16_t fmt = format_string(level, mask);
     int n = m->size;
 
     /*
@@ -692,31 +736,39 @@ static int score_penalty(const Matrix *m)
 
 QrCode *qr_encode(const char *text)
 {
-    if (!text) return NULL;
+    return qr_encode_level(text, QR_EC_M);
+}
+
+QrCode *qr_encode_level(const char *text, QrEcLevel level)
+{
+    if (!text || (int)level < 0 || (int)level > 3) return NULL;
     gf_init();
 
     int text_len = (int)strlen(text);
 
-    /* Find smallest version that fits (byte-mode character capacity at M).
-     * The terminator may be truncated when the data fills the symbol, so the
-     * capacity table — not "header + data + 4 bits" — is the right check. */
+    /* Find smallest version that fits (byte-mode character capacity at the
+     * requested level). The terminator may be truncated when the data fills
+     * the symbol, so the derived capacity — not "header + data + 4 bits" —
+     * is the right check. */
     int version = -1;
     for (int v = 1; v <= MAX_VERSION; v++) {
-        if (text_len <= DATA_CAPACITY_M[v]) {
+        if (text_len <= data_capacity(v, level)) {
             version = v;
             break;
         }
     }
     if (version < 0) return NULL; /* text too long */
+    const EccInfo *ei = &ECC_INFO[level][version];
 
-    /* Encode data codewords */
-    uint8_t data_cw[256];
-    int data_cw_count = encode_data(text, text_len, version, data_cw, (int)sizeof(data_cw));
+    /* Encode data codewords (max over the tables: 324, L v11) */
+    uint8_t data_cw[512];
+    int data_cw_count = encode_data(text, text_len, version, ei,
+                                    data_cw, (int)sizeof(data_cw));
     if (data_cw_count < 0) return NULL;
 
     /* Build interleaved codeword sequence */
     uint8_t all_cw[1024];
-    int all_cw_count = build_codewords(data_cw, data_cw_count, version,
+    int all_cw_count = build_codewords(data_cw, data_cw_count, ei,
                                         all_cw, (int)sizeof(all_cw));
     if (all_cw_count < 0) return NULL;
 
@@ -745,7 +797,7 @@ QrCode *qr_encode(const char *text)
         /* Apply mask to a temporary copy */
         Matrix tmp = m;
         apply_mask(&tmp, mask);
-        place_format_info(&tmp, mask);
+        place_format_info(&tmp, level, mask);
         int p = score_penalty(&tmp);
         if (p < best_penalty) {
             best_penalty = p;
@@ -755,7 +807,7 @@ QrCode *qr_encode(const char *text)
 
     /* Apply best mask permanently */
     apply_mask(&m, best_mask);
-    place_format_info(&m, best_mask);
+    place_format_info(&m, level, best_mask);
 
     /* Build output */
     int sz = m.size;
@@ -779,12 +831,14 @@ void qr_free(QrCode *qr)
 
 /* ── Test Introspection Hooks ───────────────────────────────────────────── */
 
-int qr_ecc_block_info(int version, int *total_cw, int *ecc_per_block,
+int qr_ecc_block_info(int version, QrEcLevel level,
+                      int *total_cw, int *ecc_per_block,
                       int *blocks_g1, int *data_g1,
                       int *blocks_g2, int *data_g2)
 {
-    if (version < 1 || version > MAX_VERSION) return -1;
-    const EccInfo *ei = &ECC_INFO_M[version];
+    if (version < 1 || version > MAX_VERSION ||
+        (int)level < 0 || (int)level > 3) return -1;
+    const EccInfo *ei = &ECC_INFO[level][version];
     if (total_cw)      *total_cw      = ei->total_cw;
     if (ecc_per_block) *ecc_per_block = ei->ecc_per_block;
     if (blocks_g1)     *blocks_g1     = ei->blocks_g1;

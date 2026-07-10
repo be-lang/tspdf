@@ -550,6 +550,22 @@ run_test "qrcode --title \"\" omits metadata title" bash -c '
   "'"$TSPDF"'" qrcode "https://example.com" -o "'"$TMPDIR"'/qr_deftitle.pdf" > /dev/null
   grep -qa "/Title (QR Code)" "'"$TMPDIR"'/qr_deftitle.pdf"
 '
+# --ec-level: all four levels accepted (upper or lower case), junk rejected.
+# A higher level spends more modules on error correction, so the same text
+# must yield a larger PDF page payload at H than at L.
+run_test "qrcode --ec-level L" $TSPDF qrcode "https://example.com" --ec-level L -o $TMPDIR/qr_l.pdf
+run_test "qrcode --ec-level M" $TSPDF qrcode "https://example.com" --ec-level M -o $TMPDIR/qr_m.pdf
+run_test "qrcode --ec-level Q" $TSPDF qrcode "https://example.com" --ec-level Q -o $TMPDIR/qr_q.pdf
+run_test "qrcode --ec-level H" $TSPDF qrcode "https://example.com" --ec-level H -o $TMPDIR/qr_h.pdf
+run_test "qrcode --ec-level lowercase h" $TSPDF qrcode "https://example.com" --ec-level h -o $TMPDIR/qr_h2.pdf
+run_test "qrcode --ec-level X rejected" bash -c "! $TSPDF qrcode 'https://example.com' --ec-level X -o $TMPDIR/qr_x.pdf > /dev/null 2>&1"
+run_test "qrcode H symbol denser than L" bash -c "
+  [ \$(stat -c%s $TMPDIR/qr_h.pdf) -gt \$(stat -c%s $TMPDIR/qr_l.pdf) ]"
+# level H shrinks capacity: 137 bytes is the v11 ceiling at H, 138 must fail
+run_test "qrcode --ec-level H capacity ceiling" bash -c "
+  set -e
+  $TSPDF qrcode \"\$(printf 'a%.0s' {1..137})\" --ec-level H -o $TMPDIR/qr_hmax.pdf > /dev/null
+  ! $TSPDF qrcode \"\$(printf 'a%.0s' {1..138})\" --ec-level H -o $TMPDIR/qr_hover.pdf > /dev/null 2>&1"
 
 # md2pdf
 cat > $TMPDIR/test.md << 'MDEOF'

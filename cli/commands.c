@@ -129,6 +129,7 @@ static const char *const VALUE_FLAGS[] = {
     "--clear",
     "--title",
     "--subtitle",
+    "--ec-level",
     "--port",
     "--format",
     "--position",
