@@ -4396,9 +4396,9 @@ TEST(test_resize_to_a4_from_letter) {
 }
 
 // A /Rotate 90 page (MediaBox 400x300, viewed 300x400) resized --to A4 must
-// come out A4 PORTRAIT in the VIEWED orientation (595x842). Since /Rotate 90
-// swaps the axes, the stored MediaBox must hold the swapped extents
-// [0 0 842 595] so that viewed = 595x842.
+// come out A4 PORTRAIT in the VIEWED orientation (595x842) because the source
+// is VIEWED portrait. Since /Rotate 90 swaps the axes, the stored MediaBox
+// must hold the swapped extents [0 0 842 595] so that viewed = 595x842.
 TEST(test_resize_to_a4_rotate90_viewed_portrait) {
     TspdfError err;
     const char *pdf =
@@ -4471,6 +4471,128 @@ TEST(test_resize_to_a4_rotate270_viewed_portrait) {
     ASSERT(viewed_h > 841.88 && viewed_h < 841.90);
 
     tspdf_reader_destroy(r);
+    tspdf_reader_destroy(doc);
+}
+
+// Orientation-preserving rule: the VIEWED output (after /Rotate) is the
+// requested size oriented to match the source's VIEWED orientation. A
+// portrait-stored page (612x792) with /Rotate 90 is viewed landscape
+// (792x612), so --to A4 must come out viewed A4 LANDSCAPE (841.89 x 595.28).
+// The viewer swaps a /Rotate 90 page's axes, so the stored MediaBox stays
+// portrait [0 0 595.28 841.89] with /Rotate 90 kept.
+TEST(test_resize_to_a4_rotate90_preserves_viewed_landscape) {
+    TspdfError err;
+    const char *pdf =
+        "%PDF-1.4\n"
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+        "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        "/Rotate 90 /Contents 4 0 R >>\nendobj\n"
+        "4 0 obj\n<< /Length 12 >>\nstream\n0 0 1 1 re f\nendstream\nendobj\n"
+        "trailer\n<< /Root 1 0 R >>\n";
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, strlen(pdf), &err);
+    ASSERT(doc != NULL);
+
+    size_t pages[] = {0};
+    TspdfReader *r = tspdf_reader_resize_to(doc, pages, 1, 595.28, 841.89, &err);
+    ASSERT(r != NULL);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_INT(tspdf_reader_get_page(r, 0)->rotate, 90);
+
+    double mb[4];
+    ASSERT(read_page_box(r, 0, "MediaBox", mb));
+    ASSERT(mb[0] == 0 && mb[1] == 0);
+    // Stored box stays portrait so the viewed page is A4 landscape.
+    ASSERT(mb[2] > 595.27 && mb[2] < 595.29);
+    ASSERT(mb[3] > 841.88 && mb[3] < 841.90);
+
+    tspdf_reader_destroy(r);
+    tspdf_reader_destroy(doc);
+}
+
+// An unrotated landscape page keeps its viewed orientation too: --to A4
+// yields A4 landscape (841.89 x 595.28), not content letterboxed in portrait.
+TEST(test_resize_to_a4_landscape_page_stays_landscape) {
+    TspdfError err;
+    const char *pdf =
+        "%PDF-1.4\n"
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+        "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 792 612] "
+        "/Contents 4 0 R >>\nendobj\n"
+        "4 0 obj\n<< /Length 12 >>\nstream\n0 0 1 1 re f\nendstream\nendobj\n"
+        "trailer\n<< /Root 1 0 R >>\n";
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, strlen(pdf), &err);
+    ASSERT(doc != NULL);
+
+    size_t pages[] = {0};
+    TspdfReader *r = tspdf_reader_resize_to(doc, pages, 1, 595.28, 841.89, &err);
+    ASSERT(r != NULL);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    double mb[4];
+    ASSERT(read_page_box(r, 0, "MediaBox", mb));
+    ASSERT(mb[0] == 0 && mb[1] == 0);
+    ASSERT(mb[2] > 841.88 && mb[2] < 841.90);
+    ASSERT(mb[3] > 595.27 && mb[3] < 595.29);
+
+    tspdf_reader_destroy(r);
+    tspdf_reader_destroy(doc);
+}
+
+// The page struct exposes the (own or inherited) /CropBox so callers like
+// `tspdf info` can report it without re-walking the page tree.
+TEST(test_page_crop_box_exposed) {
+    TspdfError err;
+    const char *pdf =
+        "%PDF-1.4\n"
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+        "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        "/CropBox [100 100 400 500] >>\nendobj\n"
+        "trailer\n<< /Root 1 0 R >>\n";
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, strlen(pdf), &err);
+    ASSERT(doc != NULL);
+    TspdfReaderPage *page = tspdf_reader_get_page(doc, 0);
+    ASSERT(page != NULL);
+    ASSERT(page->has_crop_box);
+    ASSERT(page->crop_box[0] == 100 && page->crop_box[1] == 100 &&
+           page->crop_box[2] == 400 && page->crop_box[3] == 500);
+    tspdf_reader_destroy(doc);
+
+    // A page without a CropBox reports none.
+    doc = tspdf_reader_open_file("tests/data/one_page.pdf", &err);
+    ASSERT(doc != NULL);
+    page = tspdf_reader_get_page(doc, 0);
+    ASSERT(page != NULL);
+    ASSERT(!page->has_crop_box);
+    tspdf_reader_destroy(doc);
+}
+
+// Raw /P permission flags of an encrypted document (as used by `tspdf info`).
+TEST(test_encryption_permissions_accessor) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/three_pages.pdf", &err);
+    ASSERT(doc != NULL);
+
+    // Unencrypted document: no permissions to report.
+    uint32_t p = 0;
+    ASSERT(!tspdf_reader_encryption_permissions(doc, &p));
+
+    // Encrypt allowing print (bit 3) + copy (bit 5): /P = 0xFFFFF0D4 (-3884).
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    err = tspdf_reader_save_to_memory_encrypted(doc, &buf, &len,
+                                                "pw", "pw", 0xFFFFF0D4u, 128);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    TspdfReader *enc = tspdf_reader_open_with_password(buf, len, "pw", &err);
+    ASSERT(enc != NULL);
+    ASSERT(tspdf_reader_encryption_permissions(enc, &p));
+    ASSERT(p == 0xFFFFF0D4u);
+
+    tspdf_reader_destroy(enc);
+    free(buf);
     tspdf_reader_destroy(doc);
 }
 
@@ -12979,6 +13101,9 @@ int main(void) {
     RUN(test_resize_to_a4_from_letter);
     RUN(test_resize_to_a4_rotate90_viewed_portrait);
     RUN(test_resize_to_a4_rotate270_viewed_portrait);
+    RUN(test_resize_to_a4_rotate90_preserves_viewed_landscape);
+    RUN(test_resize_to_a4_landscape_page_stays_landscape);
+    RUN(test_page_crop_box_exposed);
     RUN(test_resize_to_rejects_nonpositive);
     RUN(test_scale_rejects_nonpositive_factor);
     RUN(test_reorder_pages);
@@ -13009,6 +13134,7 @@ int main(void) {
 
     printf("\n  Encryption:\n");
     RUN(test_encrypted_pdf_needs_password);
+    RUN(test_encryption_permissions_accessor);
     RUN(test_encrypt_aes128_roundtrip);
     RUN(test_encrypt_aes256_roundtrip);
     RUN(test_reencrypt_opened_encrypted_decrypts_source_streams);

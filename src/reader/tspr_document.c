@@ -513,6 +513,13 @@ bool tspdf_reader_encryption_info(const TspdfReader *doc, int *revision,
     return true;
 }
 
+bool tspdf_reader_encryption_permissions(const TspdfReader *doc,
+                                         uint32_t *permissions) {
+    if (!doc || !doc->crypt) return false;
+    if (permissions) *permissions = doc->crypt->permissions;
+    return true;
+}
+
 static bool catalog_has(const TspdfReader *doc, const char *key) {
     if (!doc || !doc->catalog) return false;
     TspdfObj *v = tspdf_dict_get(doc->catalog, key);
@@ -730,6 +737,10 @@ static TspdfReader *create_doc_from_pages(TspdfReader *src, const size_t *page_i
             return NULL;
         }
         memcpy(doc->pages.pages[i].media_box, src_page->media_box, sizeof(double) * 4);
+        if (src_page->has_crop_box) {
+            memcpy(doc->pages.pages[i].crop_box, src_page->crop_box, sizeof(double) * 4);
+            doc->pages.pages[i].has_crop_box = true;
+        }
         doc->pages.pages[i].user_unit = src_page->user_unit > 0.0 ? src_page->user_unit : 1.0;
         doc->pages.pages[i].rotate = src_page->rotate;
 
@@ -1110,6 +1121,8 @@ static TspdfReader *set_cropbox_impl(TspdfReader *doc, const size_t *pages,
             if (err) *err = TSPDF_ERR_ALLOC;
             return NULL;
         }
+        memcpy(page->crop_box, cb, sizeof(cb));
+        page->has_crop_box = true;
     }
     if (err) *err = TSPDF_OK;
     return result;
@@ -1201,7 +1214,10 @@ TspdfReader *tspdf_reader_scale(TspdfReader *doc, const size_t *pages,
             }
             if (ok) {
                 double scb[4] = { cb[0] * sx, cb[1] * sy, cb[2] * sx, cb[3] * sy };
-                set_box_in_dict(page->page_dict, &result->arena, "CropBox", scb);
+                if (set_box_in_dict(page->page_dict, &result->arena, "CropBox", scb)) {
+                    memcpy(page->crop_box, scb, sizeof(scb));
+                    page->has_crop_box = true;
+                }
             }
         }
     }
@@ -1261,18 +1277,26 @@ TspdfReader *tspdf_reader_resize_to(TspdfReader *doc, const size_t *pages,
             return NULL;
         }
 
-        // Fit in the viewed orientation: /Rotate 90/270 swaps the axes, so the
-        // content's width is measured against the target's height.
-        int rot = ((page->rotate % 360) + 360) % 360;
-        double fit_w = (rot == 90 || rot == 270) ? target_h : target_w;
-        double fit_h = (rot == 90 || rot == 270) ? target_w : target_h;
+        // Orientation rule: the page as VIEWED (after /Rotate, which is kept)
+        // must be the target size oriented to match the source's VIEWED
+        // orientation — a landscape-viewed page comes out target-landscape, a
+        // portrait-viewed page target-portrait, so nothing is flipped and the
+        // aspect-fit below never clips. Since /Rotate applies the same axis
+        // swap to input and output, "viewed orientation preserved" collapses
+        // to "stored orientation preserved": the stored target box (fit_w x
+        // fit_h) is the requested size with width/height swapped, if needed,
+        // to match the stored source box's orientation.
+        double fit_w = target_w, fit_h = target_h;
+        if ((pw > ph) != (fit_w > fit_h)) {
+            double tmp = fit_w; fit_w = fit_h; fit_h = tmp;
+        }
 
         double s = fit_w / pw;
         double s2 = fit_h / ph;
         if (s2 < s) s = s2;
 
         // Translate so the scaled content (measured from the MediaBox origin)
-        // is centered within the new [0 0 target_w target_h] media, then
+        // is centered within the new [0 0 fit_w fit_h] media, then
         // undo the MediaBox origin so content maps from (0,0).
         double content_w = pw * s;
         double content_h = ph * s;
@@ -1297,11 +1321,8 @@ TspdfReader *tspdf_reader_resize_to(TspdfReader *doc, const size_t *pages,
             return NULL;
         }
 
-        // Store the MediaBox so the VIEWED box equals target_w x target_h. On a
-        // /Rotate 90/270 page the viewer swaps the axes, so the stored box must
-        // carry the swapped extents [0 0 target_h target_w]; for 0/180 it is the
-        // target as-is. fit_w/fit_h already encode this swap (unrotated space),
-        // which is also the space the content-wrap centered in.
+        // fit_w/fit_h are the stored (unrotated) extents of the target box,
+        // which is also the space the content-wrap above centered in.
         double mb[4] = { 0.0, 0.0, fit_w, fit_h };
         if (!set_box_in_dict(page->page_dict, &result->arena, "MediaBox", mb)) {
             tspdf_reader_destroy(result);
@@ -1311,6 +1332,7 @@ TspdfReader *tspdf_reader_resize_to(TspdfReader *doc, const size_t *pages,
         memcpy(page->media_box, mb, sizeof(mb));
         // The old CropBox no longer maps to the resized media.
         remove_from_dict(page->page_dict, "CropBox");
+        page->has_crop_box = false;
     }
     if (err) *err = TSPDF_OK;
     return result;

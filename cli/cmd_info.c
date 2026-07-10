@@ -91,6 +91,56 @@ static void page_size(TspdfReaderPage *page, double *w, double *h) {
     *h = (page->media_box[3] - page->media_box[1]) * unit;
 }
 
+static void crop_size(TspdfReaderPage *page, double *w, double *h) {
+    double unit = page->user_unit > 0.0 ? page->user_unit : 1.0;
+    *w = (page->crop_box[2] - page->crop_box[0]) * unit;
+    *h = (page->crop_box[3] - page->crop_box[1]) * unit;
+}
+
+// User-access permission bits, ISO 32000-1 Table 22 — same names (and bit
+// values) as `tspdf encrypt --permissions` in cmd_encrypt.c.
+static const struct {
+    const char *name;
+    uint32_t bit;
+} PERM_BITS[] = {
+    {"print",    1u << 2},   // bit 3: print the document
+    {"print-hq", 1u << 11},  // bit 12: high-resolution printing
+    {"copy",     1u << 4},   // bit 5: copy text and graphics
+    {"extract",  1u << 9},   // bit 10: extract for accessibility
+    {"modify",   1u << 3},   // bit 4: modify contents
+    {"annotate", 1u << 5},   // bit 6: add/modify annotations
+    {"forms",    1u << 8},   // bit 9: fill in form fields
+    {"assemble", 1u << 10},  // bit 11: insert/rotate/delete pages
+};
+#define PERM_BITS_COUNT (sizeof(PERM_BITS) / sizeof(PERM_BITS[0]))
+
+// One "  Page N:  W x H pt" line of the text output, with CropBox, /UserUnit
+// and rotation notes when relevant.
+static void print_page_line(TspdfReaderPage *page, size_t num) {
+    if (!page) return;
+    double w, h;
+    page_size(page, &w, &h);
+    printf("  Page %zu:  %.1f x %.1f pt", num, w, h);
+    if (page->has_crop_box) {
+        double cw, ch;
+        crop_size(page, &cw, &ch);
+        printf(" (CropBox %.1f x %.1f pt)", cw, ch);
+    }
+    double unit = page->user_unit > 0.0 ? page->user_unit : 1.0;
+    if (unit != 1.0)
+        printf(" (/UserUnit %.4g)", unit);
+    if (page->rotate != 0)
+        printf(" (rotated %d°)", page->rotate);
+    printf("\n");
+}
+
+// {"error":"<message>"} on stdout — the failure shape of `info --json`.
+static void json_error(const char *message) {
+    printf("{");
+    json_field_str("error", message, false);
+    printf("}\n");
+}
+
 static int print_json(TspdfReader *doc) {
     size_t page_count = tspdf_reader_page_count(doc);
 
@@ -105,8 +155,21 @@ static int print_json(TspdfReader *doc) {
         snprintf(enc, sizeof(enc), "%s (R%d)", enc_algorithm, enc_revision);
         printf("\"encrypted\":true,");
         json_field_str("encryption", enc, true);
+        uint32_t perms = 0;
+        tspdf_reader_encryption_permissions(doc, &perms);
+        printf("\"permissions\":[");
+        bool first = true;
+        for (size_t i = 0; i < PERM_BITS_COUNT; i++) {
+            if (perms & PERM_BITS[i].bit) {
+                printf("%s\"%s\"", first ? "" : ",", PERM_BITS[i].name);
+                first = false;
+            }
+        }
+        // The raw /P value as the signed 32-bit integer written to the file.
+        printf("],\"permissions_raw\":%d,", (int32_t)perms);
     } else {
-        printf("\"encrypted\":false,\"encryption\":null,");
+        printf("\"encrypted\":false,\"encryption\":null,"
+               "\"permissions\":null,\"permissions_raw\":null,");
     }
     printf("\"outlines\":%s,", tspdf_reader_has_outlines(doc) ? "true" : "false");
     printf("\"acroform\":%s,", tspdf_reader_has_acroform(doc) ? "true" : "false");
@@ -137,6 +200,41 @@ static int print_json(TspdfReader *doc) {
     }
     printf(",");
 
+    // CropBox sizes: null when no page has one; a single [w,h] when every
+    // page has the same crop; else one entry per page ([w,h] or null).
+    bool any_crop = false, crop_uniform = page_count > 0;
+    double cw0 = 0.0, ch0 = 0.0;
+    for (size_t i = 0; i < page_count; i++) {
+        TspdfReaderPage *page = tspdf_reader_get_page(doc, i);
+        if (!page || !page->has_crop_box) { crop_uniform = false; continue; }
+        any_crop = true;
+        double w, h;
+        crop_size(page, &w, &h);
+        if (i == 0) { cw0 = w; ch0 = h; }
+        else if (w != cw0 || h != ch0) crop_uniform = false;
+    }
+    printf("\"crop_sizes\":");
+    if (!any_crop) {
+        printf("null");
+    } else if (crop_uniform) {
+        printf("[%.2f,%.2f]", cw0, ch0);
+    } else {
+        printf("[");
+        for (size_t i = 0; i < page_count; i++) {
+            TspdfReaderPage *page = tspdf_reader_get_page(doc, i);
+            if (i > 0) printf(",");
+            if (page && page->has_crop_box) {
+                double w, h;
+                crop_size(page, &w, &h);
+                printf("[%.2f,%.2f]", w, h);
+            } else {
+                printf("null");
+            }
+        }
+        printf("]");
+    }
+    printf(",");
+
     json_field_str("title", tspdf_reader_get_title(doc), true);
     json_field_str("author", tspdf_reader_get_author(doc), true);
     json_field_str("subject", tspdf_reader_get_subject(doc), true);
@@ -157,19 +255,22 @@ int cmd_info(int argc, char **argv) {
         return argc == 0 ? 1 : 0;
     }
 
+    bool as_json = has_flag(argc, argv, "--json");
+
     const char *positional[2];
     int npos = collect_positional(argc, argv, positional, 2);
     if (npos < 1) {
         fprintf(stderr, "tspdf info: missing input file\n");
+        if (as_json) json_error("missing input file");
         return 1;
     }
     if (npos > 1) {
         fprintf(stderr, "tspdf info: unexpected extra argument '%s'\n", positional[1]);
+        if (as_json) json_error("unexpected extra argument");
         return 1;
     }
     const char *input = positional[0];
     const char *password = find_flag(argc, argv, "--password");
-    bool as_json = has_flag(argc, argv, "--json");
 
     TspdfError err = TSPDF_OK;
     TspdfReader *doc = password
@@ -188,6 +289,14 @@ int cmd_info(int argc, char **argv) {
             return 0;
         }
         fprintf(stderr, "tspdf info: failed to open '%s': %s\n", input, tspdf_error_string(err));
+        if (as_json) {
+            // Machine consumers read stdout: always give them a JSON object.
+            printf("{");
+            if (err == TSPDF_ERR_BAD_PASSWORD)
+                printf("\"encrypted\":true,");
+            json_field_str("error", tspdf_error_string(err), false);
+            printf("}\n");
+        }
         return 1;
     }
 
@@ -207,50 +316,33 @@ int cmd_info(int argc, char **argv) {
 
     // Show page sizes
     if (page_count > 0 && page_count <= 5) {
-        for (size_t i = 0; i < page_count; i++) {
-            TspdfReaderPage *page = tspdf_reader_get_page(doc, i);
-            if (page) {
-                double unit = page->user_unit > 0.0 ? page->user_unit : 1.0;
-                double w = (page->media_box[2] - page->media_box[0]) * unit;
-                double h = (page->media_box[3] - page->media_box[1]) * unit;
-                printf("  Page %zu:  %.1f x %.1f pt", i + 1, w, h);
-                if (unit != 1.0)
-                    printf(" (/UserUnit %.4g)", unit);
-                if (page->rotate != 0)
-                    printf(" (rotated %d°)", page->rotate);
-                printf("\n");
-            }
-        }
+        for (size_t i = 0; i < page_count; i++)
+            print_page_line(tspdf_reader_get_page(doc, i), i + 1);
     } else if (page_count > 5) {
-        TspdfReaderPage *first = tspdf_reader_get_page(doc, 0);
-        TspdfReaderPage *last = tspdf_reader_get_page(doc, page_count - 1);
-        if (first) {
-            double unit = first->user_unit > 0.0 ? first->user_unit : 1.0;
-            double w = (first->media_box[2] - first->media_box[0]) * unit;
-            double h = (first->media_box[3] - first->media_box[1]) * unit;
-            printf("  Page 1:  %.1f x %.1f pt", w, h);
-            if (unit != 1.0)
-                printf(" (/UserUnit %.4g)", unit);
-            printf("\n");
-        }
+        print_page_line(tspdf_reader_get_page(doc, 0), 1);
         printf("  ...\n");
-        if (last) {
-            double unit = last->user_unit > 0.0 ? last->user_unit : 1.0;
-            double w = (last->media_box[2] - last->media_box[0]) * unit;
-            double h = (last->media_box[3] - last->media_box[1]) * unit;
-            printf("  Page %zu: %.1f x %.1f pt", page_count, w, h);
-            if (unit != 1.0)
-                printf(" (/UserUnit %.4g)", unit);
-            printf("\n");
-        }
+        print_page_line(tspdf_reader_get_page(doc, page_count - 1), page_count);
     }
 
     int enc_revision = 0;
     const char *enc_algorithm = NULL;
-    if (tspdf_reader_encryption_info(doc, &enc_revision, &enc_algorithm))
+    if (tspdf_reader_encryption_info(doc, &enc_revision, &enc_algorithm)) {
         printf("Encrypted:  yes (%s, R%d)\n", enc_algorithm, enc_revision);
-    else
+        uint32_t perms = 0;
+        tspdf_reader_encryption_permissions(doc, &perms);
+        printf("Permissions: ");
+        bool first = true;
+        for (size_t i = 0; i < PERM_BITS_COUNT; i++) {
+            if (perms & PERM_BITS[i].bit) {
+                printf("%s%s", first ? "" : ", ", PERM_BITS[i].name);
+                first = false;
+            }
+        }
+        if (first) printf("(none)");
+        printf(" (P=%d)\n", (int32_t)perms);
+    } else {
         printf("Encrypted:  no\n");
+    }
     printf("Outlines:   %s\n", tspdf_reader_has_outlines(doc) ? "yes" : "no");
     printf("AcroForm:   %s\n", tspdf_reader_has_acroform(doc) ? "yes" : "no");
 

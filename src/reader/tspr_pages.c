@@ -242,6 +242,10 @@ static TspdfError walk_page_tree(TspdfParser *p, TspdfReaderXref *xref, TspdfObj
         } else if (has_crop_box) {
             memcpy(page.media_box, current_crop_box, sizeof(double) * 4);
         }
+        if (has_crop_box) {
+            memcpy(page.crop_box, current_crop_box, sizeof(double) * 4);
+            page.has_crop_box = true;
+        }
 
         page.rotate = current_rotate >= 0 ? normalize_rotation(current_rotate) :
                       (current_rotate < -1 ? normalize_rotation(current_rotate) : 0);
