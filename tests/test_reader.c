@@ -9303,6 +9303,19 @@ TEST(test_form_flatten_fixture) {
     err = tspdf_reader_form_flatten(doc);
     ASSERT_EQ_INT(err, TSPDF_OK);
 
+    // The fixture page carries /Resources as an indirect ref; merging the
+    // flattening resources must not leave a duplicate /Resources key behind.
+    {
+        TspdfObj *page_dict = doc->pages.pages[0].page_dict;
+        size_t res_keys = 0;
+        for (size_t i = 0; i < page_dict->dict.count; i++) {
+            if (strcmp(page_dict->dict.entries[i].key, "Resources") == 0) {
+                res_keys++;
+            }
+        }
+        ASSERT_EQ_SIZE(res_keys, 1);
+    }
+
     uint8_t *out = NULL;
     size_t out_len = 0;
     err = tspdf_reader_save_to_memory(doc, &out, &out_len);

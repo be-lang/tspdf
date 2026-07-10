@@ -1221,8 +1221,23 @@ TspdfError tspdf_reader_form_flatten(TspdfReader *doc) {
 
             TspdfRenameMap renames = {0};
             if (err == TSPDF_OK && new_res->dict.count > 0) {
-                err = tspdf_resources_merge(doc->pages.pages[p].page_dict,
-                                            new_res, a, &renames);
+                // tspdf_resources_merge treats a non-dict /Resources value as
+                // absent and would append a duplicate key: pages often carry
+                // /Resources as an indirect ref, so inline the resolved dict
+                // first (drop the entry when the ref dangles).
+                TspdfObj *page_dict = doc->pages.pages[p].page_dict;
+                TspdfObj *res_val = tspdf_dict_get(page_dict, "Resources");
+                if (res_val && res_val->type == TSPDF_OBJ_REF) {
+                    TspdfObj *res = form_resolve(doc, &ctx.parser, res_val);
+                    if (res && res->type == TSPDF_OBJ_DICT) {
+                        err = form_dict_put(page_dict, "Resources", res, a);
+                    } else {
+                        form_dict_remove(page_dict, "Resources");
+                    }
+                }
+                if (err == TSPDF_OK) {
+                    err = tspdf_resources_merge(page_dict, new_res, a, &renames);
+                }
             }
             const uint8_t *final_content = content.data;
             size_t final_len = content.len;

@@ -88,6 +88,7 @@ src/reader/tspr_metadata.c
 src/reader/tspr_content.c
 src/reader/tspr_resources.c
 src/reader/tspr_annot.c
+src/reader/tspr_form.c
 src/reader/tspr_text.c
 src/crypto/md5.c
 src/crypto/sha256.c
