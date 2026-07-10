@@ -326,6 +326,7 @@ typedef struct {
     uint64_t extra_bits;    // total len/dist extra bits tallied in this block
     size_t block_start;     // input offset of the pending block's first byte
     size_t block_end;       // one past the last tallied input byte
+    bool split_blocks;      // best level: split blocks adaptively at flush
 } Enc;
 
 static void tally_lit(Enc *e, uint8_t lit) {
@@ -495,19 +496,18 @@ static void emit_stored(BitWriter *bw, const uint8_t *src, size_t span, bool fin
     } while (off < span);
 }
 
-// Close the pending block: pick the cheapest of stored/fixed/dynamic, emit it,
-// and reset the block state.
-static void flush_block(Enc *e, bool final) {
-    e->freq_ll[256]++;  // end-of-block symbol
+// Bit cost of the cheapest encoding for a block with the given statistics.
+// freq_ll must already include the end-of-block symbol. *choice is 0 stored,
+// 1 fixed, 2 dynamic; *plan is filled as a side effect of costing dynamic.
+static uint64_t block_cost(const uint32_t *freq_ll, const uint32_t *freq_d,
+                           uint64_t extra_bits, size_t span,
+                           DynPlan *plan, int *choice) {
+    uint64_t fixed_bits = 3 + extra_bits;
+    for (int s = 0; s < 286; s++) fixed_bits += (uint64_t)freq_ll[s] * fixed_litlen[s].len;
+    for (int s = 0; s < 30; s++) fixed_bits += (uint64_t)freq_d[s] * 5;
 
-    uint64_t fixed_bits = 3 + e->extra_bits;
-    for (int s = 0; s < 286; s++) fixed_bits += (uint64_t)e->freq_ll[s] * fixed_litlen[s].len;
-    for (int s = 0; s < 30; s++) fixed_bits += (uint64_t)e->freq_d[s] * 5;
+    uint64_t dyn_bits = 3 + build_dyn_plan(plan, freq_ll, freq_d) + extra_bits;
 
-    DynPlan plan;
-    uint64_t dyn_bits = 3 + build_dyn_plan(&plan, e->freq_ll, e->freq_d) + e->extra_bits;
-
-    size_t span = e->block_end - e->block_start;
     uint64_t stored_bits = UINT64_MAX;
     if (span > 0) {
         uint64_t nchunks = ((uint64_t)span + 65534) / 65535;
@@ -516,9 +516,24 @@ static void flush_block(Enc *e, bool final) {
         stored_bits = nchunks * 40 + (uint64_t)span * 8;
     }
 
-    if (stored_bits <= fixed_bits && stored_bits <= dyn_bits) {
-        emit_stored(e->bw, e->data + e->block_start, span, final);
-    } else if (dyn_bits < fixed_bits) {
+    if (stored_bits <= fixed_bits && stored_bits <= dyn_bits) { *choice = 0; return stored_bits; }
+    if (dyn_bits < fixed_bits) { *choice = 2; return dyn_bits; }
+    *choice = 1;
+    return fixed_bits;
+}
+
+// Emit syms[lo..hi) — covering span input bytes starting at input offset
+// start — as one deflate block, using whichever encoding costs the least.
+static void emit_block(Enc *e, uint32_t lo, uint32_t hi, size_t start, size_t span,
+                       const uint32_t *freq_ll, const uint32_t *freq_d,
+                       uint64_t extra_bits, bool final) {
+    DynPlan plan;
+    int choice;
+    block_cost(freq_ll, freq_d, extra_bits, span, &plan, &choice);
+
+    if (choice == 0) {
+        emit_stored(e->bw, e->data + start, span, final);
+    } else if (choice == 2) {
         bw_bits(e->bw, final ? 1u : 0u, 1);
         bw_bits(e->bw, 2, 2);
         bw_bits(e->bw, (uint32_t)(plan.hlit - 257), 5);
@@ -532,11 +547,85 @@ static void flush_block(Enc *e, bool final) {
             bw_bits(e->bw, plan.cl[s].code, plan.cl[s].len);
             if (cl_extra_bits[s]) bw_bits(e->bw, plan.item_extra[i], cl_extra_bits[s]);
         }
-        emit_syms(e->bw, e->syms, e->nsyms, plan.ll, plan.d);
+        emit_syms(e->bw, e->syms + lo, hi - lo, plan.ll, plan.d);
     } else {
         bw_bits(e->bw, final ? 1u : 0u, 1);
         bw_bits(e->bw, 1, 2);
-        emit_syms(e->bw, e->syms, e->nsyms, fixed_litlen, fixed_dist);
+        emit_syms(e->bw, e->syms + lo, hi - lo, fixed_litlen, fixed_dist);
+    }
+}
+
+// Recompute block statistics for syms[lo..hi): symbol frequencies (including
+// the end-of-block symbol), total extra bits, and covered input byte span.
+static void tally_range(const Enc *e, uint32_t lo, uint32_t hi,
+                        uint32_t *freq_ll, uint32_t *freq_d,
+                        uint64_t *extra_bits, size_t *span) {
+    memset(freq_ll, 0, 286 * sizeof *freq_ll);
+    memset(freq_d, 0, 30 * sizeof *freq_d);
+    *extra_bits = 0;
+    *span = 0;
+    for (uint32_t i = lo; i < hi; i++) {
+        if (e->syms[i].dist == 0) {
+            freq_ll[e->syms[i].len_or_lit]++;
+            (*span)++;
+        } else {
+            int li = length_code_tab[e->syms[i].len_or_lit - 3];
+            int di = dist_code(e->syms[i].dist);
+            freq_ll[257 + li]++;
+            freq_d[di]++;
+            *extra_bits += (uint64_t)(len_extra[li] + dist_extra[di]);
+            *span += e->syms[i].len_or_lit;
+        }
+    }
+    freq_ll[256]++;
+}
+
+static uint64_t range_cost(const Enc *e, uint32_t lo, uint32_t hi, size_t *span) {
+    uint32_t freq_ll[286], freq_d[30];
+    uint64_t extra_bits;
+    DynPlan plan;
+    int choice;
+    tally_range(e, lo, hi, freq_ll, freq_d, &extra_bits, span);
+    return block_cost(freq_ll, freq_d, extra_bits, *span, &plan, &choice);
+}
+
+// Adaptive block splitting (best level): one Huffman table per 64K-symbol
+// block leaves size on the table when symbol statistics shift mid-block
+// (e.g. text next to binary). Recursively bisect the symbol range while two
+// tailored blocks cost fewer estimated bits than one shared block; homogeneous
+// data stays whole so tiny payloads don't pay for extra headers.
+#define SPLIT_MIN_SYMS 1024u
+
+static void emit_range(Enc *e, uint32_t lo, uint32_t hi, size_t start, bool final) {
+    if (hi - lo >= 2 * SPLIT_MIN_SYMS) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        size_t span_whole, span_left, span_right;
+        uint64_t cost_whole = range_cost(e, lo, hi, &span_whole);
+        uint64_t cost_left = range_cost(e, lo, mid, &span_left);
+        uint64_t cost_right = range_cost(e, mid, hi, &span_right);
+        if (cost_left + cost_right < cost_whole) {
+            emit_range(e, lo, mid, start, false);
+            emit_range(e, mid, hi, start + span_left, final);
+            return;
+        }
+    }
+    uint32_t freq_ll[286], freq_d[30];
+    uint64_t extra_bits;
+    size_t span;
+    tally_range(e, lo, hi, freq_ll, freq_d, &extra_bits, &span);
+    emit_block(e, lo, hi, start, span, freq_ll, freq_d, extra_bits, final);
+}
+
+// Close the pending block: pick the cheapest of stored/fixed/dynamic, emit it,
+// and reset the block state. The best level may split the pending symbols
+// into several blocks first (see emit_range).
+static void flush_block(Enc *e, bool final) {
+    if (e->split_blocks && e->nsyms > 0) {
+        emit_range(e, 0, e->nsyms, e->block_start, final);
+    } else {
+        e->freq_ll[256]++;  // end-of-block symbol
+        emit_block(e, 0, e->nsyms, e->block_start, e->block_end - e->block_start,
+                   e->freq_ll, e->freq_d, e->extra_bits, final);
     }
 
     e->nsyms = 0;
@@ -554,16 +643,25 @@ static void flush_block(Enc *e, bool final) {
 #define MAX_MATCH 258
 #define MIN_MATCH 3
 
-// Search tuning (roughly zlib level 6-7 territory; see benchmark notes in the
-// commit message). MAX_CHAIN bounds chain walks per position; GOOD_LEN quarters
-// it when the deferred match is already good; NICE_LEN stops a search early;
-// MAX_LAZY skips the deferred search entirely after a long match; TOO_FAR
+// Search tuning. max_chain bounds chain walks per position; good_len quarters
+// it when the deferred match is already good; nice_len stops a search early;
+// max_lazy skips the deferred search entirely after a long match; too_far
 // drops 3-byte matches whose distance costs more than three literals.
-#define MAX_CHAIN 256
-#define GOOD_LEN 8
-#define NICE_LEN 128
-#define MAX_LAZY 64
-#define TOO_FAR 4096
+typedef struct {
+    int max_chain;
+    int good_len;
+    int nice_len;
+    int max_lazy;
+    int too_far;
+    int split_blocks;  // nonzero: adaptive Huffman-block splitting at flush
+} MatchParams;
+
+// Fast level: roughly zlib level 6-7 territory (see benchmark notes in the
+// commit message). This is the default save-path compressor, so speed matters.
+static const MatchParams match_fast = { 256, 8, 128, 64, 4096, 0 };
+// Best level: zlib level 9 search parameters plus block splitting. ~4-10x
+// slower, a few percent smaller; for callers who want maximum compression.
+static const MatchParams match_best = { 4096, 32, 258, 258, 4096, 1 };
 
 typedef struct {
     int32_t head[HASH_SIZE];   // hash -> most recent position, -1 if none
@@ -587,7 +685,7 @@ static void hc_insert(HashChain *hc, const uint8_t *data, size_t pos) {
 // can never be read after being overwritten by an aliasing newer position.
 static int longest_match(const uint8_t *data, size_t len, size_t pos,
                          const int32_t *prev, int32_t cand, int floor_len,
-                         int max_chain, int *out_dist) {
+                         int max_chain, int nice_len, int *out_dist) {
     const uint8_t *scan = data + pos;
     size_t avail = len - pos;
     int max_len = avail < MAX_MATCH ? (int)avail : MAX_MATCH;
@@ -595,7 +693,7 @@ static int longest_match(const uint8_t *data, size_t len, size_t pos,
 
     int best_len = floor_len;
     int best_dist = 0;
-    int nice = NICE_LEN < max_len ? NICE_LEN : max_len;
+    int nice = nice_len < max_len ? nice_len : max_len;
     int chain = max_chain;
 
     while (cand >= 0 && chain-- > 0) {
@@ -653,7 +751,8 @@ static uint32_t adler32(const uint8_t *data, size_t len) {
 
 // --- Main compress function ---
 
-uint8_t *deflate_compress(const uint8_t *data, size_t len, size_t *out_len) {
+static uint8_t *deflate_compress_impl(const uint8_t *data, size_t len,
+                                      size_t *out_len, const MatchParams *mp) {
     // Chain positions are int32; refuse absurd inputs rather than overflow.
     // Callers treat NULL as "store uncompressed", so this fails safe.
     if (len > (size_t)INT32_MAX - WINDOW_SIZE) return NULL;
@@ -672,6 +771,7 @@ uint8_t *deflate_compress(const uint8_t *data, size_t len, size_t *out_len) {
     e.bw = &bw;
     e.data = data;
     e.len = len;
+    e.split_blocks = mp->split_blocks != 0;
     e.syms = (LzSym *)malloc(SYM_CAP * sizeof(LzSym));
     HashChain *hc = (HashChain *)malloc(sizeof(HashChain));
     if (!e.syms || !hc) {
@@ -701,13 +801,13 @@ uint8_t *deflate_compress(const uint8_t *data, size_t len, size_t *out_len) {
         }
 
         int cur_len = 0, cur_dist = 0;
-        if (cand >= 0 && prev_len < MAX_LAZY) {
-            int chain = MAX_CHAIN;
-            if (prev_len >= GOOD_LEN) chain >>= 2;
+        if (cand >= 0 && prev_len < mp->max_lazy) {
+            int chain = mp->max_chain;
+            if (prev_len >= mp->good_len) chain >>= 2;
             int floor_len = prev_len >= MIN_MATCH ? prev_len : MIN_MATCH - 1;
             cur_len = longest_match(data, len, pos, hc->prev, cand,
-                                    floor_len, chain, &cur_dist);
-            if (cur_len == MIN_MATCH && cur_dist > TOO_FAR) cur_len = 0;
+                                    floor_len, chain, mp->nice_len, &cur_dist);
+            if (cur_len == MIN_MATCH && cur_dist > mp->too_far) cur_len = 0;
         }
 
         if (prev_len >= MIN_MATCH && cur_len <= prev_len) {
@@ -759,6 +859,14 @@ uint8_t *deflate_compress(const uint8_t *data, size_t len, size_t *out_len) {
 
     *out_len = bw.len;
     return bw.buf;
+}
+
+uint8_t *deflate_compress(const uint8_t *data, size_t len, size_t *out_len) {
+    return deflate_compress_impl(data, len, out_len, &match_fast);
+}
+
+uint8_t *deflate_compress_best(const uint8_t *data, size_t len, size_t *out_len) {
+    return deflate_compress_impl(data, len, out_len, &match_best);
 }
 
 // ============================================================

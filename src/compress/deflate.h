@@ -22,6 +22,11 @@
 // Caller must free() the returned buffer.
 uint8_t *deflate_compress(const uint8_t *data, size_t len, size_t *out_len);
 
+// Same contract as deflate_compress, but spends much more search effort for a
+// smaller output (roughly zlib level 9 territory). Use for write-once data
+// where size matters more than speed.
+uint8_t *deflate_compress_best(const uint8_t *data, size_t len, size_t *out_len);
+
 // Decompress deflate data with zlib wrapper (RFC 1950).
 // Returns malloc'd buffer with decompressed data, or NULL on failure.
 // Sets *out_len to the length of the decompressed data.
