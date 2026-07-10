@@ -109,6 +109,38 @@ tspdf metadata report.pdf \
   -o report-updated.pdf
 ```
 
+## Edit bookmarks (outline)
+
+```bash
+# list existing bookmarks (LEVEL<TAB>PAGE<TAB>TITLE, one per line)
+tspdf bookmark list report.pdf
+
+# machine-readable
+tspdf bookmark list report.pdf --json
+
+# import a table of contents from a file (or - for stdin).
+# each line: LEVEL <TAB> PAGE <TAB> TITLE
+#   LEVEL is 1-based nesting (1 = top; no jumps > 1)
+#   PAGE  is 1-based
+printf '1\t1\tIntroduction\n2\t2\tBackground\n1\t5\tResults\n' > toc.txt
+tspdf bookmark import report.pdf --from toc.txt -o outlined.pdf
+
+# append a single bookmark
+tspdf bookmark add report.pdf --title "Appendix" --page 12 --level 1 -o outlined.pdf
+
+# remove all bookmarks
+tspdf bookmark clear report.pdf -o plain.pdf
+```
+
+`bookmark list` prints the exact format `bookmark import` reads, so you can
+list, edit, and re-import:
+
+```bash
+tspdf bookmark list report.pdf > toc.txt
+$EDITOR toc.txt
+tspdf bookmark import report.pdf --from toc.txt -o report-new.pdf
+```
+
 ## Encrypt and decrypt
 
 ```bash

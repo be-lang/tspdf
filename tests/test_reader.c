@@ -10960,6 +10960,378 @@ TEST(test_form_flatten_writer_checkbox_fallback) {
     free(pdf);
 }
 
+// --- Outline (bookmark) editing ---
+
+// A plain 3-page PDF (no outline) for set/import round-trip tests.
+static char *bm_make_three_page_pdf(size_t *out_len) {
+    char *pdf = (char *)malloc(4096);
+    if (!pdf) return NULL;
+    size_t pos = 0;
+    size_t off[7] = {0};
+    if (!appendf(pdf, 4096, &pos, "%%PDF-1.4\n")) goto fail;
+    off[1] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")) goto fail;
+    off[2] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>\nendobj\n")) goto fail;
+    for (int i = 0; i < 3; i++) {
+        off[3 + i] = pos;
+        if (!appendf(pdf, 4096, &pos,
+                     "%d 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+                     3 + i)) goto fail;
+    }
+    size_t xref = pos;
+    if (!appendf(pdf, 4096, &pos, "xref\n0 6\n0000000000 65535 f \n")) goto fail;
+    for (int i = 1; i <= 5; i++) {
+        if (!appendf(pdf, 4096, &pos, "%010zu 00000 n \n", off[i])) goto fail;
+    }
+    if (!appendf(pdf, 4096, &pos,
+                 "trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n%zu\n%%%%EOF", xref)) goto fail;
+    *out_len = pos;
+    return pdf;
+fail:
+    free(pdf);
+    return NULL;
+}
+
+// list on the shared outline fixture: three items, correct titles/levels/pages.
+TEST(test_bookmark_list_fixture) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/outline_form.pdf", &err);
+    ASSERT(doc != NULL);
+
+    TspdfBookmarkInfo *bm = NULL;
+    size_t n = 0;
+    err = tspdf_reader_bookmarks(doc, &bm, &n);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_SIZE(n, 3);
+
+    ASSERT_EQ_STR(bm[0].title, "OF-CH1");
+    ASSERT_EQ_INT(bm[0].level, 1);
+    ASSERT_EQ_SIZE(bm[0].page_index, 0);
+
+    ASSERT_EQ_STR(bm[1].title, "OF-CH1-SUB");
+    ASSERT_EQ_INT(bm[1].level, 2);
+    ASSERT_EQ_SIZE(bm[1].page_index, 1);
+
+    ASSERT_EQ_STR(bm[2].title, "OF-CH2");
+    ASSERT_EQ_INT(bm[2].level, 1);
+    ASSERT_EQ_SIZE(bm[2].page_index, 2);
+
+    tspdf_reader_destroy(doc);
+}
+
+TEST(test_bookmark_list_no_outline) {
+    size_t len = 0;
+    char *pdf = bm_make_three_page_pdf(&len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    TspdfBookmarkInfo *bm = (TspdfBookmarkInfo *)1;
+    size_t n = 99;
+    err = tspdf_reader_bookmarks(doc, &bm, &n);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_SIZE(n, 0);
+    ASSERT(bm == NULL);
+
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+// set a 3-level TOC, save, reopen, and verify structure via list plus the
+// raw /Count and nesting refs.
+TEST(test_bookmark_set_three_level_roundtrip) {
+    size_t len = 0;
+    char *pdf = bm_make_three_page_pdf(&len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    TspdfBookmarkEntry entries[] = {
+        {"Chapter 1", 1, 0, 0, false},
+        {"Section 1.1", 2, 1, 0, false},
+        {"Subsection 1.1.1", 3, 1, 0, false},
+        {"Section 1.2", 2, 2, 0, false},
+        {"Chapter 2", 1, 2, 0, false},
+    };
+    err = tspdf_reader_set_bookmarks(doc, entries, 5);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+
+    TspdfBookmarkInfo *bm = NULL;
+    size_t n = 0;
+    err = tspdf_reader_bookmarks(re, &bm, &n);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_SIZE(n, 5);
+    ASSERT_EQ_STR(bm[0].title, "Chapter 1");   ASSERT_EQ_INT(bm[0].level, 1);
+    ASSERT_EQ_STR(bm[1].title, "Section 1.1"); ASSERT_EQ_INT(bm[1].level, 2);
+    ASSERT_EQ_STR(bm[2].title, "Subsection 1.1.1"); ASSERT_EQ_INT(bm[2].level, 3);
+    ASSERT_EQ_STR(bm[3].title, "Section 1.2"); ASSERT_EQ_INT(bm[3].level, 2);
+    ASSERT_EQ_STR(bm[4].title, "Chapter 2");   ASSERT_EQ_INT(bm[4].level, 1);
+    ASSERT_EQ_SIZE(bm[4].page_index, 2);
+
+    // Root /Count = 5 (all items open/visible).
+    TspdfObj *root = dt_catalog_get(re, "Outlines");
+    ASSERT(root != NULL && root->type == TSPDF_OBJ_DICT);
+    TspdfObj *rc = tspdf_dict_get(root, "Count");
+    ASSERT(rc && rc->type == TSPDF_OBJ_INT);
+    ASSERT_EQ_INT((int)rc->integer, 5);
+
+    // Chapter 1 has /Count 3 (Section 1.1 + its subsection + Section 1.2).
+    TspdfObj *ch1 = dt_get(re, root, "First");
+    ASSERT(dt_str_eq(tspdf_dict_get(ch1, "Title"), "Chapter 1"));
+    TspdfObj *c1c = tspdf_dict_get(ch1, "Count");
+    ASSERT(c1c && c1c->type == TSPDF_OBJ_INT);
+    ASSERT_EQ_INT((int)c1c->integer, 3);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+// Non-ASCII title survives the UTF-16BE round-trip.
+TEST(test_bookmark_set_nonascii_title_roundtrip) {
+    size_t len = 0;
+    char *pdf = bm_make_three_page_pdf(&len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    const char *title = "Caf\xC3\xA9 \xE2\x86\x92 \xF0\x9F\x93\x84";  // "Café → 📄"
+    TspdfBookmarkEntry entries[] = {{title, 1, 0, 0, false}};
+    err = tspdf_reader_set_bookmarks(doc, entries, 1);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    // Stored as a UTF-16BE literal string: the BOM bytes serialize as the
+    // octal escapes \376\377 (bytes > 126 are escaped by write_string_escaped).
+    ASSERT(bytes_contains(out, out_len, "\\376\\377"));
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    TspdfBookmarkInfo *bm = NULL;
+    size_t n = 0;
+    err = tspdf_reader_bookmarks(re, &bm, &n);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_SIZE(n, 1);
+    ASSERT_EQ_STR(bm[0].title, title);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_bookmark_set_validation_errors) {
+    size_t len = 0;
+    char *pdf = bm_make_three_page_pdf(&len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    // First entry must be level 1.
+    TspdfBookmarkEntry e_lvl2first[] = {{"X", 2, 0, 0, false}};
+    ASSERT_EQ_INT(tspdf_reader_set_bookmarks(doc, e_lvl2first, 1), TSPDF_ERR_INVALID_ARG);
+
+    // Level jump 1 -> 3.
+    TspdfBookmarkEntry e_jump[] = {{"A", 1, 0, 0, false}, {"B", 3, 0, 0, false}};
+    ASSERT_EQ_INT(tspdf_reader_set_bookmarks(doc, e_jump, 2), TSPDF_ERR_INVALID_ARG);
+
+    // Empty title.
+    TspdfBookmarkEntry e_empty[] = {{"", 1, 0, 0, false}};
+    ASSERT_EQ_INT(tspdf_reader_set_bookmarks(doc, e_empty, 1), TSPDF_ERR_INVALID_ARG);
+
+    // Page out of range (only 3 pages: indices 0-2).
+    TspdfBookmarkEntry e_page[] = {{"A", 1, 9, 0, false}};
+    ASSERT_EQ_INT(tspdf_reader_set_bookmarks(doc, e_page, 1), TSPDF_ERR_PAGE_RANGE);
+
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+// clear drops /Outlines; a subsequent list yields nothing.
+TEST(test_bookmark_clear) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/outline_form.pdf", &err);
+    ASSERT(doc != NULL);
+
+    err = tspdf_reader_clear_bookmarks(doc);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(!bytes_contains(out, out_len, "/Outlines"));
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    TspdfBookmarkInfo *bm = NULL;
+    size_t n = 0;
+    err = tspdf_reader_bookmarks(re, &bm, &n);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_SIZE(n, 0);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(doc);
+}
+
+// clear also strips a stale /PageMode /UseOutlines from the catalog.
+TEST(test_bookmark_clear_drops_pagemode_useoutlines) {
+    size_t len = 0;
+    char *pdf = make_catalog_features_pdf(&len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    err = tspdf_reader_clear_bookmarks(doc);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(!bytes_contains(out, out_len, "/UseOutlines"));
+
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+// set with count 0 clears as well.
+TEST(test_bookmark_set_empty_clears) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/outline_form.pdf", &err);
+    ASSERT(doc != NULL);
+    err = tspdf_reader_set_bookmarks(doc, NULL, 0);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    TspdfBookmarkInfo *bm = NULL;
+    size_t n = 0;
+    err = tspdf_reader_bookmarks(doc, &bm, &n);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_SIZE(n, 0);
+    tspdf_reader_destroy(doc);
+}
+
+// Round-trip: list an existing outline, feed it back through set, and confirm
+// the enumeration is stable.
+TEST(test_bookmark_list_then_set_stable) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/outline_form.pdf", &err);
+    ASSERT(doc != NULL);
+    TspdfBookmarkInfo *bm = NULL;
+    size_t n = 0;
+    err = tspdf_reader_bookmarks(doc, &bm, &n);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_SIZE(n, 3);
+
+    TspdfBookmarkEntry *entries = (TspdfBookmarkEntry *)calloc(n, sizeof(*entries));
+    ASSERT(entries != NULL);
+    for (size_t i = 0; i < n; i++) {
+        entries[i].title = bm[i].title;
+        entries[i].level = bm[i].level;
+        entries[i].page_index = bm[i].page_index;
+    }
+    err = tspdf_reader_set_bookmarks(doc, entries, n);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    free(entries);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    TspdfBookmarkInfo *bm2 = NULL;
+    size_t n2 = 0;
+    err = tspdf_reader_bookmarks(re, &bm2, &n2);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_SIZE(n2, 3);
+    ASSERT_EQ_STR(bm2[0].title, "OF-CH1");     ASSERT_EQ_INT(bm2[0].level, 1);
+    ASSERT_EQ_STR(bm2[1].title, "OF-CH1-SUB"); ASSERT_EQ_INT(bm2[1].level, 2);
+    ASSERT_EQ_STR(bm2[2].title, "OF-CH2");     ASSERT_EQ_INT(bm2[2].level, 1);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(doc);
+}
+
+// A cyclic /Next sibling loop lists each item once and terminates.
+TEST(test_bookmark_list_cyclic_bounded) {
+    size_t len = 0;
+    char *pdf = dt_make_cyclic_outline_pdf(&len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    TspdfBookmarkInfo *bm = NULL;
+    size_t n = 0;
+    err = tspdf_reader_bookmarks(doc, &bm, &n);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_SIZE(n, 2);   // LOOPA, LOOPB — no re-emission of the cycle
+    ASSERT_EQ_STR(bm[0].title, "LOOPA");
+    ASSERT_EQ_STR(bm[1].title, "LOOPB");
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+// 10000 entries import bounded (structure builds, count matches, no runaway).
+TEST(test_bookmark_set_large_bounded) {
+    size_t len = 0;
+    char *pdf = bm_make_three_page_pdf(&len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    size_t N = 10000;
+    TspdfBookmarkEntry *entries = (TspdfBookmarkEntry *)calloc(N, sizeof(*entries));
+    ASSERT(entries != NULL);
+    for (size_t i = 0; i < N; i++) {
+        entries[i].title = "item";
+        entries[i].level = 1;
+        entries[i].page_index = i % 3;
+    }
+    err = tspdf_reader_set_bookmarks(doc, entries, N);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    free(entries);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    TspdfBookmarkInfo *bm = NULL;
+    size_t n = 0;
+    err = tspdf_reader_bookmarks(re, &bm, &n);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_SIZE(n, N);
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
 int main(void) {
     printf("tspr reader tests:\n");
 
@@ -11283,6 +11655,18 @@ int main(void) {
     RUN(test_form_flatten_no_form_noop);
     RUN(test_form_flatten_writer_checkbox_fallback);
 
+    printf("\n  Outline (bookmark) editing:\n");
+    RUN(test_bookmark_list_fixture);
+    RUN(test_bookmark_list_no_outline);
+    RUN(test_bookmark_set_three_level_roundtrip);
+    RUN(test_bookmark_set_nonascii_title_roundtrip);
+    RUN(test_bookmark_set_validation_errors);
+    RUN(test_bookmark_clear);
+    RUN(test_bookmark_clear_drops_pagemode_useoutlines);
+    RUN(test_bookmark_set_empty_clears);
+    RUN(test_bookmark_list_then_set_stable);
+    RUN(test_bookmark_list_cyclic_bounded);
+    RUN(test_bookmark_set_large_bounded);
 
     printf("\n%d tests, %d passed, %d failed\n",
            tests_run, tests_passed, tests_failed);

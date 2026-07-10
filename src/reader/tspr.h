@@ -257,6 +257,50 @@ TspdfError tspdf_reader_attachment_add(TspdfReader *doc, const char *name,
 // Remove the attachment stored under `name`. TSPDF_ERR_NOT_FOUND when no
 // attachment has that name.
 TspdfError tspdf_reader_attachment_remove(TspdfReader *doc, const char *name);
+
+// --- Outline (bookmark) editing ---
+
+typedef struct {
+    const char *title;      // UTF-8; UTF-16BE titles are decoded. "" if empty.
+    int level;              // nesting depth, 1 = top level
+    size_t page_index;      // 0-based target page; SIZE_MAX if unresolved
+    bool open;              // item shown expanded (its /Count >= 0)
+} TspdfBookmarkInfo;
+
+// Enumerate the document's outline as a flat, pre-order list (parents before
+// children). *out and everything it points to are owned by the reader's arena
+// (valid until tspdf_reader_destroy; do not free). A document without an
+// outline yields TSPDF_OK and count 0. The walk is budget-guarded, so a cyclic
+// outline tree terminates and lists each item at most once.
+TspdfError tspdf_reader_bookmarks(TspdfReader *doc, TspdfBookmarkInfo **out,
+                                  size_t *count);
+
+// One entry for tspdf_reader_set_bookmarks: a flat list whose `level` values
+// define nesting (level 1 = top; a level-N item nests under the nearest
+// preceding item of level N-1). `y` is an optional /XYZ top coordinate (in the
+// target page's user space); pass has_y = false to fit the page instead.
+typedef struct {
+    const char *title;      // UTF-8; non-ASCII becomes UTF-16BE with BOM
+    int level;              // 1-based nesting level
+    size_t page_index;      // 0-based target page
+    double y;               // /XYZ top coordinate when has_y
+    bool has_y;
+} TspdfBookmarkEntry;
+
+// Replace the whole outline tree with `entries`. Levels must start at 1 and
+// never jump by more than one from the previous entry (1->3 is rejected); every
+// page_index must be in range and every title non-empty. The document must be
+// saved for the change to persist. TSPDF_ERR_INVALID_ARG on a bad level jump or
+// empty title; TSPDF_ERR_PAGE_RANGE on an out-of-range page. An empty list
+// clears the outline (same as tspdf_reader_clear_bookmarks).
+TspdfError tspdf_reader_set_bookmarks(TspdfReader *doc,
+                                      const TspdfBookmarkEntry *entries,
+                                      size_t count);
+
+// Drop /Outlines (and /PageMode /UseOutlines) from the catalog. Succeeds even
+// when the document has no outline. The document must be saved to persist.
+TspdfError tspdf_reader_clear_bookmarks(TspdfReader *doc);
+
 // --- Page import (stamping) ---
 
 // Wrap a page of `src` as a /Form XObject in `dst`: the source page's content

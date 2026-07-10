@@ -39,6 +39,7 @@ tspdf compress doc.pdf -o smaller.pdf
 tspdf text doc.pdf -o doc.txt
 tspdf metadata doc.pdf
 tspdf attach add doc.pdf data.csv -o with-files.pdf
+tspdf bookmark import doc.pdf --from toc.txt -o outlined.pdf
 tspdf form fill form.pdf --set name=Ada -o filled.pdf
 tspdf md2pdf notes.md -o notes.pdf
 tspdf img2pdf photo.jpg -o photo.pdf
@@ -121,7 +122,7 @@ and conformance jobs, on every push.
 
 ## Features
 
-- **Reading**: open PDFs, extract/delete/rotate/reorder/merge pages, text extraction (plain or layout-preserving), AcroForm form fill/flatten, PDF stamping, watermarks, annotations, page numbers, file attachments, content overlay, AES-128/256 encryption and decryption.
+- **Reading**: open PDFs, extract/delete/rotate/reorder/merge pages, text extraction (plain or layout-preserving), AcroForm form fill/flatten, outline (bookmark) editing, PDF stamping, watermarks, annotations, page numbers, file attachments, content overlay, AES-128/256 encryption and decryption.
 - **Generation**: flexbox-style layout with fixed/grow/fit-content/percentage sizing, automatic page breaks with repeating headers, tables with auto-sized columns and colspan.
 - **Text**: TrueType parsing and embedding with subsetting, Unicode via CIDFont Type2 + Identity-H, wrapping, alignment, inline rich text.
 - **Graphics**: borders, shadows, opacity, clipping, transforms, vector paths, linear and radial gradients.
