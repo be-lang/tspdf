@@ -102,6 +102,31 @@ TspdfReader *tspdf_reader_extract(TspdfReader *doc, const size_t *pages, size_t 
 TspdfReader *tspdf_reader_delete(TspdfReader *doc, const size_t *pages, size_t count, TspdfError *err);
 TspdfReader *tspdf_reader_rotate(TspdfReader *doc, const size_t *pages, size_t count, int angle, TspdfError *err);
 TspdfReader *tspdf_reader_reorder(TspdfReader *doc, const size_t *order, size_t count, TspdfError *err);
+
+// Set the /CropBox of the given pages to `box` = [x0 y0 x1 y1] in the page's
+// default user space (the same coordinate space as the /MediaBox; not
+// relative to the MediaBox origin). This is non-destructive: page content is
+// preserved and merely clipped to the new visible region. The box is
+// intersected with each page's MediaBox (a CropBox outside the MediaBox is
+// meaningless per the spec), so the stored box never exceeds the media. A
+// degenerate box (x1<=x0 or y1<=y0, before or after clamping) yields
+// TSPDF_ERR_INVALID_ARG. Out-of-range page indices yield TSPDF_ERR_PAGE_RANGE.
+// Returns a new document (source unchanged), consistent with rotate/extract.
+TspdfReader *tspdf_reader_set_cropbox(TspdfReader *doc, const size_t *pages,
+                                      size_t count, const double box[4],
+                                      TspdfError *err);
+
+// Scale the given pages by (sx, sy): the page content is wrapped in a
+// `q sx 0 0 sy 0 0 cm ... Q` transform and the /MediaBox (and any /CropBox)
+// is multiplied by the same factors, so the page grows/shrinks with its
+// content rather than being clipped. Existing box origins are scaled too.
+// A rotated page (/Rotate) is handled: the transform is applied in unrotated
+// page space, which the viewer then rotates, so content still fills the page.
+// Non-positive factors yield TSPDF_ERR_INVALID_ARG; out-of-range indices yield
+// TSPDF_ERR_PAGE_RANGE. Returns a new document (source unchanged).
+TspdfReader *tspdf_reader_scale(TspdfReader *doc, const size_t *pages,
+                                size_t count, double sx, double sy,
+                                TspdfError *err);
 TspdfReader *tspdf_reader_merge(TspdfReader **docs, size_t count, TspdfError *err);
 
 // Save
