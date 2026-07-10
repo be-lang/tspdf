@@ -1856,6 +1856,74 @@ else
   echo "  SKIP  md2pdf qpdf structural checks (qpdf not installed)"
 fi
 
+# ── form: list / fill / flatten ─────────────────────────────────────
+FORM_PDF=tests/data/form_fields.pdf
+FORM_ENC_PDF=tests/data/form_fields_enc.pdf
+
+run_test "form list prints a JSON array" bash -c "$TSPDF form list $FORM_PDF | head -c 1 | grep -q '\['"
+run_test "form list encrypted with --password" bash -c "$TSPDF form list $FORM_ENC_PDF --password secret | grep -q '\"name\"'"
+run_test "form list wrong password fails" bash -c "! $TSPDF form list $FORM_ENC_PDF --password wrong > /dev/null 2>&1"
+run_test "form on plain PDF lists empty array" bash -c "[ \"\$($TSPDF form list $INPUT)\" = '[]' ]"
+run_test "form fill unknown field errors with its name" bash -c "
+  ! $TSPDF form fill $FORM_PDF --set nope=1 -o $TMPDIR/form_bad.pdf 2> $TMPDIR/form_bad.err
+  grep -q 'nope' $TMPDIR/form_bad.err"
+run_test "form fill --set writes values" bash -c "
+  set -e
+  $TSPDF form fill $FORM_PDF --set name=Bob --set agree=true --set color=Blue \
+      --set city=Oslo -o $TMPDIR/form_filled.pdf
+  $TSPDF form list $TMPDIR/form_filled.pdf > $TMPDIR/form_filled.json
+  grep -q '\"Bob\"' $TMPDIR/form_filled.json
+  grep -q '\"Yes\"' $TMPDIR/form_filled.json
+  grep -q '\"Blue\"' $TMPDIR/form_filled.json
+  grep -q '\"Oslo\"' $TMPDIR/form_filled.json"
+run_test "form fill --data - reads JSON from stdin" bash -c "
+  set -e
+  printf '%s' '{\"name\": \"Ren\\u00e9\", \"a.b\": \"nested\"}' \
+    | $TSPDF form fill $FORM_PDF --data - -o $TMPDIR/form_json.pdf
+  $TSPDF form list $TMPDIR/form_json.pdf > $TMPDIR/form_json.json
+  grep -q \"Ren\$(printf '\\xc3\\xa9')\" $TMPDIR/form_json.json
+  grep -q '\"nested\"' $TMPDIR/form_json.json"
+run_test "form fill rejects malformed JSON" bash -c "
+  printf '%s' '{\"name\": 12}' > $TMPDIR/form_bad.json
+  ! $TSPDF form fill $FORM_PDF --data $TMPDIR/form_bad.json -o $TMPDIR/form_x.pdf > /dev/null 2>&1"
+run_test "form flatten produces a form-free PDF" bash -c "
+  set -e
+  $TSPDF form flatten $TMPDIR/form_filled.pdf -o $TMPDIR/form_flat.pdf
+  [ \"\$($TSPDF form list $TMPDIR/form_flat.pdf)\" = '[]' ]
+  $TSPDF text $TMPDIR/form_flat.pdf | grep -q 'Bob'
+  $TSPDF text $TMPDIR/form_flat.pdf | grep -q 'Oslo'"
+run_test "help form shows command-specific usage" bash -c "$TSPDF help form 2>/dev/null | grep -q 'Usage: tspdf form'"
+
+if command -v python3 > /dev/null 2>&1; then
+  run_test "form list JSON structure validates" python3 - << PYEOF
+import json, subprocess
+out = subprocess.run(["$TSPDF", "form", "list", "$FORM_PDF"],
+                     capture_output=True, check=True).stdout
+fields = {f["name"]: f for f in json.loads(out)}
+assert set(fields) == {"name", "agree", "city", "color", "a.b"}, sorted(fields)
+assert fields["name"]["type"] == "text" and fields["name"]["value"] == "Ada"
+assert fields["name"]["page"] == 1
+assert fields["agree"]["type"] == "checkbox" and fields["agree"]["options"] == ["Yes"]
+assert fields["color"]["type"] == "radio" and sorted(fields["color"]["options"]) == ["Blue", "Red"]
+assert fields["city"]["type"] == "choice" and fields["city"]["options"] == ["Berlin", "Paris", "Oslo"]
+assert fields["a.b"]["value"] is None
+assert fields["name"]["readonly"] is False and fields["name"]["required"] is False
+PYEOF
+else
+  echo "  SKIP  form list JSON structure (python3 not found)"
+fi
+
+if command -v qpdf > /dev/null 2>&1; then
+  run_test "form fill output passes qpdf --check" bash -c "qpdf --check $TMPDIR/form_filled.pdf > /dev/null 2>&1"
+  run_test "form fill value visible to qpdf acroform json" bash -c "
+    qpdf --json --json-key=acroform $TMPDIR/form_filled.pdf | grep -q 'Bob'"
+  run_test "form flatten output passes qpdf --check" bash -c "qpdf --check $TMPDIR/form_flat.pdf > /dev/null 2>&1"
+  run_test "form flatten output has no acroform per qpdf" bash -c "
+    ! qpdf --json --json-key=acroform $TMPDIR/form_flat.pdf | grep -q '\"fullname\"'"
+else
+  echo "  SKIP  form qpdf conformance checks (qpdf not installed)"
+fi
+
 # `make amalgamation` generates build/amalgamation/tspdf.{c,h} and proves them:
 # standalone -Werror compile, link + run examples/minimal.c against them, and
 # qpdf --check on the produced PDF (inside the make target, when qpdf exists).

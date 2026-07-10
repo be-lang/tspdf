@@ -27,6 +27,7 @@ static void print_usage(void) {
     printf("  serve      Start a local web server for PDF tools\n");
     printf("  text       Extract text from a PDF\n");
     printf("  pagenum    Stamp page numbers onto a PDF\n");
+    printf("  form       List, fill, or flatten PDF form fields\n");
     printf("\n");
     printf("Options:\n");
     printf("  --help, -h     Show this help message\n");
@@ -220,6 +221,29 @@ static void print_command_help(const char *cmd) {
         printf("  --pages <range>    Only stamp these pages, e.g. 2-10 or 2,4 (default:\n");
         printf("                     all). Numbering still reflects the true position.\n");
         printf("  -o <output.pdf>    Output file path (required)\n");
+    } else if (strcmp(cmd, "form") == 0) {
+        printf("Usage: tspdf form <list|fill|flatten> <input.pdf> [options]\n");
+        printf("\n");
+        printf("Work with AcroForm form fields (interactive PDF forms).\n");
+        printf("\n");
+        printf("Subcommands:\n");
+        printf("  list <input.pdf>                    Print all fields as a JSON array:\n");
+        printf("                                      name, type, value, page, required,\n");
+        printf("                                      readonly, and options where relevant\n");
+        printf("  fill <input.pdf> -o <output.pdf>    Set field values\n");
+        printf("      --data <file.json|->            JSON object {\"field\": \"value\", ...}\n");
+        printf("                                      ('-' reads it from stdin)\n");
+        printf("      --set name=value                Set one field (repeatable)\n");
+        printf("      --force                         Also fill readonly fields\n");
+        printf("  flatten <input.pdf> -o <output.pdf> Stamp current values into the page\n");
+        printf("                                      content and remove the form\n");
+        printf("\n");
+        printf("Options:\n");
+        printf("  --password <pass>  Password for encrypted PDFs (optional)\n");
+        printf("\n");
+        printf("Checkboxes and radio groups accept an \"on\" state name (see options in\n");
+        printf("`form list`), \"Off\", or true/false. Filled text fields get a single-line\n");
+        printf("appearance (no comb or multiline layout).\n");
     } else {
         /* Unknown command — fall back to general help */
         print_usage();
@@ -276,6 +300,7 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "serve") == 0)   return cmd_serve(sub_argc, sub_argv);
     if (strcmp(cmd, "text") == 0)    return cmd_text(sub_argc, sub_argv);
     if (strcmp(cmd, "pagenum") == 0)  return cmd_pagenum(sub_argc, sub_argv);
+    if (strcmp(cmd, "form") == 0)     return cmd_form(sub_argc, sub_argv);
 
     fprintf(stderr, "tspdf: unknown command '%s'\n\n", cmd);
     print_usage();

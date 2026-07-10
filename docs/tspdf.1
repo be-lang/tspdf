@@ -54,6 +54,20 @@ Extract text from a PDF to stdout or a file.
 .B \-\-pages
 selects pages.
 .TP
+.B form
+List, fill, or flatten AcroForm form fields.
+.B form list
+prints the fields as JSON;
+.B form fill
+takes a JSON object
+.RB ( \-\-data )
+and/or repeated
+.B \-\-set
+.I name=value
+pairs;
+.B form flatten
+stamps the values into the page content and removes the form.
+.TP
 .B img2pdf
 Convert images (JPEG/PNG) to a PDF.
 .B \-\-page\-size
@@ -89,6 +103,7 @@ tspdf merge a.pdf b.pdf \-o combined.pdf
 tspdf split report.pdf \-\-pages 1\-5 \-o extract.pdf
 tspdf encrypt doc.pdf \-o locked.pdf \-\-password secret
 tspdf watermark doc.pdf \-o draft.pdf \-\-text "DRAFT"
+tspdf form fill form.pdf \-\-set name=Ada \-o filled.pdf
 tspdf serve \-\-port 3000
 .fi
 .SH SEE ALSO

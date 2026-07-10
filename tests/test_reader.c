@@ -8724,6 +8724,824 @@ TEST(test_reader_save_to_memory_with_options_matches_file) {
     tspdf_reader_destroy(doc);
 }
 
+// ============================================================
+// AcroForm form fields (feat/form): list / fill / flatten
+// ============================================================
+
+static const TspdfFormFieldInfo *form_find(TspdfFormFieldInfo *fields,
+                                           size_t count, const char *name) {
+    for (size_t i = 0; i < count; i++) {
+        if (fields[i].name && strcmp(fields[i].name, name) == 0) {
+            return &fields[i];
+        }
+    }
+    return NULL;
+}
+
+static bool form_has_option(const TspdfFormFieldInfo *f, const char *opt) {
+    for (size_t i = 0; i < f->option_count; i++) {
+        if (f->options[i] && strcmp(f->options[i], opt) == 0) return true;
+    }
+    return false;
+}
+
+TEST(test_form_fields_fixture) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/form_fields.pdf", &err);
+    ASSERT(doc != NULL);
+
+    TspdfFormFieldInfo *fields = NULL;
+    size_t count = 0;
+    err = tspdf_reader_form_fields(doc, &fields, &count);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_SIZE(count, 5);
+
+    const TspdfFormFieldInfo *name = form_find(fields, count, "name");
+    ASSERT(name != NULL);
+    ASSERT_EQ_INT(name->type, TSPDF_FIELD_TEXT);
+    ASSERT(name->value && strcmp(name->value, "Ada") == 0);
+    ASSERT(!name->readonly);
+    ASSERT(!name->required);
+    ASSERT_EQ_SIZE(name->page_index, 0);
+    ASSERT(name->rect[0] == 72 && name->rect[1] == 672 &&
+           name->rect[2] == 300 && name->rect[3] == 692);
+
+    const TspdfFormFieldInfo *agree = form_find(fields, count, "agree");
+    ASSERT(agree != NULL);
+    ASSERT_EQ_INT(agree->type, TSPDF_FIELD_CHECKBOX);
+    ASSERT(agree->value && strcmp(agree->value, "Off") == 0);
+    ASSERT_EQ_SIZE(agree->option_count, 1);
+    ASSERT(form_has_option(agree, "Yes"));
+
+    const TspdfFormFieldInfo *city = form_find(fields, count, "city");
+    ASSERT(city != NULL);
+    ASSERT_EQ_INT(city->type, TSPDF_FIELD_CHOICE);
+    ASSERT(city->value && strcmp(city->value, "Berlin") == 0);
+    ASSERT_EQ_SIZE(city->option_count, 3);
+    ASSERT(form_has_option(city, "Berlin"));
+    ASSERT(form_has_option(city, "Paris"));
+    ASSERT(form_has_option(city, "Oslo"));
+
+    const TspdfFormFieldInfo *color = form_find(fields, count, "color");
+    ASSERT(color != NULL);
+    ASSERT_EQ_INT(color->type, TSPDF_FIELD_RADIO);
+    ASSERT(color->value && strcmp(color->value, "Red") == 0);
+    ASSERT_EQ_SIZE(color->option_count, 2);
+    ASSERT(form_has_option(color, "Red"));
+    ASSERT(form_has_option(color, "Blue"));
+    ASSERT_EQ_SIZE(color->page_index, 0);
+
+    // Hierarchical field: parent /T (a), widget kid /T (b).
+    const TspdfFormFieldInfo *ab = form_find(fields, count, "a.b");
+    ASSERT(ab != NULL);
+    ASSERT_EQ_INT(ab->type, TSPDF_FIELD_TEXT);
+    ASSERT(ab->value == NULL);
+    ASSERT_EQ_SIZE(ab->page_index, 0);
+
+    tspdf_reader_destroy(doc);
+}
+
+TEST(test_form_fields_no_form) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/three_pages.pdf", &err);
+    ASSERT(doc != NULL);
+    TspdfFormFieldInfo *fields = NULL;
+    size_t count = 123;
+    err = tspdf_reader_form_fields(doc, &fields, &count);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_SIZE(count, 0);
+    tspdf_reader_destroy(doc);
+}
+
+TEST(test_form_fields_encrypted) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file_with_password(
+        "tests/data/form_fields_enc.pdf", "secret", &err);
+    ASSERT(doc != NULL);
+
+    TspdfFormFieldInfo *fields = NULL;
+    size_t count = 0;
+    err = tspdf_reader_form_fields(doc, &fields, &count);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_SIZE(count, 5);
+    const TspdfFormFieldInfo *name = form_find(fields, count, "name");
+    ASSERT(name != NULL);
+    ASSERT(name->value && strcmp(name->value, "Ada") == 0);
+    const TspdfFormFieldInfo *color = form_find(fields, count, "color");
+    ASSERT(color != NULL);
+    ASSERT(color->value && strcmp(color->value, "Red") == 0);
+
+    tspdf_reader_destroy(doc);
+}
+
+TEST(test_form_fields_writer_roundtrip) {
+    size_t len = 0;
+    uint8_t *pdf = dt_writer_pdf(2, false, true, "W1", "Helvetica", &len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open(pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    TspdfFormFieldInfo *fields = NULL;
+    size_t count = 0;
+    err = tspdf_reader_form_fields(doc, &fields, &count);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_SIZE(count, 2);
+
+    const TspdfFormFieldInfo *text = form_find(fields, count, "W1_text");
+    ASSERT(text != NULL);
+    ASSERT_EQ_INT(text->type, TSPDF_FIELD_TEXT);
+    ASSERT(text->value && strcmp(text->value, "hello") == 0);
+    ASSERT_EQ_SIZE(text->page_index, 0);
+
+    // tspdf's own writer emits checkbox /V as a string and no /AP.
+    const TspdfFormFieldInfo *check = form_find(fields, count, "W1_check");
+    ASSERT(check != NULL);
+    ASSERT_EQ_INT(check->type, TSPDF_FIELD_CHECKBOX);
+    ASSERT(check->value && strcmp(check->value, "Yes") == 0);
+    ASSERT_EQ_SIZE(check->page_index, 1);
+    ASSERT_EQ_SIZE(check->option_count, 0);
+
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+// Field whose /Kids array points back at itself and at a child that points
+// back at the parent: enumeration must stay bounded (budget guard).
+static char *form_make_cyclic_kids_pdf(size_t *out_len) {
+    char *pdf = (char *)malloc(4096);
+    if (!pdf) return NULL;
+    size_t pos = 0;
+    size_t off[8] = {0};
+
+    if (!appendf(pdf, 4096, &pos, "%%PDF-1.4\n")) goto fail;
+    off[1] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R "
+                 "/AcroForm << /Fields [3 0 R] >> >>\nendobj\n")) goto fail;
+    off[2] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [4 0 R] /Count 1 >>\nendobj\n")) goto fail;
+    off[3] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "3 0 obj\n<< /FT /Tx /T (loop) /Kids [3 0 R 5 0 R] >>\nendobj\n")) goto fail;
+    off[4] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n")) goto fail;
+    off[5] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "5 0 obj\n<< /T (kid) /Kids [3 0 R] >>\nendobj\n")) goto fail;
+
+    size_t xref = pos;
+    if (!appendf(pdf, 4096, &pos, "xref\n0 6\n0000000000 65535 f \n")) goto fail;
+    for (int i = 1; i <= 5; i++) {
+        if (!appendf(pdf, 4096, &pos, "%010zu 00000 n \n", off[i])) goto fail;
+    }
+    if (!appendf(pdf, 4096, &pos,
+                 "trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n%zu\n%%%%EOF",
+                 xref)) goto fail;
+    *out_len = pos;
+    return pdf;
+fail:
+    free(pdf);
+    return NULL;
+}
+
+// A field that lists itself in /Kids. Because the self-reference resolves to
+// a node with /T, a naive walker treats it as an interior node and recurses,
+// re-appending its own name each level ("self.self.self...") until the budget
+// drains. It must instead appear exactly once.
+static char *form_make_self_kid_pdf(size_t *out_len) {
+    char *pdf = (char *)malloc(4096);
+    if (!pdf) return NULL;
+    size_t pos = 0;
+    size_t off[8] = {0};
+
+    if (!appendf(pdf, 4096, &pos, "%%PDF-1.4\n")) goto fail;
+    off[1] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R "
+                 "/AcroForm << /Fields [3 0 R] >> >>\nendobj\n")) goto fail;
+    off[2] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [4 0 R] /Count 1 >>\nendobj\n")) goto fail;
+    off[3] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "3 0 obj\n<< /FT /Tx /T (self) /Kids [3 0 R] >>\nendobj\n")) goto fail;
+    off[4] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n")) goto fail;
+
+    size_t xref = pos;
+    if (!appendf(pdf, 4096, &pos, "xref\n0 5\n0000000000 65535 f \n")) goto fail;
+    for (int i = 1; i <= 4; i++) {
+        if (!appendf(pdf, 4096, &pos, "%010zu 00000 n \n", off[i])) goto fail;
+    }
+    if (!appendf(pdf, 4096, &pos,
+                 "trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n%zu\n%%%%EOF",
+                 xref)) goto fail;
+    *out_len = pos;
+    return pdf;
+fail:
+    free(pdf);
+    return NULL;
+}
+
+TEST(test_form_fields_self_kid_listed_once) {
+    size_t len = 0;
+    char *pdf = form_make_self_kid_pdf(&len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    TspdfFormFieldInfo *fields = NULL;
+    size_t count = 0;
+    err = tspdf_reader_form_fields(doc, &fields, &count);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    // The self-referential field is terminal; it lists exactly once as "self",
+    // not stacked "self.self..." names.
+    ASSERT_EQ_SIZE(count, 1);
+    ASSERT(form_find(fields, count, "self") != NULL);
+
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_form_fields_cyclic_kids_bounded) {
+    size_t len = 0;
+    char *pdf = form_make_cyclic_kids_pdf(&len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    TspdfFormFieldInfo *fields = NULL;
+    size_t count = 0;
+    err = tspdf_reader_form_fields(doc, &fields, &count);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    // Bounded: the cycle must not fan out into an unbounded field list.
+    ASSERT(count < 16);
+
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+// Adversarial structure: a terminal field with no /T, no /Rect and no page
+// link; a field whose only kid ref dangles; a button whose /AP appearance
+// refs dangle; a dangling ref and a non-ref directly in /Fields.
+static char *form_make_adversarial_pdf(size_t *out_len) {
+    char *pdf = (char *)malloc(4096);
+    if (!pdf) return NULL;
+    size_t pos = 0;
+    size_t off[8] = {0};
+
+    if (!appendf(pdf, 4096, &pos, "%%PDF-1.4\n")) goto fail;
+    off[1] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R "
+                 "/AcroForm << /Fields [3 0 R 5 0 R 6 0 R 88 0 R 42] >> >>\nendobj\n")) goto fail;
+    off[2] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [4 0 R] /Count 1 >>\nendobj\n")) goto fail;
+    off[3] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "3 0 obj\n<< /FT /Tx /Type /Annot /Subtype /Widget >>\nendobj\n")) goto fail;
+    off[4] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                 "/Annots [97 0 R] >>\nendobj\n")) goto fail;
+    off[5] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "5 0 obj\n<< /FT /Tx /T (dangler) /Kids [98 0 R] >>\nendobj\n")) goto fail;
+    off[6] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "6 0 obj\n<< /FT /Btn /T (chk) /Type /Annot /Subtype /Widget "
+                 "/Rect [10 10 20 20] "
+                 "/AP << /N << /On 96 0 R /Off 95 0 R >> >> >>\nendobj\n")) goto fail;
+
+    size_t xref = pos;
+    if (!appendf(pdf, 4096, &pos, "xref\n0 7\n0000000000 65535 f \n")) goto fail;
+    for (int i = 1; i <= 6; i++) {
+        if (!appendf(pdf, 4096, &pos, "%010zu 00000 n \n", off[i])) goto fail;
+    }
+    if (!appendf(pdf, 4096, &pos,
+                 "trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n%zu\n%%%%EOF",
+                 xref)) goto fail;
+    *out_len = pos;
+    return pdf;
+fail:
+    free(pdf);
+    return NULL;
+}
+
+TEST(test_form_fields_adversarial_no_crash) {
+    size_t len = 0;
+    char *pdf = form_make_adversarial_pdf(&len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    TspdfFormFieldInfo *fields = NULL;
+    size_t count = 0;
+    err = tspdf_reader_form_fields(doc, &fields, &count);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_SIZE(count, 3);
+
+    // Unnamed widget field: listed with "" name, no page, zero rect.
+    const TspdfFormFieldInfo *unnamed = form_find(fields, count, "");
+    ASSERT(unnamed != NULL);
+    ASSERT_EQ_INT(unnamed->type, TSPDF_FIELD_TEXT);
+    ASSERT(unnamed->page_index == (size_t)-1);
+    ASSERT(unnamed->rect[0] == 0 && unnamed->rect[2] == 0);
+
+    // Field whose kid ref dangles still enumerates by name.
+    ASSERT(form_find(fields, count, "dangler") != NULL);
+
+    // Button options come from the /AP /N keys even when the streams dangle.
+    const TspdfFormFieldInfo *chk = form_find(fields, count, "chk");
+    ASSERT(chk != NULL);
+    ASSERT_EQ_INT(chk->type, TSPDF_FIELD_CHECKBOX);
+    ASSERT_EQ_SIZE(chk->option_count, 1);
+    ASSERT(form_has_option(chk, "On"));
+
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+// --- fill ---
+
+// Save doc to memory, destroy it, reopen from the copy. Returns the new doc
+// (caller destroys) and the malloc'd buffer backing it (caller frees after
+// destroying the doc).
+static TspdfReader *form_reopen(TspdfReader *doc, uint8_t **out_buf) {
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    if (tspdf_reader_save_to_memory(doc, &out, &out_len) != TSPDF_OK) {
+        free(out);
+        return NULL;
+    }
+    TspdfError err;
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    if (!re) {
+        free(out);
+        return NULL;
+    }
+    *out_buf = out;
+    return re;
+}
+
+TEST(test_form_fill_text_value_and_appearance) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/form_fields.pdf", &err);
+    ASSERT(doc != NULL);
+
+    err = tspdf_reader_form_fill(doc, "name", "Grace Hopper", false);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    err = tspdf_reader_form_fill(doc, "a.b", "nested", false);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    // The appearance stream shows the value (the /V string alone would not
+    // produce a "... Tj" operator sequence) and the AcroForm is marked
+    // NeedAppearances as a belt for viewers that regenerate.
+    ASSERT(bytes_contains(out, out_len, "(Grace Hopper) Tj"));
+    ASSERT(bytes_contains(out, out_len, "/NeedAppearances true"));
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    TspdfFormFieldInfo *fields = NULL;
+    size_t count = 0;
+    err = tspdf_reader_form_fields(re, &fields, &count);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    const TspdfFormFieldInfo *name = form_find(fields, count, "name");
+    ASSERT(name != NULL);
+    ASSERT(name->value && strcmp(name->value, "Grace Hopper") == 0);
+    const TspdfFormFieldInfo *ab = form_find(fields, count, "a.b");
+    ASSERT(ab != NULL);
+    ASSERT(ab->value && strcmp(ab->value, "nested") == 0);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(doc);
+}
+
+TEST(test_form_fill_text_nonascii_roundtrip) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/form_fields.pdf", &err);
+    ASSERT(doc != NULL);
+
+    err = tspdf_reader_form_fill(doc, "name", "Gr\xc3\xbc\xc3\x9f" "e", false);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *out = NULL;
+    TspdfReader *re = form_reopen(doc, &out);
+    ASSERT(re != NULL);
+    TspdfFormFieldInfo *fields = NULL;
+    size_t count = 0;
+    err = tspdf_reader_form_fields(re, &fields, &count);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    const TspdfFormFieldInfo *name = form_find(fields, count, "name");
+    ASSERT(name != NULL);
+    ASSERT(name->value && strcmp(name->value, "Gr\xc3\xbc\xc3\x9f" "e") == 0);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(doc);
+}
+
+TEST(test_form_fill_checkbox_states) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/form_fields.pdf", &err);
+    ASSERT(doc != NULL);
+
+    // Not an on-state of this checkbox.
+    err = tspdf_reader_form_fill(doc, "agree", "Bogus", false);
+    ASSERT_EQ_INT(err, TSPDF_ERR_INVALID_ARG);
+
+    err = tspdf_reader_form_fill(doc, "agree", "Yes", false);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *out = NULL;
+    TspdfReader *re = form_reopen(doc, &out);
+    ASSERT(re != NULL);
+    TspdfFormFieldInfo *fields = NULL;
+    size_t count = 0;
+    err = tspdf_reader_form_fields(re, &fields, &count);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    const TspdfFormFieldInfo *agree = form_find(fields, count, "agree");
+    ASSERT(agree != NULL);
+    ASSERT(agree->value && strcmp(agree->value, "Yes") == 0);
+
+    // And back off.
+    err = tspdf_reader_form_fill(re, "agree", "Off", false);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    uint8_t *out2 = NULL;
+    TspdfReader *re2 = form_reopen(re, &out2);
+    ASSERT(re2 != NULL);
+    err = tspdf_reader_form_fields(re2, &fields, &count);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    agree = form_find(fields, count, "agree");
+    ASSERT(agree != NULL);
+    ASSERT(agree->value && strcmp(agree->value, "Off") == 0);
+
+    tspdf_reader_destroy(re2);
+    free(out2);
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(doc);
+}
+
+TEST(test_form_fill_radio_sets_widget_as) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/form_fields.pdf", &err);
+    ASSERT(doc != NULL);
+
+    err = tspdf_reader_form_fill(doc, "color", "Blue", false);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *out = NULL;
+    TspdfReader *re = form_reopen(doc, &out);
+    ASSERT(re != NULL);
+    TspdfFormFieldInfo *fields = NULL;
+    size_t count = 0;
+    err = tspdf_reader_form_fields(re, &fields, &count);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    const TspdfFormFieldInfo *color = form_find(fields, count, "color");
+    ASSERT(color != NULL);
+    ASSERT(color->value && strcmp(color->value, "Blue") == 0);
+
+    // Each widget's /AS follows its own /AP /N states: the "Red" kid goes
+    // /Off, the "Blue" kid goes /Blue.
+    TspdfObj *acro = dt_catalog_get(re, "AcroForm");
+    ASSERT(acro != NULL);
+    TspdfObj *flds = dt_get(re, acro, "Fields");
+    ASSERT(flds && flds->type == TSPDF_OBJ_ARRAY);
+    TspdfObj *radio = NULL;
+    for (size_t i = 0; i < flds->array.count; i++) {
+        TspdfObj *f = test_resolve_ref(re, &flds->array.items[i]);
+        if (f && f->type == TSPDF_OBJ_DICT && dt_str_eq(tspdf_dict_get(f, "T"), "color")) {
+            radio = f;
+            break;
+        }
+    }
+    ASSERT(radio != NULL);
+    TspdfObj *kids = dt_get(re, radio, "Kids");
+    ASSERT(kids && kids->type == TSPDF_OBJ_ARRAY && kids->array.count == 2);
+    int blue_as = 0, off_as = 0;
+    for (size_t i = 0; i < kids->array.count; i++) {
+        TspdfObj *kid = test_resolve_ref(re, &kids->array.items[i]);
+        ASSERT(kid && kid->type == TSPDF_OBJ_DICT);
+        TspdfObj *as = tspdf_dict_get(kid, "AS");
+        ASSERT(as != NULL);
+        if (dt_str_eq(as, "Blue")) blue_as++;
+        if (dt_str_eq(as, "Off")) off_as++;
+    }
+    ASSERT_EQ_INT(blue_as, 1);
+    ASSERT_EQ_INT(off_as, 1);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(doc);
+}
+
+TEST(test_form_fill_choice) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/form_fields.pdf", &err);
+    ASSERT(doc != NULL);
+
+    err = tspdf_reader_form_fill(doc, "city", "Oslo", false);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *out = NULL;
+    TspdfReader *re = form_reopen(doc, &out);
+    ASSERT(re != NULL);
+    TspdfFormFieldInfo *fields = NULL;
+    size_t count = 0;
+    err = tspdf_reader_form_fields(re, &fields, &count);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    const TspdfFormFieldInfo *city = form_find(fields, count, "city");
+    ASSERT(city != NULL);
+    ASSERT(city->value && strcmp(city->value, "Oslo") == 0);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(doc);
+}
+
+TEST(test_form_fill_unknown_name_errors) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/form_fields.pdf", &err);
+    ASSERT(doc != NULL);
+    err = tspdf_reader_form_fill(doc, "no_such_field", "x", false);
+    ASSERT_EQ_INT(err, TSPDF_ERR_INVALID_ARG);
+    tspdf_reader_destroy(doc);
+}
+
+// Readonly text field (/Ff 1): fill fails without force, succeeds with it.
+static char *form_make_readonly_pdf(size_t *out_len) {
+    char *pdf = (char *)malloc(4096);
+    if (!pdf) return NULL;
+    size_t pos = 0;
+    size_t off[8] = {0};
+
+    if (!appendf(pdf, 4096, &pos, "%%PDF-1.4\n")) goto fail;
+    off[1] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R "
+                 "/AcroForm << /Fields [4 0 R] /DA (/Helv 12 Tf 0 g) >> >>\nendobj\n")) goto fail;
+    off[2] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")) goto fail;
+    off[3] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                 "/Annots [4 0 R] >>\nendobj\n")) goto fail;
+    off[4] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "4 0 obj\n<< /FT /Tx /T (locked) /Ff 1 /Type /Annot /Subtype /Widget "
+                 "/Rect [72 700 300 720] /P 3 0 R >>\nendobj\n")) goto fail;
+
+    size_t xref = pos;
+    if (!appendf(pdf, 4096, &pos, "xref\n0 5\n0000000000 65535 f \n")) goto fail;
+    for (int i = 1; i <= 4; i++) {
+        if (!appendf(pdf, 4096, &pos, "%010zu 00000 n \n", off[i])) goto fail;
+    }
+    if (!appendf(pdf, 4096, &pos,
+                 "trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n%zu\n%%%%EOF",
+                 xref)) goto fail;
+    *out_len = pos;
+    return pdf;
+fail:
+    free(pdf);
+    return NULL;
+}
+
+TEST(test_form_fill_readonly_requires_force) {
+    size_t len = 0;
+    char *pdf = form_make_readonly_pdf(&len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    err = tspdf_reader_form_fill(doc, "locked", "nope", false);
+    ASSERT_EQ_INT(err, TSPDF_ERR_UNSUPPORTED);
+    err = tspdf_reader_form_fill(doc, "locked", "forced", true);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *out = NULL;
+    TspdfReader *re = form_reopen(doc, &out);
+    ASSERT(re != NULL);
+    TspdfFormFieldInfo *fields = NULL;
+    size_t count = 0;
+    err = tspdf_reader_form_fields(re, &fields, &count);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    const TspdfFormFieldInfo *locked = form_find(fields, count, "locked");
+    ASSERT(locked != NULL);
+    ASSERT(locked->readonly);
+    ASSERT(locked->value && strcmp(locked->value, "forced") == 0);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+// Text field whose /DA carries a hostile font name laced with PDF delimiters:
+// "/Bad(Font)Name 12 Tf". The generated appearance stream must not let those
+// delimiters reach the content-stream Tf operand, and the sanitized name it
+// emits must match the key it registers in the appearance /Resources /Font.
+static char *form_make_evil_da_pdf(size_t *out_len) {
+    char *pdf = (char *)malloc(4096);
+    if (!pdf) return NULL;
+    size_t pos = 0;
+    size_t off[8] = {0};
+
+    if (!appendf(pdf, 4096, &pos, "%%PDF-1.4\n")) goto fail;
+    off[1] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R "
+                 "/AcroForm << /Fields [3 0 R] >> >>\nendobj\n")) goto fail;
+    off[2] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [4 0 R] /Count 1 >>\nendobj\n")) goto fail;
+    off[3] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "3 0 obj\n<< /FT /Tx /T (evil) /Type /Annot /Subtype /Widget "
+                 "/Rect [10 10 200 30] /DA (/Bad\\(Font\\)Name 12 Tf) "
+                 "/P 4 0 R >>\nendobj\n")) goto fail;
+    off[4] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                 "/Annots [3 0 R] >>\nendobj\n")) goto fail;
+
+    size_t xref = pos;
+    if (!appendf(pdf, 4096, &pos, "xref\n0 5\n0000000000 65535 f \n")) goto fail;
+    for (int i = 1; i <= 4; i++) {
+        if (!appendf(pdf, 4096, &pos, "%010zu 00000 n \n", off[i])) goto fail;
+    }
+    if (!appendf(pdf, 4096, &pos,
+                 "trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n%zu\n%%%%EOF",
+                 xref)) goto fail;
+    *out_len = pos;
+    return pdf;
+fail:
+    free(pdf);
+    return NULL;
+}
+
+TEST(test_form_fill_text_da_font_name_sanitized) {
+    size_t len = 0;
+    char *pdf = form_make_evil_da_pdf(&len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    err = tspdf_reader_form_fill(doc, "evil", "hi", false);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    // The sanitized DA font is BadFontName (delimiters stripped). It must
+    // appear both as the content-stream Tf operand and as the appearance
+    // /Resources /Font key -- and they must be identical, so a strict renderer
+    // resolves the font.
+    ASSERT(bytes_contains(out, out_len, "/BadFontName 12.00 Tf"));
+    ASSERT(bytes_contains(out, out_len, "/Font << /BadFontName "));
+
+    // No PDF delimiter from the hostile /DA reaches the content Tf token: the
+    // serializer-escaped form "/Bad#28Font#29Name" (which would desync from
+    // the content name) must never appear.
+    ASSERT(!bytes_contains(out, out_len, "/Bad#28Font"));
+
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+// --- flatten ---
+
+TEST(test_form_flatten_fixture) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/form_fields.pdf", &err);
+    ASSERT(doc != NULL);
+
+    err = tspdf_reader_form_fill(doc, "name", "Grace", false);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    err = tspdf_reader_form_flatten(doc);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    // The fixture page carries /Resources as an indirect ref; merging the
+    // flattening resources must not leave a duplicate /Resources key behind.
+    {
+        TspdfObj *page_dict = doc->pages.pages[0].page_dict;
+        size_t res_keys = 0;
+        for (size_t i = 0; i < page_dict->dict.count; i++) {
+            if (strcmp(page_dict->dict.entries[i].key, "Resources") == 0) {
+                res_keys++;
+            }
+        }
+        ASSERT_EQ_SIZE(res_keys, 1);
+    }
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    // The form is gone: no catalog /AcroForm, no widget annotations.
+    ASSERT(!bytes_contains(out, out_len, "/AcroForm"));
+    ASSERT(!bytes_contains(out, out_len, "/Widget"));
+    // The checked radio ("Red") appearance stream was stamped into the page
+    // content as a form XObject.
+    ASSERT(bytes_contains(out, out_len, "/TspdfFx0 Do"));
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    ASSERT(!tspdf_reader_has_acroform(re));
+
+    TspdfFormFieldInfo *fields = NULL;
+    size_t count = 123;
+    err = tspdf_reader_form_fields(re, &fields, &count);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_SIZE(count, 0);
+
+    // All fixture annotations were widgets, so the page has none left.
+    TspdfObj *annots = dt_get(re, re->pages.pages[0].page_dict, "Annots");
+    ASSERT(annots == NULL || annots->array.count == 0);
+
+    // The stamped values extract as page text.
+    const char *text = tspdf_reader_page_text(re, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT(strstr(text, "Grace") != NULL);
+    ASSERT(strstr(text, "Berlin") != NULL);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(doc);
+}
+
+TEST(test_form_flatten_no_form_noop) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/three_pages.pdf", &err);
+    ASSERT(doc != NULL);
+    err = tspdf_reader_form_flatten(doc);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *out = NULL;
+    TspdfReader *re = form_reopen(doc, &out);
+    ASSERT(re != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(re), 3);
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(doc);
+}
+
+// tspdf's own writer emits checkboxes without /AP appearance streams; the
+// flattener falls back to drawing a check mark directly.
+TEST(test_form_flatten_writer_checkbox_fallback) {
+    size_t len = 0;
+    uint8_t *pdf = dt_writer_pdf(1, false, true, "W2", "Helvetica", &len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open(pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    err = tspdf_reader_form_flatten(doc);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(!bytes_contains(out, out_len, "/AcroForm"));
+    ASSERT(!bytes_contains(out, out_len, "/Widget"));
+    // Vector check-mark fallback for the checked box (distinctive line width).
+    ASSERT(bytes_contains(out, out_len, "1.5 w"));
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    const char *text = tspdf_reader_page_text(re, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT(strstr(text, "hello") != NULL);  // flattened text field value
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
 int main(void) {
     printf("tspr reader tests:\n");
 
@@ -8989,6 +9807,26 @@ int main(void) {
     printf("\n  Save-to-memory byte identity (wasm):\n");
     RUN(test_reader_save_to_memory_matches_file);
     RUN(test_reader_save_to_memory_with_options_matches_file);
+
+    printf("\n  AcroForm fields (list/fill/flatten):\n");
+    RUN(test_form_fields_fixture);
+    RUN(test_form_fields_no_form);
+    RUN(test_form_fields_encrypted);
+    RUN(test_form_fields_writer_roundtrip);
+    RUN(test_form_fields_cyclic_kids_bounded);
+    RUN(test_form_fields_self_kid_listed_once);
+    RUN(test_form_fields_adversarial_no_crash);
+    RUN(test_form_fill_text_value_and_appearance);
+    RUN(test_form_fill_text_da_font_name_sanitized);
+    RUN(test_form_fill_text_nonascii_roundtrip);
+    RUN(test_form_fill_checkbox_states);
+    RUN(test_form_fill_radio_sets_widget_as);
+    RUN(test_form_fill_choice);
+    RUN(test_form_fill_unknown_name_errors);
+    RUN(test_form_fill_readonly_requires_force);
+    RUN(test_form_flatten_fixture);
+    RUN(test_form_flatten_no_form_noop);
+    RUN(test_form_flatten_writer_checkbox_fallback);
 
 
     printf("\n%d tests, %d passed, %d failed\n",

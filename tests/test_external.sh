@@ -241,6 +241,25 @@ reader_check "encrypt"  "$TMPDIR/encrypt.pdf" secret
 "$TSPDF" decrypt  "$TMPDIR/encrypt.pdf" --password secret -o "$TMPDIR/decrypt.pdf" > /dev/null 2>&1
 reader_check "decrypt"  "$TMPDIR/decrypt.pdf"
 
+"$TSPDF" form fill tests/data/form_fields.pdf --set name=External --set agree=true \
+    -o "$TMPDIR/form_fill.pdf" > /dev/null 2>&1
+reader_check "form fill" "$TMPDIR/form_fill.pdf"
+
+"$TSPDF" form flatten "$TMPDIR/form_fill.pdf" -o "$TMPDIR/form_flat.pdf" > /dev/null 2>&1
+reader_check "form flatten" "$TMPDIR/form_flat.pdf"
+
+# Flatten must leave no trace of the form for real readers.
+if [ "$HAVE_QPDF" -eq 1 ]; then
+    if qpdf --json --json-key=acroform "$TMPDIR/form_flat.pdf" 2>/dev/null \
+            | grep -q '"hasacroform": false'; then
+        echo "  PASS  form flatten leaves no acroform (qpdf json)"
+        pass=$((pass + 1))
+    else
+        echo "  FAIL  form flatten leaves no acroform (qpdf json)"
+        fail=$((fail + 1))
+    fi
+fi
+
 echo ""
 if [ "$pending" -gt 0 ]; then
     echo "$pass passed, $fail failed, $pending pending (T19: reader trailer still emits /TspdfSize)"
