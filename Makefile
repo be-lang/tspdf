@@ -107,6 +107,7 @@ TSPR_SOURCES = \
 	$(SRCDIR)/reader/tspr_document.c \
 	$(SRCDIR)/reader/tspr_doctree.c \
 	$(SRCDIR)/reader/tspr_attach.c \
+	$(SRCDIR)/reader/tspr_bookmark.c \
 	$(SRCDIR)/reader/tspr_metadata.c \
 	$(SRCDIR)/reader/tspr_content.c \
 	$(SRCDIR)/reader/tspr_import.c \
