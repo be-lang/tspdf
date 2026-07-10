@@ -220,6 +220,15 @@ reader_check "merge"    "$TMPDIR/merge.pdf"
 "$TSPDF" rotate   "$INPUT" --angle 90      -o "$TMPDIR/rotate.pdf"   > /dev/null 2>&1
 reader_check "rotate"   "$TMPDIR/rotate.pdf"
 
+"$TSPDF" crop     "$INPUT" --margin 36     -o "$TMPDIR/crop.pdf"     > /dev/null 2>&1
+reader_check "crop"     "$TMPDIR/crop.pdf"
+
+"$TSPDF" scale    "$INPUT" --to a4         -o "$TMPDIR/scale_to.pdf" > /dev/null 2>&1
+reader_check "scale --to" "$TMPDIR/scale_to.pdf"
+
+"$TSPDF" scale    "$INPUT" --factor 0.5    -o "$TMPDIR/scale_f.pdf"  > /dev/null 2>&1
+reader_check "scale --factor" "$TMPDIR/scale_f.pdf"
+
 "$TSPDF" delete   "$INPUT" --pages 1       -o "$TMPDIR/delete.pdf"   > /dev/null 2>&1
 reader_check "delete"   "$TMPDIR/delete.pdf"
 

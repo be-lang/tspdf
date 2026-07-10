@@ -51,6 +51,37 @@ tspdf reorder report.pdf --order 3,1,2 -o reordered.pdf
 tspdf rotate report.pdf --pages 1,2 --angle 90 -o rotated.pdf
 ```
 
+## Crop pages (set the CropBox)
+
+Cropping sets the visible region without deleting content, so it is safe and
+reversible. The box is clamped to the MediaBox.
+
+```bash
+# explicit box, relative to the page's MediaBox origin (x0,y0,x1,y1)
+tspdf crop report.pdf --box 50,50,545,742 -o cropped.pdf
+
+# crop 1 inch (72 pt) off every side
+tspdf crop report.pdf --margin 72 -o cropped.pdf
+
+# per-side margins: top, right, bottom, left
+tspdf crop report.pdf --margins 72,36,72,36 --pages 1-3 -o cropped.pdf
+```
+
+## Scale or resize pages
+
+Scaling resizes the page and its content together (unlike cropping, which only
+clips the view).
+
+```bash
+# fit each page to A4, aspect preserved and centered
+tspdf scale report.pdf --to a4 -o a4.pdf
+
+# uniform scale to 50%
+tspdf scale report.pdf --factor 0.5 -o half.pdf
+```
+
+Named sizes for `--to`: `a4`, `letter`, `legal`, `a3`, `a5`.
+
 ## Add a text watermark
 
 ```bash
