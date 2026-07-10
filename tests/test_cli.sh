@@ -376,6 +376,57 @@ fi
 # meta.pdf just got a fresh ModDate from the --set save above.
 run_test "metadata prints dates human-readable" bash -c "$TSPDF metadata $TMPDIR/meta.pdf | grep -qE '^Modified:[[:space:]]+[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\$'"
 
+# metadata on encrypted files: --password opens them, and the written Info
+# strings must be ENCRYPTED (ISO 32000 exempts only /Encrypt and /ID) —
+# plaintext Info strings decrypt to garbage in poppler et al.
+run_test "metadata --set on encrypted file with --password" bash -c "
+  set -e
+  $TSPDF encrypt $INPUT -o $TMPDIR/meta_enc_in.pdf --password metapw > /dev/null
+  $TSPDF metadata $TMPDIR/meta_enc_in.pdf --password metapw --set title='Encrypted Title XYZQ' -o $TMPDIR/meta_enc.pdf > /dev/null
+  $TSPDF metadata $TMPDIR/meta_enc.pdf --password metapw | grep -q 'Encrypted Title XYZQ'"
+run_test "encrypted Info strings are not plaintext in the file" bash -c "
+  ! grep -aq 'Encrypted Title XYZQ' $TMPDIR/meta_enc.pdf"
+if command -v pdfinfo > /dev/null 2>&1; then
+  run_test "pdfinfo decrypts the title of the encrypted file" bash -c "
+    pdfinfo -upw metapw $TMPDIR/meta_enc.pdf | grep -q 'Encrypted Title XYZQ'"
+else
+  echo "  SKIP  encrypted-Info pdfinfo assertion (pdfinfo not found)"
+fi
+
+# Object-stream re-packing: rewriting a file that used object streams must
+# re-pack them (not explode every member into a classic top-level object,
+# which roughly doubles such files); classic inputs stay classic.
+if command -v qpdf > /dev/null 2>&1; then
+  run_test "rewrite of an objstm file re-packs it (<= 1.2x input)" bash -c "
+    set -e
+    qpdf --object-streams=generate $INPUT $TMPDIR/objstm_in.pdf
+    $TSPDF crop --margin 0 $TMPDIR/objstm_in.pdf -o $TMPDIR/objstm_out.pdf > /dev/null
+    in=\$(wc -c < $TMPDIR/objstm_in.pdf)
+    out=\$(wc -c < $TMPDIR/objstm_out.pdf)
+    [ \$((out * 10)) -le \$((in * 12)) ]
+    grep -aq '/Type /ObjStm' $TMPDIR/objstm_out.pdf
+    qpdf --check $TMPDIR/objstm_out.pdf > /dev/null"
+  run_test "encrypted save of an objstm file keeps object streams" bash -c "
+    set -e
+    $TSPDF encrypt $TMPDIR/objstm_in.pdf -o $TMPDIR/objstm_enc.pdf --password s3cret > /dev/null
+    grep -aq '/Type /ObjStm' $TMPDIR/objstm_enc.pdf
+    qpdf --password=s3cret --check $TMPDIR/objstm_enc.pdf > /dev/null"
+  run_test "encrypted objstm rewrite opens with the password" bash -c "
+    set -e
+    $TSPDF metadata $TMPDIR/objstm_enc.pdf --password s3cret --set title='ObjStm Enc' -o $TMPDIR/objstm_enc2.pdf > /dev/null
+    grep -aq '/Type /ObjStm' $TMPDIR/objstm_enc2.pdf
+    ! grep -aq 'ObjStm Enc' $TMPDIR/objstm_enc2.pdf
+    qpdf --password=s3cret --check $TMPDIR/objstm_enc2.pdf > /dev/null
+    $TSPDF metadata $TMPDIR/objstm_enc2.pdf --password s3cret | grep -q 'ObjStm Enc'"
+else
+  echo "  SKIP  objstm re-pack assertions (qpdf not found)"
+fi
+run_test "classic-xref input stays classic on rewrite" bash -c "
+  set -e
+  $TSPDF crop --margin 0 $INPUT -o $TMPDIR/classic_out.pdf > /dev/null
+  ! grep -aq '/Type /ObjStm' $TMPDIR/classic_out.pdf
+  grep -aq 'trailer' $TMPDIR/classic_out.pdf"
+
 # info --json
 if command -v python3 > /dev/null 2>&1; then
   run_test "info --json is valid JSON with the expected fields" bash -c "
