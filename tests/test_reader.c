@@ -5812,6 +5812,113 @@ TEST(test_phase3_full_pipeline) {
 
 // --- Content overlay tests ---
 
+// A page whose content stream is q/Q-unbalanced: it does `q 2 0 0 2 0 0 cm`
+// (a 2x scale) and never restores it. This is a spec violation but is seen in
+// the wild. If the overlay let that leaked CTM reach the new content, an
+// overlay drawn at (72,72) would render at (144,144). The overlay must wrap the
+// original content in its own q..Q so the leak cannot escape.
+static char *make_unbalanced_content_pdf(size_t *out_len) {
+    char *pdf = (char *)malloc(2048);
+    if (!pdf) return NULL;
+
+    size_t pos = 0;
+    if (!appendf(pdf, 2048, &pos, "%%PDF-1.4\n")) goto fail;
+
+    size_t obj1 = pos;
+    if (!appendf(pdf, 2048, &pos,
+                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")) goto fail;
+    size_t obj2 = pos;
+    if (!appendf(pdf, 2048, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")) goto fail;
+    size_t obj3 = pos;
+    if (!appendf(pdf, 2048, &pos,
+                 "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] "
+                 "/Contents 4 0 R >>\nendobj\n")) goto fail;
+    // Unbalanced: an extra `q` with a 2x scale, never matched by `Q`.
+    const char *content = "q 2 0 0 2 0 0 cm\n";
+    size_t obj4 = pos;
+    if (!appendf(pdf, 2048, &pos,
+                 "4 0 obj\n<< /Length %zu >>\nstream\n%sendstream\nendobj\n",
+                 strlen(content), content)) goto fail;
+
+    size_t xref = pos;
+    if (!appendf(pdf, 2048, &pos,
+                 "xref\n0 5\n0000000000 65535 f \n"
+                 "%010zu 00000 n \n%010zu 00000 n \n%010zu 00000 n \n%010zu 00000 n \n"
+                 "trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n%zu\n%%%%EOF",
+                 obj1, obj2, obj3, obj4, xref)) goto fail;
+
+    *out_len = pos;
+    return pdf;
+fail:
+    free(pdf);
+    return NULL;
+}
+
+// Resolve a /Contents array item (a REF) to its stream bytes for inspection.
+static bool contents_item_bytes(TspdfReader *doc, TspdfObj *item,
+                                const char **out, size_t *out_len) {
+    if (!item || item->type != TSPDF_OBJ_REF) return false;
+    TspdfParser parser;
+    tspdf_parser_init(&parser, doc->data, doc->data_len, &doc->arena);
+    TspdfObj *s = NULL;
+    if (item->ref.num < doc->xref.count) {
+        s = tspdf_xref_resolve(&doc->xref, &parser, item->ref.num, doc->obj_cache, doc->crypt);
+    } else {
+        size_t idx = item->ref.num - doc->xref.count;
+        if (idx < doc->new_objs.count) s = doc->new_objs.objs[idx];
+    }
+    if (!s || s->type != TSPDF_OBJ_STREAM) return false;
+    *out = (const char *)s->stream.data;
+    *out_len = s->stream.len;
+    return s->stream.data != NULL;
+}
+
+// Overlaying onto a q/Q-unbalanced page must wrap the original content in a
+// balanced q..Q so its leaked CTM cannot reach the overlay: the resulting
+// /Contents must be [q, old, Q, new].
+TEST(test_overlay_wraps_unbalanced_content) {
+    size_t len = 0;
+    char *raw = make_unbalanced_content_pdf(&len);
+    ASSERT(raw != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)raw, len, &err);
+    ASSERT(doc != NULL);
+
+    TspdfWriter *res = tspdf_writer_create();
+    const char *font = tspdf_writer_add_builtin_font(res, "Helvetica");
+    TspdfStream *ov = tspdf_page_begin_content(doc, 0);
+    ASSERT(ov != NULL);
+    tspdf_stream_begin_text(ov);
+    tspdf_stream_set_font(ov, font, 12.0);
+    tspdf_stream_text_position(ov, 72, 72);
+    tspdf_stream_show_text(ov, "MARK");
+    tspdf_stream_end_text(ov);
+    err = tspdf_page_end_content(doc, 0, ov, res);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    tspdf_writer_destroy(res);
+
+    // The single original ref becomes a 4-item [q, old, Q, new] array.
+    TspdfObj *contents = tspdf_dict_get(doc->pages.pages[0].page_dict, "Contents");
+    ASSERT(contents != NULL);
+    ASSERT_EQ_INT(contents->type, TSPDF_OBJ_ARRAY);
+    ASSERT_EQ_SIZE(contents->array.count, 4);
+
+    const char *b = NULL;
+    size_t bl = 0;
+    // items[0] is the "q\n" save that brackets the original content.
+    ASSERT(contents_item_bytes(doc, &contents->array.items[0], &b, &bl));
+    ASSERT(bl == 2 && memcmp(b, "q\n", 2) == 0);
+    // items[2] is the matching "Q\n" restore, popping the original's leak.
+    ASSERT(contents_item_bytes(doc, &contents->array.items[2], &b, &bl));
+    ASSERT(bl == 2 && memcmp(b, "Q\n", 2) == 0);
+
+    tspdf_reader_destroy(doc);
+    free(raw);
+}
+
+
 TEST(test_overlay_text) {
     // Create a 1-page PDF
     TspdfWriter *creator = tspdf_writer_create();
@@ -11976,6 +12083,62 @@ TEST(test_bookmark_set_large_bounded) {
     free(pdf);
 }
 
+// Resolve `obj` if it is an indirect ref, using the reopened reader.
+static TspdfObj *flat_resolve(TspdfReader *doc, TspdfObj *obj) {
+    if (!obj || obj->type != TSPDF_OBJ_REF) return obj;
+    TspdfParser parser;
+    tspdf_parser_init(&parser, doc->data, doc->data_len, &doc->arena);
+    if (obj->ref.num < doc->xref.count) {
+        return tspdf_xref_resolve(&doc->xref, &parser, obj->ref.num,
+                                  doc->obj_cache, doc->crypt);
+    }
+    return NULL;
+}
+
+// Count entries in a page's /Resources /Font sub-dict (0 when absent).
+static size_t flat_page_font_count(TspdfReader *doc, size_t page) {
+    TspdfObj *pd = tspdf_reader_get_page(doc, page)->page_dict;
+    TspdfObj *res = flat_resolve(doc, tspdf_dict_get(pd, "Resources"));
+    if (!res || res->type != TSPDF_OBJ_DICT) return 0;
+    TspdfObj *font = flat_resolve(doc, tspdf_dict_get(res, "Font"));
+    if (!font || font->type != TSPDF_OBJ_DICT) return 0;
+    return font->dict.count;
+}
+
+// Two pages that share one indirect /Resources must, after flatten, each end
+// up with their OWN additions only. Merging into the shared dict once per page
+// would accumulate every page's font key on every page (finding M3).
+TEST(test_form_flatten_shared_resources_not_accumulated) {
+    TspdfError err;
+    TspdfReader *doc =
+        tspdf_reader_open_file("tests/data/form_shared_resources.pdf", &err);
+    ASSERT(doc != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(doc), 2);
+
+    err = tspdf_reader_form_flatten(doc);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *out = NULL;
+    TspdfReader *re = form_reopen(doc, &out);
+    ASSERT(re != NULL);
+
+    // Each page: the original /Helv plus its own /TspdfFf == 2 entries. The
+    // pre-fix bug leaked the other page's key in too (Helv + TspdfFf +
+    // TspdfFf_2 == 3).
+    ASSERT_EQ_SIZE(flat_page_font_count(re, 0), 2);
+    ASSERT_EQ_SIZE(flat_page_font_count(re, 1), 2);
+
+    // Both field values must still render on their own page.
+    const char *t0 = tspdf_reader_page_text(re, 0, &err);
+    const char *t1 = tspdf_reader_page_text(re, 1, &err);
+    ASSERT(t0 && strstr(t0, "Alpha") != NULL);
+    ASSERT(t1 && strstr(t1, "Beta") != NULL);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(doc);
+}
+
 int main(void) {
     printf("tspr reader tests:\n");
 
@@ -12158,6 +12321,7 @@ int main(void) {
     RUN(test_overlay_text);
     RUN(test_overlay_on_specific_page);
     RUN(test_overlay_abort);
+    RUN(test_overlay_wraps_unbalanced_content);
 
     printf("\n  Form XObject import:\n");
     RUN(test_end_content_under);
@@ -12321,6 +12485,7 @@ int main(void) {
     RUN(test_form_flatten_fixture);
     RUN(test_form_flatten_no_form_noop);
     RUN(test_form_flatten_writer_checkbox_fallback);
+    RUN(test_form_flatten_shared_resources_not_accumulated);
 
     printf("\n  Outline (bookmark) editing:\n");
     RUN(test_bookmark_list_fixture);

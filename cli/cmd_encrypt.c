@@ -48,6 +48,11 @@ static bool parse_permissions(const char *spec, uint32_t *out) {
         if (!end) break;
         tok = end + 1;
     }
+    // High-quality print (bit 12) is meaningless without plain print (bit 3):
+    // a viewer that honors /P would deny printing entirely, so "print-hq"
+    // alone silently blocks all printing. Auto-enable print when print-hq is
+    // requested (friendlier than erroring).
+    if (p & (1u << 11)) p |= (1u << 2);
     *out = p;
     return true;
 }
@@ -65,6 +70,7 @@ int cmd_encrypt(int argc, char **argv) {
         printf("\n--permissions takes a comma-separated list of ALLOWED actions; anything\n");
         printf("not listed is denied. Without the flag everything is allowed. Actions:\n");
         printf("  print, modify, copy, annotate, forms, extract, assemble, print-hq\n");
+        printf("Requesting print-hq also enables print (high-res print needs print).\n");
         return argc == 0 ? 1 : 0;
     }
 

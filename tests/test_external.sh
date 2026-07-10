@@ -259,6 +259,20 @@ reader_check "nup 2" "$TMPDIR/nup2.pdf"
 "$TSPDF" nup 4 "$INPUT" --frame --gap 10 --page-size letter -o "$TMPDIR/nup4.pdf" > /dev/null 2>&1
 reader_check "nup 4 --frame --gap" "$TMPDIR/nup4.pdf"
 
+# An encrypted stamp source needs --stamp-password to open.
+"$TSPDF" encrypt "$TMPDIR/stamp_src.pdf" --password stamppw -o "$TMPDIR/stamp_src_enc.pdf" > /dev/null 2>&1
+"$TSPDF" stamp "$INPUT" --stamp "$TMPDIR/stamp_src_enc.pdf" --stamp-password stamppw \
+    -o "$TMPDIR/stamp_enc.pdf" > /dev/null 2>&1
+reader_check "stamp --stamp-password" "$TMPDIR/stamp_enc.pdf"
+# The imported stamp content must actually land on the page.
+if "$TSPDF" text "$TMPDIR/stamp_enc.pdf" 2>/dev/null | grep -q 'APPROVED'; then
+    echo "  PASS  stamp --stamp-password imports encrypted stamp content"
+    pass=$((pass + 1))
+else
+    echo "  FAIL  stamp --stamp-password imports encrypted stamp content"
+    fail=$((fail + 1))
+fi
+
 "$TSPDF" compress "$INPUT"                 -o "$TMPDIR/compress.pdf" > /dev/null 2>&1
 reader_check "compress" "$TMPDIR/compress.pdf"
 
@@ -267,6 +281,22 @@ reader_check "encrypt"  "$TMPDIR/encrypt.pdf" secret
 
 "$TSPDF" decrypt  "$TMPDIR/encrypt.pdf" --password secret -o "$TMPDIR/decrypt.pdf" > /dev/null 2>&1
 reader_check "decrypt"  "$TMPDIR/decrypt.pdf"
+
+# High-res print (bit 12) is meaningless without plain print (bit 3): requesting
+# print-hq must auto-enable print so both are allowed.
+if [ "$HAVE_QPDF" -eq 1 ]; then
+    "$TSPDF" encrypt "$INPUT" --password secret --permissions print-hq \
+        -o "$TMPDIR/enc_hq.pdf" > /dev/null 2>&1
+    enc=$(qpdf --show-encryption --password=secret "$TMPDIR/enc_hq.pdf" 2>/dev/null)
+    if printf '%s' "$enc" | grep -q 'print low resolution: allowed' && \
+       printf '%s' "$enc" | grep -q 'print high resolution: allowed'; then
+        echo "  PASS  encrypt --permissions print-hq implies print"
+        pass=$((pass + 1))
+    else
+        echo "  FAIL  encrypt --permissions print-hq implies print"
+        fail=$((fail + 1))
+    fi
+fi
 
 "$TSPDF" form fill tests/data/form_fields.pdf --set name=External --set agree=true \
     -o "$TMPDIR/form_fill.pdf" > /dev/null 2>&1
@@ -283,6 +313,23 @@ if [ "$HAVE_QPDF" -eq 1 ]; then
         pass=$((pass + 1))
     else
         echo "  FAIL  form flatten leaves no acroform (qpdf json)"
+        fail=$((fail + 1))
+    fi
+fi
+
+# Two pages sharing one indirect /Resources must not accumulate each other's
+# font key on flatten (finding M3): each page's /Font gets only its own /TspdfFf.
+"$TSPDF" form flatten tests/data/form_shared_resources.pdf \
+    -o "$TMPDIR/form_shared_flat.pdf" > /dev/null 2>&1
+reader_check "form flatten (shared resources)" "$TMPDIR/form_shared_flat.pdf"
+if [ "$HAVE_QPDF" -eq 1 ]; then
+    dup=$(qpdf --qdf --object-streams=disable "$TMPDIR/form_shared_flat.pdf" - 2>/dev/null \
+            | grep -c 'TspdfFf_2')
+    if [ "$dup" -eq 0 ]; then
+        echo "  PASS  form flatten shared /Resources not accumulated (no TspdfFf_2)"
+        pass=$((pass + 1))
+    else
+        echo "  FAIL  form flatten shared /Resources accumulated ($dup TspdfFf_2 keys)"
         fail=$((fail + 1))
     fi
 fi
