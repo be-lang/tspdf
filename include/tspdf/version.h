@@ -6,7 +6,7 @@
 // compiled-in constants can never drift apart.
 
 #define TSPDF_VERSION_MAJOR 0
-#define TSPDF_VERSION_MINOR 2
+#define TSPDF_VERSION_MINOR 3
 #define TSPDF_VERSION_PATCH 0
 
 #define TSPDF_STRINGIFY_(x) #x

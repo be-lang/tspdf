@@ -7,6 +7,36 @@ on 0.x, the CLI is considered stable but the low-level C API may still change.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-10
+
+### Added
+- `tspdf form` — list, fill, and flatten AcroForm form fields. `form list`
+  emits JSON; `form fill` takes `--data <json>` or repeated `--set name=value`
+  (text, checkbox, radio, and choice fields); `form flatten` bakes values into
+  the page and drops the interactive form.
+- `tspdf attach` — embed, list, extract, and remove file attachments; attached
+  files survive merge and split, and extraction sanitizes stored names.
+- `tspdf stamp` — overlay one PDF's page onto another's pages, with `--pages`,
+  `--under`, and `--stamp-page`.
+- `tspdf watermark --image <file>` — image watermarks (PNG/JPEG), with
+  `--opacity`, `--scale`, and positioning, honoring page rotation.
+- `tspdf text --layout` — layout-preserving extraction that keeps columns and
+  tables aligned (pdftotext -layout style).
+- `tspdf info --json` — machine-readable document facts.
+- `tspdf encrypt --permissions <list>` — restrict allowed actions (print,
+  copy, modify, annotate, forms, extract, assemble, print-hq).
+- `tspdf qrcode --ec-level L|M|Q|H` — choose the QR error-correction level.
+- `metadata --clear <key>` removes a field; `producer` is now settable.
+- C API: `tspdf_reader_form_fields`/`_form_fill`/`_form_flatten`,
+  `tspdf_reader_attachments`/`_attachment_get`/`_attachment_add`/`_remove`,
+  `tspdf_reader_import_page_xobject`, `tspdf_reader_page_text_layout`.
+
+### Changed
+- merge and split preserve embedded-file attachments and `/PageLabels` (page
+  numbering styles) in addition to bookmarks and form fields.
+- `metadata` and `info` print PDF dates in a readable form
+  (`2013-10-31 14:01:50 +04:00`); `info --json` also keeps the raw value.
+
 ## [0.2.0] - 2026-07-09
 
 ### Added
