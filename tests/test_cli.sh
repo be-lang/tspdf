@@ -2708,19 +2708,27 @@ run_test "form fill accepts free text in an editable combo" bash -c "
   $TSPDF form list $TMPDIR/combo.pdf | grep -q '\"Zaphod\"'"
 
 # Values outside the appearance font's encoding are stored intact in /V but
-# render as '?' in the generated appearance — that must be warned about.
+# render as '?' in the generated appearance when no fallback TrueType font is
+# available — that must be warned about. Hermetic: the fallback discovery is
+# pointed at an empty directory so machine-installed fonts cannot mask the
+# warning path (mkdir here: this may run before the fallback section below).
+mkdir -p $TMPDIR/nofonts
 run_test "form fill warns when the appearance loses characters" bash -c "
   set -e
+  TSPDF_FALLBACK_FONT= TSPDF_FONT_DIRS=$TMPDIR/nofonts \
   $TSPDF form fill $FORM_PDF --set 'name=日本語' -o $TMPDIR/cjk.pdf 2> $TMPDIR/cjk_err.txt
   grep -q 'not representable' $TMPDIR/cjk_err.txt
+  grep -q 'TSPDF_FALLBACK_FONT' $TMPDIR/cjk_err.txt
   grep -q \"'name'\" $TMPDIR/cjk_err.txt
   $TSPDF form list $TMPDIR/cjk.pdf | grep -q '日本語'"
 run_test "form fill does not warn for cp1252-safe values" bash -c "
   set -e
+  TSPDF_FALLBACK_FONT= TSPDF_FONT_DIRS=$TMPDIR/nofonts \
   $TSPDF form fill $FORM_PDF --set 'name=Grüße' -o $TMPDIR/latin.pdf 2> $TMPDIR/latin_err.txt
   ! grep -q 'not representable' $TMPDIR/latin_err.txt"
 run_test "form flatten warns when a stamped value loses characters" bash -c "
   set -e
+  TSPDF_FALLBACK_FONT= TSPDF_FONT_DIRS=$TMPDIR/nofonts \
   $TSPDF form flatten $TMPDIR/cjk.pdf -o $TMPDIR/cjk_flat.pdf 2> $TMPDIR/cjk_flat_err.txt
   grep -q 'not representable' $TMPDIR/cjk_flat_err.txt"
 
@@ -2915,6 +2923,73 @@ if command -v python3 >/dev/null 2>&1 && [ -f "$LOSSY_IN" ]; then
 else
   echo "  SKIP  compress --lossy tests (python3 or fixtures missing)"
 fi
+
+# --- form fill/flatten fallback font (values outside WinAnsi/cp1252) ---
+#
+# Hermetic: TSPDF_FALLBACK_FONT pins the committed fixture font, and the
+# no-font case overrides the scan roots (TSPDF_FONT_DIRS) with an empty dir
+# so the test never depends on fonts installed on this machine.
+FBFONT=tests/data/fallback_font.ttf
+mkdir -p "$TMPDIR/nofonts"
+run_test "form fill CJK embeds fallback CID font (no warning)" bash -c '
+  set -e
+  err="'"$TMPDIR"'/fb_fill_err.txt"
+  TSPDF_FALLBACK_FONT=tests/data/fallback_font.ttf "'"$TSPDF"'" form fill \
+      tests/data/form_fields.pdf --set "name=日本語テスト" \
+      -o "'"$TMPDIR"'/fb_fill.pdf" 2> "$err"
+  [ ! -s "$err" ]
+  grep -aq "Identity-H" "'"$TMPDIR"'/fb_fill.pdf"
+  grep -aq "FontFile2" "'"$TMPDIR"'/fb_fill.pdf"
+  grep -aq "CIDFontType2" "'"$TMPDIR"'/fb_fill.pdf"
+  "'"$TSPDF"'" form list "'"$TMPDIR"'/fb_fill.pdf" | grep -q "日本語テスト"'
+
+run_test "form fill CJK with .ttc fallback font" bash -c '
+  set -e
+  TSPDF_FALLBACK_FONT=tests/data/fallback_font.ttc "'"$TSPDF"'" form fill \
+      tests/data/form_fields.pdf --set "name=日本語" \
+      -o "'"$TMPDIR"'/fb_ttc.pdf" 2> /dev/null
+  grep -aq "Identity-H" "'"$TMPDIR"'/fb_ttc.pdf"'
+
+run_test "form fill CJK discovers font by directory scan" bash -c '
+  set -e
+  err="'"$TMPDIR"'/fb_scan_err.txt"
+  TSPDF_FALLBACK_FONT= TSPDF_FONT_DIRS=tests/data "'"$TSPDF"'" form fill \
+      tests/data/form_fields.pdf --set "name=日本語" \
+      -o "'"$TMPDIR"'/fb_scan.pdf" 2> "$err"
+  [ ! -s "$err" ]
+  grep -aq "Identity-H" "'"$TMPDIR"'/fb_scan.pdf"'
+
+run_test "form fill CJK without a usable font warns and keeps value" bash -c '
+  set -e
+  err="'"$TMPDIR"'/fb_warn_err.txt"
+  TSPDF_FALLBACK_FONT= TSPDF_FONT_DIRS="'"$TMPDIR"'/nofonts" "'"$TSPDF"'" \
+      form fill tests/data/form_fields.pdf --set "name=日本語" \
+      -o "'"$TMPDIR"'/fb_warn.pdf" 2> "$err"
+  grep -q "TSPDF_FALLBACK_FONT" "$err"
+  ! grep -aq "Identity-H" "'"$TMPDIR"'/fb_warn.pdf"
+  "'"$TSPDF"'" form list "'"$TMPDIR"'/fb_warn.pdf" | grep -q "日本語"'
+
+run_test "form flatten CJK stamps fallback glyphs (no warning)" bash -c '
+  set -e
+  err="'"$TMPDIR"'/fb_flat_err.txt"
+  TSPDF_FALLBACK_FONT=tests/data/fallback_font.ttf "'"$TSPDF"'" form fill \
+      tests/data/form_fields.pdf --set "name=日本語" \
+      -o "'"$TMPDIR"'/fb_prefill.pdf" 2> /dev/null
+  TSPDF_FALLBACK_FONT=tests/data/fallback_font.ttf "'"$TSPDF"'" form flatten \
+      "'"$TMPDIR"'/fb_prefill.pdf" -o "'"$TMPDIR"'/fb_flat.pdf" 2> "$err"
+  [ ! -s "$err" ]
+  grep -aq "Identity-H" "'"$TMPDIR"'/fb_flat.pdf"
+  grep -aq "TspdfFb" "'"$TMPDIR"'/fb_flat.pdf"'
+
+run_test "form fill validates inherited /Opt (parent-held options)" bash -c '
+  set -e
+  # city has /Opt on the terminal itself; the reader-suite fixture covers the
+  # parent-held case — here just pin the CLI error message path end-to-end.
+  if "'"$TSPDF"'" form fill tests/data/form_fields.pdf --set city=Atlantis \
+      -o "'"$TMPDIR"'/fb_opt.pdf" 2> "'"$TMPDIR"'/fb_opt_err.txt"; then
+    exit 1
+  fi
+  grep -q "not an option" "'"$TMPDIR"'/fb_opt_err.txt"'
 
 # `make amalgamation` generates build/amalgamation/tspdf.{c,h} and proves them:
 # standalone -Werror compile, link + run examples/minimal.c against them, and

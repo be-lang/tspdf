@@ -334,6 +334,65 @@ if [ "$HAVE_QPDF" -eq 1 ]; then
     fi
 fi
 
+# --- Form fallback font (values outside cp1252): validity + pixel oracle ---
+#
+# TSPDF_FALLBACK_FONT pins the committed fixture font so this is hermetic.
+# The pixel oracle renders the CJK fill and a literal "??????" fill: the two
+# pages must differ, proving the fallback appearance is not the old '?'
+# rendering. (pdftoppm is optional, like qpdf/mutool.)
+HAVE_PDFTOPPM=0
+command -v pdftoppm > /dev/null 2>&1 && HAVE_PDFTOPPM=1
+
+TSPDF_FALLBACK_FONT=tests/data/fallback_font.ttf "$TSPDF" form fill \
+    tests/data/form_fields.pdf --set 'name=日本語テスト' \
+    -o "$TMPDIR/form_cjk.pdf" > /dev/null 2>&1
+reader_check "form fill (fallback CID font)" "$TMPDIR/form_cjk.pdf"
+
+TSPDF_FALLBACK_FONT=tests/data/fallback_font.ttf "$TSPDF" form flatten \
+    "$TMPDIR/form_cjk.pdf" -o "$TMPDIR/form_cjk_flat.pdf" > /dev/null 2>&1
+reader_check "form flatten (fallback CID font)" "$TMPDIR/form_cjk_flat.pdf"
+
+if [ "$HAVE_MUTOOL" -eq 1 ]; then
+    # AP-strict render: mutool draws the widget /AP streams as written.
+    if mutool draw -o "$TMPDIR/form_cjk_mu.png" "$TMPDIR/form_cjk.pdf" 1 > /dev/null 2>&1 \
+       && [ -s "$TMPDIR/form_cjk_mu.png" ]; then
+        echo "  PASS  form fill fallback renders in mutool (AP-strict)"
+        pass=$((pass + 1))
+    else
+        echo "  FAIL  form fill fallback renders in mutool (AP-strict)"
+        fail=$((fail + 1))
+    fi
+fi
+
+if [ "$HAVE_PDFTOPPM" -eq 1 ]; then
+    TSPDF_FALLBACK_FONT= TSPDF_FONT_DIRS="$TMPDIR" "$TSPDF" form fill \
+        tests/data/form_fields.pdf --set 'name=??????' \
+        -o "$TMPDIR/form_qm.pdf" > /dev/null 2>&1
+    pdftoppm -r 60 -png -f 1 -l 1 "$TMPDIR/form_cjk.pdf" "$TMPDIR/r_cjk" > /dev/null 2>&1
+    pdftoppm -r 60 -png -f 1 -l 1 "$TMPDIR/form_qm.pdf" "$TMPDIR/r_qm" > /dev/null 2>&1
+    if [ -s "$TMPDIR/r_cjk-1.png" ] && [ -s "$TMPDIR/r_qm-1.png" ] && \
+       ! cmp -s "$TMPDIR/r_cjk-1.png" "$TMPDIR/r_qm-1.png"; then
+        echo "  PASS  form fill fallback render differs from '?' rendering"
+        pass=$((pass + 1))
+    else
+        echo "  FAIL  form fill fallback render differs from '?' rendering"
+        fail=$((fail + 1))
+    fi
+
+    TSPDF_FALLBACK_FONT= TSPDF_FONT_DIRS="$TMPDIR" "$TSPDF" form flatten \
+        "$TMPDIR/form_qm.pdf" -o "$TMPDIR/form_qm_flat.pdf" > /dev/null 2>&1
+    pdftoppm -r 60 -png -f 1 -l 1 "$TMPDIR/form_cjk_flat.pdf" "$TMPDIR/r_cjk_flat" > /dev/null 2>&1
+    pdftoppm -r 60 -png -f 1 -l 1 "$TMPDIR/form_qm_flat.pdf" "$TMPDIR/r_qm_flat" > /dev/null 2>&1
+    if [ -s "$TMPDIR/r_cjk_flat-1.png" ] && [ -s "$TMPDIR/r_qm_flat-1.png" ] && \
+       ! cmp -s "$TMPDIR/r_cjk_flat-1.png" "$TMPDIR/r_qm_flat-1.png"; then
+        echo "  PASS  form flatten fallback render differs from '?' rendering"
+        pass=$((pass + 1))
+    else
+        echo "  FAIL  form flatten fallback render differs from '?' rendering"
+        fail=$((fail + 1))
+    fi
+fi
+
 # --- Attachments: qpdf interop in both directions ---
 
 echo ""

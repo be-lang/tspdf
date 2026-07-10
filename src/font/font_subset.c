@@ -1,5 +1,6 @@
 #include "font_subset.h"
 #include "../util/buffer.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -124,6 +125,76 @@ static int table_out_cmp(const void *a, const void *b) {
     uint32_t ta = ((const TableOut *)a)->tag;
     uint32_t tb = ((const TableOut *)b)->tag;
     return (ta > tb) - (ta < tb);
+}
+
+// --- ToUnicode CMap for Identity-H CID fonts (CID == glyph ID) ---
+
+uint8_t *tspdf_font_tounicode_cmap(const bool *used_glyphs,
+                                   const uint32_t *glyph_to_unicode,
+                                   int glyph_count, size_t *out_len) {
+    TspdfBuffer cmap = tspdf_buffer_create(4096);
+    tspdf_buffer_append_str(&cmap,
+        "/CIDInit /ProcSet findresource begin\n"
+        "12 dict begin\n"
+        "begincmap\n"
+        "/CIDSystemInfo\n"
+        "<< /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n"
+        "/CMapName /Adobe-Identity-UCS def\n"
+        "/CMapType 2 def\n"
+        "1 begincodespacerange\n"
+        "<0000> <FFFF>\n"
+        "endcodespacerange\n"
+    );
+
+    if (used_glyphs && glyph_to_unicode) {
+        // Count the mapped glyphs first so the batches (max 100 mappings per
+        // beginbfchar block, per the CMap spec) can be sized up front.
+        int g = 0;
+        while (g < glyph_count) {
+            // Collect the next batch of up to 100 mapped glyphs.
+            int batch_ids[100];
+            int batch = 0;
+            while (g < glyph_count && batch < 100) {
+                if (used_glyphs[g] && glyph_to_unicode[g] != 0) {
+                    batch_ids[batch++] = g;
+                }
+                g++;
+            }
+            if (batch == 0) continue;
+            char tmp[80];
+            snprintf(tmp, sizeof(tmp), "%d beginbfchar\n", batch);
+            tspdf_buffer_append_str(&cmap, tmp);
+            for (int i = 0; i < batch; i++) {
+                uint32_t ucp = glyph_to_unicode[batch_ids[i]];
+                if (ucp > 0xFFFF) {
+                    // UTF-16 surrogate pair
+                    uint32_t u = ucp - 0x10000;
+                    uint16_t hi = (uint16_t)(0xD800 + (u >> 10));
+                    uint16_t lo = (uint16_t)(0xDC00 + (u & 0x3FF));
+                    snprintf(tmp, sizeof(tmp), "<%04X> <%04X%04X>\n",
+                             batch_ids[i], hi, lo);
+                } else {
+                    snprintf(tmp, sizeof(tmp), "<%04X> <%04X>\n",
+                             batch_ids[i], (uint16_t)ucp);
+                }
+                tspdf_buffer_append_str(&cmap, tmp);
+            }
+            tspdf_buffer_append_str(&cmap, "endbfchar\n");
+        }
+    }
+
+    tspdf_buffer_append_str(&cmap,
+        "endcmap\n"
+        "CMapName currentdict /CMap defineresource pop\n"
+        "end\n"
+        "end\n"
+    );
+    if (cmap.error) {
+        tspdf_buffer_destroy(&cmap);
+        return NULL;
+    }
+    *out_len = cmap.len;
+    return cmap.data;  // caller frees (buffer ownership transferred)
 }
 
 // --- Build subset TTF ---

@@ -8,6 +8,9 @@
 #include "tspr_internal.h"
 #include "tspr_overlay.h"
 #include "../util/pdftext.h"
+#include "../font/ttf_parser.h"
+#include "../font/font_subset.h"
+#include "../font/font_fallback.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -95,6 +98,7 @@ typedef struct {
     TspdfFieldType type;
     TspdfObj *v;            // effective /V, resolved (may be NULL)
     TspdfObj *da;           // effective /DA string (field else AcroForm)
+    TspdfObj *opt;          // effective /Opt array (inheritable), may be NULL
     int64_t ff;             // effective /Ff
 } FormTerminal;
 
@@ -147,7 +151,7 @@ static TspdfFieldType form_field_type(TspdfObj *ft, int64_t ff) {
 
 static void form_walk(FormCtx *ctx, TspdfObj *field_val, const char *prefix,
                       TspdfObj *in_ft, TspdfObj *in_v, TspdfObj *in_da,
-                      int64_t in_ff, int depth) {
+                      TspdfObj *in_opt, int64_t in_ff, int depth) {
     if (ctx->err != TSPDF_OK || depth > FORM_MAX_DEPTH) return;
     if (ctx->budget == 0) return;
     ctx->budget--;
@@ -194,6 +198,11 @@ static void form_walk(FormCtx *ctx, TspdfObj *field_val, const char *prefix,
     TspdfObj *da = form_resolve(ctx->doc, &ctx->parser,
                                 tspdf_dict_get(field, "DA"));
     if (!da || da->type != TSPDF_OBJ_STRING) da = in_da;
+    // /Opt is inheritable too (ISO 32000 table 231): a parent-held option
+    // list must still validate (and list) at the terminal field.
+    TspdfObj *opt = form_resolve(ctx->doc, &ctx->parser,
+                                 tspdf_dict_get(field, "Opt"));
+    if (!opt || opt->type != TSPDF_OBJ_ARRAY) opt = in_opt;
     TspdfObj *ffo = form_resolve(ctx->doc, &ctx->parser,
                                  tspdf_dict_get(field, "Ff"));
     int64_t ff = (ffo && ffo->type == TSPDF_OBJ_INT) ? ffo->integer : in_ff;
@@ -222,7 +231,7 @@ static void form_walk(FormCtx *ctx, TspdfObj *field_val, const char *prefix,
 
     if (has_child_fields) {
         for (size_t i = 0; i < kids->array.count; i++) {
-            form_walk(ctx, &kids->array.items[i], name, ft, v, da, ff,
+            form_walk(ctx, &kids->array.items[i], name, ft, v, da, opt, ff,
                       depth + 1);
             if (ctx->err != TSPDF_OK) return;
         }
@@ -238,6 +247,7 @@ static void form_walk(FormCtx *ctx, TspdfObj *field_val, const char *prefix,
     term->field_num = num;
     term->v = v;
     term->da = da;
+    term->opt = opt;
     term->ff = ff;
     term->type = form_field_type(ft, ff);
 
@@ -297,7 +307,8 @@ static TspdfError form_collect_terminals(TspdfReader *doc, FormCtx *ctx) {
     if (!fields || fields->type != TSPDF_OBJ_ARRAY) return TSPDF_OK;
 
     for (size_t i = 0; i < fields->array.count; i++) {
-        form_walk(ctx, &fields->array.items[i], "", NULL, NULL, acro_da, 0, 0);
+        form_walk(ctx, &fields->array.items[i], "", NULL, NULL, acro_da, NULL,
+                  0, 0);
         if (ctx->err != TSPDF_OK) break;
     }
     if (ctx->err != TSPDF_OK) {
@@ -401,12 +412,12 @@ static TspdfError form_button_options(FormCtx *ctx, const FormTerminal *term,
 }
 
 // Choice options: /Opt export values (first element of two-element arrays).
+// term->opt is the effective (inheritance-resolved) /Opt from the tree walk.
 static TspdfError form_choice_options(FormCtx *ctx, const FormTerminal *term,
                                       const char ***out, size_t *out_count) {
     *out = NULL;
     *out_count = 0;
-    TspdfObj *opt = form_resolve(ctx->doc, &ctx->parser,
-                                 tspdf_dict_get(term->field, "Opt"));
+    TspdfObj *opt = term->opt;
     if (!opt || opt->type != TSPDF_OBJ_ARRAY || opt->array.count == 0) {
         return TSPDF_OK;
     }
@@ -706,6 +717,490 @@ static void form_sanitize_font_name(char *name) {
     if (o == 0) snprintf(name, 5, "Helv");
 }
 
+// --- fallback font for non-WinAnsi appearance text ---
+//
+// Values with characters outside cp1252 cannot be drawn with the base-14
+// Helvetica the generated appearances use. When such a value is filled (or
+// flattened), a system TrueType font is discovered (font_fallback.c: env
+// override, else a bounded scan of the system font directories with a real
+// cmap coverage check), the needed glyphs are subset (font_subset.c), and
+// the font is embedded once per document as a CIDFontType2 / Identity-H
+// Type0 font — the same construction the writer uses for TTF embedding.
+// Appearances then draw the WHOLE value with the fallback font (mixed
+// Latin+CJK values switch entirely; per-run font switching is not worth the
+// complexity for form fields). When no usable font exists, the old lossy
+// '?' rendering (and the CLI warning) stays.
+
+#define FORM_FALLBACK_RES_NAME "TspdfFb"
+
+struct TspdfFormFallback {
+    bool usable;            // font loaded, glyf-flavored, arrays allocated
+    TTF_Font ttf;
+    bool *used;             // malloc'd, ttf.num_glyphs: glyphs to subset
+    uint32_t *gid_cp;       // malloc'd: glyph id -> unicode (for /ToUnicode)
+    bool registered;        // PDF objects created and registered
+    TspdfObj *file_stream;  // FontFile2 (subset TTF), refreshed per use
+    TspdfObj *tounicode;    // ToUnicode CMap stream, refreshed per use
+    TspdfObj *cidfont;      // CIDFontType2 dict (holds /W, refreshed)
+    uint32_t type0_num;     // object number of the /Type0 font
+    // Negative cache: the code-point set of the last failed discovery, so
+    // repeated fills/queries of the same value do not rescan the disk.
+    uint32_t *failed_cps;   // malloc'd
+    size_t failed_count;
+};
+
+void tspdf_form_fallback_free(TspdfReader *doc) {
+    if (!doc || !doc->form_fallback) return;
+    TspdfFormFallback *fb = doc->form_fallback;
+    ttf_free(&fb->ttf);
+    free(fb->used);
+    free(fb->gid_cp);
+    free(fb->failed_cps);
+    free(fb);
+    doc->form_fallback = NULL;
+}
+
+// Unique code points of a UTF-8 string, with line breaks folded to spaces
+// (matching the appearance generator). *needs_fallback: any code point has
+// no cp1252 slot. Returns a malloc'd array (caller frees); NULL when the
+// string is empty or not valid UTF-8 (then *needs_fallback stays false and
+// the caller keeps the lossy path).
+static uint32_t *form_value_codepoints(const char *utf8, size_t *out_count,
+                                       bool *needs_fallback) {
+    *out_count = 0;
+    *needs_fallback = false;
+    size_t len = strlen(utf8);
+    if (len == 0) return NULL;
+    uint32_t *cps = (uint32_t *)malloc(len * sizeof(uint32_t));
+    if (!cps) return NULL;
+    size_t count = 0;
+    const char *p = utf8;
+    while (*p) {
+        uint32_t cp = 0;
+        size_t n = tspdf_utf8_decode(p, &cp);
+        if (n == 0) {
+            free(cps);
+            *needs_fallback = false;
+            return NULL;
+        }
+        p += n;
+        if (cp == '\n' || cp == '\r') cp = ' ';
+        if (tspdf_cp1252_from_codepoint(cp) < 0) *needs_fallback = true;
+        bool seen = false;
+        for (size_t i = 0; i < count && !seen; i++) seen = (cps[i] == cp);
+        if (!seen) cps[count++] = cp;
+    }
+    if (count == 0) {
+        free(cps);
+        return NULL;
+    }
+    *out_count = count;
+    return cps;
+}
+
+// Same code-point multiset? (order-insensitive; both sides are dedup'd)
+static bool form_cps_equal(const uint32_t *a, size_t an,
+                           const uint32_t *b, size_t bn) {
+    if (an != bn) return false;
+    for (size_t i = 0; i < an; i++) {
+        bool found = false;
+        for (size_t j = 0; j < bn && !found; j++) found = (b[j] == a[i]);
+        if (!found) return false;
+    }
+    return true;
+}
+
+// The document's fallback font when it covers `cps`, running discovery on
+// first need. Returns NULL when nothing usable is available (or the cached
+// font lacks coverage — one fallback font per document, so a second script
+// that the first font does not cover keeps the '?' path; documented).
+static TspdfFormFallback *form_fallback_font(TspdfReader *doc,
+                                             const uint32_t *cps,
+                                             size_t count) {
+    TspdfFormFallback *fb = doc->form_fallback;
+    if (fb && fb->usable) {
+        for (size_t i = 0; i < count; i++) {
+            if (ttf_get_glyph_index(&fb->ttf, cps[i]) == 0) return NULL;
+        }
+        return fb;
+    }
+    if (fb && form_cps_equal(fb->failed_cps, fb->failed_count, cps, count)) {
+        return NULL;  // same value already failed discovery; don't rescan
+    }
+
+    char *path = tspdf_fallback_font_find(cps, count);
+    bool ok = path != NULL;
+    if (!fb) {
+        fb = (TspdfFormFallback *)calloc(1, sizeof(*fb));
+        if (!fb) {
+            free(path);
+            return NULL;
+        }
+        doc->form_fallback = fb;
+    }
+    if (ok) ok = ttf_load(&fb->ttf, path);
+    free(path);
+    if (ok && (fb->ttf.num_glyphs == 0 || fb->ttf.units_per_em == 0 ||
+               fb->ttf.glyf_offset == 0 || fb->ttf.loca_offset == 0)) {
+        ttf_free(&fb->ttf);
+        ok = false;
+    }
+    if (ok) {
+        fb->used = (bool *)calloc(fb->ttf.num_glyphs, sizeof(bool));
+        fb->gid_cp = (uint32_t *)calloc(fb->ttf.num_glyphs, sizeof(uint32_t));
+        if (!fb->used || !fb->gid_cp) {
+            free(fb->used);
+            free(fb->gid_cp);
+            fb->used = NULL;
+            fb->gid_cp = NULL;
+            ttf_free(&fb->ttf);
+            ok = false;
+        }
+    }
+    if (!ok) {
+        // Remember the failing set (best effort; a failed alloc just means
+        // the next call rescans).
+        free(fb->failed_cps);
+        fb->failed_cps = (uint32_t *)malloc(count * sizeof(uint32_t));
+        if (fb->failed_cps) {
+            memcpy(fb->failed_cps, cps, count * sizeof(uint32_t));
+            fb->failed_count = count;
+        } else {
+            fb->failed_count = 0;
+        }
+        return NULL;
+    }
+    fb->usable = true;
+    return fb;
+}
+
+// Sanitized PostScript-ish name for the embedded font dicts.
+static void form_fallback_base_name(const TspdfFormFallback *fb, char *out,
+                                    size_t out_size) {
+    const char *src = fb->ttf.postscript_name[0] ? fb->ttf.postscript_name
+                                                 : fb->ttf.font_family;
+    size_t pos = 0;
+    const char *tag = "TSPDFB+";
+    while (*tag && pos + 1 < out_size) out[pos++] = *tag++;
+    for (const char *p = src; *p && pos + 1 < out_size; p++) {
+        unsigned char c = (unsigned char)*p;
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-') {
+            out[pos++] = (char)c;
+        }
+    }
+    if (pos == strlen("TSPDFB+")) {
+        const char *fallback = "Fallback";
+        while (*fallback && pos + 1 < out_size) out[pos++] = *fallback++;
+    }
+    out[pos] = '\0';
+}
+
+// Create + register the five PDF objects of the embedded fallback font
+// (FontFile2, FontDescriptor, ToUnicode, CIDFontType2, Type0). The mutable
+// parts (subset bytes, /W, ToUnicode) are (re)filled by
+// form_fallback_refresh after each use.
+static TspdfError form_fallback_register(TspdfReader *doc,
+                                         TspdfFormFallback *fb) {
+    if (fb->registered) return TSPDF_OK;
+    TspdfArena *a = &doc->arena;
+    const TTF_Font *ttf = &fb->ttf;
+    double scale = 1000.0 / (double)ttf->units_per_em;
+
+    char base_name[128];
+    form_fallback_base_name(fb, base_name, sizeof(base_name));
+
+    TspdfObj *file_dict = form_obj_new(a, TSPDF_OBJ_DICT);
+    TspdfObj *file_stream = form_obj_new(a, TSPDF_OBJ_STREAM);
+    TspdfObj *tou_dict = form_obj_new(a, TSPDF_OBJ_DICT);
+    TspdfObj *tounicode = form_obj_new(a, TSPDF_OBJ_STREAM);
+    TspdfObj *desc = form_obj_new(a, TSPDF_OBJ_DICT);
+    TspdfObj *cidfont = form_obj_new(a, TSPDF_OBJ_DICT);
+    TspdfObj *sysinfo = form_obj_new(a, TSPDF_OBJ_DICT);
+    TspdfObj *type0 = form_obj_new(a, TSPDF_OBJ_DICT);
+    TspdfObj *bbox = form_obj_new(a, TSPDF_OBJ_ARRAY);
+    TspdfObj *descendants = form_obj_new(a, TSPDF_OBJ_ARRAY);
+    if (!file_dict || !file_stream || !tou_dict || !tounicode || !desc ||
+        !cidfont || !sysinfo || !type0 || !bbox || !descendants) {
+        return TSPDF_ERR_ALLOC;
+    }
+
+    file_stream->stream.dict = file_dict;
+    file_stream->stream.data = (uint8_t *)tspdf_arena_alloc(a, 1);
+    file_stream->stream.len = 0;
+    file_stream->stream.self_contained = true;
+    tounicode->stream.dict = tou_dict;
+    tounicode->stream.data = file_stream->stream.data;
+    tounicode->stream.len = 0;
+    tounicode->stream.self_contained = true;
+    if (!file_stream->stream.data) return TSPDF_ERR_ALLOC;
+
+    uint32_t file_num = tspdf_register_new_obj(doc, file_stream);
+    uint32_t tou_num = tspdf_register_new_obj(doc, tounicode);
+    uint32_t desc_num = tspdf_register_new_obj(doc, desc);
+    uint32_t cid_num = tspdf_register_new_obj(doc, cidfont);
+    uint32_t type0_num = tspdf_register_new_obj(doc, type0);
+    if (!file_num || !tou_num || !desc_num || !cid_num || !type0_num) {
+        return TSPDF_ERR_ALLOC;
+    }
+
+    TspdfError err = form_dict_put(file_dict, "Length",
+                                   form_make_int(a, 0), a);
+    if (err == TSPDF_OK) {
+        err = form_dict_put(file_dict, "Length1", form_make_int(a, 0), a);
+    }
+    if (err == TSPDF_OK) {
+        err = form_dict_put(tou_dict, "Length", form_make_int(a, 0), a);
+    }
+
+    // FontDescriptor (same fields as the writer's TTF embedding).
+    bbox->array.items = (TspdfObj *)tspdf_arena_alloc_zero(
+        a, 4 * sizeof(TspdfObj));
+    if (!bbox->array.items) return TSPDF_ERR_ALLOC;
+    bbox->array.count = 4;
+    const int16_t bb[4] = {ttf->x_min, ttf->y_min, ttf->x_max, ttf->y_max};
+    for (size_t i = 0; i < 4; i++) {
+        bbox->array.items[i].type = TSPDF_OBJ_INT;
+        bbox->array.items[i].integer = (int64_t)((double)bb[i] * scale);
+    }
+    int16_t cap_height = (ttf->has_os2 && ttf->os2_cap_height)
+                             ? ttf->os2_cap_height
+                             : (int16_t)(ttf->ascent * 0.7);
+    if (err == TSPDF_OK) err = form_dict_put(desc, "Type", form_make_name(a, "FontDescriptor"), a);
+    if (err == TSPDF_OK) err = form_dict_put(desc, "FontName", form_make_name(a, base_name), a);
+    if (err == TSPDF_OK) err = form_dict_put(desc, "Flags", form_make_int(a, 4), a);
+    if (err == TSPDF_OK) err = form_dict_put(desc, "FontBBox", bbox, a);
+    if (err == TSPDF_OK) err = form_dict_put(desc, "ItalicAngle", form_make_int(a, 0), a);
+    if (err == TSPDF_OK) err = form_dict_put(desc, "Ascent", form_make_int(a, (int64_t)((double)ttf->ascent * scale)), a);
+    if (err == TSPDF_OK) err = form_dict_put(desc, "Descent", form_make_int(a, (int64_t)((double)ttf->descent * scale)), a);
+    if (err == TSPDF_OK) err = form_dict_put(desc, "CapHeight", form_make_int(a, (int64_t)((double)cap_height * scale)), a);
+    if (err == TSPDF_OK) err = form_dict_put(desc, "StemV", form_make_int(a, 80), a);
+    if (err == TSPDF_OK) err = form_dict_put(desc, "FontFile2", form_make_ref(a, file_num), a);
+
+    // CIDFontType2 descendant.
+    if (err == TSPDF_OK) err = form_dict_put(sysinfo, "Registry", form_make_text_string(a, "Adobe"), a);
+    if (err == TSPDF_OK) err = form_dict_put(sysinfo, "Ordering", form_make_text_string(a, "Identity"), a);
+    if (err == TSPDF_OK) err = form_dict_put(sysinfo, "Supplement", form_make_int(a, 0), a);
+    if (err == TSPDF_OK) err = form_dict_put(cidfont, "Type", form_make_name(a, "Font"), a);
+    if (err == TSPDF_OK) err = form_dict_put(cidfont, "Subtype", form_make_name(a, "CIDFontType2"), a);
+    if (err == TSPDF_OK) err = form_dict_put(cidfont, "BaseFont", form_make_name(a, base_name), a);
+    if (err == TSPDF_OK) err = form_dict_put(cidfont, "CIDSystemInfo", sysinfo, a);
+    if (err == TSPDF_OK) err = form_dict_put(cidfont, "DW", form_make_int(a, 1000), a);
+    if (err == TSPDF_OK) err = form_dict_put(cidfont, "CIDToGIDMap", form_make_name(a, "Identity"), a);
+    if (err == TSPDF_OK) err = form_dict_put(cidfont, "FontDescriptor", form_make_ref(a, desc_num), a);
+
+    // Type0 wrapper (what appearance /Resources reference).
+    descendants->array.items = (TspdfObj *)tspdf_arena_alloc_zero(
+        a, sizeof(TspdfObj));
+    if (!descendants->array.items) return TSPDF_ERR_ALLOC;
+    descendants->array.count = 1;
+    descendants->array.items[0].type = TSPDF_OBJ_REF;
+    descendants->array.items[0].ref.num = cid_num;
+    if (err == TSPDF_OK) err = form_dict_put(type0, "Type", form_make_name(a, "Font"), a);
+    if (err == TSPDF_OK) err = form_dict_put(type0, "Subtype", form_make_name(a, "Type0"), a);
+    if (err == TSPDF_OK) err = form_dict_put(type0, "BaseFont", form_make_name(a, base_name), a);
+    if (err == TSPDF_OK) err = form_dict_put(type0, "Encoding", form_make_name(a, "Identity-H"), a);
+    if (err == TSPDF_OK) err = form_dict_put(type0, "DescendantFonts", descendants, a);
+    if (err == TSPDF_OK) err = form_dict_put(type0, "ToUnicode", form_make_ref(a, tou_num), a);
+    if (err != TSPDF_OK) return err;
+
+    fb->file_stream = file_stream;
+    fb->tounicode = tounicode;
+    fb->cidfont = cidfont;
+    fb->type0_num = type0_num;
+    fb->registered = true;
+    return TSPDF_OK;
+}
+
+// Rebuild the parts of the embedded font that depend on which glyphs are
+// used: subset FontFile2 bytes, the /W width array, and the /ToUnicode
+// CMap. Called after each value marks its glyphs, so the last call before
+// save always reflects the cumulative glyph set.
+static TspdfError form_fallback_refresh(TspdfReader *doc,
+                                        TspdfFormFallback *fb) {
+    TspdfArena *a = &doc->arena;
+
+    size_t sub_len = 0;
+    uint8_t *sub = ttf_subset(&fb->ttf, fb->used, &sub_len);
+    if (!sub) return TSPDF_ERR_ALLOC;
+    uint8_t *sub_a = (uint8_t *)tspdf_arena_alloc(a, sub_len);
+    if (!sub_a) {
+        free(sub);
+        return TSPDF_ERR_ALLOC;
+    }
+    memcpy(sub_a, sub, sub_len);
+    free(sub);
+    fb->file_stream->stream.data = sub_a;
+    fb->file_stream->stream.len = sub_len;
+    TspdfError err = form_dict_put(fb->file_stream->stream.dict, "Length",
+                                   form_make_int(a, (int64_t)sub_len), a);
+    if (err == TSPDF_OK) {
+        err = form_dict_put(fb->file_stream->stream.dict, "Length1",
+                            form_make_int(a, (int64_t)sub_len), a);
+    }
+    if (err != TSPDF_OK) return err;
+
+    size_t cmap_len = 0;
+    uint8_t *cmap = tspdf_font_tounicode_cmap(fb->used, fb->gid_cp,
+                                              (int)fb->ttf.num_glyphs,
+                                              &cmap_len);
+    if (!cmap) return TSPDF_ERR_ALLOC;
+    uint8_t *cmap_a = (uint8_t *)tspdf_arena_alloc(a, cmap_len);
+    if (!cmap_a) {
+        free(cmap);
+        return TSPDF_ERR_ALLOC;
+    }
+    memcpy(cmap_a, cmap, cmap_len);
+    free(cmap);
+    fb->tounicode->stream.data = cmap_a;
+    fb->tounicode->stream.len = cmap_len;
+    err = form_dict_put(fb->tounicode->stream.dict, "Length",
+                        form_make_int(a, (int64_t)cmap_len), a);
+    if (err != TSPDF_OK) return err;
+
+    // /W: runs of consecutive used glyph ids -> "gid [w w ...]".
+    uint32_t ng = fb->ttf.num_glyphs;
+    size_t runs = 0;
+    for (uint32_t g = 0; g < ng; g++) {
+        if (fb->used[g] && (g == 0 || !fb->used[g - 1])) runs++;
+    }
+    TspdfObj *w = form_obj_new(a, TSPDF_OBJ_ARRAY);
+    if (!w) return TSPDF_ERR_ALLOC;
+    if (runs > 0) {
+        w->array.items = (TspdfObj *)tspdf_arena_alloc_zero(
+            a, runs * 2 * sizeof(TspdfObj));
+        if (!w->array.items) return TSPDF_ERR_ALLOC;
+        double scale = 1000.0 / (double)fb->ttf.units_per_em;
+        size_t idx = 0;
+        for (uint32_t g = 0; g < ng;) {
+            if (!fb->used[g]) {
+                g++;
+                continue;
+            }
+            uint32_t start = g;
+            while (g < ng && fb->used[g]) g++;
+            w->array.items[idx].type = TSPDF_OBJ_INT;
+            w->array.items[idx].integer = (int64_t)start;
+            idx++;
+            TspdfObj *inner = &w->array.items[idx];
+            inner->type = TSPDF_OBJ_ARRAY;
+            inner->array.count = g - start;
+            inner->array.items = (TspdfObj *)tspdf_arena_alloc_zero(
+                a, (g - start) * sizeof(TspdfObj));
+            if (!inner->array.items) return TSPDF_ERR_ALLOC;
+            for (uint32_t k = start; k < g; k++) {
+                inner->array.items[k - start].type = TSPDF_OBJ_INT;
+                inner->array.items[k - start].integer = (int64_t)(
+                    (double)ttf_get_glyph_advance(&fb->ttf, (uint16_t)k) *
+                    scale);
+            }
+            idx++;
+        }
+        w->array.count = idx;
+    }
+    return form_dict_put(fb->cidfont, "W", w, a);
+}
+
+// Build the Identity-H hex-string Tj operand ("<0A1B...>") for `line`
+// (UTF-8, already line-break-folded) and mark the glyphs used. Malloc'd;
+// caller frees. NULL on bad UTF-8 or allocation failure.
+static char *form_fallback_hex_string(TspdfFormFallback *fb,
+                                      const char *line) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t len = strlen(line);
+    char *out = (char *)malloc(len * 4 + 3);
+    if (!out) return NULL;
+    size_t pos = 0;
+    out[pos++] = '<';
+    const char *p = line;
+    while (*p) {
+        uint32_t cp = 0;
+        size_t n = tspdf_utf8_decode(p, &cp);
+        if (n == 0) {
+            free(out);
+            return NULL;
+        }
+        p += n;
+        uint16_t gid = ttf_get_glyph_index(&fb->ttf, cp);
+        if (gid < fb->ttf.num_glyphs) {
+            fb->used[gid] = true;
+            fb->gid_cp[gid] = cp;
+        }
+        out[pos++] = hex[(gid >> 12) & 0xF];
+        out[pos++] = hex[(gid >> 8) & 0xF];
+        out[pos++] = hex[(gid >> 4) & 0xF];
+        out[pos++] = hex[gid & 0xF];
+    }
+    out[pos++] = '>';
+    out[pos] = '\0';
+    return out;
+}
+
+// Prepare the fallback rendering of `line` when it needs one and a font is
+// available: returns the hex Tj operand (malloc'd, caller frees) and sets
+// *out_font_num. Returns NULL when the value renders fine as cp1252, when
+// no usable font exists, or on any failure — the caller then uses the
+// existing lossy path.
+static char *form_fallback_prepare(TspdfReader *doc, const char *line,
+                                   uint32_t *out_font_num) {
+    *out_font_num = 0;
+    size_t cp_count = 0;
+    bool needs = false;
+    uint32_t *cps = form_value_codepoints(line, &cp_count, &needs);
+    char *tj = NULL;
+    if (cps && needs) {
+        TspdfFormFallback *fb = form_fallback_font(doc, cps, cp_count);
+        if (fb && form_fallback_register(doc, fb) == TSPDF_OK) {
+            tj = form_fallback_hex_string(fb, line);
+            if (tj && form_fallback_refresh(doc, fb) != TSPDF_OK) {
+                free(tj);
+                tj = NULL;
+            }
+            if (tj) *out_font_num = fb->type0_num;
+        }
+    }
+    free(cps);
+    return tj;
+}
+
+// Also expose the embedded font through the AcroForm default resources so
+// viewers that consult /DR find it (best effort; failures are harmless —
+// the /AP stream's own /Resources carry the binding that matters).
+static void form_fallback_add_to_dr(FormCtx *ctx, uint32_t type0_num) {
+    if (!ctx->acroform) return;
+    TspdfArena *a = ctx->a;
+    TspdfObj *dr = form_resolve(ctx->doc, &ctx->parser,
+                                tspdf_dict_get(ctx->acroform, "DR"));
+    if (!dr || dr->type != TSPDF_OBJ_DICT) {
+        dr = form_obj_new(a, TSPDF_OBJ_DICT);
+        if (!dr || form_dict_put(ctx->acroform, "DR", dr, a) != TSPDF_OK) {
+            return;
+        }
+    }
+    TspdfObj *fonts = form_resolve(ctx->doc, &ctx->parser,
+                                   tspdf_dict_get(dr, "Font"));
+    if (!fonts || fonts->type != TSPDF_OBJ_DICT) {
+        fonts = form_obj_new(a, TSPDF_OBJ_DICT);
+        if (!fonts || form_dict_put(dr, "Font", fonts, a) != TSPDF_OK) return;
+    }
+    TspdfObj *ref = form_make_ref(a, type0_num);
+    if (ref) form_dict_put(fonts, FORM_FALLBACK_RES_NAME, ref, a);
+}
+
+bool tspdf_reader_form_value_renderable(TspdfReader *doc, const char *value) {
+    if (!doc || !value) return false;
+    size_t cp_count = 0;
+    bool needs = false;
+    uint32_t *cps = form_value_codepoints(value, &cp_count, &needs);
+    if (!cps) {
+        // Empty renders trivially; invalid UTF-8 keeps the lossy '?' path.
+        return value[0] == '\0';
+    }
+    bool ok = !needs || form_fallback_font(doc, cps, cp_count) != NULL;
+    free(cps);
+    return ok;
+}
+
 // --- appearance stream generation (text fields) ---
 
 // Grow-append for the content buffer (malloc'd, caller frees).
@@ -790,7 +1285,9 @@ static TspdfError form_set_text_appearance(FormCtx *ctx, TspdfObj *widget,
         if (size < 4) size = 4;
     }
 
-    // Single line: fold line breaks, then cp1252 (lossy) for a base14 font.
+    // Single line: fold line breaks. Values that fit cp1252 are drawn with
+    // the base-14 /DA font; anything else tries the embedded fallback font
+    // first and only degrades to lossy cp1252 ('?') when none is usable.
     size_t vlen = strlen(value);
     char *line = (char *)malloc(vlen + 1);
     if (!line) return TSPDF_ERR_ALLOC;
@@ -798,29 +1295,43 @@ static TspdfError form_set_text_appearance(FormCtx *ctx, TspdfObj *widget,
     for (size_t i = 0; i < vlen; i++) {
         if (line[i] == '\n' || line[i] == '\r') line[i] = ' ';
     }
-    tspdf_utf8_to_cp1252_lossy(line, line, NULL);
+    uint32_t fallback_num = 0;
+    char *fallback_tj = form_fallback_prepare(ctx->doc, line, &fallback_num);
+    if (!fallback_tj) tspdf_utf8_to_cp1252_lossy(line, line, NULL);
+    const char *res_font = fallback_tj ? FORM_FALLBACK_RES_NAME : da_font;
 
-    // Content: /Tx BMC q BT <da font+size> 0 g x y Td (line) Tj ET Q EMC
+    // Content: /Tx BMC q BT <font+size> 0 g x y Td (line) Tj ET Q EMC
     char *content = NULL;
     size_t clen = 0, ccap = 0;
     char head[256];
     double baseline = (h - size * 0.7) / 2.0;
     if (baseline < 1) baseline = 1;
     int n = snprintf(head, sizeof(head),
-                     "/Tx BMC\nq\nBT\n/%s %.2f Tf\n0 g\n2 %.2f Td\n(",
-                     da_font, size, baseline);
+                     "/Tx BMC\nq\nBT\n/%s %.2f Tf\n0 g\n2 %.2f Td\n",
+                     res_font, size, baseline);
     bool ok = n > 0 && form_buf_append(&content, &clen, &ccap, head, (size_t)n);
-    for (const char *p = line; ok && *p; p++) {
-        char c = *p;
-        if (c == '(' || c == ')' || c == '\\') {
-            char esc[2] = {'\\', c};
-            ok = form_buf_append(&content, &clen, &ccap, esc, 2);
-        } else {
-            ok = form_buf_append(&content, &clen, &ccap, &c, 1);
+    if (fallback_tj) {
+        // Identity-H glyph string: hex form, nothing to escape.
+        if (ok) {
+            ok = form_buf_append(&content, &clen, &ccap, fallback_tj,
+                                 strlen(fallback_tj));
         }
+    } else {
+        if (ok) ok = form_buf_append(&content, &clen, &ccap, "(", 1);
+        for (const char *p = line; ok && *p; p++) {
+            char c = *p;
+            if (c == '(' || c == ')' || c == '\\') {
+                char esc[2] = {'\\', c};
+                ok = form_buf_append(&content, &clen, &ccap, esc, 2);
+            } else {
+                ok = form_buf_append(&content, &clen, &ccap, &c, 1);
+            }
+        }
+        if (ok) ok = form_buf_append(&content, &clen, &ccap, ")", 1);
     }
-    if (ok) ok = form_buf_append(&content, &clen, &ccap, ") Tj\nET\nQ\nEMC", 13);
+    if (ok) ok = form_buf_append(&content, &clen, &ccap, " Tj\nET\nQ\nEMC", 12);
     free(line);
+    free(fallback_tj);
     if (!ok) {
         free(content);
         return TSPDF_ERR_ALLOC;
@@ -832,12 +1343,15 @@ static TspdfError form_set_text_appearance(FormCtx *ctx, TspdfObj *widget,
     TspdfObj *bbox = form_obj_new(a, TSPDF_OBJ_ARRAY);
     TspdfObj *resources = form_obj_new(a, TSPDF_OBJ_DICT);
     TspdfObj *fonts = form_obj_new(a, TSPDF_OBJ_DICT);
-    TspdfObj *font = form_appearance_font(ctx, da_font);
+    TspdfObj *font = fallback_num > 0
+        ? form_make_ref(a, fallback_num)
+        : form_appearance_font(ctx, da_font);
     TspdfObj *stream = form_obj_new(a, TSPDF_OBJ_STREAM);
     if (!sdict || !bbox || !resources || !fonts || !font || !stream) {
         free(content);
         return TSPDF_ERR_ALLOC;
     }
+    if (fallback_num > 0) form_fallback_add_to_dr(ctx, fallback_num);
     bbox->array.items = (TspdfObj *)tspdf_arena_alloc_zero(a, 4 * sizeof(TspdfObj));
     if (!bbox->array.items) {
         free(content);
@@ -849,7 +1363,7 @@ static TspdfError form_set_text_appearance(FormCtx *ctx, TspdfObj *widget,
     bbox->array.items[2] = (TspdfObj){.type = TSPDF_OBJ_REAL, .real = w};
     bbox->array.items[3] = (TspdfObj){.type = TSPDF_OBJ_REAL, .real = h};
 
-    TspdfError err = form_dict_put(fonts, da_font, font, a);
+    TspdfError err = form_dict_put(fonts, res_font, font, a);
     if (err == TSPDF_OK) err = form_dict_put(resources, "Font", fonts, a);
     if (err == TSPDF_OK) err = form_dict_put(sdict, "Type", form_make_name(a, "XObject"), a);
     if (err == TSPDF_OK) err = form_dict_put(sdict, "Subtype", form_make_name(a, "Form"), a);
@@ -1006,9 +1520,14 @@ TspdfError tspdf_reader_form_fill(TspdfReader *doc, const char *name,
             break;
     }
 
-    // Belt: ask viewers to regenerate appearances for everything we set.
+    // Belt: ask viewers to regenerate appearances for everything we set —
+    // EXCEPT when any fill in this document drew with the embedded fallback
+    // font. Viewers honoring NeedAppearances rebuild appearances from /DA
+    // (a base-14 font), which would throw away the only rendering that can
+    // show those characters, so the generated /AP must stay authoritative.
     if (err == TSPDF_OK && ctx.acroform) {
-        TspdfObj *na = form_make_bool(&doc->arena, true);
+        bool keep_ap = doc->form_fallback && doc->form_fallback->registered;
+        TspdfObj *na = form_make_bool(&doc->arena, !keep_ap);
         if (!na) err = TSPDF_ERR_ALLOC;
         else err = form_dict_put(ctx.acroform, "NeedAppearances", na, &doc->arena);
     }
@@ -1055,11 +1574,13 @@ static TspdfObj *form_copy_resources_for_merge(TspdfArena *a, TspdfReader *doc,
 }
 
 // Append the value text of a widget to the page content buffer, clipped to
-// the widget rect. Uses the shared flattening font (see form_flatten_font).
+// the widget rect. Values that fit cp1252 use the shared flattening font
+// (/TspdfFf, WinAnsi Helvetica); values that need it and can get it use the
+// embedded fallback font (/TspdfFb, Identity-H glyph string).
 static void form_flatten_draw_text(FormCtx *ctx, TspdfBuffer *content,
                                    TspdfObj *widget, const char *utf8,
                                    double x0, double y0, double w, double h,
-                                   bool *used_font) {
+                                   bool *used_font, bool *used_fallback) {
     char da_font[64];
     double size = 0;
     TspdfObj *da = form_resolve(ctx->doc, &ctx->parser,
@@ -1082,22 +1603,34 @@ static void form_flatten_draw_text(FormCtx *ctx, TspdfBuffer *content,
     for (size_t i = 0; i < vlen; i++) {
         if (line[i] == '\n' || line[i] == '\r') line[i] = ' ';
     }
-    tspdf_utf8_to_cp1252_lossy(line, line, NULL);
+    uint32_t fallback_num = 0;
+    char *fallback_tj = form_fallback_prepare(ctx->doc, line, &fallback_num);
+    if (!fallback_tj) tspdf_utf8_to_cp1252_lossy(line, line, NULL);
 
     double baseline = y0 + (h - size * 0.7) / 2.0;
     if (baseline < y0 + 1) baseline = y0 + 1;
     tspdf_buffer_printf(content,
-                        "q\n%.2f %.2f %.2f %.2f re W n\nBT\n/TspdfFf %.2f Tf\n"
-                        "0 g\n%.2f %.2f Td\n(",
-                        x0, y0, w, h, size, x0 + 2, baseline);
-    for (const char *p = line; *p; p++) {
-        if (*p == '(' || *p == ')' || *p == '\\') {
-            tspdf_buffer_append_byte(content, '\\');
+                        "q\n%.2f %.2f %.2f %.2f re W n\nBT\n/%s %.2f Tf\n"
+                        "0 g\n%.2f %.2f Td\n",
+                        x0, y0, w, h,
+                        fallback_tj ? FORM_FALLBACK_RES_NAME : "TspdfFf",
+                        size, x0 + 2, baseline);
+    if (fallback_tj) {
+        tspdf_buffer_append_str(content, fallback_tj);
+        tspdf_buffer_append_str(content, " Tj\nET\nQ\n");
+        *used_fallback = true;
+    } else {
+        tspdf_buffer_append_byte(content, '(');
+        for (const char *p = line; *p; p++) {
+            if (*p == '(' || *p == ')' || *p == '\\') {
+                tspdf_buffer_append_byte(content, '\\');
+            }
+            tspdf_buffer_append_byte(content, (uint8_t)*p);
         }
-        tspdf_buffer_append_byte(content, (uint8_t)*p);
+        tspdf_buffer_append_str(content, ") Tj\nET\nQ\n");
+        *used_font = true;
     }
-    tspdf_buffer_append_str(content, ") Tj\nET\nQ\n");
-    *used_font = true;
+    free(fallback_tj);
     free(line);
 }
 
@@ -1201,6 +1734,7 @@ TspdfError tspdf_reader_form_flatten(TspdfReader *doc) {
         TspdfBuffer content = tspdf_buffer_create(256);
         TspdfObj *xobjects = NULL;  // /XObject additions for this page
         bool used_font = false;
+        bool used_fallback = false;
         size_t xobj_counter = 0;
 
         for (size_t i = 0; i < ctx.count && err == TSPDF_OK; i++) {
@@ -1241,7 +1775,8 @@ TspdfError tspdf_reader_form_flatten(TspdfReader *doc) {
                     }
                     if (utf8[0] == '\0') continue;
                     form_flatten_draw_text(&ctx, &content, widget, utf8,
-                                           x0, y0, w, h, &used_font);
+                                           x0, y0, w, h, &used_font,
+                                           &used_fallback);
                 } else if (term->type == TSPDF_FIELD_CHECKBOX ||
                            term->type == TSPDF_FIELD_RADIO) {
                     const char *state = form_widget_on_state(&ctx, term, widget);
@@ -1286,19 +1821,32 @@ TspdfError tspdf_reader_form_flatten(TspdfReader *doc) {
             // it renders correctly; not worth per-page duplication.
             TspdfObj *new_res = form_obj_new(a, TSPDF_OBJ_DICT);
             if (!new_res) err = TSPDF_ERR_ALLOC;
-            if (err == TSPDF_OK && used_font) {
-                if (font_num == 0) {
-                    TspdfObj *font = form_appearance_font(&ctx, "TspdfFf");
-                    if (font) font_num = tspdf_register_new_obj(doc, font);
-                    if (font_num == 0) err = TSPDF_ERR_ALLOC;
+            if (err == TSPDF_OK && (used_font || used_fallback)) {
+                TspdfObj *fonts = form_obj_new(a, TSPDF_OBJ_DICT);
+                if (!fonts) err = TSPDF_ERR_ALLOC;
+                if (err == TSPDF_OK && used_font) {
+                    if (font_num == 0) {
+                        TspdfObj *font = form_appearance_font(&ctx, "TspdfFf");
+                        if (font) font_num = tspdf_register_new_obj(doc, font);
+                        if (font_num == 0) err = TSPDF_ERR_ALLOC;
+                    }
+                    if (err == TSPDF_OK) {
+                        TspdfObj *fref = form_make_ref(a, font_num);
+                        if (!fref) err = TSPDF_ERR_ALLOC;
+                        if (err == TSPDF_OK) err = form_dict_put(fonts, "TspdfFf", fref, a);
+                    }
                 }
-                if (err == TSPDF_OK) {
-                    TspdfObj *fonts = form_obj_new(a, TSPDF_OBJ_DICT);
-                    TspdfObj *fref = form_make_ref(a, font_num);
-                    if (!fonts || !fref) err = TSPDF_ERR_ALLOC;
-                    if (err == TSPDF_OK) err = form_dict_put(fonts, "TspdfFf", fref, a);
-                    if (err == TSPDF_OK) err = form_dict_put(new_res, "Font", fonts, a);
+                if (err == TSPDF_OK && used_fallback && doc->form_fallback &&
+                    doc->form_fallback->type0_num > 0) {
+                    TspdfObj *fref = form_make_ref(
+                        a, doc->form_fallback->type0_num);
+                    if (!fref) err = TSPDF_ERR_ALLOC;
+                    if (err == TSPDF_OK) {
+                        err = form_dict_put(fonts, FORM_FALLBACK_RES_NAME,
+                                            fref, a);
+                    }
                 }
+                if (err == TSPDF_OK) err = form_dict_put(new_res, "Font", fonts, a);
             }
             if (err == TSPDF_OK && xobjects) {
                 err = form_dict_put(new_res, "XObject", xobjects, a);
