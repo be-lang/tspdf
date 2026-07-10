@@ -30,6 +30,7 @@ static void print_usage(void) {
     printf("  form       List, fill, or flatten PDF form fields\n");
     printf("  attach     Embed, list, extract, or remove file attachments\n");
     printf("  stamp      Overlay a PDF page onto another PDF's pages\n");
+    printf("  nup        Place multiple pages per sheet (2-up, 4-up, ...)\n");
     printf("\n");
     printf("Options:\n");
     printf("  --help, -h     Show this help message\n");
@@ -171,6 +172,27 @@ static void print_command_help(const char *cmd) {
         printf("                      (letterhead/background) instead of on top\n");
         printf("  --password <pass>   Password for an encrypted input (output is saved\n");
         printf("                      decrypted; re-encrypt with 'tspdf encrypt')\n");
+        printf("  -o <output.pdf>     Output file path (required)\n");
+    } else if (strcmp(cmd, "nup") == 0) {
+        printf("Usage: tspdf nup <N> <input.pdf> -o <output.pdf>\n");
+        printf("                 [--pages <range>] [--page-size a4|letter|source]\n");
+        printf("                 [--landscape] [--gap <pt>] [--frame] [--password <pass>]\n");
+        printf("\n");
+        printf("Place N source pages onto each output sheet in a grid (imposition,\n");
+        printf("like pdfjam/pdftk). Each page is scaled to fit its cell, keeping its\n");
+        printf("aspect ratio, and centered, in reading order (left-to-right, top-to-bottom).\n");
+        printf("Only page content is kept; bookmarks, forms, and annotations are dropped.\n");
+        printf("\n");
+        printf("Arguments:\n");
+        printf("  <N>                 Pages per sheet: 2, 4, 6, 8, 9, or 16\n");
+        printf("  <input.pdf>         Input PDF file\n");
+        printf("  --pages <range>     Pages to impose, e.g. 1-3 or 2,4 (default: all)\n");
+        printf("  --page-size <s>     Sheet size: a4 (default), letter, or source\n");
+        printf("                      (source sizes the sheet as a grid of the first page)\n");
+        printf("  --landscape         Swap the sheet width and height\n");
+        printf("  --gap <pt>          Gap in points between cells (default: 0)\n");
+        printf("  --frame             Draw a thin border around each cell\n");
+        printf("  --password <pass>   Password for an encrypted input (or --password-file)\n");
         printf("  -o <output.pdf>     Output file path (required)\n");
     } else if (strcmp(cmd, "compress") == 0) {
         printf("Usage: tspdf compress <input.pdf> -o <output.pdf>\n");
@@ -353,6 +375,7 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "form") == 0)     return cmd_form(sub_argc, sub_argv);
     if (strcmp(cmd, "attach") == 0)   return cmd_attach(sub_argc, sub_argv);
     if (strcmp(cmd, "stamp") == 0)    return cmd_stamp(sub_argc, sub_argv);
+    if (strcmp(cmd, "nup") == 0)      return cmd_nup(sub_argc, sub_argv);
 
     fprintf(stderr, "tspdf: unknown command '%s'\n\n", cmd);
     print_usage();

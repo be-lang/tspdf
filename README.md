@@ -34,6 +34,7 @@ tspdf rotate doc.pdf --angle 90 -o rotated.pdf
 tspdf watermark doc.pdf -o draft.pdf --text "DRAFT"
 tspdf watermark doc.pdf -o marked.pdf --image logo.png
 tspdf stamp doc.pdf --stamp approved.pdf -o stamped.pdf
+tspdf nup 2 slides.pdf -o handout.pdf
 tspdf pagenum doc.pdf -o numbered.pdf
 tspdf compress doc.pdf -o smaller.pdf
 tspdf text doc.pdf -o doc.txt
@@ -121,7 +122,7 @@ and conformance jobs, on every push.
 
 ## Features
 
-- **Reading**: open PDFs, extract/delete/rotate/reorder/merge pages, text extraction (plain or layout-preserving), AcroForm form fill/flatten, PDF stamping, watermarks, annotations, page numbers, file attachments, content overlay, AES-128/256 encryption and decryption.
+- **Reading**: open PDFs, extract/delete/rotate/reorder/merge pages, text extraction (plain or layout-preserving), AcroForm form fill/flatten, PDF stamping, N-up imposition, watermarks, annotations, page numbers, file attachments, content overlay, AES-128/256 encryption and decryption.
 - **Generation**: flexbox-style layout with fixed/grow/fit-content/percentage sizing, automatic page breaks with repeating headers, tables with auto-sized columns and colspan.
 - **Text**: TrueType parsing and embedding with subsetting, Unicode via CIDFont Type2 + Identity-H, wrapping, alignment, inline rich text.
 - **Graphics**: borders, shadows, opacity, clipping, transforms, vector paths, linear and radial gradients.

@@ -53,6 +53,21 @@ Overlay a page of another PDF onto pages of the input (like pdftk stamp).
 .B \-\-under
 puts it beneath the existing content.
 .TP
+.B nup
+Place multiple source pages onto each output sheet in a grid (imposition,
+like pdfjam/pdftk).
+.I N
+is one of 2, 4, 6, 8, 9, 16.
+.B \-\-page\-size
+sets the sheet (a4, letter, or source);
+.B \-\-landscape ,
+.B \-\-gap
+.IR pt ,
+and
+.B \-\-frame
+control orientation, cell spacing, and per\-cell borders.
+Each page is scaled to fit its cell, aspect ratio preserved and centered.
+.TP
 .B pagenum
 Stamp page numbers on a PDF.
 .B \-\-pages
@@ -124,6 +139,7 @@ tspdf watermark doc.pdf \-o draft.pdf \-\-text "DRAFT"
 tspdf form fill form.pdf \-\-set name=Ada \-o filled.pdf
 tspdf watermark doc.pdf \-o marked.pdf \-\-image logo.png \-\-opacity 0.2
 tspdf stamp report.pdf \-\-stamp approved.pdf \-o stamped.pdf
+tspdf nup 2 slides.pdf \-o handout.pdf
 tspdf serve \-\-port 3000
 .fi
 .SH SEE ALSO
