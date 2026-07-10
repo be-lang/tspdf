@@ -279,6 +279,37 @@ uint32_t tspdf_reader_import_page_xobject(TspdfReader *dst, TspdfReader *src,
 const char *tspdf_page_add_xobject(TspdfReader *doc, size_t page_index,
                                    uint32_t xobj_num);
 
+// --- N-up imposition ---
+
+// Output sheet sizing for tspdf_reader_nup.
+typedef enum {
+    TSPDF_NUP_SIZE_A4,       // 595.276 x 841.890 pt (portrait unless landscape)
+    TSPDF_NUP_SIZE_LETTER,   // 612 x 792 pt (portrait unless landscape)
+    TSPDF_NUP_SIZE_SOURCE,   // grid sized from the first selected source page
+} TspdfNupPageSize;
+
+typedef struct {
+    unsigned n;              // cells per sheet: one of 2,4,6,8,9,16
+    const size_t *pages;     // 0-based source page indices to impose, in order;
+                             // NULL = all pages of the source in natural order
+    size_t page_count;       // number of entries in pages[] (ignored if NULL)
+    TspdfNupPageSize size;   // output sheet size
+    bool landscape;          // swap sheet width/height
+    double gap;              // gap in points between cells (>= 0)
+    bool frame;              // draw a thin border around each occupied cell
+} TspdfNupOptions;
+
+// Impose multiple source pages onto larger sheets (2-up, 4-up, ...). Each
+// selected source page is placed in a grid cell, scaled to fit while
+// preserving aspect ratio and centered, in reading order (left-to-right,
+// top-to-bottom). The last sheet is partially filled when the page count is
+// not a multiple of n. Returns a new self-contained document (the source is
+// unchanged and may be destroyed afterwards), or NULL with *err set. Only the
+// imposed page content is preserved: bookmarks, forms, and annotations are
+// dropped.
+TspdfReader *tspdf_reader_nup(TspdfReader *src, const TspdfNupOptions *opts,
+                              TspdfError *err);
+
 // --- Annotations ---
 
 TspdfError tspdf_page_add_link(TspdfReader *doc, size_t page_index,
