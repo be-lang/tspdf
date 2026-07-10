@@ -7,6 +7,39 @@ on 0.x, the CLI is considered stable but the low-level C API may still change.
 
 ## [Unreleased]
 
+### Changed
+- Saving a document opened with a password now keeps it encrypted (same
+  passwords and permissions), matching qpdf. This covers form fill/flatten,
+  bookmark, attach, stamp, nup, metadata, rotate, and the C API; `tspdf
+  decrypt` (and the web UI's unlock) remain the explicit way to remove
+  encryption. C API: new `TspdfSaveOptions.decrypt` opt-out.
+- `tspdf info` reports decoded permissions and the raw /P value on encrypted
+  files, and shows the CropBox when it differs from the MediaBox; `info
+  --json` failures now emit a JSON error object instead of plain text.
+
+### Fixed
+- `watermark` and `pagenum` corrupted pages whose /Resources is an indirect
+  reference (common in pdfTeX and PyMuPDF output): a duplicate /Resources key
+  made strict viewers drop the page's fonts.
+- `merge` wrote invalid xref entries and blanked bookmark titles when outline
+  /Title strings are indirect (pdfTeX/hyperref); `bookmark list` showed those
+  titles as empty and `bookmark add` failed outright on such files.
+- Text extraction missed inter-word spaces at font-change boundaries
+  (italic/math in TeX documents): "arXivpreprintarXiv" → "arXiv preprint
+  arXiv". Word recall on a typical arXiv paper: 96.4% → 99.0%.
+- Attachment names, bookmark titles, and metadata now follow the PDF
+  text-string rules (ISO 32000 §7.9.2.2): non-ASCII attachment names are
+  written as UTF-16BE (readable by qpdf/PyMuPDF instead of mojibake), and
+  UTF-16BE / PDFDocEncoding strings from other tools decode correctly —
+  `attach extract --all` no longer fails on them.
+- `form fill` validates choice values against the field's options (free text
+  still allowed for editable combos) and warns when a value contains
+  characters the appearance font cannot show.
+- `scale --to` preserved page size but flipped the viewed orientation of
+  rotated (/Rotate 90/270) pages.
+- Re-encrypting a file with new passwords no longer embeds the old /Encrypt
+  dictionary (old password verifiers) as an orphan object.
+
 ## [0.3.0] - 2026-07-10
 
 ### Added
