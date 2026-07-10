@@ -170,6 +170,53 @@ TspdfError tspdf_reader_save_to_memory_with_options(TspdfReader *doc, uint8_t **
 // bad page index).
 const char *tspdf_reader_page_text(TspdfReader *doc, size_t page_index, TspdfError *err);
 
+// --- AcroForm form fields ---
+
+typedef enum {
+    TSPDF_FIELD_TEXT,        // /FT /Tx
+    TSPDF_FIELD_CHECKBOX,    // /FT /Btn without the radio/pushbutton flags
+    TSPDF_FIELD_RADIO,       // /FT /Btn with /Ff bit 16
+    TSPDF_FIELD_PUSHBUTTON,  // /FT /Btn with /Ff bit 17
+    TSPDF_FIELD_CHOICE,      // /FT /Ch
+    TSPDF_FIELD_SIGNATURE,   // /FT /Sig
+    TSPDF_FIELD_UNKNOWN,     // missing or unrecognized /FT
+} TspdfFieldType;
+
+typedef struct {
+    const char *name;        // fully-qualified dotted name (UTF-8); "" if unnamed
+    TspdfFieldType type;
+    const char *value;       // current /V as UTF-8, or NULL when unset
+    bool readonly;           // /Ff bit 1
+    bool required;           // /Ff bit 2
+    size_t page_index;       // 0-based page of the first widget; SIZE_MAX unknown
+    double rect[4];          // first widget /Rect [x0 y0 x1 y1]; zeros if absent
+    const char **options;    // checkbox/radio: "on" state names (/AP /N keys
+                             // != /Off); choice: /Opt export values
+    size_t option_count;
+} TspdfFormFieldInfo;
+
+// Enumerate the terminal fields of the document's AcroForm. *out_fields and
+// everything it points to are owned by the reader (valid until destroy; do
+// not free). A document without a form yields TSPDF_OK and count 0.
+TspdfError tspdf_reader_form_fields(TspdfReader *doc,
+                                    TspdfFormFieldInfo **out_fields,
+                                    size_t *out_count);
+
+// Set the value of the named field (fully-qualified name as returned by
+// tspdf_reader_form_fields). Text/choice fields take any UTF-8 string;
+// checkbox/radio fields take an "on" state name or "Off". Text fields get a
+// regenerated appearance stream (single-line; no comb/multiline support) and
+// the AcroForm is marked NeedAppearances. Unknown names return
+// TSPDF_ERR_INVALID_ARG; readonly fields return TSPDF_ERR_UNSUPPORTED unless
+// `force` is set.
+TspdfError tspdf_reader_form_fill(TspdfReader *doc, const char *name,
+                                  const char *value, bool force);
+
+// Stamp every field's current value into the page content (text values and
+// button check marks), then remove all widget annotations and the catalog
+// /AcroForm so the result is a plain, non-interactive document.
+TspdfError tspdf_reader_form_flatten(TspdfReader *doc);
+
 // --- Annotations ---
 
 TspdfError tspdf_page_add_link(TspdfReader *doc, size_t page_index,

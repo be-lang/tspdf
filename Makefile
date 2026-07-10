@@ -109,6 +109,7 @@ TSPR_SOURCES = \
 	$(SRCDIR)/reader/tspr_content.c \
 	$(SRCDIR)/reader/tspr_resources.c \
 	$(SRCDIR)/reader/tspr_annot.c \
+	$(SRCDIR)/reader/tspr_form.c \
 	$(SRCDIR)/reader/tspr_text.c
 
 CRYPTO_SOURCES = \
