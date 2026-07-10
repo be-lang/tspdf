@@ -22,6 +22,14 @@ on 0.x, the CLI is considered stable but the low-level C API may still change.
   `--opacity`, `--scale`, and positioning, honoring page rotation.
 - `tspdf text --layout` — layout-preserving extraction that keeps columns and
   tables aligned (pdftotext -layout style).
+- `tspdf nup <N>` — place multiple source pages per sheet (2-up, 4-up, ...),
+  with grid, gap, frame, and page-size options.
+- `tspdf crop` — set the CropBox (clip the visible region) by explicit box or
+  margins; `tspdf scale` — resize pages to a named size or by a factor,
+  scaling their content.
+- `tspdf bookmark` — list, add, import (from a TAB-separated TOC file), and
+  clear the outline of an existing PDF.
+- `tspdf stamp --stamp-password` for encrypted stamp sources.
 - `tspdf info --json` — machine-readable document facts.
 - `tspdf encrypt --permissions <list>` — restrict allowed actions (print,
   copy, modify, annotate, forms, extract, assemble, print-hq).
