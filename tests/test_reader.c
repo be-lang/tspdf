@@ -4395,6 +4395,85 @@ TEST(test_resize_to_a4_from_letter) {
     tspdf_reader_destroy(doc);
 }
 
+// A /Rotate 90 page (MediaBox 400x300, viewed 300x400) resized --to A4 must
+// come out A4 PORTRAIT in the VIEWED orientation (595x842). Since /Rotate 90
+// swaps the axes, the stored MediaBox must hold the swapped extents
+// [0 0 842 595] so that viewed = 595x842.
+TEST(test_resize_to_a4_rotate90_viewed_portrait) {
+    TspdfError err;
+    const char *pdf =
+        "%PDF-1.4\n"
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+        "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] "
+        "/Rotate 90 /Contents 4 0 R >>\nendobj\n"
+        "4 0 obj\n<< /Length 12 >>\nstream\n0 0 1 1 re f\nendstream\nendobj\n"
+        "trailer\n<< /Root 1 0 R >>\n";
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, strlen(pdf), &err);
+    ASSERT(doc != NULL);
+
+    size_t pages[] = {0};
+    TspdfReader *r = tspdf_reader_resize_to(doc, pages, 1, 595.28, 841.89, &err);
+    ASSERT(r != NULL);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    // /Rotate is preserved.
+    ASSERT_EQ_INT(tspdf_reader_get_page(r, 0)->rotate, 90);
+
+    // Stored MediaBox is the SWAPPED extents (target_h x target_w).
+    double mb[4];
+    ASSERT(read_page_box(r, 0, "MediaBox", mb));
+    ASSERT(mb[0] == 0 && mb[1] == 0);
+    ASSERT(mb[2] > 841.88 && mb[2] < 841.90);   // stored width  = target_h
+    ASSERT(mb[3] > 595.27 && mb[3] < 595.29);   // stored height = target_w
+
+    // Viewed dims after applying /Rotate 90 (swap): 595.28 x 841.89 => portrait.
+    int rot = tspdf_reader_get_page(r, 0)->rotate;
+    double stored_w = mb[2] - mb[0];
+    double stored_h = mb[3] - mb[1];
+    double viewed_w = (rot == 90 || rot == 270) ? stored_h : stored_w;
+    double viewed_h = (rot == 90 || rot == 270) ? stored_w : stored_h;
+    ASSERT(viewed_w > 595.27 && viewed_w < 595.29);
+    ASSERT(viewed_h > 841.88 && viewed_h < 841.90);
+
+    tspdf_reader_destroy(r);
+    tspdf_reader_destroy(doc);
+}
+
+// Same for /Rotate 270.
+TEST(test_resize_to_a4_rotate270_viewed_portrait) {
+    TspdfError err;
+    const char *pdf =
+        "%PDF-1.4\n"
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+        "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] "
+        "/Rotate 270 /Contents 4 0 R >>\nendobj\n"
+        "4 0 obj\n<< /Length 12 >>\nstream\n0 0 1 1 re f\nendstream\nendobj\n"
+        "trailer\n<< /Root 1 0 R >>\n";
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, strlen(pdf), &err);
+    ASSERT(doc != NULL);
+
+    size_t pages[] = {0};
+    TspdfReader *r = tspdf_reader_resize_to(doc, pages, 1, 595.28, 841.89, &err);
+    ASSERT(r != NULL);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_INT(tspdf_reader_get_page(r, 0)->rotate, 270);
+
+    double mb[4];
+    ASSERT(read_page_box(r, 0, "MediaBox", mb));
+    int rot = tspdf_reader_get_page(r, 0)->rotate;
+    double stored_w = mb[2] - mb[0];
+    double stored_h = mb[3] - mb[1];
+    double viewed_w = (rot == 90 || rot == 270) ? stored_h : stored_w;
+    double viewed_h = (rot == 90 || rot == 270) ? stored_w : stored_h;
+    ASSERT(viewed_w > 595.27 && viewed_w < 595.29);
+    ASSERT(viewed_h > 841.88 && viewed_h < 841.90);
+
+    tspdf_reader_destroy(r);
+    tspdf_reader_destroy(doc);
+}
+
 TEST(test_resize_to_rejects_nonpositive) {
     TspdfError err;
     TspdfReader *doc = tspdf_reader_open_file("tests/data/one_page.pdf", &err);
@@ -11323,6 +11402,8 @@ int main(void) {
     RUN(test_scale_factor_half);
     RUN(test_scale_nonuniform_and_cropbox);
     RUN(test_resize_to_a4_from_letter);
+    RUN(test_resize_to_a4_rotate90_viewed_portrait);
+    RUN(test_resize_to_a4_rotate270_viewed_portrait);
     RUN(test_resize_to_rejects_nonpositive);
     RUN(test_scale_rejects_nonpositive_factor);
     RUN(test_reorder_pages);

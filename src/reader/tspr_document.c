@@ -1297,7 +1297,12 @@ TspdfReader *tspdf_reader_resize_to(TspdfReader *doc, const size_t *pages,
             return NULL;
         }
 
-        double mb[4] = { 0.0, 0.0, target_w, target_h };
+        // Store the MediaBox so the VIEWED box equals target_w x target_h. On a
+        // /Rotate 90/270 page the viewer swaps the axes, so the stored box must
+        // carry the swapped extents [0 0 target_h target_w]; for 0/180 it is the
+        // target as-is. fit_w/fit_h already encode this swap (unrotated space),
+        // which is also the space the content-wrap centered in.
+        double mb[4] = { 0.0, 0.0, fit_w, fit_h };
         if (!set_box_in_dict(page->page_dict, &result->arena, "MediaBox", mb)) {
             tspdf_reader_destroy(result);
             if (err) *err = TSPDF_ERR_ALLOC;
