@@ -243,6 +243,20 @@ reader_check "stamp" "$TMPDIR/stamp.pdf"
 "$TSPDF" stamp "$INPUT" --stamp "$TMPDIR/stamp_src.pdf" --under -o "$TMPDIR/stamp_under.pdf" > /dev/null 2>&1
 reader_check "stamp --under" "$TMPDIR/stamp_under.pdf"
 
+# An encrypted stamp source needs --stamp-password to open.
+"$TSPDF" encrypt "$TMPDIR/stamp_src.pdf" --password stamppw -o "$TMPDIR/stamp_src_enc.pdf" > /dev/null 2>&1
+"$TSPDF" stamp "$INPUT" --stamp "$TMPDIR/stamp_src_enc.pdf" --stamp-password stamppw \
+    -o "$TMPDIR/stamp_enc.pdf" > /dev/null 2>&1
+reader_check "stamp --stamp-password" "$TMPDIR/stamp_enc.pdf"
+# The imported stamp content must actually land on the page.
+if "$TSPDF" text "$TMPDIR/stamp_enc.pdf" 2>/dev/null | grep -q 'APPROVED'; then
+    echo "  PASS  stamp --stamp-password imports encrypted stamp content"
+    pass=$((pass + 1))
+else
+    echo "  FAIL  stamp --stamp-password imports encrypted stamp content"
+    fail=$((fail + 1))
+fi
+
 "$TSPDF" compress "$INPUT"                 -o "$TMPDIR/compress.pdf" > /dev/null 2>&1
 reader_check "compress" "$TMPDIR/compress.pdf"
 

@@ -28,7 +28,7 @@ void tspdf_cli_emit_rotate_compensation(TspdfStream *s, int rot, double cx, doub
 static void print_stamp_help(void) {
     printf("Usage: tspdf stamp <input.pdf> --stamp <stamp.pdf> -o <output.pdf>\n");
     printf("                   [--pages <range>] [--under] [--stamp-page N]\n");
-    printf("                   [--password <pass>]\n");
+    printf("                   [--password <pass>] [--stamp-password <pass>]\n");
     printf("\nOverlay a page of stamp.pdf onto pages of input.pdf.\n");
     printf("The stamp page is scaled to fit each target page (aspect preserved,\n");
     printf("centered). By default it is drawn on top of the existing content;\n");
@@ -78,6 +78,7 @@ int cmd_stamp(int argc, char **argv) {
 
     bool under = has_flag(argc, argv, "--under");
     const char *password = find_flag(argc, argv, "--password");
+    const char *stamp_password = find_flag(argc, argv, "--stamp-password");
 
     size_t sel_count = 0;
     size_t *sel = NULL;
@@ -112,7 +113,9 @@ int cmd_stamp(int argc, char **argv) {
         }
     }
 
-    TspdfReader *stamp_doc = tspdf_reader_open_file(stamp_path, &err);
+    TspdfReader *stamp_doc = stamp_password
+        ? tspdf_reader_open_file_with_password(stamp_path, stamp_password, &err)
+        : tspdf_reader_open_file(stamp_path, &err);
     if (!stamp_doc) {
         fprintf(stderr, "tspdf stamp: failed to open '%s': %s\n", stamp_path, tspdf_error_string(err));
         tspdf_reader_destroy(doc);

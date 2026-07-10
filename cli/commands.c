@@ -128,6 +128,7 @@ static const char *const VALUE_FLAGS[] = {
     "--scale",
     "--stamp",
     "--stamp-page",
+    "--stamp-password",
     "--opacity",
     "--set",
     "--data",
