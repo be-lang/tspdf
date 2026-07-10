@@ -32,6 +32,7 @@ tspdf encrypt doc.pdf -o locked.pdf --password secret
 tspdf decrypt locked.pdf -o unlocked.pdf --password secret
 tspdf rotate doc.pdf --angle 90 -o rotated.pdf
 tspdf watermark doc.pdf -o draft.pdf --text "DRAFT"
+tspdf stamp doc.pdf --stamp approved.pdf -o stamped.pdf
 tspdf pagenum doc.pdf -o numbered.pdf
 tspdf compress doc.pdf -o smaller.pdf
 tspdf text doc.pdf -o doc.txt

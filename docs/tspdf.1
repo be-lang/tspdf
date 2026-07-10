@@ -41,6 +41,11 @@ Print information about a PDF.
 .B watermark
 Add a text watermark to a PDF.
 .TP
+.B stamp
+Overlay a page of another PDF onto pages of the input (like pdftk stamp).
+.B \-\-under
+puts it beneath the existing content.
+.TP
 .B pagenum
 Stamp page numbers on a PDF.
 .B \-\-pages
@@ -89,6 +94,7 @@ tspdf merge a.pdf b.pdf \-o combined.pdf
 tspdf split report.pdf \-\-pages 1\-5 \-o extract.pdf
 tspdf encrypt doc.pdf \-o locked.pdf \-\-password secret
 tspdf watermark doc.pdf \-o draft.pdf \-\-text "DRAFT"
+tspdf stamp report.pdf \-\-stamp approved.pdf \-o stamped.pdf
 tspdf serve \-\-port 3000
 .fi
 .SH SEE ALSO

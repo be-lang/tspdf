@@ -27,6 +27,7 @@ static void print_usage(void) {
     printf("  serve      Start a local web server for PDF tools\n");
     printf("  text       Extract text from a PDF\n");
     printf("  pagenum    Stamp page numbers onto a PDF\n");
+    printf("  stamp      Overlay a PDF page onto another PDF's pages\n");
     printf("\n");
     printf("Options:\n");
     printf("  --help, -h     Show this help message\n");
@@ -141,6 +142,25 @@ static void print_command_help(const char *cmd) {
         printf("  <input.pdf>         Input PDF file\n");
         printf("  --text <text>       Watermark text, e.g. \"DRAFT\" (required)\n");
         printf("  --opacity <float>   Opacity from 0.0 (invisible) to 1.0 (opaque), default: 0.3\n");
+        printf("  -o <output.pdf>     Output file path (required)\n");
+    } else if (strcmp(cmd, "stamp") == 0) {
+        printf("Usage: tspdf stamp <input.pdf> --stamp <stamp.pdf> -o <output.pdf>\n");
+        printf("                   [--pages <range>] [--under] [--stamp-page N]\n");
+        printf("                   [--password <pass>]\n");
+        printf("\n");
+        printf("Overlay a page of stamp.pdf onto pages of input.pdf (like pdftk\n");
+        printf("stamp / qpdf overlay). The stamp page is scaled to fit each target\n");
+        printf("page, keeping its aspect ratio, and centered.\n");
+        printf("\n");
+        printf("Arguments:\n");
+        printf("  <input.pdf>         Input PDF file\n");
+        printf("  --stamp <stamp.pdf> PDF whose page is stamped onto the input (required)\n");
+        printf("  --stamp-page N      Which page of stamp.pdf to use (default: 1)\n");
+        printf("  --pages <range>     Pages to stamp, e.g. 1-3 or 2,4 (default: all)\n");
+        printf("  --under             Draw the stamp beneath the existing content\n");
+        printf("                      (letterhead/background) instead of on top\n");
+        printf("  --password <pass>   Password for an encrypted input (output is saved\n");
+        printf("                      decrypted; re-encrypt with 'tspdf encrypt')\n");
         printf("  -o <output.pdf>     Output file path (required)\n");
     } else if (strcmp(cmd, "compress") == 0) {
         printf("Usage: tspdf compress <input.pdf> -o <output.pdf>\n");
@@ -276,6 +296,7 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "serve") == 0)   return cmd_serve(sub_argc, sub_argv);
     if (strcmp(cmd, "text") == 0)    return cmd_text(sub_argc, sub_argv);
     if (strcmp(cmd, "pagenum") == 0)  return cmd_pagenum(sub_argc, sub_argv);
+    if (strcmp(cmd, "stamp") == 0)    return cmd_stamp(sub_argc, sub_argv);
 
     fprintf(stderr, "tspdf: unknown command '%s'\n\n", cmd);
     print_usage();

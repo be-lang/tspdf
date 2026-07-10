@@ -123,6 +123,8 @@ static const char *const VALUE_FLAGS[] = {
     "--owner-password-file",
     "--bits",
     "--text",
+    "--stamp",
+    "--stamp-page",
     "--opacity",
     "--set",
     "--title",
