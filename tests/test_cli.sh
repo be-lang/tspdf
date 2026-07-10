@@ -1348,6 +1348,44 @@ run_test "text help mentions --pages" bash -c "$TSPDF text --help | grep -q -- '
 run_test "text help mentions --password" bash -c "$TSPDF text --help | grep -q -- '--password'"
 run_test "text missing input fails" bash -c "! $TSPDF text $TMPDIR/no_such_input.pdf > /dev/null 2>&1"
 run_test "text listed in main help" bash -c "$TSPDF --help | grep -q '^  text'"
+run_test "text help mentions --layout" bash -c "$TSPDF text --help | grep -q -- '--layout'"
+
+# --layout: a two-column page (drawn right column first) must come out with
+# both cells of a row on one line, left cell first, separated by a space run.
+if command -v python3 > /dev/null 2>&1; then
+  python3 - "$TMPDIR/twocol.pdf" << 'PYEOF'
+import sys
+content = (b"BT /F1 12 Tf 300 700 Td (RIGHTONE) Tj ET "
+           b"BT /F1 12 Tf 72 700 Td (LEFTONE) Tj ET "
+           b"BT /F1 12 Tf 72 686 Td (LEFTTWO) Tj ET "
+           b"BT /F1 12 Tf 300 686 Td (RIGHTTWO) Tj ET")
+objs = [
+    b"<< /Type /Catalog /Pages 2 0 R >>",
+    b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+     b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"),
+    b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+]
+out = bytearray(b"%PDF-1.4\n")
+offsets = []
+for i, body in enumerate(objs, 1):
+    offsets.append(len(out))
+    out += b"%d 0 obj\n%s\nendobj\n" % (i, body)
+xref = len(out)
+out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1)
+for off in offsets:
+    out += b"%010d 00000 n \n" % off
+out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF" % (len(objs) + 1, xref)
+open(sys.argv[1], "wb").write(out)
+PYEOF
+  run_test "text --layout keeps columns on one line" bash -c "$TSPDF text --layout $TMPDIR/twocol.pdf | grep -qE 'LEFTONE {2,}RIGHTONE'"
+  run_test "text --layout second row aligned too" bash -c "$TSPDF text --layout $TMPDIR/twocol.pdf | grep -qE 'LEFTTWO {2,}RIGHTTWO'"
+  run_test "text --layout composes with --pages and -o" bash -c "$TSPDF text --layout $TMPDIR/twocol.pdf --pages 1 -o $TMPDIR/twocol.txt && grep -qE 'LEFTONE {2,}RIGHTONE' $TMPDIR/twocol.txt"
+  run_test "text without --layout stays in stream order" bash -c "$TSPDF text $TMPDIR/twocol.pdf | head -1 | grep -q 'RIGHTONE LEFTONE'"
+else
+  echo "  SKIP  text --layout fixture tests (python3 not found)"
+fi
 
 # --- Doc trees: bookmarks and form fields across merge/split ---
 # Verified against qpdf's JSON view of the outputs; skipped when qpdf is not

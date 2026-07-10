@@ -193,13 +193,15 @@ static void print_command_help(const char *cmd) {
         printf("Binding a non-loopback address exposes the unauthenticated UI\n");
         printf("to the network; a warning is printed.\n");
     } else if (strcmp(cmd, "text") == 0) {
-        printf("Usage: tspdf text <input.pdf> [--pages <range>] [--password <pass>] [-o <output.txt>]\n");
+        printf("Usage: tspdf text <input.pdf> [--layout] [--pages <range>] [--password <pass>] [-o <output.txt>]\n");
         printf("\n");
         printf("Extract text from a PDF, in content-stream order.\n");
         printf("All pages go to stdout by default, separated by form-feed (\\f).\n");
         printf("\n");
         printf("Arguments:\n");
         printf("  <input.pdf>        Input PDF file\n");
+        printf("  --layout           Preserve the page layout (columns and tables\n");
+        printf("                     stay aligned, like pdftotext -layout)\n");
         printf("  --pages <range>    Pages to extract, e.g. 1-3 or 1,3,5 (default: all)\n");
         printf("  -o <output.txt>    Write to a file instead of stdout\n");
         printf("  --password <pass>  Password for encrypted PDFs (optional)\n");

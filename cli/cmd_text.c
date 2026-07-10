@@ -11,8 +11,9 @@
 // marker.
 int cmd_text(int argc, char **argv) {
     if (argc == 0 || has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
-        printf("Usage: tspdf text <input.pdf> [--pages <range>] [--password <pass>] [-o <output.txt>]\n");
+        printf("Usage: tspdf text <input.pdf> [--layout] [--pages <range>] [--password <pass>] [-o <output.txt>]\n");
         printf("\nExtract text from a PDF (all pages to stdout by default).\n");
+        printf("--layout preserves the page layout: columns and tables stay aligned.\n");
         return argc == 0 ? 1 : 0;
     }
 
@@ -30,6 +31,7 @@ int cmd_text(int argc, char **argv) {
     const char *output = find_flag(argc, argv, "-o");
     const char *password = find_flag(argc, argv, "--password");
     const char *pages_spec = find_flag(argc, argv, "--pages");
+    bool layout = has_flag(argc, argv, "--layout");
 
     size_t page_count = 0;
     size_t *pages = NULL;
@@ -79,7 +81,9 @@ int cmd_text(int argc, char **argv) {
     for (size_t i = 0; i < n; i++) {
         size_t page_index = pages ? pages[i] : i;
         TspdfTextStats stats;
-        const char *text = tspdf_reader_page_text_stats(doc, page_index, &stats, &err);
+        const char *text = layout
+            ? tspdf_reader_page_text_layout_stats(doc, page_index, &stats, &err)
+            : tspdf_reader_page_text_stats(doc, page_index, &stats, &err);
         if (!text) {
             if (err == TSPDF_ERR_PAGE_RANGE) {
                 fprintf(stderr, "tspdf text: page %zu is out of range (document has %zu page%s)\n",

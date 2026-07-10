@@ -216,6 +216,13 @@ TspdfError tspdf_reader_form_fill(TspdfReader *doc, const char *name,
 // button check marks), then remove all widget annotations and the catalog
 // /AcroForm so the result is a plain, non-interactive document.
 TspdfError tspdf_reader_form_flatten(TspdfReader *doc);
+// Layout-preserving variant (pdftotext -layout style): fragments are placed
+// on a character grid by their device-space positions, so columns and tables
+// stay visually aligned. Lines run top to bottom, fragments left to right;
+// vertical gaps beyond ~1.8 line heights become blank lines (at most 2).
+// Decoding, ownership and errors are identical to tspdf_reader_page_text.
+const char *tspdf_reader_page_text_layout(TspdfReader *doc, size_t page_index,
+                                          TspdfError *err);
 
 // --- Annotations ---
 
