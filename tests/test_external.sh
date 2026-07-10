@@ -259,6 +259,47 @@ reader_check "nup 2" "$TMPDIR/nup2.pdf"
 "$TSPDF" nup 4 "$INPUT" --frame --gap 10 --page-size letter -o "$TMPDIR/nup4.pdf" > /dev/null 2>&1
 reader_check "nup 4 --frame --gap" "$TMPDIR/nup4.pdf"
 
+# Cross-import dedup: nup imports one form XObject per placement, so resources
+# shared between source pages (an embedded font, here) must be imported once,
+# not once per placement — measured 2.2MB -> 3.2MB on a real paper before the
+# import cache. No committed fixture embeds a FontFile, so build one in-line:
+# a hand-written 2-page PDF whose pages share a /Font carrying a dummy
+# /FontFile2 stream (nothing parses the font bytes; the object identity is
+# what's under test), normalized by qpdf (it reconstructs the missing xref).
+# grep needs -a: qdf output contains binary that trips grep's binary mode.
+if [ "$HAVE_QPDF" -eq 1 ]; then
+    cat > "$TMPDIR/dedup_raw.pdf" <<'EOF'
+%PDF-1.4
+1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj
+2 0 obj << /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >> endobj
+3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources 5 0 R /Contents 8 0 R >> endobj
+4 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources 5 0 R /Contents 8 0 R >> endobj
+5 0 obj << /Font << /F1 6 0 R >> >> endobj
+6 0 obj << /Type /Font /Subtype /TrueType /BaseFont /Dummy /FirstChar 32 /LastChar 32 /Widths [500] /FontDescriptor 7 0 R >> endobj
+7 0 obj << /Type /FontDescriptor /FontName /Dummy /Flags 4 /FontBBox [0 0 1000 1000] /ItalicAngle 0 /Ascent 800 /Descent -200 /CapHeight 700 /StemV 80 /FontFile2 9 0 R >> endobj
+8 0 obj << /Length 4 >> stream
+q Q
+endstream endobj
+9 0 obj << /Length 4 >> stream
+DUMY
+endstream endobj
+trailer << /Root 1 0 R /Size 10 >>
+%%EOF
+EOF
+    qpdf "$TMPDIR/dedup_raw.pdf" "$TMPDIR/dedup_src.pdf" > /dev/null 2>&1  # exit 3 = warnings, output written
+    in_ff=$(qpdf --qdf --object-streams=disable "$TMPDIR/dedup_src.pdf" - 2>/dev/null | grep -ac '/FontFile')
+    "$TSPDF" nup 4 "$TMPDIR/dedup_src.pdf" -o "$TMPDIR/dedup_nup.pdf" > /dev/null 2>&1
+    out_ff=$(qpdf --qdf --object-streams=disable "$TMPDIR/dedup_nup.pdf" - 2>/dev/null | grep -ac '/FontFile')
+    if [ "$in_ff" -ge 1 ] && [ "$out_ff" -eq "$in_ff" ]; then
+        echo "  PASS  nup dedups shared embedded font ($in_ff FontFile in, $out_ff out)"
+        pass=$((pass + 1))
+    else
+        echo "  FAIL  nup dedups shared embedded font ($in_ff FontFile in, $out_ff out)"
+        fail=$((fail + 1))
+    fi
+    reader_check "nup dedup fixture output" "$TMPDIR/dedup_nup.pdf"
+fi
+
 # An encrypted stamp source needs --stamp-password to open.
 "$TSPDF" encrypt "$TMPDIR/stamp_src.pdf" --password stamppw -o "$TMPDIR/stamp_src_enc.pdf" > /dev/null 2>&1
 "$TSPDF" stamp "$INPUT" --stamp "$TMPDIR/stamp_src_enc.pdf" --stamp-password stamppw \

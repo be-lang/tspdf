@@ -6412,6 +6412,129 @@ TEST(test_import_page_xobject_basic) {
     free(src_data);
 }
 
+// First indirect reference number found in an object tree (DFS), or 0. Used
+// to check that two imported forms' /Resources point at the same destination
+// objects (the dedup cache reused them) without caring about resource shape.
+static uint32_t first_ref_num_in(TspdfObj *obj, int depth) {
+    if (!obj || depth > 16) return 0;
+    switch (obj->type) {
+        case TSPDF_OBJ_REF:
+            return obj->ref.num;
+        case TSPDF_OBJ_ARRAY:
+            for (size_t i = 0; i < obj->array.count; i++) {
+                uint32_t n = first_ref_num_in(&obj->array.items[i], depth + 1);
+                if (n) return n;
+            }
+            return 0;
+        case TSPDF_OBJ_DICT:
+            for (size_t i = 0; i < obj->dict.count; i++) {
+                uint32_t n = first_ref_num_in(obj->dict.entries[i].value, depth + 1);
+                if (n) return n;
+            }
+            return 0;
+        default:
+            return 0;
+    }
+}
+
+TEST(test_import_same_source_twice_dedups) {
+    // Repeated imports from the same source into one destination (the nup /
+    // stamp pattern: one import per placement) must reuse already-imported
+    // referenced objects instead of copying them again.
+    size_t src_len = 0, dst_len = 0;
+    uint8_t *src_data = make_stamp_text_pdf("StampText", &src_len);
+    uint8_t *dst_data = make_stamp_text_pdf("BaseText", &dst_len);
+    ASSERT(src_data != NULL);
+    ASSERT(dst_data != NULL);
+
+    TspdfError err;
+    TspdfReader *src = tspdf_reader_open(src_data, src_len, &err);
+    TspdfReader *dst = tspdf_reader_open(dst_data, dst_len, &err);
+    ASSERT(src != NULL);
+    ASSERT(dst != NULL);
+
+    size_t base = dst->new_objs.count;
+    uint32_t x1 = tspdf_reader_import_page_xobject(dst, src, 0, NULL, &err);
+    ASSERT(x1 > 0);
+    size_t after_first = dst->new_objs.count;
+    // First import brings the form plus at least one referenced object (the
+    // font) — otherwise the dedup assertion below would be vacuous.
+    ASSERT(after_first - base >= 2);
+
+    uint32_t x2 = tspdf_reader_import_page_xobject(dst, src, 0, NULL, &err);
+    ASSERT(x2 > 0);
+    ASSERT(x1 != x2);
+    // Every referenced object is a cache hit: only the form itself is new.
+    ASSERT_EQ_INT((int)(dst->new_objs.count - after_first), 1);
+
+    // Both forms' /Resources must reference the SAME destination objects.
+    TspdfObj *form1 = dst->new_objs.objs[x1 - dst->xref.count];
+    TspdfObj *form2 = dst->new_objs.objs[x2 - dst->xref.count];
+    ASSERT(form1 && form1->type == TSPDF_OBJ_STREAM);
+    ASSERT(form2 && form2->type == TSPDF_OBJ_STREAM);
+    uint32_t ref1 = first_ref_num_in(tspdf_dict_get(form1->stream.dict, "Resources"), 0);
+    uint32_t ref2 = first_ref_num_in(tspdf_dict_get(form2->stream.dict, "Resources"), 0);
+    ASSERT(ref1 != 0);
+    ASSERT_EQ_INT((int)ref1, (int)ref2);
+
+    // The deduped result must still save and render both texts.
+    ASSERT_EQ_INT(draw_xobject_on_page(dst, 0, x1, 0.5, 0, 0), TSPDF_OK);
+    ASSERT_EQ_INT(draw_xobject_on_page(dst, 0, x2, 0.5, 200, 200), TSPDF_OK);
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(dst, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    const char *text = tspdf_reader_page_text(re, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT(strstr(text, "StampText") != NULL);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(dst);
+    tspdf_reader_destroy(src);
+    free(dst_data);
+    free(src_data);
+}
+
+TEST(test_import_distinct_readers_not_deduped) {
+    // The cache key includes the source reader pointer: two readers opened
+    // from the same bytes are distinct sources and must NOT share entries
+    // (nothing guarantees their object graphs stay in sync).
+    size_t src_len = 0, dst_len = 0;
+    uint8_t *src_data = make_stamp_text_pdf("StampText", &src_len);
+    uint8_t *dst_data = make_stamp_text_pdf("BaseText", &dst_len);
+    ASSERT(src_data != NULL);
+    ASSERT(dst_data != NULL);
+
+    TspdfError err;
+    TspdfReader *src1 = tspdf_reader_open(src_data, src_len, &err);
+    TspdfReader *src2 = tspdf_reader_open(src_data, src_len, &err);
+    TspdfReader *dst = tspdf_reader_open(dst_data, dst_len, &err);
+    ASSERT(src1 != NULL);
+    ASSERT(src2 != NULL);
+    ASSERT(dst != NULL);
+
+    size_t base = dst->new_objs.count;
+    uint32_t x1 = tspdf_reader_import_page_xobject(dst, src1, 0, NULL, &err);
+    ASSERT(x1 > 0);
+    size_t delta1 = dst->new_objs.count - base;
+    ASSERT(delta1 >= 2);
+
+    uint32_t x2 = tspdf_reader_import_page_xobject(dst, src2, 0, NULL, &err);
+    ASSERT(x2 > 0);
+    size_t delta2 = dst->new_objs.count - base - delta1;
+    // Full copy again: same object count as the first import.
+    ASSERT_EQ_INT((int)delta2, (int)delta1);
+
+    tspdf_reader_destroy(dst);
+    tspdf_reader_destroy(src2);
+    tspdf_reader_destroy(src1);
+    free(dst_data);
+    free(src_data);
+}
+
 TEST(test_import_source_freed_before_save) {
     // The import must be self-contained: destroying the source document (and
     // freeing its buffer) before saving the destination must be safe.
@@ -8334,8 +8457,9 @@ TEST(test_recompress_objstm_output_does_not_grow) {
 }
 
 TEST(test_encrypted_save_has_no_objstm) {
-    // Encrypted saves keep plain top-level objects: strings inside an object
-    // stream must not be individually encrypted, so we don't pack them.
+    // Classic (non-ObjStm) inputs are never force-packed: an encrypted save
+    // of a classic file keeps plain top-level objects and a classic xref
+    // table. (ObjStm inputs DO re-pack — see the tests below.)
     size_t len = 0;
     char *pdf = make_many_small_objects_pdf(&len, 50);
     ASSERT(pdf != NULL);
@@ -8355,6 +8479,167 @@ TEST(test_encrypted_save_has_no_objstm) {
     ASSERT(doc2 != NULL);
     ASSERT_EQ_SIZE(tspdf_reader_page_count(doc2), 1);
 
+    tspdf_reader_destroy(doc2);
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_default_save_repacks_objstm_input) {
+    // A default (non-compress) save of a file that used object streams must
+    // re-pack them, not explode every member into a classic top-level object
+    // (which roughly doubles ObjStm-heavy files) — and must not copy the
+    // source ObjStm/XRef containers along as orphans.
+    size_t len = 0;
+    char *pdf = make_object_stream_pdf(&len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(bytes_contains(out, out_len, "/Type /ObjStm"));
+    // Xref stream instead of a classic table (type-2 entries need it).
+    ASSERT(bytes_contains(out, out_len, "/Type /XRef"));
+    ASSERT(!bytes_contains(out, out_len, "\ntrailer"));
+
+    TspdfReader *doc2 = tspdf_reader_open(out, out_len, &err);
+    ASSERT(doc2 != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(doc2), 1);
+
+    // No orphans: every in-use object must resolve.
+    TspdfParser parser;
+    tspdf_parser_init(&parser, doc2->data, doc2->data_len, &doc2->arena);
+    for (uint32_t i = 1; i < (uint32_t)doc2->xref.count; i++) {
+        if (!doc2->xref.entries[i].in_use) continue;
+        ASSERT(tspdf_xref_resolve(&doc2->xref, &parser, i, doc2->obj_cache, NULL) != NULL);
+    }
+
+    tspdf_reader_destroy(doc2);
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_default_save_classic_input_stays_classic) {
+    // qpdf's preserve-style rule: object streams are only written when the
+    // input had them (or `compress` asks for minimal output).
+    size_t len = 0;
+    char *pdf = make_many_small_objects_pdf(&len, 50);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(!bytes_contains(out, out_len, "/Type /ObjStm"));
+    ASSERT(bytes_contains(out, out_len, "\ntrailer"));
+
+    TspdfReader *doc2 = tspdf_reader_open(out, out_len, &err);
+    ASSERT(doc2 != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(doc2), 1);
+
+    tspdf_reader_destroy(doc2);
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_encrypted_save_repacks_objstm_input) {
+    // Encrypted saves re-pack ObjStm inputs too: member bodies carry plain
+    // strings and the container stream is encrypted as one unit, with the
+    // trailer keys (/Encrypt, /ID) on the — itself unencrypted — xref stream.
+    size_t len = 0;
+    char *pdf = make_object_stream_pdf(&len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory_encrypted(doc, &out, &out_len,
+                                                "user123", "owner456", 0xFFFFFFFC, 128);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(bytes_contains(out, out_len, "/Type /ObjStm"));
+    ASSERT(bytes_contains(out, out_len, "/Type /XRef"));
+    ASSERT(bytes_contains(out, out_len, "/Encrypt"));
+
+    TspdfReader *doc2 = tspdf_reader_open_with_password(out, out_len, "user123", &err);
+    ASSERT(doc2 != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(doc2), 1);
+
+    // Round-trip once more (re-save of the opened-encrypted doc exercises the
+    // preserved-crypt repack path).
+    uint8_t *out2 = NULL;
+    size_t out2_len = 0;
+    err = tspdf_reader_save_to_memory(doc2, &out2, &out2_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(bytes_contains(out2, out2_len, "/Type /ObjStm"));
+    TspdfReader *doc3 = tspdf_reader_open_with_password(out2, out2_len, "user123", &err);
+    ASSERT(doc3 != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(doc3), 1);
+
+    tspdf_reader_destroy(doc3);
+    free(out2);
+    tspdf_reader_destroy(doc2);
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_encrypted_info_strings_are_encrypted) {
+    // ISO 32000 exempts only the /Encrypt dict and /ID from string
+    // encryption: Info metadata written into an encrypted file must be
+    // encrypted with the Info object's key, or readers that decrypt it
+    // unconditionally (poppler among them) show garbage.
+    size_t len = 0;
+    char *pdf = make_many_small_objects_pdf(&len, 10);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    tspdf_reader_set_title(doc, "SeekritTitle42");
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory_encrypted(doc, &out, &out_len,
+                                                "user123", "owner456", 0xFFFFFFFC, 128);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(!bytes_contains(out, out_len, "SeekritTitle42"));
+
+    TspdfReader *doc2 = tspdf_reader_open_with_password(out, out_len, "user123", &err);
+    ASSERT(doc2 != NULL);
+    const char *title = tspdf_reader_get_title(doc2);
+    ASSERT(title != NULL);
+    ASSERT(strcmp(title, "SeekritTitle42") == 0);
+
+    // Same on the preserved-crypt path: edit metadata on the opened
+    // encrypted document and re-save with the original encryption.
+    tspdf_reader_set_title(doc2, "SecondSecret77");
+    uint8_t *out2 = NULL;
+    size_t out2_len = 0;
+    err = tspdf_reader_save_to_memory(doc2, &out2, &out2_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(!bytes_contains(out2, out2_len, "SecondSecret77"));
+    TspdfReader *doc3 = tspdf_reader_open_with_password(out2, out2_len, "user123", &err);
+    ASSERT(doc3 != NULL);
+    const char *title3 = tspdf_reader_get_title(doc3);
+    ASSERT(title3 != NULL);
+    ASSERT(strcmp(title3, "SecondSecret77") == 0);
+
+    tspdf_reader_destroy(doc3);
+    free(out2);
     tspdf_reader_destroy(doc2);
     free(out);
     tspdf_reader_destroy(doc);
@@ -15192,6 +15477,8 @@ int main(void) {
     printf("\n  Form XObject import:\n");
     RUN(test_end_content_under);
     RUN(test_import_page_xobject_basic);
+    RUN(test_import_same_source_twice_dedups);
+    RUN(test_import_distinct_readers_not_deduped);
     RUN(test_import_source_freed_before_save);
     RUN(test_import_from_encrypted_source);
     RUN(test_import_page_out_of_range);
@@ -15257,6 +15544,10 @@ int main(void) {
     RUN(test_recompress_roundtrip_from_objstm_input);
     RUN(test_recompress_objstm_output_does_not_grow);
     RUN(test_encrypted_save_has_no_objstm);
+    RUN(test_default_save_repacks_objstm_input);
+    RUN(test_default_save_classic_input_stays_classic);
+    RUN(test_encrypted_save_repacks_objstm_input);
+    RUN(test_encrypted_info_strings_are_encrypted);
 
     printf("\n  Encoding/i18n:\n");
     RUN(test_pdftext_cp1252_from_codepoint);

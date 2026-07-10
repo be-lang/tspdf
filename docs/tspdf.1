@@ -60,7 +60,11 @@ Decrypt a password-protected PDF.
 .B metadata
 View or edit PDF metadata (the Info dictionary). If the document also carries
 XMP metadata, an edit leaves the XMP stream untouched and prints a notice,
-since some viewers prefer XMP over the Info dictionary.
+since some viewers prefer XMP over the Info dictionary. Encrypted files need
+.B \-\-password
+(or
+.BR \-\-password\-file );
+edited output keeps the original encryption.
 .TP
 .B info
 Print information about a PDF.

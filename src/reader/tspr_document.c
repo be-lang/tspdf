@@ -456,6 +456,9 @@ void tspdf_reader_destroy(TspdfReader *doc) {
     }
     free(doc->new_objs.objs);
     tspdf_form_fallback_free(doc);
+    // Import dedup cache: like new_objs, starts zeroed (readers are calloc'd)
+    // and grows only via tspdf_reader_import_page_xobject.
+    free(doc->import_cache.entries);
     tspdf_arena_destroy(&doc->arena);
     if (doc->owns_data) {
         free((void *)doc->data);

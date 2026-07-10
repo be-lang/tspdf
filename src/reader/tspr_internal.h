@@ -129,6 +129,41 @@ typedef struct {
 // tspdf_form_fallback_free from tspdf_reader_destroy).
 typedef struct TspdfFormFallback TspdfFormFallback;
 
+// --- Cross-import dedup cache (tspr_import.c) ---
+//
+// Maps (source reader, source object number) -> destination object number so
+// repeated imports from the same source into one destination reuse the copy
+// made by an earlier tspdf_reader_import_page_xobject call. nup and stamp
+// import once per placement/page, so without this every placement re-copied
+// the shared resources (FontFile streams etc.), bloating the output.
+//
+// Constraints (keys hold the source by pointer):
+//   1. The source must outlive the destination until the destination is saved
+//      — the documented derived-document rule (see the "Manipulate" section of
+//      tspr.h: "The source document must outlive the returned document unless
+//      saved first"). Corollary: if a source IS destroyed early (which the
+//      import API itself permits) and a new reader happens to be allocated at
+//      the same address, a later import from it into the same destination
+//      could alias a stale key. Acceptable under rule 1; no CLI flow does it.
+//   2. Mutating a source between imports into the same destination leaves the
+//      cached copies stale (the dedup returns the pre-mutation import). The
+//      CLI flows (nup, stamp, watermark) never mutate the source; this is a
+//      documented constraint of the import API, not detected at runtime.
+// Generation numbers are not part of the key: imports always rewrite refs to
+// generation 0 and registered objects serialize as gen 0, so the source gen
+// is irrelevant after the copy.
+typedef struct {
+    const TspdfReader *src;  // source reader identity (never dereferenced)
+    uint32_t src_num;        // object number in the source
+    uint32_t dst_num;        // object number of the imported copy in dst
+} TspdfImportCacheEntry;
+
+typedef struct {
+    TspdfImportCacheEntry *entries;  // sorted by (src, src_num) for bsearch
+    size_t count;
+    size_t capacity;
+} TspdfImportCache;
+
 // --- Document (full definition) ---
 
 struct TspdfReader {
@@ -144,6 +179,7 @@ struct TspdfReader {
     TspdfCrypt *crypt;           // non-NULL if encrypted (malloc'd)
     TspdfReaderMetadata *metadata;     // non-NULL if metadata modified (malloc'd)
     TspdfNewObjList new_objs;    // objects created by Phase 3 APIs
+    TspdfImportCache import_cache;  // cross-import dedup (see typedef above)
     bool modified;              // set by manipulation/annotation/metadata functions
     TspdfFormFallback *form_fallback;  // lazy fallback font cache (malloc'd)
 };

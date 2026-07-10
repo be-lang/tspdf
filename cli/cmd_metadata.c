@@ -1,6 +1,7 @@
 #include "commands.h"
 #include "../include/tspdf.h"
 #include "../src/util/pdfdate.h"
+#include "password_input.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -53,6 +54,8 @@ int cmd_metadata(int argc, char **argv) {
         printf("       tspdf metadata <input.pdf> --clear title -o out.pdf            # remove a field\n");
         printf("\nView or edit PDF metadata. --set and --clear are repeatable.\n");
         printf("Supported keys: title, author, subject, keywords, creator, producer\n");
+        printf("Encrypted files: pass --password <pass> or --password-file <file>;\n");
+        printf("edited output keeps the original encryption.\n");
         return argc == 0 ? 1 : 0;
     }
 
@@ -76,10 +79,22 @@ int cmd_metadata(int argc, char **argv) {
 
     const char *output = find_flag(argc, argv, "-o");
 
+    static char pwbuf[TSPDF_PASSWORD_MAX];
+    const char *password = tspdf_resolve_password(argc, argv,
+                                                  "--password", "--password-file",
+                                                  "metadata", "Password: ",
+                                                  false, pwbuf, sizeof(pwbuf));
+
     TspdfError err = TSPDF_OK;
-    TspdfReader *doc = tspdf_reader_open_file(input, &err);
+    TspdfReader *doc = password
+        ? tspdf_reader_open_file_with_password(input, password, &err)
+        : tspdf_reader_open_file(input, &err);
     if (!doc) {
-        fprintf(stderr, "tspdf metadata: failed to open '%s': %s\n", input, tspdf_error_string(err));
+        if (err == TSPDF_ERR_ENCRYPTED) {
+            fprintf(stderr, "tspdf metadata: '%s' is encrypted; use --password or --password-file\n", input);
+        } else {
+            fprintf(stderr, "tspdf metadata: failed to open '%s': %s\n", input, tspdf_error_string(err));
+        }
         return 1;
     }
 

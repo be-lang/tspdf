@@ -376,6 +376,57 @@ fi
 # meta.pdf just got a fresh ModDate from the --set save above.
 run_test "metadata prints dates human-readable" bash -c "$TSPDF metadata $TMPDIR/meta.pdf | grep -qE '^Modified:[[:space:]]+[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\$'"
 
+# metadata on encrypted files: --password opens them, and the written Info
+# strings must be ENCRYPTED (ISO 32000 exempts only /Encrypt and /ID) —
+# plaintext Info strings decrypt to garbage in poppler et al.
+run_test "metadata --set on encrypted file with --password" bash -c "
+  set -e
+  $TSPDF encrypt $INPUT -o $TMPDIR/meta_enc_in.pdf --password metapw > /dev/null
+  $TSPDF metadata $TMPDIR/meta_enc_in.pdf --password metapw --set title='Encrypted Title XYZQ' -o $TMPDIR/meta_enc.pdf > /dev/null
+  $TSPDF metadata $TMPDIR/meta_enc.pdf --password metapw | grep -q 'Encrypted Title XYZQ'"
+run_test "encrypted Info strings are not plaintext in the file" bash -c "
+  ! grep -aq 'Encrypted Title XYZQ' $TMPDIR/meta_enc.pdf"
+if command -v pdfinfo > /dev/null 2>&1; then
+  run_test "pdfinfo decrypts the title of the encrypted file" bash -c "
+    pdfinfo -upw metapw $TMPDIR/meta_enc.pdf | grep -q 'Encrypted Title XYZQ'"
+else
+  echo "  SKIP  encrypted-Info pdfinfo assertion (pdfinfo not found)"
+fi
+
+# Object-stream re-packing: rewriting a file that used object streams must
+# re-pack them (not explode every member into a classic top-level object,
+# which roughly doubles such files); classic inputs stay classic.
+if command -v qpdf > /dev/null 2>&1; then
+  run_test "rewrite of an objstm file re-packs it (<= 1.2x input)" bash -c "
+    set -e
+    qpdf --object-streams=generate $INPUT $TMPDIR/objstm_in.pdf
+    $TSPDF crop --margin 0 $TMPDIR/objstm_in.pdf -o $TMPDIR/objstm_out.pdf > /dev/null
+    in=\$(wc -c < $TMPDIR/objstm_in.pdf)
+    out=\$(wc -c < $TMPDIR/objstm_out.pdf)
+    [ \$((out * 10)) -le \$((in * 12)) ]
+    grep -aq '/Type /ObjStm' $TMPDIR/objstm_out.pdf
+    qpdf --check $TMPDIR/objstm_out.pdf > /dev/null"
+  run_test "encrypted save of an objstm file keeps object streams" bash -c "
+    set -e
+    $TSPDF encrypt $TMPDIR/objstm_in.pdf -o $TMPDIR/objstm_enc.pdf --password s3cret > /dev/null
+    grep -aq '/Type /ObjStm' $TMPDIR/objstm_enc.pdf
+    qpdf --password=s3cret --check $TMPDIR/objstm_enc.pdf > /dev/null"
+  run_test "encrypted objstm rewrite opens with the password" bash -c "
+    set -e
+    $TSPDF metadata $TMPDIR/objstm_enc.pdf --password s3cret --set title='ObjStm Enc' -o $TMPDIR/objstm_enc2.pdf > /dev/null
+    grep -aq '/Type /ObjStm' $TMPDIR/objstm_enc2.pdf
+    ! grep -aq 'ObjStm Enc' $TMPDIR/objstm_enc2.pdf
+    qpdf --password=s3cret --check $TMPDIR/objstm_enc2.pdf > /dev/null
+    $TSPDF metadata $TMPDIR/objstm_enc2.pdf --password s3cret | grep -q 'ObjStm Enc'"
+else
+  echo "  SKIP  objstm re-pack assertions (qpdf not found)"
+fi
+run_test "classic-xref input stays classic on rewrite" bash -c "
+  set -e
+  $TSPDF crop --margin 0 $INPUT -o $TMPDIR/classic_out.pdf > /dev/null
+  ! grep -aq '/Type /ObjStm' $TMPDIR/classic_out.pdf
+  grep -aq 'trailer' $TMPDIR/classic_out.pdf"
+
 # info --json
 if command -v python3 > /dev/null 2>&1; then
   run_test "info --json is valid JSON with the expected fields" bash -c "
@@ -746,11 +797,11 @@ run_test "compress" $TSPDF compress $INPUT -o $TMPDIR/compressed.pdf
 # flag-first ordering: -o output must not be swallowed as input
 run_test "compress flag-first ordering (-o before input)" $TSPDF compress -o $TMPDIR/compressed_ff.pdf $INPUT
 
-# compress must not re-inflate an already-well-compressed FlateDecode stream:
-# round-tripping such a stream costs CPU and never shrinks it (often grows it).
-# Build a PDF whose content stream is a large payload already stored as
-# FlateDecode (compressed size above the skip floor), then assert the compressed
-# stream bytes are preserved verbatim and the file still reopens.
+# compress keeps whichever encoding of a FlateDecode stream is smaller: a
+# re-encoded stream is only written when it actually shrinks (the best-effort
+# deflate level can beat zlib-9), never grows. Build a PDF whose content
+# stream is a large zlib-9 payload, then assert the stream never grew and the
+# file still reopens.
 if command -v python3 > /dev/null 2>&1; then
   python3 -c "
 import zlib, random, sys
@@ -779,21 +830,84 @@ out += b'trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n' % (len(o
 open(sys.argv[1], 'wb').write(out)
 " "$TMPDIR/bigflate.pdf"
   run_test "compress runs on already-compressed stream" $TSPDF compress "$TMPDIR/bigflate.pdf" -o "$TMPDIR/bigflate_out.pdf"
-  run_test "compress preserves already-well-compressed stream bytes" python3 - "$TMPDIR/bigflate.pdf" "$TMPDIR/bigflate_out.pdf" << 'PYEOF'
-import re, sys
+  run_test "compress never grows an already-well-compressed stream" python3 - "$TMPDIR/bigflate.pdf" "$TMPDIR/bigflate_out.pdf" << 'PYEOF'
+import re, sys, zlib
 def stream_bytes(p):
     d = open(p, "rb").read()
-    m = re.search(rb"/Filter /FlateDecode >>\nstream\n(.*?)\nendstream", d, re.DOTALL)
+    m = re.search(rb"/Filter /FlateDecode.*?>>\nstream\n(.*?)\nendstream", d, re.DOTALL)
     return m.group(1) if m else None
 a = stream_bytes(sys.argv[1])
 b = stream_bytes(sys.argv[2])
 assert a is not None and b is not None, "stream not found"
-# The well-compressed stream must be kept verbatim, not re-inflated.
-assert a == b, "stream was needlessly re-encoded (%d -> %d bytes)" % (len(a), len(b))
+# Keep-if-smaller: a differing stream must be a strictly smaller encoding of
+# the exact same payload; an equal-or-larger re-encode must keep the original.
+assert len(b) <= len(a), "stream grew (%d -> %d bytes)" % (len(a), len(b))
+if a != b:
+    assert len(b) < len(a), "same-size stream was needlessly re-encoded"
+    assert zlib.decompress(b) == zlib.decompress(a), "payload changed"
 PYEOF
   run_test "compress output reopens cleanly (round-trip)" $TSPDF info "$TMPDIR/bigflate_out.pdf"
 else
   echo "  SKIP  compress well-compressed stream (python3 not found)"
+fi
+
+# The lossless armor-strip must refuse streams whose /DecodeParms is an
+# indirect reference: tspdf_stream_decode does not resolve refs, so it would
+# silently skip the predictor and bake the predictor-coded bytes into the
+# output as plain Flate. The committed fixture's content stream is
+# /Filter [/FlateDecode] /DecodeParms <n> 0 R -> << /Predictor 12 /Columns 32 >>
+# deflated at level 1, so a re-encode would win on size if not gated.
+# (Regenerate with tests/data/gen_armor_predref.py. The grep assertion is
+# tied to the conservative keep-verbatim gate; revisit it if indirect
+# DecodeParms refs are ever resolved during decode.)
+run_test "compress keeps /DecodeParms of an indirect-parms stream" bash -c "
+  set -e
+  $TSPDF compress tests/data/armor_predref.pdf -o $TMPDIR/predref_out.pdf > /dev/null
+  grep -aq '/DecodeParms' $TMPDIR/predref_out.pdf
+  $TSPDF info $TMPDIR/predref_out.pdf > /dev/null"
+if command -v python3 > /dev/null 2>&1; then
+  run_test "indirect-parms stream still decodes after compress" python3 - "$TMPDIR/predref_out.pdf" << 'PYEOF'
+import re, sys, zlib
+d = open(sys.argv[1], "rb").read()
+marker = b"ArmorPredRefCheck"
+def unpred_up(data, cols):
+    # PNG Up predictor, filter byte 2 per row (the fixture's declared parms).
+    out = bytearray()
+    prev = bytes(cols)
+    for off in range(0, len(data), cols + 1):
+        row = data[off:off + cols + 1]
+        if not row or row[0] != 2:
+            raise ValueError("not Up-predicted")
+        cur = bytes((row[1 + i] + prev[i]) & 0xFF for i in range(len(row) - 1))
+        out += cur
+        prev = cur
+    return bytes(out)
+# Decode every Flate stream exactly as its dict declares: plain inflate, plus
+# the fixture's PNG-Up /Columns 32 predictor when the dict carries parms. The
+# marker must survive; the pre-fix corruption dropped the parms while keeping
+# predictor-coded bytes, so no declared decoding yields it.
+found = False
+for m in re.finditer(rb"<<([^<>]*)>>\s*stream\r?\n", d):
+    dct = m.group(1)
+    lm = re.search(rb"/Length\s+(\d+)", dct)
+    if lm is None or b"/FlateDecode" not in dct:
+        continue
+    raw = d[m.end():m.end() + int(lm.group(1))]
+    try:
+        dec = zlib.decompress(raw)
+    except zlib.error:
+        continue
+    if b"/DecodeParms" in dct or b"/DP" in dct:
+        try:
+            dec = unpred_up(dec, 32)
+        except ValueError:
+            continue
+    if marker in dec:
+        found = True
+assert found, "content stream no longer decodes to the fixture marker"
+PYEOF
+else
+  echo "  SKIP  indirect-parms decode assertion (python3 not found)"
 fi
 
 # compress packs small non-stream objects into object streams (ObjStm) so
