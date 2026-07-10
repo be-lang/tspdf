@@ -288,6 +288,15 @@ TspdfError tspdf_reader_form_fields(TspdfReader *doc,
 TspdfError tspdf_reader_form_fill(TspdfReader *doc, const char *name,
                                   const char *value, bool force);
 
+// True when `value` can be rendered by the appearance streams this library
+// generates (form fill and flatten): either every character fits the WinAnsi
+// (cp1252) base font, or a fallback TrueType font covering the value is
+// available (TSPDF_FALLBACK_FONT=<path> override, else a scan of the system
+// font directories; TSPDF_FONT_DIRS=<dir:dir> replaces the scan roots).
+// When this returns false, fill/flatten still store the full value but the
+// generated appearance draws unmappable characters as '?'.
+bool tspdf_reader_form_value_renderable(TspdfReader *doc, const char *value);
+
 // Stamp every field's current value into the page content (text values and
 // button check marks), then remove all widget annotations and the catalog
 // /AcroForm so the result is a plain, non-interactive document.

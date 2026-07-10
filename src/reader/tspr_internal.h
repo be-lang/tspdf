@@ -122,6 +122,13 @@ typedef struct {
     size_t capacity;
 } TspdfNewObjList;
 
+// --- Form fallback font (tspr_form.c) ---
+
+// Cached fallback font for form appearance streams whose value contains
+// characters outside cp1252 (defined in tspr_form.c; freed by
+// tspdf_form_fallback_free from tspdf_reader_destroy).
+typedef struct TspdfFormFallback TspdfFormFallback;
+
 // --- Document (full definition) ---
 
 struct TspdfReader {
@@ -138,7 +145,11 @@ struct TspdfReader {
     TspdfReaderMetadata *metadata;     // non-NULL if metadata modified (malloc'd)
     TspdfNewObjList new_objs;    // objects created by Phase 3 APIs
     bool modified;              // set by manipulation/annotation/metadata functions
+    TspdfFormFallback *form_fallback;  // lazy fallback font cache (malloc'd)
 };
+
+// Free doc->form_fallback (safe when NULL). Defined in tspr_form.c.
+void tspdf_form_fallback_free(struct TspdfReader *doc);
 
 // --- Crypt ---
 

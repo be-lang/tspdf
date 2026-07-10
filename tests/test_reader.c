@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L  // setenv/unsetenv (fallback-font env tests)
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,6 +15,8 @@
 #include "../src/compress/deflate.h"
 #include "../src/util/arena.h"
 #include "../src/image/jpeg_codec.h"
+#include "../src/font/ttf_parser.h"
+#include "../src/font/font_fallback.h"
 #include "../src/crypto/md5.h"
 
 static bool bytes_contains(const uint8_t *haystack, size_t haystack_len, const char *needle) {
@@ -12282,6 +12286,407 @@ TEST(test_form_fill_editable_combo_accepts_free_text) {
 // Saving a document that was opened with a password must keep it encrypted:
 // the original /Encrypt dictionary and /ID are carried over, so the original
 // password still opens the output (and no password does not).
+// --- choice /Opt inheritance ---
+//
+// /Opt is inheritable (ISO 32000 table 231): a parent-held /Opt must both
+// list at the terminal field and validate fills there. Hand-built fixture:
+// two choice parents holding /Opt, each with a named widget kid (so the kid
+// is the terminal), one flat and one with [export display] pairs.
+static char *form_make_inherited_opt_pdf(size_t *out_len) {
+    char *pdf = (char *)malloc(4096);
+    if (!pdf) return NULL;
+    size_t pos = 0;
+    size_t off[8] = {0};
+
+    if (!appendf(pdf, 4096, &pos, "%%PDF-1.4\n")) goto fail;
+    off[1] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R "
+                 "/AcroForm << /Fields [3 0 R 6 0 R] >> >>\nendobj\n")) goto fail;
+    off[2] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [4 0 R] /Count 1 >>\nendobj\n")) goto fail;
+    off[3] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "3 0 obj\n<< /FT /Ch /T (size) /Opt [(S) (M) (L)] "
+                 "/Kids [5 0 R] >>\nendobj\n")) goto fail;
+    off[4] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                 "/Annots [5 0 R 7 0 R] >>\nendobj\n")) goto fail;
+    off[5] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "5 0 obj\n<< /T (inner) /Type /Annot /Subtype /Widget "
+                 "/Rect [10 700 110 720] /Parent 3 0 R >>\nendobj\n")) goto fail;
+    off[6] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "6 0 obj\n<< /FT /Ch /T (pair) "
+                 "/Opt [[(ex1) (Display One)] [(ex2) (Display Two)]] "
+                 "/Kids [7 0 R] >>\nendobj\n")) goto fail;
+    off[7] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "7 0 obj\n<< /T (k) /Type /Annot /Subtype /Widget "
+                 "/Rect [10 660 110 680] /Parent 6 0 R >>\nendobj\n")) goto fail;
+
+    size_t xref = pos;
+    if (!appendf(pdf, 4096, &pos, "xref\n0 8\n0000000000 65535 f \n")) goto fail;
+    for (int i = 1; i <= 7; i++) {
+        if (!appendf(pdf, 4096, &pos, "%010zu 00000 n \n", off[i])) goto fail;
+    }
+    if (!appendf(pdf, 4096, &pos,
+                 "trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n%zu\n%%%%EOF",
+                 xref)) goto fail;
+    *out_len = pos;
+    return pdf;
+fail:
+    free(pdf);
+    return NULL;
+}
+
+TEST(test_form_choice_opt_inherited_lists_options) {
+    size_t len = 0;
+    char *pdf = form_make_inherited_opt_pdf(&len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    TspdfFormFieldInfo *fields = NULL;
+    size_t count = 0;
+    err = tspdf_reader_form_fields(doc, &fields, &count);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_SIZE(count, 2);
+
+    const TspdfFormFieldInfo *inner = form_find(fields, count, "size.inner");
+    ASSERT(inner != NULL);
+    ASSERT_EQ_INT(inner->type, TSPDF_FIELD_CHOICE);
+    ASSERT_EQ_SIZE(inner->option_count, 3);
+    ASSERT(form_has_option(inner, "S"));
+    ASSERT(form_has_option(inner, "M"));
+    ASSERT(form_has_option(inner, "L"));
+
+    // [export display] pairs list the export value, from the parent /Opt.
+    const TspdfFormFieldInfo *k = form_find(fields, count, "pair.k");
+    ASSERT(k != NULL);
+    ASSERT_EQ_SIZE(k->option_count, 2);
+    ASSERT(form_has_option(k, "ex1"));
+    ASSERT(form_has_option(k, "ex2"));
+
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_form_choice_opt_inherited_validates_fill) {
+    size_t len = 0;
+    char *pdf = form_make_inherited_opt_pdf(&len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    // A value outside the parent-held /Opt must be rejected (before the
+    // inheritance fix this silently passed because only the terminal dict
+    // was consulted).
+    err = tspdf_reader_form_fill(doc, "size.inner", "XL", false);
+    ASSERT_EQ_INT(err, TSPDF_ERR_INVALID_ARG);
+    // Listed options and clearing still work.
+    err = tspdf_reader_form_fill(doc, "size.inner", "M", false);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    err = tspdf_reader_form_fill(doc, "size.inner", "", false);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    // Pairs validate against the export value, not the display string.
+    err = tspdf_reader_form_fill(doc, "pair.k", "Display One", false);
+    ASSERT_EQ_INT(err, TSPDF_ERR_INVALID_ARG);
+    err = tspdf_reader_form_fill(doc, "pair.k", "ex2", false);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+// --- fallback font (non-WinAnsi appearance text) ---
+
+#define FALLBACK_TTF "tests/data/fallback_font.ttf"
+#define FALLBACK_TTC "tests/data/fallback_font.ttc"
+#define FALLBACK_LATIN_TTF "tests/data/fallback_latin.ttf"
+
+// Force a hermetic fallback configuration: the suite must not depend on the
+// fonts installed on this machine. font = TSPDF_FALLBACK_FONT (NULL unsets),
+// dirs = TSPDF_FONT_DIRS scan-root override (NULL unsets).
+static void fallback_env(const char *font, const char *dirs) {
+    if (font) setenv("TSPDF_FALLBACK_FONT", font, 1);
+    else unsetenv("TSPDF_FALLBACK_FONT");
+    if (dirs) setenv("TSPDF_FONT_DIRS", dirs, 1);
+    else unsetenv("TSPDF_FONT_DIRS");
+}
+
+TEST(test_fallback_font_score_ordering) {
+    // CJK-hinted names come first when CJK coverage is needed...
+    ASSERT(tspdf_fallback_font_score("NotoSansCJK-Regular.ttc", true) >
+           tspdf_fallback_font_score("DejaVuSans.ttf", true));
+    // ...and drop behind general-purpose fonts when it is not.
+    ASSERT(tspdf_fallback_font_score("DejaVuSans.ttf", false) >
+           tspdf_fallback_font_score("NotoSansCJK-Regular.ttc", false));
+    // Regular beats italic/bold variants of the same family.
+    ASSERT(tspdf_fallback_font_score("DejaVuSans.ttf", false) >
+           tspdf_fallback_font_score("DejaVuSans-BoldItalic.ttf", false));
+    // .otf (usually CFF) is parsed last.
+    ASSERT(tspdf_fallback_font_score("NotoSans-Regular.ttf", false) >
+           tspdf_fallback_font_score("NotoSans-Regular.otf", false));
+}
+
+TEST(test_fallback_font_coverage_check) {
+    const uint32_t cjk[] = {0x65E5, 0x672C, 0x8A9E};  // 日本語
+    const uint32_t latin[] = {'A', 'z', '9'};
+    ASSERT(tspdf_fallback_font_covers(FALLBACK_TTF, cjk, 3));
+    ASSERT(tspdf_fallback_font_covers(FALLBACK_TTF, latin, 3));
+    // The Latin-only sibling parses fine but must fail CJK coverage.
+    ASSERT(tspdf_fallback_font_covers(FALLBACK_LATIN_TTF, latin, 3));
+    ASSERT(!tspdf_fallback_font_covers(FALLBACK_LATIN_TTF, cjk, 3));
+    // Not a font at all.
+    ASSERT(!tspdf_fallback_font_covers("tests/data/form_fields.pdf", cjk, 3));
+}
+
+TEST(test_fallback_font_ttc_loads) {
+    // The .ttc wrapper parses through the ttcf header and covers the same
+    // glyphs as the plain .ttf face.
+    const uint32_t cjk[] = {0x65E5, 0x30C8};  // 日 ト
+    ASSERT(tspdf_fallback_font_covers(FALLBACK_TTC, cjk, 2));
+
+    TTF_Font font;
+    ASSERT(ttf_load(&font, FALLBACK_TTC));
+    ASSERT(font.glyf_offset != 0 && font.loca_offset != 0);
+    ASSERT(ttf_get_glyph_index(&font, 0x65E5) != 0);
+    ttf_free(&font);
+}
+
+TEST(test_fallback_font_ttc_skips_non_truetype_face) {
+    // Synthetic collection: face 0 is CFF-flavored ('OTTO'), face 1 is the
+    // real TrueType face. The loader must skip to face 1.
+    size_t ttf_len = 0;
+    uint8_t *ttf = wasm_read_whole_file(FALLBACK_TTF, &ttf_len);
+    ASSERT(ttf != NULL);
+    size_t base = 24;
+    size_t total = base + ttf_len;
+    uint8_t *ttc = (uint8_t *)calloc(1, total);
+    ASSERT(ttc != NULL);
+    memcpy(ttc, "ttcf", 4);
+    ttc[5] = 1;                        // version 1.0
+    ttc[11] = 2;                       // numFonts = 2
+    ttc[15] = 20;                      // face 0 offset -> the 'OTTO' filler
+    ttc[19] = (uint8_t)base;           // face 1 offset -> real sfnt
+    memcpy(ttc + 20, "OTTO", 4);
+    memcpy(ttc + base, ttf, ttf_len);
+    // Rebase the copied face's table offsets (they are file-absolute).
+    uint16_t num_tables = (uint16_t)((ttc[base + 4] << 8) | ttc[base + 5]);
+    for (uint16_t i = 0; i < num_tables; i++) {
+        size_t rec = base + 12 + (size_t)i * 16 + 8;
+        uint32_t off = ((uint32_t)ttc[rec] << 24) | ((uint32_t)ttc[rec + 1] << 16) |
+                       ((uint32_t)ttc[rec + 2] << 8) | (uint32_t)ttc[rec + 3];
+        off += (uint32_t)base;
+        ttc[rec] = (uint8_t)(off >> 24);
+        ttc[rec + 1] = (uint8_t)(off >> 16);
+        ttc[rec + 2] = (uint8_t)(off >> 8);
+        ttc[rec + 3] = (uint8_t)off;
+    }
+    free(ttf);
+
+    TTF_Font font;
+    ASSERT(ttf_load_from_memory(&font, ttc, total));  // takes ownership
+    ASSERT(ttf_get_glyph_index(&font, 0x65E5) != 0);
+    ttf_free(&font);
+}
+
+TEST(test_form_fill_fallback_embeds_cid_font) {
+    fallback_env(FALLBACK_TTF, NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/form_fields.pdf", &err);
+    ASSERT(doc != NULL);
+
+    // 日本語テスト
+    err = tspdf_reader_form_fill(doc, "name",
+        "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe3\x83\x86\xe3\x82\xb9\xe3\x83\x88",
+        false);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    // The full CIDFontType2/Identity-H chain is embedded and referenced.
+    ASSERT(bytes_contains(out, out_len, "/Identity-H"));
+    ASSERT(bytes_contains(out, out_len, "/CIDFontType2"));
+    ASSERT(bytes_contains(out, out_len, "/FontFile2"));
+    ASSERT(bytes_contains(out, out_len, "/TspdfFb"));
+    ASSERT(bytes_contains(out, out_len, "beginbfchar"));
+    // The appearance draws a glyph hex string, not "??????".
+    ASSERT(bytes_contains(out, out_len, "> Tj"));
+    ASSERT(!bytes_contains(out, out_len, "(?\?\?\?\?\?) Tj"));
+    // Viewers must keep our /AP (regeneration would lose the glyphs).
+    ASSERT(bytes_contains(out, out_len, "/NeedAppearances false"));
+
+    // /V round-trips unchanged.
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    TspdfFormFieldInfo *fields = NULL;
+    size_t count = 0;
+    err = tspdf_reader_form_fields(re, &fields, &count);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    const TspdfFormFieldInfo *name = form_find(fields, count, "name");
+    ASSERT(name != NULL);
+    ASSERT(name->value && strcmp(name->value,
+        "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe3\x83\x86\xe3\x82\xb9\xe3\x83\x88") == 0);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(doc);
+    fallback_env(NULL, NULL);
+}
+
+TEST(test_form_fill_fallback_mixed_value_renders_whole_value) {
+    fallback_env(FALLBACK_TTF, NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/form_fields.pdf", &err);
+    ASSERT(doc != NULL);
+
+    // Mixed Latin + CJK: the whole value is drawn with the fallback font
+    // (documented v1 behavior), so no literal-string fragment remains.
+    err = tspdf_reader_form_fill(doc, "name", "Tokyo\xe6\x97\xa5\xe6\x9c\xac",
+                                 false);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(bytes_contains(out, out_len, "/Identity-H"));
+    ASSERT(!bytes_contains(out, out_len, "(Tokyo"));
+
+    free(out);
+    tspdf_reader_destroy(doc);
+    fallback_env(NULL, NULL);
+}
+
+TEST(test_form_fill_fallback_unavailable_keeps_lossy_path) {
+    // Hermetic "no usable font anywhere": empty scan roots, no override.
+    fallback_env(NULL, "/nonexistent-tspdf-font-dir");
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/form_fields.pdf", &err);
+    ASSERT(doc != NULL);
+
+    ASSERT(!tspdf_reader_form_value_renderable(doc,
+        "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e"));
+
+    err = tspdf_reader_form_fill(doc, "name",
+        "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e", false);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    // Old behavior: '?' substitution in the appearance, /V intact, and the
+    // NeedAppearances belt stays on.
+    ASSERT(bytes_contains(out, out_len, "(?\?\?) Tj"));
+    ASSERT(!bytes_contains(out, out_len, "/Identity-H"));
+    ASSERT(bytes_contains(out, out_len, "/NeedAppearances true"));
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    TspdfFormFieldInfo *fields = NULL;
+    size_t count = 0;
+    err = tspdf_reader_form_fields(re, &fields, &count);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    const TspdfFormFieldInfo *name = form_find(fields, count, "name");
+    ASSERT(name != NULL);
+    ASSERT(name->value &&
+           strcmp(name->value, "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e") == 0);
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(doc);
+    fallback_env(NULL, NULL);
+}
+
+TEST(test_form_fill_fallback_discovery_scan) {
+    // No override: the directory scan (rooted at tests/data via
+    // TSPDF_FONT_DIRS) must find the covering font and reject the
+    // Latin-only sibling by actual cmap coverage.
+    fallback_env(NULL, "tests/data");
+    const uint32_t cjk[] = {0x65E5, 0x672C};
+    char *path = tspdf_fallback_font_find(cjk, 2);
+    ASSERT(path != NULL);
+    ASSERT(strstr(path, "fallback_font") != NULL);
+    ASSERT(strstr(path, "fallback_latin") == NULL);
+    free(path);
+
+    // And nothing covers Hangul in the fixture set.
+    const uint32_t hangul[] = {0xD55C};
+    path = tspdf_fallback_font_find(hangul, 1);
+    ASSERT(path == NULL);
+    fallback_env(NULL, NULL);
+}
+
+TEST(test_form_value_renderable) {
+    fallback_env(FALLBACK_TTF, NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/form_fields.pdf", &err);
+    ASSERT(doc != NULL);
+
+    ASSERT(tspdf_reader_form_value_renderable(doc, "plain ascii"));
+    ASSERT(tspdf_reader_form_value_renderable(doc, "Gr\xc3\xbc\xc3\x9f" "e"));
+    ASSERT(tspdf_reader_form_value_renderable(doc, ""));
+    // Covered by the fixture fallback font.
+    ASSERT(tspdf_reader_form_value_renderable(doc,
+        "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e"));
+    // Hangul is not in the fixture font: not renderable even with it set.
+    ASSERT(!tspdf_reader_form_value_renderable(doc, "\xed\x95\x9c"));
+    // Invalid UTF-8 keeps the lossy path.
+    ASSERT(!tspdf_reader_form_value_renderable(doc, "\xff\xfe"));
+
+    tspdf_reader_destroy(doc);
+    fallback_env(NULL, NULL);
+}
+
+TEST(test_form_flatten_fallback_font) {
+    fallback_env(FALLBACK_TTF, NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/form_fields.pdf", &err);
+    ASSERT(doc != NULL);
+
+    err = tspdf_reader_form_fill(doc, "name",
+        "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e", false);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    // Reopen so flatten runs on a saved document (like the CLI does).
+    uint8_t *out = NULL;
+    TspdfReader *re = form_reopen(doc, &out);
+    ASSERT(re != NULL);
+    err = tspdf_reader_form_flatten(re);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *flat = NULL;
+    size_t flat_len = 0;
+    err = tspdf_reader_save_to_memory(re, &flat, &flat_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    // The page content draws the glyph string with the embedded font and
+    // the form itself is gone.
+    ASSERT(bytes_contains(flat, flat_len, "/TspdfFb"));
+    ASSERT(bytes_contains(flat, flat_len, "/Identity-H"));
+    ASSERT(bytes_contains(flat, flat_len, "> Tj"));
+    ASSERT(!bytes_contains(flat, flat_len, "/AcroForm"));
+    ASSERT(!bytes_contains(flat, flat_len, "(?\?\?) Tj"));
+
+    free(flat);
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(doc);
+    fallback_env(NULL, NULL);
+}
+
 TEST(test_form_fill_encrypted_save_preserves_encryption) {
     TspdfError err;
     TspdfReader *doc = tspdf_reader_open_file_with_password(
@@ -14536,6 +14941,18 @@ int main(void) {
     RUN(test_form_fill_choice);
     RUN(test_form_fill_choice_rejects_non_option);
     RUN(test_form_fill_editable_combo_accepts_free_text);
+    RUN(test_form_choice_opt_inherited_lists_options);
+    RUN(test_form_choice_opt_inherited_validates_fill);
+    RUN(test_fallback_font_score_ordering);
+    RUN(test_fallback_font_coverage_check);
+    RUN(test_fallback_font_ttc_loads);
+    RUN(test_fallback_font_ttc_skips_non_truetype_face);
+    RUN(test_form_fill_fallback_embeds_cid_font);
+    RUN(test_form_fill_fallback_mixed_value_renders_whole_value);
+    RUN(test_form_fill_fallback_unavailable_keeps_lossy_path);
+    RUN(test_form_fill_fallback_discovery_scan);
+    RUN(test_form_value_renderable);
+    RUN(test_form_flatten_fallback_font);
     RUN(test_form_fill_encrypted_save_preserves_encryption);
     RUN(test_save_decrypt_option_writes_plaintext);
     RUN(test_form_fill_unknown_name_errors);

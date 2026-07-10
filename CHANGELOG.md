@@ -8,6 +8,16 @@ on 0.x, the CLI is considered stable but the low-level C API may still change.
 ## [Unreleased]
 
 ### Added
+- `form fill` / `form flatten`: values with characters outside WinAnsi (CJK,
+  Greek, ...) now render in the generated appearances instead of `?`. A
+  TrueType fallback font is discovered at run time (`TSPDF_FALLBACK_FONT=
+  /path/to/font.ttf` override, else a scan of the system font directories
+  with a real coverage check; `TSPDF_FONT_DIRS` replaces the scan roots),
+  subset to the needed glyphs, and embedded as a CIDFontType2/Identity-H
+  font with /ToUnicode. `.ttc` collections with TrueType outlines are
+  supported; CFF-flavored fonts are skipped. Without a usable font the old
+  `?` rendering and warning remain. C API:
+  `tspdf_reader_form_value_renderable`.
 - `tspdf compress --lossy`: downsample oversized photos/scans to a target
   resolution (`--image-dpi`, default 150) and re-encode them as JPEG
   (`--image-quality`, default 75), using a from-scratch baseline JPEG codec.
@@ -43,6 +53,9 @@ on 0.x, the CLI is considered stable but the low-level C API may still change.
   actions, colors, styles, and collapsed state are now preserved.
 - `metadata --set/--clear` silently left an XMP metadata stream stale; it now
   prints a notice, since viewers preferring XMP may show the old values.
+- `form fill` skipped /Opt validation for choice fields whose option list
+  lives on an ancestor field (/Opt is inheritable): unknown values were
+  silently accepted, and `form list` showed no options for such fields.
 - `watermark` and `pagenum` corrupted pages whose /Resources is an indirect
   reference (common in pdfTeX and PyMuPDF output): a duplicate /Resources key
   made strict viewers drop the page's fonts.

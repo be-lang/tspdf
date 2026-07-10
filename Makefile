@@ -91,6 +91,7 @@ LIB_SOURCES = \
 	$(SRCDIR)/pdf/tspdf_writer.c \
 	$(SRCDIR)/font/ttf_parser.c \
 	$(SRCDIR)/font/font_subset.c \
+	$(SRCDIR)/font/font_fallback.c \
 	$(SRCDIR)/layout/layout.c \
 	$(SRCDIR)/image/jpeg_embed.c \
 	$(SRCDIR)/image/jpeg_codec.c \

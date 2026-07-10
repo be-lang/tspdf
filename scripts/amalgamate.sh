@@ -57,6 +57,7 @@ src/image/jpeg_codec.h
 src/qr/qr_encode.h
 src/util/pdftext.h
 src/util/pdfdate.h
+src/font/font_fallback.h
 src/reader/tspr_internal.h
 src/reader/tspr_doctree.h
 src/reader/tspr_attach.h
@@ -75,6 +76,7 @@ src/pdf/pdf_base14.c
 src/pdf/tspdf_writer.c
 src/font/ttf_parser.c
 src/font/font_subset.c
+src/font/font_fallback.c
 src/layout/layout.c
 src/image/jpeg_embed.c
 src/image/jpeg_codec.c

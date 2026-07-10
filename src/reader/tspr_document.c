@@ -455,6 +455,7 @@ void tspdf_reader_destroy(TspdfReader *doc) {
         free(doc->metadata);
     }
     free(doc->new_objs.objs);
+    tspdf_form_fallback_free(doc);
     tspdf_arena_destroy(&doc->arena);
     if (doc->owns_data) {
         free((void *)doc->data);

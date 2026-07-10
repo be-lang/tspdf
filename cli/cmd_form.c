@@ -45,6 +45,13 @@ static void form_usage(void) {
     printf("fields only accept their listed options, unless the combo is\n");
     printf("editable. Text appearances are single-line (no comb/multiline\n");
     printf("layout).\n");
+    printf("\n");
+    printf("Values with characters outside WinAnsi (CJK, Greek, ...) are\n");
+    printf("rendered with a fallback TrueType font: set\n");
+    printf("TSPDF_FALLBACK_FONT=/path/to/font.ttf, or let tspdf scan the\n");
+    printf("system font directories (TSPDF_FONT_DIRS overrides the scan\n");
+    printf("roots). Without a usable font those characters display as '?'\n");
+    printf("(the stored value keeps them).\n");
 }
 
 // --- JSON string output ---
@@ -419,23 +426,28 @@ static const TspdfFormFieldInfo *form_find_field(
 }
 
 // Generated text appearances (fill) and flatten stamping render values with
-// a WinAnsi (cp1252) base font: characters outside it display as '?'. The
-// stored /V keeps the full value, so this is a visual-only loss — but a
-// silent one, hence the warning.
-static void form_warn_lossy_value(const char *name, const char *value) {
+// a WinAnsi (cp1252) base font; characters outside it are drawn with an
+// embedded fallback TrueType font when one is discoverable on this machine
+// (TSPDF_FALLBACK_FONT override, else a system font scan). Only when neither
+// works do they display as '?' — the stored /V keeps the full value, so that
+// is a visual-only loss, but a silent one, hence the warning.
+static void form_warn_lossy_value(TspdfReader *doc, const char *name,
+                                  const char *value) {
     if (tspdf_str_is_ascii(value)) return;
     size_t len = strlen(value);
     char *scratch = malloc(len + 1);  // cp1252 is never longer than UTF-8
     if (!scratch) return;
     size_t subs = tspdf_utf8_to_cp1252_lossy(value, scratch, NULL);
     free(scratch);
-    if (subs > 0) {
-        fprintf(stderr,
-                "tspdf form: warning: value for field '%s' contains "
-                "characters not representable in the appearance font; "
-                "they will display as '?' (the stored value is intact)\n",
-                name);
-    }
+    if (subs == 0) return;
+    if (tspdf_reader_form_value_renderable(doc, value)) return;
+    fprintf(stderr,
+            "tspdf form: warning: value for field '%s' contains "
+            "characters not representable in the appearance font and no "
+            "fallback TrueType font was found; they will display as '?' "
+            "(the stored value is intact). Set TSPDF_FALLBACK_FONT=</path/"
+            "to/font.ttf> to embed one.\n",
+            name);
 }
 
 // Checkbox/radio convenience: true/false (and friends) map to the first
@@ -579,9 +591,10 @@ static int form_fill(int argc, char **argv, const char *input,
             break;
         }
         // The generated appearance stream (text fields) uses a cp1252 base
-        // font: warn when that loses characters. /V itself is unaffected.
+        // font with a fallback-font escape hatch: warn when characters are
+        // lost anyway. /V itself is unaffected.
         if (f->type == TSPDF_FIELD_TEXT) {
-            form_warn_lossy_value(pairs.keys[i], value);
+            form_warn_lossy_value(doc, pairs.keys[i], value);
         }
     }
 
@@ -609,8 +622,9 @@ static int form_flatten(const char *input, const char *output,
     TspdfReader *doc = form_open(input, password);
     if (!doc) return 1;
 
-    // Flatten stamps current values with a cp1252 base font: warn up front
-    // about values that will lose characters in the stamped page content.
+    // Flatten stamps current values with a cp1252 base font (fallback
+    // TrueType font for characters outside it): warn up front about values
+    // that will still lose characters in the stamped page content.
     {
         TspdfFormFieldInfo *fields = NULL;
         size_t count = 0;
@@ -619,7 +633,8 @@ static int form_flatten(const char *input, const char *output,
                 if ((fields[i].type == TSPDF_FIELD_TEXT ||
                      fields[i].type == TSPDF_FIELD_CHOICE) &&
                     fields[i].value) {
-                    form_warn_lossy_value(fields[i].name, fields[i].value);
+                    form_warn_lossy_value(doc, fields[i].name,
+                                          fields[i].value);
                 }
             }
         }

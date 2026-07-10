@@ -166,6 +166,34 @@ tspdf compress --lossy --image-dpi 100 --image-quality 60 scan.pdf -o tiny.pdf
 spaces are left alone, as is anything within 1.3x of the target dpi (too
 close to be worth re-encoding).
 
+## Fill form fields
+
+```bash
+# see what the form has
+tspdf form list application.pdf
+
+# fill fields (repeatable --set, or a JSON file / stdin via --data)
+tspdf form fill application.pdf \
+  --set name="Ada Lovelace" \
+  --set agree=true \
+  -o filled.pdf
+
+# stamp the values into the page and remove the form
+tspdf form flatten filled.pdf -o final.pdf
+```
+
+Values with characters outside WinAnsi (CJK, Greek, ...) need a fallback
+font for display. tspdf looks for one automatically in the system font
+directories (TrueType only); to pick one yourself:
+
+```bash
+TSPDF_FALLBACK_FONT=/usr/share/fonts/some/font.ttf \
+  tspdf form fill application.pdf --set name=日本語 -o filled.pdf
+```
+
+If no usable font is found the value is still stored, but displays as `?`
+(tspdf prints a warning).
+
 ## Read or update metadata
 
 ```bash

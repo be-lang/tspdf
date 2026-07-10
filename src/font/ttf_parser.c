@@ -346,20 +346,47 @@ bool ttf_load_from_memory(TTF_Font *font, uint8_t *data, size_t len) {
 
     // Read offset table
     uint32_t sfnt_version = read_u32(data);
+    size_t dir = 0;  // offset of the sfnt table directory within `data`
+
+    // TrueType collection ('ttcf'): a 12-byte header plus an array of
+    // offsets, each pointing at an ordinary sfnt table directory whose table
+    // offsets stay absolute within the file. Pick the first face with
+    // TrueType outlines (skip CFF 'OTTO' faces — the glyf subsetter cannot
+    // process those) and parse from its directory.
+    if (sfnt_version == make_tag("ttcf")) {
+        uint32_t num_fonts = read_u32(data + 8);
+        if (num_fonts > 512) num_fonts = 512;  // untrusted header, stay bounded
+        bool found = false;
+        for (uint32_t i = 0; i < num_fonts; i++) {
+            size_t rec = 12 + (size_t)i * 4;
+            if (rec + 4 > len) break;
+            uint32_t face_off = read_u32(data + rec);
+            if (face_off > len || len - face_off < 12) continue;
+            uint32_t v = read_u32(data + face_off);
+            if (v == 0x00010000 || v == 0x74727565) {
+                dir = face_off;
+                sfnt_version = v;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+
     // Accept TrueType (0x00010000) and OpenType with TrueType outlines ('true')
     if (sfnt_version != 0x00010000 && sfnt_version != 0x74727565) {
         // Also accept OpenType CFF ('OTTO') for basic metrics
         if (sfnt_version != 0x4F54544F) return false;
     }
 
-    font->num_tables = read_u16(data + 4);
+    font->num_tables = read_u16(data + dir + 4);
 
     // Parse table directory
     font->tables = (TTF_TableEntry *)calloc(font->num_tables, sizeof(TTF_TableEntry));
     if (!font->tables) return false;
 
     for (int i = 0; i < font->num_tables; i++) {
-        uint32_t offset = 12 + i * 16;
+        size_t offset = dir + 12 + (size_t)i * 16;
         if (offset + 16 > len) goto fail;
         font->tables[i].tag = read_u32(data + offset);
         font->tables[i].checksum = read_u32(data + offset + 4);

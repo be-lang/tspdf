@@ -448,82 +448,19 @@ static void write_ttf_font_objects(TspdfWriter *doc, TspdfFont *font) {
 
     // --- ToUnicode CMap ---
     // Maps glyph IDs to Unicode codepoints from font->glyph_to_unicode[]
-    TspdfBuffer cmap = tspdf_buffer_create(4096);
-    tspdf_buffer_append_str(&cmap,
-        "/CIDInit /ProcSet findresource begin\n"
-        "12 dict begin\n"
-        "begincmap\n"
-        "/CIDSystemInfo\n"
-        "<< /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n"
-        "/CMapName /Adobe-Identity-UCS def\n"
-        "/CMapType 2 def\n"
-        "1 begincodespacerange\n"
-        "<0000> <FFFF>\n"
-        "endcodespacerange\n"
-    );
-
-    {
-        // Heap-allocate mapping arrays (too large for stack)
-        int max_mappings = font->used_glyphs_count;
-        uint16_t *glyph_ids = malloc(max_mappings * sizeof(uint16_t));
-        uint32_t *unicode_vals = malloc(max_mappings * sizeof(uint32_t));
-        int mapping_count = 0;
-
-        if (glyph_ids && unicode_vals) {
-            for (int g = 0; g < font->used_glyphs_count; g++) {
-                if (!font->used_glyphs[g]) continue;
-                if (!font->glyph_to_unicode) continue;
-                uint32_t ucp = font->glyph_to_unicode[g];
-                if (ucp == 0) continue;
-                glyph_ids[mapping_count] = (uint16_t)g;
-                unicode_vals[mapping_count] = ucp;
-                mapping_count++;
-            }
-
-            // Write in batches of 100 (PDF CMap limit per beginbfchar block)
-            int offset = 0;
-            while (offset < mapping_count) {
-                int batch = mapping_count - offset;
-                if (batch > 100) batch = 100;
-                char tmp[80];
-                snprintf(tmp, sizeof(tmp), "%d beginbfchar\n", batch);
-                tspdf_buffer_append_str(&cmap, tmp);
-                for (int i = 0; i < batch; i++) {
-                    uint32_t ucp = unicode_vals[offset + i];
-                    if (ucp > 0xFFFF) {
-                        // UTF-16 surrogate pair
-                        uint32_t u = ucp - 0x10000;
-                        uint16_t hi = 0xD800 + (uint16_t)(u >> 10);
-                        uint16_t lo = 0xDC00 + (uint16_t)(u & 0x3FF);
-                        snprintf(tmp, sizeof(tmp), "<%04X> <%04X%04X>\n",
-                                 glyph_ids[offset + i], hi, lo);
-                    } else {
-                        snprintf(tmp, sizeof(tmp), "<%04X> <%04X>\n",
-                                 glyph_ids[offset + i], (uint16_t)ucp);
-                    }
-                    tspdf_buffer_append_str(&cmap, tmp);
-                }
-                tspdf_buffer_append_str(&cmap, "endbfchar\n");
-                offset += batch;
-            }
-        }
-
-        free(glyph_ids);
-        free(unicode_vals);
-    }
-
-    tspdf_buffer_append_str(&cmap,
-        "endcmap\n"
-        "CMapName currentdict /CMap defineresource pop\n"
-        "end\n"
-        "end\n"
-    );
-
+    // (shared builder: font_subset.c, also used by the reader's form
+    // fallback-font embedding).
+    size_t cmap_len = 0;
+    uint8_t *cmap = tspdf_font_tounicode_cmap(font->used_glyphs,
+                                              font->glyph_to_unicode,
+                                              font->used_glyphs_count,
+                                              &cmap_len);
     tspdf_raw_writer_begin_object(w, tounicode_ref);
     tspdf_raw_write_dict_begin(w);
-    tspdf_raw_write_stream_compressed(w, cmap.data, cmap.len);
+    tspdf_raw_write_stream_compressed(w, cmap ? cmap : (const uint8_t *)"",
+                                      cmap ? cmap_len : 0);
     tspdf_raw_writer_end_object(w);
-    tspdf_buffer_destroy(&cmap);
+    free(cmap);
 
     // --- CIDFont dict ---
     tspdf_raw_writer_begin_object(w, cidfont_ref);
