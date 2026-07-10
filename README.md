@@ -140,6 +140,11 @@ and conformance jobs, on every push.
 Created by [Benjamin Lang](https://github.com/be-lang). Built with
 [Claude Code](https://claude.ai/claude-code).
 
+## Security
+
+tspdf parses untrusted input. Please report security issues privately to
+**beni@lbau.org** instead of the public tracker.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

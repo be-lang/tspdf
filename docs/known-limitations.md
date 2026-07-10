@@ -44,3 +44,14 @@ If you hit a limitation with a reproducible file/command, open an issue with:
 2. expected behavior,
 3. actual output/error,
 4. sanitized sample input if possible.
+
+## Crypto
+
+tspdf implements MD5, RC4, AES, and the SHA-2 family from scratch to honor its
+zero-dependency rule. They exist for PDF-format encryption compatibility, not
+as a general-purpose cryptography library — do not reuse them elsewhere. The
+portable AES path is not constant-time (key-dependent table lookups), so
+cache-timing attacks by co-resident processes are outside the threat model of
+a local file tool. On x86 with AES-NI and on ARMv8 with the crypto extensions,
+AES dispatches to hardware instructions instead, which avoid data-dependent
+lookups; set `TSPDF_NO_AESHW=1` to force the portable path.

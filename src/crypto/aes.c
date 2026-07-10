@@ -36,7 +36,8 @@ static void aes_hw_decrypt_cbc(const Aes *ctx, const uint8_t iv[16],
  * in principle recover key material. The previous byte-oriented code was
  * not constant-time either (S-box lookups, branchy xtime). tspdf is a local
  * file tool, not a network service handling attacker-timed traffic, so
- * cache-timing adversaries are out of its threat model — see SECURITY.md.
+ * cache-timing adversaries are out of its threat model — see
+ * docs/known-limitations.md.
  * ------------------------------------------------------------------------- */
 
 /* AES S-box */
