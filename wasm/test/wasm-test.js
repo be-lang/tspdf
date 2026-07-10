@@ -111,9 +111,25 @@ assert.throws(() => t.open(encrypted), /password required/,
 
 const hdec = t.open(encrypted, 'wasmpw');
 assert.equal(t.pageCount(hdec), pagesA + pagesB, 'decrypted page count');
-const decrypted = t.save(hdec);
+
+// A plain save preserves the source encryption: the result must still
+// require the original password.
+const resaved = t.save(hdec);
+assertPdf(resaved, 'resave encrypted');
+assert.throws(() => t.open(resaved), /password required/,
+  'plain save of an encrypted doc must stay encrypted');
+const hres = t.open(resaved, 'wasmpw');
+assert.equal(t.pageCount(hres), pagesA + pagesB, 'resaved page count');
+t.close(hres);
+await writeOut('out_resaved_encrypted.pdf', resaved);
+
+// saveDecrypted is the explicit opt-out the unlock tool uses.
+const decrypted = t.saveDecrypted(hdec);
 assertPdf(decrypted, 'decrypt');
 t.close(hdec);
+const hplain = t.open(decrypted); // no password: must be unencrypted
+assert.equal(t.pageCount(hplain), pagesA + pagesB, 'unlocked page count');
+t.close(hplain);
 await writeOut('out_decrypted.pdf', decrypted);
 
 // error surface: invalid handle and invalid page index give real messages

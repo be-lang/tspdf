@@ -100,7 +100,8 @@ const handlers = {
   },
 
   async unlock(t, config, files) {
-    return withDoc(t, files, (h) => t.save(h), config.password || '');
+    // A plain save preserves the source encryption; unlock must opt out.
+    return withDoc(t, files, (h) => t.saveDecrypted(h), config.password || '');
   },
 
   async 'password-protect'(t, config, files) {

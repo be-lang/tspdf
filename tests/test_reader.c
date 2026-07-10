@@ -5578,6 +5578,44 @@ TEST(test_reencrypt_opened_encrypted_decrypts_source_streams) {
     tspdf_reader_destroy(doc);
 }
 
+// Changing a file's password must not embed the OLD /Encrypt dict as an
+// orphan object: its O/U hashes are offline-crackable material for the old
+// password. Exactly one /Standard security handler may appear in the output.
+TEST(test_reencrypt_single_encrypt_dict) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/one_page.pdf", &err);
+    ASSERT(doc != NULL);
+
+    uint8_t *old_enc = NULL;
+    size_t old_enc_len = 0;
+    err = tspdf_reader_save_to_memory_encrypted(doc, &old_enc, &old_enc_len,
+                                                  "oldpass", "oldowner", 0xFFFFFFFC, 128);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_SIZE(bytes_count(old_enc, old_enc_len, "/Standard"), 1);
+
+    TspdfReader *opened = tspdf_reader_open_with_password(old_enc, old_enc_len, "oldpass", &err);
+    ASSERT(opened != NULL);
+
+    uint8_t *new_enc = NULL;
+    size_t new_enc_len = 0;
+    err = tspdf_reader_save_to_memory_encrypted(opened, &new_enc, &new_enc_len,
+                                                  "newpass", "newowner", 0xFFFFFFFC, 128);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    ASSERT_EQ_SIZE(bytes_count(new_enc, new_enc_len, "/Standard"), 1);
+
+    // The new password still opens the re-encrypted file.
+    TspdfReader *reopened = tspdf_reader_open_with_password(new_enc, new_enc_len, "newpass", &err);
+    ASSERT(reopened != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(reopened), 1);
+
+    tspdf_reader_destroy(reopened);
+    free(new_enc);
+    tspdf_reader_destroy(opened);
+    free(old_enc);
+    tspdf_reader_destroy(doc);
+}
+
 TEST(test_encrypt_empty_user_password) {
     TspdfError err;
     TspdfReader *doc = tspdf_reader_open_file("tests/data/one_page.pdf", &err);
@@ -12449,6 +12487,7 @@ int main(void) {
     RUN(test_encrypt_aes128_roundtrip);
     RUN(test_encrypt_aes256_roundtrip);
     RUN(test_reencrypt_opened_encrypted_decrypts_source_streams);
+    RUN(test_reencrypt_single_encrypt_dict);
     RUN(test_encrypt_empty_user_password);
     RUN(test_manipulate_encrypted);
     RUN(test_open_r6_aes256_with_user_password);

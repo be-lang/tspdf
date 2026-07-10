@@ -1726,9 +1726,14 @@ TspdfError tspdf_serialize_encrypted(TspdfReader *doc, TspdfCrypt *crypt,
 
     /* The source /Encrypt dict is re-emitted as a dedicated object below
      * (either preserved verbatim or freshly generated); never copy the
-     * original as a normal — and then string-encrypted — object. */
-    if (crypt->src_encrypt_num > 0 && crypt->src_encrypt_num < total_objs) {
-        visited[crypt->src_encrypt_num] = false;
+     * original as a normal — and then string-encrypted — object. Check the
+     * SOURCE document's crypt, not `crypt`: when re-encrypting with new
+     * passwords, `crypt` is a fresh encryption crypt (src_encrypt_num 0)
+     * while the old dict is recorded in doc->crypt, and copying it would
+     * embed the old (offline-crackable) O/U hashes as an orphan object. */
+    if (doc->crypt && doc->crypt->src_encrypt_num > 0 &&
+        doc->crypt->src_encrypt_num < total_objs) {
+        visited[doc->crypt->src_encrypt_num] = false;
     }
 
     /* 2. Build renumbering map */

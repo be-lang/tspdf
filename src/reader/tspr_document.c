@@ -43,7 +43,12 @@ static void free_reader_crypt(TspdfCrypt *crypt) {
     free(crypt);
 }
 
-static TspdfCrypt *clone_reader_crypt(const TspdfCrypt *src) {
+// Clone a reader's crypt for a derived document (extract, nup, ...) so its
+// save preserves the source encryption. The clone owns its file_id copy;
+// src_encrypt_dict still points into the SOURCE document's arena, which the
+// derived-document lifetime rules already require to outlive the clone
+// (source must outlive the derived document until it is saved).
+TspdfCrypt *tspdf_crypt_clone(const TspdfCrypt *src) {
     if (!src) return NULL;
 
     TspdfCrypt *copy = (TspdfCrypt *)malloc(sizeof(TspdfCrypt));
@@ -757,7 +762,7 @@ static TspdfReader *create_doc_from_pages(TspdfReader *src, const size_t *page_i
     }
 
     if (src->crypt) {
-        doc->crypt = clone_reader_crypt(src->crypt);
+        doc->crypt = tspdf_crypt_clone(src->crypt);
         if (!doc->crypt) {
             tspdf_arena_destroy(&doc->arena);
             free(doc);

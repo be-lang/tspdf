@@ -2399,6 +2399,14 @@ if command -v qpdf > /dev/null 2>&1; then
     qpdf --is-encrypted $TMPDIR/bm_enc.pdf
     qpdf --password=secret --check $TMPDIR/bm_enc.pdf > /dev/null
     $TSPDF bookmark list $TMPDIR/bm_enc.pdf --password secret | grep -q 'Intro'"
+  # nup builds its output from imported (decrypted) page copies rather than
+  # the shared source structure — it must still re-encrypt on save.
+  run_test "nup keeps encrypted input encrypted" bash -c "
+    set -e
+    $TSPDF nup 2 $FORM_ENC_PDF --password secret -o $TMPDIR/nup_enc.pdf
+    qpdf --is-encrypted $TMPDIR/nup_enc.pdf
+    qpdf --password=secret --check $TMPDIR/nup_enc.pdf > /dev/null
+    $TSPDF info $TMPDIR/nup_enc.pdf --password secret | grep -q 'Pages'"
   # decrypt is the explicit opt-out and must still write plaintext.
   run_test "decrypt still writes an unencrypted file" bash -c "
     set -e

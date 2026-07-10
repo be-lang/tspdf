@@ -145,12 +145,19 @@ TspdfReader *tspdf_reader_scale(TspdfReader *doc, const size_t *pages,
 TspdfReader *tspdf_reader_resize_to(TspdfReader *doc, const size_t *pages,
                                     size_t count, double target_w, double target_h,
                                     TspdfError *err);
+// Merge documents into one. EXCEPTION to the encryption-preserving save
+// below: the merged document is always UNENCRYPTED. Sources are decrypted
+// into a self-contained copy, and with several sources there is no single
+// /Encrypt dictionary (or file key) that could be carried over. Re-encrypt
+// the result with tspdf_reader_save_encrypted if it must stay protected.
 TspdfReader *tspdf_reader_merge(TspdfReader **docs, size_t count, TspdfError *err);
 
 // Save. A document opened with a password stays encrypted: the output reuses
 // the source's /Encrypt dictionary, file key and /ID, so the original user
-// and owner passwords keep working. Use TspdfSaveOptions.decrypt (or
-// tspdf_reader_save_encrypted with new passwords) to change that.
+// and owner passwords keep working. This includes documents derived from it
+// (extract, delete, rotate, nup, ...) — but NOT tspdf_reader_merge (see
+// above). Use TspdfSaveOptions.decrypt (or tspdf_reader_save_encrypted with
+// new passwords) to change that.
 TspdfError tspdf_reader_save(TspdfReader *doc, const char *path);
 TspdfError tspdf_reader_save_to_memory(TspdfReader *doc, uint8_t **out, size_t *out_len);
 
@@ -402,7 +409,8 @@ typedef struct {
 // top-to-bottom). The last sheet is partially filled when the page count is
 // not a multiple of n. Returns a new document (the source is unchanged), or
 // NULL with *err set. Only the imposed page content is preserved: bookmarks,
-// forms, and annotations are dropped.
+// forms, and annotations are dropped. An encrypted source's encryption is
+// preserved (the output saves encrypted with the original passwords).
 //
 // LIFETIME: the returned document is NOT self-contained — it references the
 // source's trailer, xref, and backing data until it is serialized. The SOURCE

@@ -85,6 +85,21 @@ assert.equal(t.pageCount(hm), N, 'merged page count');
 t.close(hm);
 await writeOut('out_backend_merged.pdf', merged);
 
+// The unlock tool must return a file that opens WITHOUT a password (a plain
+// save preserves the source encryption, so unlock needs the explicit opt-out).
+const henc = t.open(bytesA);
+const lockedBytes = t.encrypt(henc, 'backendpw', 'backendpw', 128);
+t.close(henc);
+const unlockRes = await backend.run('unlock', { password: 'backendpw' }, {
+  pdf_file: new File([lockedBytes], 'locked.pdf', { type: 'application/pdf' }),
+});
+if (!unlockRes.ok) assert.fail(`unlock failed: ${await unlockRes.text()}`);
+const unlocked = new Uint8Array(await unlockRes.arrayBuffer());
+const hun = t.open(unlocked); // throws if the output is still encrypted
+assert.ok(t.pageCount(hun) > 0, 'unlocked page count');
+t.close(hun);
+await writeOut('out_backend_unlocked.pdf', unlocked);
+
 // Unknown tools come back as a non-ok Response, not a throw.
 const bad = await backend.run('no-such-tool', {}, {});
 assert.equal(bad.ok, false, 'unknown tool must return a non-ok Response');
