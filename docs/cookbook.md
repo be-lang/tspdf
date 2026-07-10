@@ -150,8 +150,9 @@ tspdf compress --lossy scan.pdf -o small.pdf
 tspdf compress --lossy --image-dpi 100 --image-quality 60 scan.pdf -o tiny.pdf
 ```
 
-`--lossy` reduces image quality. Images with transparency, unusual color
-spaces, or already at or below the target dpi are left alone.
+`--lossy` reduces image quality. Images with transparency or unusual color
+spaces are left alone, as is anything within 1.3x of the target dpi (too
+close to be worth re-encoding).
 
 ## Read or update metadata
 

@@ -198,8 +198,9 @@ TspdfError tspdf_stream_decode(TspdfObj *stream_dict, const uint8_t *raw_data,
 
 // Box-filter downsample (arbitrary ratios >= 1, per channel, exact edge
 // weights). src is sw*sh*comps interleaved 8-bit pixels, dst dw*dh*comps.
-// dw/dh must not exceed sw/sh (this never upsamples).
-void tspdf_lossy_box_downsample(const uint8_t *src, uint32_t sw, uint32_t sh,
+// dw/dh must not exceed sw/sh (this never upsamples). Returns false on bad
+// arguments or allocation failure, leaving dst untouched.
+bool tspdf_lossy_box_downsample(const uint8_t *src, uint32_t sw, uint32_t sh,
                                 int comps, uint8_t *dst, uint32_t dw, uint32_t dh);
 
 // True when every RGB pixel has max(|R-G|,|R-B|,|G-B|) <= 8 (all pixels are
@@ -228,7 +229,8 @@ typedef struct {
 } TspdfLossyPlacement;
 
 // Scan all pages for image XObject placements. *out is malloc'd (caller
-// frees); *count 0 with *out NULL when no image is drawn.
+// frees); *count 0 with *out NULL when no image is drawn. Images with any
+// unmeasurable placement (q/Q nesting too deep to track) are excluded.
 TspdfError tspdf_lossy_scan_placements(TspdfReader *doc,
                                        TspdfLossyPlacement **out, size_t *count);
 

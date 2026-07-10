@@ -13162,7 +13162,7 @@ TEST(test_lossy_box_downsample_exact) {
     const uint8_t src[8] = { 10, 20, 100, 200,
                              30, 40, 100,   0 };
     uint8_t dst[2] = { 0xAA, 0xAA };
-    tspdf_lossy_box_downsample(src, 4, 2, 1, dst, 2, 1);
+    ASSERT(tspdf_lossy_box_downsample(src, 4, 2, 1, dst, 2, 1));
     ASSERT_EQ_INT(dst[0], 25);  // (10+20+30+40)/4
     ASSERT_EQ_INT(dst[1], 100); // (100+200+100+0)/4
 
@@ -13170,10 +13170,15 @@ TEST(test_lossy_box_downsample_exact) {
     const uint8_t rgb[12] = { 0,0,255,  100,50,255,
                               200,150,255, 100,200,255 };
     uint8_t d1[3] = {0};
-    tspdf_lossy_box_downsample(rgb, 2, 2, 3, d1, 1, 1);
+    ASSERT(tspdf_lossy_box_downsample(rgb, 2, 2, 3, d1, 1, 1));
     ASSERT_EQ_INT(d1[0], 100); // (0+100+200+100)/4
     ASSERT_EQ_INT(d1[1], 100); // (0+50+150+200)/4
     ASSERT_EQ_INT(d1[2], 255);
+
+    // Invalid arguments report failure instead of silently doing nothing.
+    ASSERT(!tspdf_lossy_box_downsample(NULL, 4, 2, 1, dst, 2, 1));
+    ASSERT(!tspdf_lossy_box_downsample(src, 4, 2, 1, dst, 0, 1));
+    ASSERT(!tspdf_lossy_box_downsample(src, 4, 2, 0, dst, 2, 1));
 }
 
 TEST(test_lossy_box_downsample_fractional_edges) {
@@ -13675,6 +13680,182 @@ TEST(test_lossy_skips_low_dpi_smask_and_small) {
     free(pixels);
 }
 
+// Like lossy_make_image_pdf but with caller-supplied page content.
+static uint8_t *lossy_make_content_image_pdf(const uint8_t *img, size_t img_len,
+                                             const char *img_extra, int w, int h,
+                                             const char *cs, const char *content,
+                                             size_t *out_len) {
+    size_t content_len = strlen(content);
+    size_t cap = img_len + content_len + 4096;
+    uint8_t *pdf = (uint8_t *)malloc(cap);
+    if (!pdf) return NULL;
+    size_t pos = 0;
+    size_t off[7] = {0};
+    char head[512];
+
+#define LPUT(...) do { \
+        int _n = snprintf(head, sizeof(head), __VA_ARGS__); \
+        if (_n < 0 || (size_t)_n >= sizeof(head) || pos + (size_t)_n > cap) goto fail; \
+        memcpy(pdf + pos, head, (size_t)_n); \
+        pos += (size_t)_n; \
+    } while (0)
+
+    LPUT("%%PDF-1.5\n%%\xE2\xE3\xCF\xD3\n");
+    off[1] = pos;
+    LPUT("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    off[2] = pos;
+    LPUT("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    off[3] = pos;
+    LPUT("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+         "/Resources << /XObject << /Im1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n");
+    off[4] = pos;
+    LPUT("4 0 obj\n<< /Type /XObject /Subtype /Image /Width %d /Height %d "
+         "/ColorSpace /%s /BitsPerComponent 8 %s /Length %zu >>\nstream\n",
+         w, h, cs, img_extra ? img_extra : "", img_len);
+    if (pos + img_len > cap) goto fail;
+    memcpy(pdf + pos, img, img_len);
+    pos += img_len;
+    LPUT("\nendstream\nendobj\n");
+    off[5] = pos;
+    LPUT("5 0 obj\n<< /Length %zu >>\nstream\n", content_len);
+    if (pos + content_len > cap) goto fail;
+    memcpy(pdf + pos, content, content_len);
+    pos += content_len;
+    LPUT("\nendstream\nendobj\n");
+
+    {
+        size_t xref = pos;
+        LPUT("xref\n0 6\n0000000000 65535 f \n");
+        for (int i = 1; i <= 5; i++) LPUT("%010zu 00000 n \n", off[i]);
+        LPUT("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n%zu\n%%%%EOF", xref);
+    }
+#undef LPUT
+
+    *out_len = pos;
+    return pdf;
+fail:
+    free(pdf);
+    return NULL;
+}
+
+// "q 500 0 0 500 0 0 cm" then nq bare q's, nq Q's, then "/Im1 Do Q": the
+// image is placed at 500x500 pt however deep the q/Q nesting goes.
+static char *lossy_deepq_content(int nq) {
+    size_t cap = 32 + (size_t)nq * 4 + 16;
+    char *c = (char *)malloc(cap);
+    if (!c) return NULL;
+    size_t pos = (size_t)snprintf(c, cap, "q 500 0 0 500 0 0 cm ");
+    for (int i = 0; i < nq; i++) { c[pos++] = 'q'; c[pos++] = ' '; }
+    for (int i = 0; i < nq; i++) { c[pos++] = 'Q'; c[pos++] = ' '; }
+    memcpy(c + pos, "/Im1 Do Q", sizeof("/Im1 Do Q"));
+    return c;
+}
+
+TEST(test_lossy_deep_q_nesting_measured_at_outer_ctm) {
+    // Reviewer repro: q <big cm>, 100 nested q's, 100 Q's, then Do. The Do
+    // still happens under the 500x500 cm; a bounded gstate stack that drops
+    // saves but pops on Q restores the identity CTM too early and measures
+    // the image at 1x1 pt, shrinking a real 512x512 image to nearly nothing.
+    enum { W = 512, H = 512 };
+    uint8_t *pixels = (uint8_t *)malloc((size_t)W * H);
+    ASSERT(pixels != NULL);
+    for (size_t i = 0; i < (size_t)W * H; i++) pixels[i] = (uint8_t)(i * 7);
+    size_t comp_len = 0;
+    uint8_t *comp = deflate_compress(pixels, (size_t)W * H, &comp_len);
+    free(pixels);
+    ASSERT(comp != NULL);
+
+    char *content = lossy_deepq_content(100);
+    ASSERT(content != NULL);
+    size_t len = 0;
+    uint8_t *pdf = lossy_make_content_image_pdf(comp, comp_len,
+                                                "/Filter /FlateDecode",
+                                                W, H, "DeviceGray", content, &len);
+    free(content);
+    free(comp);
+    ASSERT(pdf != NULL);
+
+    TspdfError err = TSPDF_OK;
+    TspdfReader *doc = tspdf_reader_open(pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    // The scan must see the true 500x500 pt placement.
+    TspdfLossyPlacement *pl = NULL;
+    size_t n = 0;
+    ASSERT_EQ_INT(tspdf_lossy_scan_placements(doc, &pl, &n), TSPDF_OK);
+    const TspdfLossyPlacement *im = lossy_find_placement(pl, n, 4);
+    ASSERT(im != NULL);
+    ASSERT(im->w_pt > 499.9 && im->w_pt < 500.1);
+    ASSERT(im->h_pt > 499.9 && im->h_pt < 500.1);
+    free(pl);
+
+    // 512 px over 500 pt is ~74 dpi, well under the 150-dpi target: the
+    // lossy pass must leave the image alone, never shrink it.
+    TspdfLossyStats st = {0};
+    ASSERT_EQ_INT(tspdf_reader_lossy_images(doc, 150, 75, &st), TSPDF_OK);
+    ASSERT_EQ_SIZE(st.images_recompressed, 0);
+    TspdfObj *img_obj = lossy_get_image_obj(doc);
+    ASSERT(img_obj != NULL);
+    TspdfObj *wobj = tspdf_dict_get(img_obj->stream.dict, "Width");
+    ASSERT(wobj && wobj->integer == W);
+    TspdfObj *filter = tspdf_dict_get(img_obj->stream.dict, "Filter");
+    ASSERT(filter && filter->type == TSPDF_OBJ_NAME);
+    ASSERT_EQ_STR((const char *)filter->string.data, "FlateDecode");
+
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_lossy_gstate_overflow_skips_image) {
+    // Nesting past any sane depth (deeper than the gstate stack will grow):
+    // the CTM is no longer trustworthy, so the image must be treated as
+    // unmeasurable and skipped -- never downsampled.
+    enum { W = 512, H = 512 };
+    uint8_t *pixels = (uint8_t *)malloc((size_t)W * H);
+    ASSERT(pixels != NULL);
+    for (size_t i = 0; i < (size_t)W * H; i++) pixels[i] = (uint8_t)(i * 7);
+    size_t comp_len = 0;
+    uint8_t *comp = deflate_compress(pixels, (size_t)W * H, &comp_len);
+    free(pixels);
+    ASSERT(comp != NULL);
+
+    char *content = lossy_deepq_content(5000);
+    ASSERT(content != NULL);
+    size_t len = 0;
+    uint8_t *pdf = lossy_make_content_image_pdf(comp, comp_len,
+                                                "/Filter /FlateDecode",
+                                                W, H, "DeviceGray", content, &len);
+    free(content);
+    free(comp);
+    ASSERT(pdf != NULL);
+
+    TspdfError err = TSPDF_OK;
+    TspdfReader *doc = tspdf_reader_open(pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    // Unmeasurable: excluded from the placement list entirely.
+    TspdfLossyPlacement *pl = NULL;
+    size_t n = 0;
+    ASSERT_EQ_INT(tspdf_lossy_scan_placements(doc, &pl, &n), TSPDF_OK);
+    ASSERT(lossy_find_placement(pl, n, 4) == NULL);
+    free(pl);
+
+    // And the lossy pass leaves the stream byte-for-byte in place.
+    TspdfLossyStats st = {0};
+    ASSERT_EQ_INT(tspdf_reader_lossy_images(doc, 150, 75, &st), TSPDF_OK);
+    ASSERT_EQ_SIZE(st.images_recompressed, 0);
+    TspdfObj *img_obj = lossy_get_image_obj(doc);
+    ASSERT(img_obj != NULL);
+    TspdfObj *wobj = tspdf_dict_get(img_obj->stream.dict, "Width");
+    ASSERT(wobj && wobj->integer == W);
+    TspdfObj *filter = tspdf_dict_get(img_obj->stream.dict, "Filter");
+    ASSERT(filter && filter->type == TSPDF_OBJ_NAME);
+    ASSERT_EQ_STR((const char *)filter->string.data, "FlateDecode");
+
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
 TEST(test_lossy_invalid_args_rejected) {
     size_t len = 0;
     char *pdf = lossy_make_ctm_pdf(&len);
@@ -14087,6 +14268,8 @@ int main(void) {
     RUN(test_lossy_predictor15_flate_image_recompressed);
     RUN(test_lossy_rgb_near_gray_converts_to_devicegray);
     RUN(test_lossy_skips_low_dpi_smask_and_small);
+    RUN(test_lossy_deep_q_nesting_measured_at_outer_ctm);
+    RUN(test_lossy_gstate_overflow_skips_image);
     RUN(test_lossy_invalid_args_rejected);
 
     printf("\n%d tests, %d passed, %d failed\n",

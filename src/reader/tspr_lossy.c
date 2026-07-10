@@ -18,6 +18,12 @@
 //  - Multiple placements: the largest rendered extent per axis wins (the
 //    placement needing the most pixels). Images never drawn are skipped.
 //  - /UserUnit is ignored (rare; would only make us keep more pixels).
+//  - Only page /Contents (and Form XObjects reached from them) are scanned.
+//    Annotation appearance streams, tiling patterns, and Type3 CharProcs are
+//    not, so images drawn only there count as never drawn and are left
+//    untouched; but an image drawn both on a page and larger inside an
+//    annotation appearance could be downsampled to the page extent
+//    (accepted limitation).
 
 #include "tspr_internal.h"
 #include "../image/jpeg_codec.h"
@@ -27,10 +33,10 @@
 
 // --- Pure pixel helpers (unit-tested directly) ---
 
-void tspdf_lossy_box_downsample(const uint8_t *src, uint32_t sw, uint32_t sh,
+bool tspdf_lossy_box_downsample(const uint8_t *src, uint32_t sw, uint32_t sh,
                                 int comps, uint8_t *dst, uint32_t dw, uint32_t dh) {
     if (!src || !dst || sw == 0 || sh == 0 || dw == 0 || dh == 0 || comps <= 0)
-        return;
+        return false;
     if (dw > sw) dw = sw;  // this filter never upsamples
     if (dh > sh) dh = sh;
 
@@ -45,7 +51,7 @@ void tspdf_lossy_box_downsample(const uint8_t *src, uint32_t sw, uint32_t sh,
     if (!hacc || !acc) {
         free(hacc);
         free(acc);
-        return;
+        return false;
     }
 
     const double inv_area = 1.0 / (xs * ys);
@@ -115,6 +121,7 @@ void tspdf_lossy_box_downsample(const uint8_t *src, uint32_t sw, uint32_t sh,
 
     free(hacc);
     free(acc);
+    return true;
 }
 
 bool tspdf_lossy_rgb_is_gray(const uint8_t *rgb, size_t npix) {
@@ -193,11 +200,13 @@ static LossyMat lossy_mat_mul(LossyMat m, LossyMat n) {
 typedef struct {
     double w_pt, h_pt;
     bool drawn;
+    bool lost;  // drawn while the CTM was untracked: never downsample
 } LossyUse;
 
 #define LOSSY_MAX_DEPTH 8       // Form XObject recursion cap
 #define LOSSY_OP_STACK 8        // operands kept for cm/Do
-#define LOSSY_GS_STACK 64       // q/Q nesting kept exactly
+#define LOSSY_GS_STACK 64       // initial q/Q save-stack capacity (heap-grown)
+#define LOSSY_GS_MAX 4096       // growth cap; deeper nesting loses CTM tracking
 #define LOSSY_CONTENT_MAX (64u << 20)
 
 typedef struct {
@@ -304,10 +313,11 @@ static void lossy_skip_inline_image(TspdfParser *p) {
 }
 
 static void lossy_interpret(LossyCtx *ctx, const uint8_t *data, size_t len,
-                            LossyMat ctm, TspdfObj *resources, int depth);
+                            LossyMat ctm, TspdfObj *resources, int depth,
+                            bool ctm_lost);
 
 static void lossy_do_xobject(LossyCtx *ctx, LossyMat ctm, TspdfObj *resources,
-                             const TspdfObj *name, int depth) {
+                             const TspdfObj *name, int depth, bool ctm_lost) {
     if (!resources || !name || name->type != TSPDF_OBJ_NAME) return;
     TspdfObj *xobjs = lossy_resolve(ctx, tspdf_dict_get(resources, "XObject"));
     if (!xobjs || xobjs->type != TSPDF_OBJ_DICT) return;
@@ -320,11 +330,18 @@ static void lossy_do_xobject(LossyCtx *ctx, LossyMat ctm, TspdfObj *resources,
 
     if (strcmp((const char *)sub->string.data, "Image") == 0) {
         if (num == 0 || num >= ctx->doc->xref.count) return;
+        LossyUse *u = &ctx->use[num];
+        if (ctm_lost) {
+            // The CTM is untrustworthy (q nesting outgrew the save stack):
+            // this placement is unmeasurable, so the image must never be
+            // downsampled, no matter what other placements measured.
+            u->lost = true;
+            return;
+        }
         // The image fills the unit square under the CTM; the rendered size
         // in points is the length of the transformed basis vectors.
         double w = hypot(ctm.a, ctm.b);
         double h = hypot(ctm.c, ctm.d);
-        LossyUse *u = &ctx->use[num];
         if (w > u->w_pt) u->w_pt = w;
         if (h > u->h_pt) u->h_pt = h;
         u->drawn = true;
@@ -354,20 +371,30 @@ static void lossy_do_xobject(LossyCtx *ctx, LossyMat ctm, TspdfObj *resources,
         }
         TspdfObj *sub_res = lossy_resolve(ctx, tspdf_dict_get(xo->stream.dict, "Resources"));
         if (!sub_res || sub_res->type != TSPDF_OBJ_DICT) sub_res = resources;
-        lossy_interpret(ctx, bytes, blen, sub_ctm, sub_res, depth + 1);
+        lossy_interpret(ctx, bytes, blen, sub_ctm, sub_res, depth + 1, ctm_lost);
         free(bytes);
     }
     ctx->form_stack[depth + 1] = NULL;
 }
 
 static void lossy_interpret(LossyCtx *ctx, const uint8_t *data, size_t len,
-                            LossyMat ctm, TspdfObj *resources, int depth) {
+                            LossyMat ctm, TspdfObj *resources, int depth,
+                            bool ctm_lost) {
     TspdfParser p;
     tspdf_parser_init(&p, data, len, &ctx->scratch);
     TspdfObj *stk[LOSSY_OP_STACK];
     int ns = 0;
-    LossyMat gstack[LOSSY_GS_STACK];
-    int ngs = 0;
+    // q/Q save stack: starts on the C stack, grows on the heap up to
+    // LOSSY_GS_MAX. If nesting goes deeper still (or the realloc fails),
+    // ctm_lost is set for the rest of this content stream: an unmatched Q
+    // would otherwise restore an ancestor CTM too early and make a large
+    // image look tiny, so from then on every image Do is marked
+    // unmeasurable and skipped instead.
+    LossyMat gs_fixed[LOSSY_GS_STACK];
+    LossyMat *gstack = gs_fixed;
+    LossyMat *gs_heap = NULL;
+    size_t gs_cap = LOSSY_GS_STACK;
+    size_t ngs = 0;
 
     while (1) {
         tspdf_skip_whitespace(&p);
@@ -421,9 +448,23 @@ static void lossy_interpret(LossyCtx *ctx, const uint8_t *data, size_t len,
         }
 
         if (strcmp(op, "q") == 0) {
-            if (ngs < LOSSY_GS_STACK) gstack[ngs++] = ctm;
+            if (!ctm_lost && ngs == gs_cap) {
+                LossyMat *nh = NULL;
+                size_t ncap = gs_cap * 2;
+                if (ncap <= LOSSY_GS_MAX)
+                    nh = (LossyMat *)realloc(gs_heap, ncap * sizeof(LossyMat));
+                if (nh) {
+                    if (!gs_heap) memcpy(nh, gs_fixed, sizeof(gs_fixed));
+                    gs_heap = nh;
+                    gstack = nh;
+                    gs_cap = ncap;
+                } else {
+                    ctm_lost = true;  // too deep / OOM: stop trusting the CTM
+                }
+            }
+            if (!ctm_lost) gstack[ngs++] = ctm;
         } else if (strcmp(op, "Q") == 0) {
-            if (ngs > 0) ctm = gstack[--ngs];
+            if (!ctm_lost && ngs > 0) ctm = gstack[--ngs];
         } else if (strcmp(op, "cm") == 0 && ns >= 6) {
             LossyMat m;
             m.a = lossy_obj_num(stk[ns - 6]);
@@ -434,13 +475,14 @@ static void lossy_interpret(LossyCtx *ctx, const uint8_t *data, size_t len,
             m.f = lossy_obj_num(stk[ns - 1]);
             ctm = lossy_mat_mul(m, ctm);
         } else if (strcmp(op, "Do") == 0 && ns >= 1) {
-            lossy_do_xobject(ctx, ctm, resources, stk[ns - 1], depth);
+            lossy_do_xobject(ctx, ctm, resources, stk[ns - 1], depth, ctm_lost);
         } else if (strcmp(op, "BI") == 0) {
             lossy_skip_inline_image(&p);
         }
         // every other operator: irrelevant to image placement
         ns = 0;
     }
+    free(gs_heap);
 }
 
 // Page /Resources with Pages-tree inheritance via the /Parent chain.
@@ -529,15 +571,18 @@ TspdfError tspdf_lossy_scan_placements(TspdfReader *doc,
         size_t clen = 0;
         uint8_t *content = lossy_page_content(&ctx, page, &clen);
         if (content) {
-            lossy_interpret(&ctx, content, clen, LOSSY_IDENTITY, res, 0);
+            lossy_interpret(&ctx, content, clen, LOSSY_IDENTITY, res, 0, false);
             free(content);
         }
         tspdf_arena_reset(&ctx.scratch);
     }
 
+    // An image with any unmeasurable placement (ctx.use[i].lost) is excluded
+    // entirely: downsizing it to some other, smaller placement could destroy
+    // the placement we could not measure.
     size_t n = 0;
     for (size_t i = 0; i < doc->xref.count; i++)
-        if (ctx.use[i].drawn) n++;
+        if (ctx.use[i].drawn && !ctx.use[i].lost) n++;
 
     if (n > 0) {
         TspdfLossyPlacement *pl =
@@ -549,7 +594,7 @@ TspdfError tspdf_lossy_scan_placements(TspdfReader *doc,
         }
         size_t j = 0;
         for (size_t i = 0; i < doc->xref.count; i++) {
-            if (!ctx.use[i].drawn) continue;
+            if (!ctx.use[i].drawn || ctx.use[i].lost) continue;
             pl[j].obj_num = (uint32_t)i;
             pl[j].w_pt = ctx.use[i].w_pt;
             pl[j].h_pt = ctx.use[i].h_pt;
@@ -780,9 +825,9 @@ static bool lossy_process_image(LossyCtx *ctx, uint32_t obj_num,
     if (ok) {
         uint8_t *down = (uint8_t *)tspdf_arena_alloc(&work,
                                                      (size_t)dw * dh * (unsigned)comps);
-        if (down) {
-            tspdf_lossy_box_downsample(pixels, w, h, comps, down, dw, dh);
-
+        // On downsample failure (allocation) keep the original image: `down`
+        // holds uninitialized arena bytes and must never reach the encoder.
+        if (down && tspdf_lossy_box_downsample(pixels, w, h, comps, down, dw, dh)) {
             TspdfRawImage out_img;
             out_img.width = (int)dw;
             out_img.height = (int)dh;
