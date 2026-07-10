@@ -7,6 +7,13 @@
 // operate on readers. We seed the output reader from the source's structure
 // (sharing its data buffer, xref and a stripped catalog copy) so that object
 // numbering works — new objects are numbered from src->xref.count upward — then
+//
+// LIFETIME: the returned document is NOT self-contained. It references the
+// source's trailer, xref and backing data until it is serialized, so the SOURCE
+// MUST OUTLIVE the returned document until that document is saved; destroying
+// the source first is a use-after-free. The tspdf CLI observes this order
+// (nup -> save -> destroy source).
+//
 // REPLACE the page list with freshly registered blank sheet page dicts. Each
 // selected source page is imported as a self-contained /Form XObject (which
 // decrypts encrypted sources and bounds hostile resource cycles) and placed in

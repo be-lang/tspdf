@@ -303,10 +303,15 @@ typedef struct {
 // selected source page is placed in a grid cell, scaled to fit while
 // preserving aspect ratio and centered, in reading order (left-to-right,
 // top-to-bottom). The last sheet is partially filled when the page count is
-// not a multiple of n. Returns a new self-contained document (the source is
-// unchanged and may be destroyed afterwards), or NULL with *err set. Only the
-// imposed page content is preserved: bookmarks, forms, and annotations are
-// dropped.
+// not a multiple of n. Returns a new document (the source is unchanged), or
+// NULL with *err set. Only the imposed page content is preserved: bookmarks,
+// forms, and annotations are dropped.
+//
+// LIFETIME: the returned document is NOT self-contained — it references the
+// source's trailer, xref, and backing data until it is serialized. The SOURCE
+// MUST OUTLIVE the returned document until that document is saved; destroying
+// the source first is a use-after-free. Order: nup -> save -> then destroy the
+// source. (The tspdf CLI follows this order.)
 TspdfReader *tspdf_reader_nup(TspdfReader *src, const TspdfNupOptions *opts,
                               TspdfError *err);
 

@@ -6393,6 +6393,46 @@ TEST(test_nup_cyclic_resources_bounded) {
     free(src_data);
 }
 
+// Codifies the documented lifetime contract: the nup output is NOT
+// self-contained, so the supported order is nup -> save -> THEN destroy the
+// source. (Destroying the source before saving would be a use-after-free and is
+// intentionally not exercised.) Runs clean under ASan.
+TEST(test_nup_source_outlives_output_until_saved) {
+    size_t src_len = 0;
+    uint8_t *src_data = make_multipage_text_pdf(4, &src_len);
+    ASSERT(src_data != NULL);
+
+    TspdfError err = TSPDF_OK;
+    TspdfReader *src = tspdf_reader_open(src_data, src_len, &err);
+    ASSERT(src != NULL);
+
+    TspdfNupOptions opts = {0};
+    opts.n = 4;
+    opts.size = TSPDF_NUP_SIZE_A4;
+    TspdfReader *out = tspdf_reader_nup(src, &opts, &err);
+    ASSERT(out != NULL);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    // Save while the source is still alive (the output references it).
+    uint8_t *bytes = NULL;
+    size_t bytes_len = 0;
+    err = tspdf_reader_save_to_memory(out, &bytes, &bytes_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(bytes_len > 0);
+
+    // Only now may the source be destroyed.
+    tspdf_reader_destroy(out);
+    tspdf_reader_destroy(src);
+    free(src_data);
+
+    // The saved bytes are self-contained and reopen without the source.
+    TspdfReader *re = tspdf_reader_open(bytes, bytes_len, &err);
+    ASSERT(re != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(re), 1);
+    tspdf_reader_destroy(re);
+    free(bytes);
+}
+
 // --- Annotation tests ---
 
 TEST(test_add_link_annotation) {
@@ -11446,6 +11486,7 @@ int main(void) {
     RUN(test_nup_aspect_ratio_uniform_scale);
     RUN(test_nup_frame_draws_border);
     RUN(test_nup_cyclic_resources_bounded);
+    RUN(test_nup_source_outlives_output_until_saved);
 
     printf("\n  Annotations:\n");
     RUN(test_add_link_annotation);
