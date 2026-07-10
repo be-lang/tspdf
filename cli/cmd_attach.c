@@ -11,9 +11,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <sys/stat.h>
 
 static void attach_usage(void) {
-    printf("Usage: tspdf attach add <input.pdf> <file> [<file2> ...] [--desc <text>] -o <output.pdf>\n");
+    printf("Usage: tspdf attach add <input.pdf> <file> [<file2> ...] [--desc <text>] [--mime <type>] -o <output.pdf>\n");
     printf("       tspdf attach list <input.pdf> [--json]\n");
     printf("       tspdf attach extract <input.pdf> [--name <name> | --all] [-o <dir>]\n");
     printf("       tspdf attach remove <input.pdf> --name <name> -o <output.pdf>\n");
@@ -23,6 +25,8 @@ static void attach_usage(void) {
     printf("Arguments:\n");
     printf("  add <file> [...]          Files to embed (stored under their base names)\n");
     printf("  --desc <text>             Description stored with each added file\n");
+    printf("  --mime <type>             MIME type stored with each added file\n");
+    printf("                            (default: derived from the file extension)\n");
     printf("  list --json               Machine-readable listing\n");
     printf("  extract --name <name>     Extract one attachment by stored name\n");
     printf("  extract --all             Extract every attachment (default)\n");
@@ -90,6 +94,29 @@ static const char *attach_base_name(const char *path) {
     return base;
 }
 
+// MIME type for an added file, from its extension (case-insensitive).
+// Anything unrecognized is application/octet-stream.
+static const char *attach_mime_for(const char *name) {
+    static const struct { const char *ext, *mime; } map[] = {
+        {"txt",  "text/plain"},
+        {"pdf",  "application/pdf"},
+        {"csv",  "text/csv"},
+        {"json", "application/json"},
+        {"xml",  "application/xml"},
+        {"png",  "image/png"},
+        {"jpg",  "image/jpeg"},
+        {"jpeg", "image/jpeg"},
+        {"zip",  "application/zip"},
+    };
+    const char *dot = strrchr(name, '.');
+    if (dot && dot[1] != '\0') {
+        for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
+            if (strcasecmp(dot + 1, map[i].ext) == 0) return map[i].mime;
+        }
+    }
+    return "application/octet-stream";
+}
+
 // Reduce a stored attachment name to a safe file name inside the target
 // directory: last path component only, and never empty or a dot name.
 static const char *attach_sanitize_name(const char *stored) {
@@ -118,6 +145,7 @@ static int attach_add(int argc, char **argv) {
         return 1;
     }
     const char *desc = find_flag(argc, argv, "--desc");
+    const char *mime_override = find_flag(argc, argv, "--mime");
 
     TspdfReader *doc = attach_open(argc, argv, input);
     if (!doc) return 1;
@@ -136,7 +164,14 @@ static int attach_add(int argc, char **argv) {
             tspdf_reader_destroy(doc);
             return 1;
         }
-        TspdfError err = tspdf_reader_attachment_add(doc, name, data, len, desc);
+        // File metadata for /Params and /Subtype: modification time from the
+        // source file, MIME type from --mime or the extension.
+        struct stat st;
+        int64_t mtime = 0;
+        if (stat(positional[i], &st) == 0) mtime = (int64_t)st.st_mtime;
+        const char *mime = mime_override ? mime_override : attach_mime_for(name);
+        TspdfError err = tspdf_reader_attachment_add_ex(doc, name, data, len,
+                                                        desc, mime, mtime);
         free(data);
         if (err != TSPDF_OK) {
             fprintf(stderr, "tspdf attach add: failed to attach '%s': %s\n",

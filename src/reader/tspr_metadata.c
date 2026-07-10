@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "tspr_internal.h"
+#include "tspr_doctree.h"
 #include "../util/pdftext.h"
 #include <stdlib.h>
 #include <string.h>
@@ -43,6 +44,24 @@ const char *tspdf_reader_get_creator(const TspdfReader *doc) { return get_info_f
 const char *tspdf_reader_get_producer(const TspdfReader *doc) { return get_info_field(doc, "Producer"); }
 const char *tspdf_reader_get_creation_date(const TspdfReader *doc) { return get_info_field(doc, "CreationDate"); }
 const char *tspdf_reader_get_mod_date(const TspdfReader *doc) { return get_info_field(doc, "ModDate"); }
+
+// True when the catalog carries an XMP metadata stream. The Info setters
+// below never touch it, so callers use this to warn about stale XMP values.
+bool tspdf_reader_has_xmp_metadata(TspdfReader *doc) {
+    if (!doc) return false;
+    TspdfParser parser;
+    tspdf_parser_init(&parser, doc->data, doc->data_len, &doc->arena);
+    TspdfObj *catalog = doc->catalog && doc->catalog->type == TSPDF_OBJ_DICT
+        ? doc->catalog
+        : (doc->xref.trailer
+               ? tspdf_doctree_resolve(doc, &parser,
+                                       tspdf_dict_get(doc->xref.trailer, "Root"))
+               : NULL);
+    if (!catalog || catalog->type != TSPDF_OBJ_DICT) return false;
+    TspdfObj *meta = tspdf_doctree_resolve(doc, &parser,
+                                           tspdf_dict_get(catalog, "Metadata"));
+    return meta && meta->type == TSPDF_OBJ_STREAM;
+}
 
 static void ensure_metadata(TspdfReader *doc) {
     if (!doc->metadata) {

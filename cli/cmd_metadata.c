@@ -130,6 +130,13 @@ int cmd_metadata(int argc, char **argv) {
         }
     }
 
+    // The Info-dict edit leaves any XMP metadata stream untouched, and some
+    // viewers (Acrobat) prefer XMP over /Info. Say so once on stderr.
+    if (tspdf_reader_has_xmp_metadata(doc)) {
+        fprintf(stderr, "note: XMP metadata present and not updated; viewers "
+                        "preferring XMP may show old values\n");
+    }
+
     err = tspdf_reader_save(doc, output);
     if (err != TSPDF_OK) {
         fprintf(stderr, "tspdf metadata: failed to save '%s': %s\n", output, tspdf_error_string(err));

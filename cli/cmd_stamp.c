@@ -4,6 +4,7 @@
 // centered), compensating a page-level /Rotate so the stamp reads upright.
 
 #include "commands.h"
+#include "password_input.h"
 #include "../include/tspdf_overlay.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,11 +29,15 @@ void tspdf_cli_emit_rotate_compensation(TspdfStream *s, int rot, double cx, doub
 static void print_stamp_help(void) {
     printf("Usage: tspdf stamp <input.pdf> --stamp <stamp.pdf> -o <output.pdf>\n");
     printf("                   [--pages <range>] [--under] [--stamp-page N]\n");
-    printf("                   [--password <pass>] [--stamp-password <pass>]\n");
+    printf("                   [--password <pass> | --password-file <path>]\n");
+    printf("                   [--stamp-password <pass> | --stamp-password-file <path>]\n");
     printf("\nOverlay a page of stamp.pdf onto pages of input.pdf.\n");
     printf("The stamp page is scaled to fit each target page (aspect preserved,\n");
     printf("centered). By default it is drawn on top of the existing content;\n");
     printf("--under puts it beneath instead (a letterhead/background).\n");
+    printf("--password unlocks an encrypted input, --stamp-password an encrypted\n");
+    printf("stamp file; the *-file variants read the first line of a file\n");
+    printf("('-' reads stdin) so the password stays out of argv.\n");
 }
 
 int cmd_stamp(int argc, char **argv) {
@@ -77,8 +82,18 @@ int cmd_stamp(int argc, char **argv) {
     }
 
     bool under = has_flag(argc, argv, "--under");
-    const char *password = find_flag(argc, argv, "--password");
-    const char *stamp_password = find_flag(argc, argv, "--stamp-password");
+    static char pwbuf[TSPDF_PASSWORD_MAX];
+    static char stamp_pwbuf[TSPDF_PASSWORD_MAX];
+    const char *password = tspdf_resolve_password(argc, argv,
+                                                  "--password", "--password-file",
+                                                  "stamp", "Password: ",
+                                                  false, pwbuf, sizeof(pwbuf));
+    const char *stamp_password = tspdf_resolve_password(argc, argv,
+                                                        "--stamp-password",
+                                                        "--stamp-password-file",
+                                                        "stamp", "Stamp password: ",
+                                                        false, stamp_pwbuf,
+                                                        sizeof(stamp_pwbuf));
 
     size_t sel_count = 0;
     size_t *sel = NULL;
@@ -96,7 +111,13 @@ int cmd_stamp(int argc, char **argv) {
         ? tspdf_reader_open_file_with_password(input, password, &err)
         : tspdf_reader_open_file(input, &err);
     if (!doc) {
-        fprintf(stderr, "tspdf stamp: failed to open '%s': %s\n", input, tspdf_error_string(err));
+        if (err == TSPDF_ERR_ENCRYPTED) {
+            fprintf(stderr, "tspdf stamp: '%s' is encrypted; use --password or "
+                            "--password-file\n", input);
+        } else {
+            fprintf(stderr, "tspdf stamp: failed to open '%s': %s\n", input,
+                    tspdf_error_string(err));
+        }
         free(sel);
         return 1;
     }
@@ -117,7 +138,13 @@ int cmd_stamp(int argc, char **argv) {
         ? tspdf_reader_open_file_with_password(stamp_path, stamp_password, &err)
         : tspdf_reader_open_file(stamp_path, &err);
     if (!stamp_doc) {
-        fprintf(stderr, "tspdf stamp: failed to open '%s': %s\n", stamp_path, tspdf_error_string(err));
+        if (err == TSPDF_ERR_ENCRYPTED) {
+            fprintf(stderr, "tspdf stamp: '%s' is encrypted; use --stamp-password "
+                            "or --stamp-password-file\n", stamp_path);
+        } else {
+            fprintf(stderr, "tspdf stamp: failed to open '%s': %s\n", stamp_path,
+                    tspdf_error_string(err));
+        }
         tspdf_reader_destroy(doc);
         free(sel);
         return 1;

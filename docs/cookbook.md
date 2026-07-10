@@ -21,6 +21,13 @@ tspdf split report.pdf --pages 1-5,9 -o extracted.pdf
 tspdf split report.pdf -o page.pdf
 ```
 
+Embedded file attachments are copied into every output. Add
+`--no-attachments` to drop them instead:
+
+```bash
+tspdf split report.pdf --no-attachments -o page.pdf
+```
+
 ## Stamp page numbers
 
 ```bash
@@ -109,6 +116,11 @@ tspdf stamp report.pdf --stamp letterhead.pdf --under -o out.pdf
 
 # only page 1, using page 2 of the stamp file
 tspdf stamp report.pdf --stamp marks.pdf --stamp-page 2 --pages 1 -o out.pdf
+
+# encrypted input or stamp file: --password / --stamp-password, or read the
+# password from a file so it stays out of the process list
+tspdf stamp locked.pdf --stamp approved.pdf --password-file pw.txt -o out.pdf
+tspdf stamp report.pdf --stamp locked-stamp.pdf --stamp-password-file pw.txt -o out.pdf
 ```
 
 ## Place multiple pages per sheet (N-up)
@@ -167,6 +179,10 @@ tspdf metadata report.pdf \
   -o report-updated.pdf
 ```
 
+This edits the Info dictionary. If the document also carries XMP metadata,
+the XMP stream is left as-is and tspdf prints a notice, because some viewers
+(Acrobat among them) show the XMP values instead.
+
 ## Edit bookmarks (outline)
 
 ```bash
@@ -183,12 +199,19 @@ tspdf bookmark list report.pdf --json
 printf '1\t1\tIntroduction\n2\t2\tBackground\n1\t5\tResults\n' > toc.txt
 tspdf bookmark import report.pdf --from toc.txt -o outlined.pdf
 
+# add the imported entries after the existing outline instead of replacing it
+tspdf bookmark import report.pdf --from extra.txt --append -o outlined.pdf
+
 # append a single bookmark
 tspdf bookmark add report.pdf --title "Appendix" --page 12 --level 1 -o outlined.pdf
 
 # remove all bookmarks
 tspdf bookmark clear report.pdf -o plain.pdf
 ```
+
+`bookmark add` and `bookmark import --append` leave the existing entries
+untouched: destinations (scroll position, zoom, view type), link actions,
+colors, styles, and collapsed state all carry over.
 
 `bookmark list` prints the exact format `bookmark import` reads, so you can
 list, edit, and re-import:
@@ -197,6 +220,22 @@ list, edit, and re-import:
 tspdf bookmark list report.pdf > toc.txt
 $EDITOR toc.txt
 tspdf bookmark import report.pdf --from toc.txt -o report-new.pdf
+```
+
+## Embed file attachments
+
+```bash
+# embed files (stored under their base names, with size, modification date,
+# checksum, and a MIME type from the extension)
+tspdf attach add report.pdf data.csv notes.txt -o bundled.pdf
+
+# set the MIME type yourself
+tspdf attach add report.pdf export.dat --mime application/x-custom -o bundled.pdf
+
+# list / extract / remove
+tspdf attach list bundled.pdf --json
+tspdf attach extract bundled.pdf --all -o out-dir/
+tspdf attach remove bundled.pdf --name notes.txt -o trimmed.pdf
 ```
 
 ## Encrypt and decrypt

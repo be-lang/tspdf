@@ -18,6 +18,7 @@
 #include "tspr_attach.h"
 #include "tspr_doctree.h"
 #include "../compress/deflate.h"
+#include "../crypto/md5.h"
 #include "../util/pdftext.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -385,10 +386,13 @@ static TspdfError att_write_tree(TspdfReader *doc, TspdfParser *parser,
 // Build + register an /EmbeddedFile stream for `data` (decoded bytes),
 // deflating when that shrinks it. `subtype` (a MIME type) and `params_src`
 // (a /Params dict to carry over, deep-copied; refs inside disqualify it) are
-// optional. Returns the object number, 0 on allocation failure.
+// optional. Fresh /Params (no carry-over) record /Size, /ModDate (from
+// `mod_time`, Unix seconds; 0 = now) and an MD5 /CheckSum of the contents.
+// Returns the object number, 0 on allocation failure.
 static uint32_t att_make_ef_stream(TspdfReader *doc, const uint8_t *data,
                                    size_t len, const uint8_t *subtype,
-                                   size_t subtype_len, TspdfObj *params_src) {
+                                   size_t subtype_len, TspdfObj *params_src,
+                                   int64_t mod_time) {
     TspdfArena *a = &doc->arena;
 
     const uint8_t *stored = data;
@@ -438,11 +442,12 @@ static uint32_t att_make_ef_stream(TspdfReader *doc, const uint8_t *data,
     if (!params) {
         params = att_obj_new(a, TSPDF_OBJ_DICT);
         if (!params) return 0;
-        // Fresh attachments get a modification date; carried-over /Params
-        // dicts keep whatever dates the source recorded.
+        // Fresh attachments get a modification date (the caller's mtime when
+        // given, else now) and an MD5 checksum of the contents; carried-over
+        // /Params dicts keep whatever the source recorded.
         char mod_date[80];
-        time_t now = time(NULL);
-        struct tm *tm_info = gmtime(&now);
+        time_t when = mod_time != 0 ? (time_t)mod_time : time(NULL);
+        struct tm *tm_info = gmtime(&when);
         if (tm_info) {
             snprintf(mod_date, sizeof(mod_date), "D:%04d%02d%02d%02d%02d%02dZ",
                      tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,
@@ -452,6 +457,12 @@ static uint32_t att_make_ef_stream(TspdfReader *doc, const uint8_t *data,
             if (!md || tspdf_obj_dict_put(params, "ModDate", md, a) != TSPDF_OK) {
                 return 0;
             }
+        }
+        uint8_t digest[16];
+        md5_hash(len > 0 ? data : (const uint8_t *)"", len, digest);
+        TspdfObj *cks = att_obj_text(a, TSPDF_OBJ_STRING, digest, sizeof(digest));
+        if (!cks || tspdf_obj_dict_put(params, "CheckSum", cks, a) != TSPDF_OK) {
+            return 0;
         }
     }
     TspdfObj *size = att_obj_int(a, (int64_t)len);
@@ -503,7 +514,7 @@ static TspdfError att_add_internal(TspdfReader *doc,
                                    const uint8_t *data, size_t len,
                                    const uint8_t *desc, size_t desc_len,
                                    const uint8_t *subtype, size_t subtype_len,
-                                   TspdfObj *params_src) {
+                                   TspdfObj *params_src, int64_t mod_time) {
     TspdfParser parser;
     tspdf_parser_init(&parser, doc->data, doc->data_len, &doc->arena);
 
@@ -512,7 +523,7 @@ static TspdfError att_add_internal(TspdfReader *doc,
     if (err != TSPDF_OK) return err;
 
     uint32_t ef_num = att_make_ef_stream(doc, data, len, subtype, subtype_len,
-                                         params_src);
+                                         params_src, mod_time);
     uint32_t fs_num = ef_num ? att_make_filespec(doc, name, name_len,
                                                  desc, desc_len, ef_num) : 0;
     TspdfObj *fs_ref = fs_num ? att_obj_ref(&doc->arena, fs_num) : NULL;
@@ -652,9 +663,10 @@ TspdfError tspdf_reader_attachment_get(TspdfReader *doc, const char *name,
     return att_stream_decoded(doc, stream, snum, out, out_len);
 }
 
-TspdfError tspdf_reader_attachment_add(TspdfReader *doc, const char *name,
-                                       const uint8_t *data, size_t len,
-                                       const char *desc) {
+TspdfError tspdf_reader_attachment_add_ex(TspdfReader *doc, const char *name,
+                                          const uint8_t *data, size_t len,
+                                          const char *desc, const char *mime,
+                                          int64_t mod_time_unix) {
     if (!doc || !name || name[0] == '\0' || (!data && len > 0)) {
         return TSPDF_ERR_INVALID_ARG;
     }
@@ -670,8 +682,19 @@ TspdfError tspdf_reader_attachment_add(TspdfReader *doc, const char *name,
         enc_desc = tspdf_utf8_to_pdf_text(desc, &enc_desc_len, &doc->arena);
         if (!enc_desc) return TSPDF_ERR_ALLOC;
     }
+    // The MIME type becomes the stream /Subtype name; the serializer escapes
+    // the '/' (e.g. /text#2Fplain) per the PDF name rules.
+    const uint8_t *subtype = (const uint8_t *)mime;
+    size_t subtype_len = mime ? strlen(mime) : 0;
     return att_add_internal(doc, enc_name, enc_name_len, data, len,
-                            enc_desc, enc_desc_len, NULL, 0, NULL);
+                            enc_desc, enc_desc_len, subtype, subtype_len,
+                            NULL, mod_time_unix);
+}
+
+TspdfError tspdf_reader_attachment_add(TspdfReader *doc, const char *name,
+                                       const uint8_t *data, size_t len,
+                                       const char *desc) {
+    return tspdf_reader_attachment_add_ex(doc, name, data, len, desc, NULL, 0);
 }
 
 TspdfError tspdf_reader_attachment_remove(TspdfReader *doc, const char *name) {
@@ -737,7 +760,7 @@ static TspdfError att_copy_entry(TspdfReader *src, TspdfParser *sp,
                                                             "Params"));
 
     err = att_add_internal(dst, e->key, e->key_len, bytes, blen,
-                           desc, desc_len, subtype, subtype_len, params);
+                           desc, desc_len, subtype, subtype_len, params, 0);
     free(bytes);
     return err;
 }

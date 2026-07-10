@@ -15,7 +15,10 @@ PDF files, entirely on the local machine. No network access, no dependencies.
 Merge multiple PDF files into one.
 .TP
 .B split
-Split a PDF into individual pages or ranges.
+Split a PDF into individual pages or ranges. Embedded file attachments are
+copied into every output;
+.B \-\-no\-attachments
+drops them instead.
 .TP
 .B rotate
 Rotate pages in a PDF.
@@ -55,7 +58,9 @@ Encrypt a PDF with a password.
 Decrypt a password-protected PDF.
 .TP
 .B metadata
-View or edit PDF metadata.
+View or edit PDF metadata (the Info dictionary). If the document also carries
+XMP metadata, an edit leaves the XMP stream untouched and prints a notice,
+since some viewers prefer XMP over the Info dictionary.
 .TP
 .B info
 Print information about a PDF.
@@ -73,7 +78,16 @@ and
 .B stamp
 Overlay a page of another PDF onto pages of the input (like pdftk stamp).
 .B \-\-under
-puts it beneath the existing content.
+puts it beneath the existing content. Encrypted files are unlocked with
+.B \-\-password
+(input) and
+.B \-\-stamp\-password
+(stamp file), or their
+.B \-\-password\-file
+/
+.B \-\-stamp\-password\-file
+variants, which read the first line of a file ('\-' reads stdin) so the
+password stays out of the process list.
 .TP
 .B nup
 Place multiple source pages onto each output sheet in a grid (imposition,
@@ -130,6 +144,10 @@ stamps the values into the page content and removes the form.
 .B attach
 Embed files in a PDF, or list, extract, or remove embedded files
 .RB ( "attach add" / list / extract / remove ).
+Added files are stored with their size, modification date, an MD5 checksum,
+and a MIME type derived from the file extension
+.RB ( "\-\-mime " \fItype\fR
+overrides it).
 .TP
 .B bookmark
 Edit the outline (bookmarks) of an existing PDF
@@ -141,13 +159,21 @@ prints one entry per line as
 .BR \-\-json );
 .B bookmark import
 reads that same format from a file or stdin
-.RB ( "\-\-from " \fIfile\fR ", " "\-\-from -" );
+.RB ( "\-\-from " \fIfile\fR ", " "\-\-from -" ),
+replacing the outline unless
+.B \-\-append
+adds the entries after the existing one;
 .B bookmark add
 appends a single entry
 .RB ( "\-\-title" ", " "\-\-page" ", " \-\-level );
 .B bookmark clear
 removes the outline. Levels are 1\-based and must not jump by more than one;
 pages are 1\-based.
+.B add
+and
+.B "import \-\-append"
+keep the existing entries as they are: destinations (scroll position, zoom,
+view type), actions, colors, styles, and collapsed state are preserved.
 .TP
 .B img2pdf
 Convert images (JPEG/PNG) to a PDF.

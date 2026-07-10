@@ -21,7 +21,7 @@
 static void bookmark_usage(void) {
     printf("Usage: tspdf bookmark list <input.pdf> [--json]\n");
     printf("       tspdf bookmark add <input.pdf> --title <text> --page <N> [--level <L>] -o <output.pdf>\n");
-    printf("       tspdf bookmark import <input.pdf> --from <toc.txt|-> -o <output.pdf>\n");
+    printf("       tspdf bookmark import <input.pdf> --from <toc.txt|-> [--append] -o <output.pdf>\n");
     printf("       tspdf bookmark clear <input.pdf> -o <output.pdf>\n");
     printf("\n");
     printf("Edit the outline (bookmarks) of an existing PDF.\n");
@@ -32,6 +32,7 @@ static void bookmark_usage(void) {
     printf("  add --page <N>            Target page (1-based)\n");
     printf("  add --level <L>           Nesting level (1-based, default 1)\n");
     printf("  import --from <file>      TOC file (LEVEL<TAB>PAGE<TAB>TITLE per line; - is stdin)\n");
+    printf("  import --append           Append the TOC after the existing outline instead of replacing it\n");
     printf("  --password <pass>         Password for encrypted PDFs (or --password-file)\n");
     printf("  -o <output.pdf>           Output file (required for add/import/clear)\n");
 }
@@ -208,6 +209,7 @@ static int bookmark_add(int argc, char **argv) {
         entries[i].title = bm[i].title;
         entries[i].level = bm[i].level;
         entries[i].page_index = bm[i].page_index;
+        entries[i].keep = bm[i].node;   // preserve dest/color/flags/collapse
     }
     entries[n].title = title;
     entries[n].level = (int)level;
@@ -387,6 +389,52 @@ static int bookmark_import(int argc, char **argv) {
     TspdfReader *doc = bookmark_open(argc, argv, positional[0]);
     if (!doc) { free(entries); free(toc); return 1; }
 
+    size_t imported = count;
+
+    // --append keeps the existing outline (destinations, colors, flags and
+    // collapse state verbatim) and adds the imported entries after it.
+    if (has_flag(argc, argv, "--append")) {
+        TspdfBookmarkInfo *bm = NULL;
+        size_t n = 0;
+        TspdfError lerr = tspdf_reader_bookmarks(doc, &bm, &n);
+        if (lerr != TSPDF_OK) {
+            fprintf(stderr, "tspdf bookmark import: %s\n", tspdf_error_string(lerr));
+            tspdf_reader_destroy(doc);
+            free(entries); free(toc);
+            return 1;
+        }
+        if (n > 0) {
+            int last_level = bm[n - 1].level;
+            if (entries[0].level > last_level + 1) {
+                fprintf(stderr, "tspdf bookmark import: first imported entry "
+                                "(level %d) jumps more than one below the last "
+                                "existing entry (level %d)\n",
+                        entries[0].level, last_level);
+                tspdf_reader_destroy(doc);
+                free(entries); free(toc);
+                return 1;
+            }
+            TspdfBookmarkEntry *combined = (TspdfBookmarkEntry *)calloc(
+                n + count, sizeof(TspdfBookmarkEntry));
+            if (!combined) {
+                fprintf(stderr, "tspdf bookmark import: out of memory\n");
+                tspdf_reader_destroy(doc);
+                free(entries); free(toc);
+                return 1;
+            }
+            for (size_t i = 0; i < n; i++) {
+                combined[i].title = bm[i].title;
+                combined[i].level = bm[i].level;
+                combined[i].page_index = bm[i].page_index;
+                combined[i].keep = bm[i].node;
+            }
+            memcpy(combined + n, entries, count * sizeof(TspdfBookmarkEntry));
+            free(entries);
+            entries = combined;
+            count += n;
+        }
+    }
+
     TspdfError err = tspdf_reader_set_bookmarks(doc, entries, count);
     if (err != TSPDF_OK) {
         if (err == TSPDF_ERR_PAGE_RANGE) {
@@ -408,14 +456,13 @@ static int bookmark_import(int argc, char **argv) {
     free(toc);
 
     err = tspdf_reader_save(doc, output);
-    size_t saved = count;
     tspdf_reader_destroy(doc);
     if (err != TSPDF_OK) {
         fprintf(stderr, "tspdf bookmark import: failed to save '%s': %s\n",
                 output, tspdf_error_string(err));
         return 1;
     }
-    printf("Imported %zu bookmark(s) → %s\n", saved, output);
+    printf("Imported %zu bookmark(s) → %s\n", imported, output);
     return 0;
 }
 

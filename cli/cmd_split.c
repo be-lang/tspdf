@@ -16,10 +16,23 @@ static void zero_pad(char *dst, size_t dst_sz, size_t n, int width) {
     dst[out] = '\0';
 }
 
+// Drop every document-level embedded file from `doc` (for --no-attachments;
+// extract copies attachments into each part by default). Returns TSPDF_OK
+// when there was nothing to drop.
+static TspdfError split_drop_attachments(TspdfReader *doc) {
+    TspdfAttachmentInfo *infos = NULL;
+    size_t count = 0;
+    TspdfError err = tspdf_reader_attachments(doc, &infos, &count);
+    for (size_t i = 0; i < count && err == TSPDF_OK; i++) {
+        err = tspdf_reader_attachment_remove(doc, infos[i].name);
+    }
+    return err;
+}
+
 // Burst mode: write every page of `doc` to its own file. `output` is the
 // name template: "out.pdf" becomes out-001.pdf, out-002.pdf, ... zero-padded
 // to the page-count width (minimum 3 digits).
-static int split_burst(TspdfReader *doc, const char *output) {
+static int split_burst(TspdfReader *doc, const char *output, bool no_attachments) {
     size_t total = tspdf_reader_page_count(doc);
     if (total == 0) {
         fprintf(stderr, "tspdf split: document has no pages\n");
@@ -60,6 +73,14 @@ static int split_burst(TspdfReader *doc, const char *output) {
             free(first_name);
             return 1;
         }
+        if (no_attachments && (err = split_drop_attachments(page)) != TSPDF_OK) {
+            fprintf(stderr, "tspdf split: dropping attachments failed: %s\n",
+                    tspdf_error_string(err));
+            tspdf_reader_destroy(page);
+            free(name);
+            free(first_name);
+            return 1;
+        }
 
         // Only write objects reachable from this page (same rationale as the
         // strip_unused_objects note in the --pages path below).
@@ -85,11 +106,13 @@ static int split_burst(TspdfReader *doc, const char *output) {
 // First 0-based page index in `pages` that is out of range for `total`.
 int cmd_split(int argc, char **argv) {
     if (argc == 0 || has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
-        printf("Usage: tspdf split <input.pdf> [--pages 1-3,5 | --burst] -o <output.pdf>\n");
+        printf("Usage: tspdf split <input.pdf> [--pages 1-3,5 | --burst] [--no-attachments] -o <output.pdf>\n");
         printf("\nExtract specific pages from a PDF, or split it into one file per page.\n");
         printf("With --pages, the selected pages are written to the output file.\n");
         printf("With --burst (the default when --pages is absent), each page is written\n");
         printf("to its own file: out.pdf becomes out-001.pdf, out-002.pdf, ...\n");
+        printf("Embedded file attachments are copied into every output; --no-attachments\n");
+        printf("drops them instead.\n");
         return argc == 0 ? 1 : 0;
     }
 
@@ -112,6 +135,7 @@ int cmd_split(int argc, char **argv) {
     }
 
     const char *pages_spec = find_flag(argc, argv, "--pages");
+    bool no_attachments = has_flag(argc, argv, "--no-attachments");
     if (has_flag(argc, argv, "--burst") && pages_spec) {
         fprintf(stderr, "tspdf split: --burst and --pages are mutually exclusive\n");
         return 1;
@@ -124,7 +148,7 @@ int cmd_split(int argc, char **argv) {
             fprintf(stderr, "tspdf split: failed to open '%s': %s\n", input, tspdf_error_string(err));
             return 1;
         }
-        int rc = split_burst(doc, output);
+        int rc = split_burst(doc, output, no_attachments);
         tspdf_reader_destroy(doc);
         return rc;
     }
@@ -157,6 +181,18 @@ int cmd_split(int argc, char **argv) {
         tspdf_reader_destroy(doc);
         free(pages);
         return 1;
+    }
+
+    if (no_attachments) {
+        err = split_drop_attachments(result);
+        if (err != TSPDF_OK) {
+            fprintf(stderr, "tspdf split: dropping attachments failed: %s\n",
+                    tspdf_error_string(err));
+            tspdf_reader_destroy(result);
+            tspdf_reader_destroy(doc);
+            free(pages);
+            return 1;
+        }
     }
 
     // Only write objects reachable from the extracted pages; without this the
