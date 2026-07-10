@@ -1013,6 +1013,309 @@ TspdfReader *tspdf_reader_rotate(TspdfReader *doc, const size_t *pages, size_t c
     return result;
 }
 
+// Build a 4-element numeric array object [a b c d] in `arena`.
+static TspdfObj *make_box_array(TspdfArena *arena, const double v[4]) {
+    TspdfObj *arr = (TspdfObj *)tspdf_arena_alloc(arena, sizeof(TspdfObj));
+    if (!arr) return NULL;
+    arr->type = TSPDF_OBJ_ARRAY;
+    arr->array.count = 4;
+    arr->array.items = (TspdfObj *)tspdf_arena_alloc(arena, sizeof(TspdfObj) * 4);
+    if (!arr->array.items) return NULL;
+    for (int i = 0; i < 4; i++) {
+        arr->array.items[i].type = TSPDF_OBJ_REAL;
+        arr->array.items[i].real = v[i];
+    }
+    return arr;
+}
+
+// Set (replace or append) a box entry `key` = [x0 y0 x1 y1] in a page dict.
+static bool set_box_in_dict(TspdfObj *page_dict, TspdfArena *arena,
+                            const char *key, const double v[4]) {
+    if (!page_dict || page_dict->type != TSPDF_OBJ_DICT) return false;
+    TspdfObj *arr = make_box_array(arena, v);
+    if (!arr) return false;
+
+    for (size_t i = 0; i < page_dict->dict.count; i++) {
+        if (strcmp(page_dict->dict.entries[i].key, key) == 0) {
+            page_dict->dict.entries[i].value = arr;
+            return true;
+        }
+    }
+    size_t old_count = page_dict->dict.count;
+    TspdfDictEntry *entries = (TspdfDictEntry *)tspdf_arena_alloc(arena,
+                                sizeof(TspdfDictEntry) * (old_count + 1));
+    if (!entries) return false;
+    if (page_dict->dict.entries && old_count > 0) {
+        memcpy(entries, page_dict->dict.entries, sizeof(TspdfDictEntry) * old_count);
+    }
+    size_t klen = strlen(key);
+    char *k = (char *)tspdf_arena_alloc(arena, klen + 1);
+    if (!k) return false;
+    memcpy(k, key, klen + 1);
+    entries[old_count].key = k;
+    entries[old_count].value = arr;
+    page_dict->dict.entries = entries;
+    page_dict->dict.count = old_count + 1;
+    return true;
+}
+
+// Core: each pages[i] gets boxes[i*4 .. i*4+3] as its CropBox (absolute, in
+// default user space), intersected with the page MediaBox. When `boxes` is
+// NULL, `single` is used for every listed page instead.
+static TspdfReader *set_cropbox_impl(TspdfReader *doc, const size_t *pages,
+                                     size_t count, const double *boxes,
+                                     const double single[4], TspdfError *err) {
+    if (!doc || !pages || count == 0) {
+        if (err) *err = TSPDF_ERR_INVALID_ARG;
+        return NULL;
+    }
+    for (size_t i = 0; i < count; i++) {
+        const double *b = boxes ? &boxes[i * 4] : single;
+        if (b[2] <= b[0] || b[3] <= b[1]) {
+            if (err) *err = TSPDF_ERR_INVALID_ARG;
+            return NULL;
+        }
+        if (pages[i] >= doc->pages.count) {
+            if (err) *err = TSPDF_ERR_PAGE_RANGE;
+            return NULL;
+        }
+    }
+
+    size_t total = doc->pages.count;
+    size_t *all = (size_t *)malloc(sizeof(size_t) * total);
+    if (!all) { if (err) *err = TSPDF_ERR_ALLOC; return NULL; }
+    for (size_t i = 0; i < total; i++) all[i] = i;
+    TspdfReader *result = create_doc_from_pages(doc, all, total, err);
+    free(all);
+    if (!result) return NULL;
+
+    for (size_t i = 0; i < count; i++) {
+        const double *b = boxes ? &boxes[i * 4] : single;
+        TspdfReaderPage *page = &result->pages.pages[pages[i]];
+        const double *mb = page->media_box;
+        // Intersect the requested box with the page MediaBox.
+        double cb[4];
+        cb[0] = b[0] < mb[0] ? mb[0] : b[0];
+        cb[1] = b[1] < mb[1] ? mb[1] : b[1];
+        cb[2] = b[2] > mb[2] ? mb[2] : b[2];
+        cb[3] = b[3] > mb[3] ? mb[3] : b[3];
+        if (cb[2] <= cb[0] || cb[3] <= cb[1]) {
+            // The clamped box collapsed (requested box lies outside the media).
+            tspdf_reader_destroy(result);
+            if (err) *err = TSPDF_ERR_INVALID_ARG;
+            return NULL;
+        }
+        if (!set_box_in_dict(page->page_dict, &result->arena, "CropBox", cb)) {
+            tspdf_reader_destroy(result);
+            if (err) *err = TSPDF_ERR_ALLOC;
+            return NULL;
+        }
+    }
+    if (err) *err = TSPDF_OK;
+    return result;
+}
+
+TspdfReader *tspdf_reader_set_cropbox(TspdfReader *doc, const size_t *pages,
+                                      size_t count, const double box[4],
+                                      TspdfError *err) {
+    if (!box) { if (err) *err = TSPDF_ERR_INVALID_ARG; return NULL; }
+    return set_cropbox_impl(doc, pages, count, NULL, box, err);
+}
+
+TspdfReader *tspdf_reader_set_cropboxes(TspdfReader *doc, const size_t *pages,
+                                        size_t count, const double *boxes,
+                                        TspdfError *err) {
+    if (!boxes) { if (err) *err = TSPDF_ERR_INVALID_ARG; return NULL; }
+    return set_cropbox_impl(doc, pages, count, boxes, NULL, err);
+}
+
+TspdfReader *tspdf_reader_scale(TspdfReader *doc, const size_t *pages,
+                                size_t count, double sx, double sy,
+                                TspdfError *err) {
+    if (!doc || !pages || count == 0) {
+        if (err) *err = TSPDF_ERR_INVALID_ARG;
+        return NULL;
+    }
+    if (!(sx > 0.0) || !(sy > 0.0)) {
+        if (err) *err = TSPDF_ERR_INVALID_ARG;
+        return NULL;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (pages[i] >= doc->pages.count) {
+            if (err) *err = TSPDF_ERR_PAGE_RANGE;
+            return NULL;
+        }
+    }
+
+    size_t total = doc->pages.count;
+    size_t *all = (size_t *)malloc(sizeof(size_t) * total);
+    if (!all) { if (err) *err = TSPDF_ERR_ALLOC; return NULL; }
+    for (size_t i = 0; i < total; i++) all[i] = i;
+    TspdfReader *result = create_doc_from_pages(doc, all, total, err);
+    free(all);
+    if (!result) return NULL;
+
+    for (size_t i = 0; i < count; i++) {
+        size_t pi = pages[i];
+        TspdfReaderPage *page = &result->pages.pages[pi];
+
+        // Wrap the existing content in "q sx 0 0 sy 0 0 cm ... Q" so it scales
+        // about the default-user-space origin, matching the scaled boxes.
+        char prefix[64];
+        int plen = snprintf(prefix, sizeof(prefix), "q %.6g 0 0 %.6g 0 0 cm\n", sx, sy);
+        if (plen < 0 || plen >= (int)sizeof(prefix)) {
+            tspdf_reader_destroy(result);
+            if (err) *err = TSPDF_ERR_INVALID_ARG;
+            return NULL;
+        }
+        const char *suffix = "\nQ\n";
+        TspdfError werr = tspdf_page_wrap_content(result, pi,
+                                                  (const uint8_t *)prefix, (size_t)plen,
+                                                  (const uint8_t *)suffix, strlen(suffix));
+        if (werr != TSPDF_OK) {
+            tspdf_reader_destroy(result);
+            if (err) *err = werr;
+            return NULL;
+        }
+
+        // Scale MediaBox and (if present) CropBox by the same factors.
+        double mb[4];
+        memcpy(mb, page->media_box, sizeof(mb));
+        double smb[4] = { mb[0] * sx, mb[1] * sy, mb[2] * sx, mb[3] * sy };
+        if (!set_box_in_dict(page->page_dict, &result->arena, "MediaBox", smb)) {
+            tspdf_reader_destroy(result);
+            if (err) *err = TSPDF_ERR_ALLOC;
+            return NULL;
+        }
+        memcpy(page->media_box, smb, sizeof(smb));
+
+        TspdfObj *cbobj = tspdf_dict_get(page->page_dict, "CropBox");
+        if (cbobj && cbobj->type == TSPDF_OBJ_ARRAY && cbobj->array.count >= 4) {
+            double cb[4];
+            bool ok = true;
+            for (int k = 0; k < 4; k++) {
+                TspdfObj *it = &cbobj->array.items[k];
+                if (it->type == TSPDF_OBJ_INT) cb[k] = (double)it->integer;
+                else if (it->type == TSPDF_OBJ_REAL) cb[k] = it->real;
+                else { ok = false; break; }
+            }
+            if (ok) {
+                double scb[4] = { cb[0] * sx, cb[1] * sy, cb[2] * sx, cb[3] * sy };
+                set_box_in_dict(page->page_dict, &result->arena, "CropBox", scb);
+            }
+        }
+    }
+    if (err) *err = TSPDF_OK;
+    return result;
+}
+
+// Remove a dict entry by key (shifts the remaining entries down).
+static void remove_from_dict(TspdfObj *dict, const char *key) {
+    if (!dict || dict->type != TSPDF_OBJ_DICT) return;
+    for (size_t i = 0; i < dict->dict.count; i++) {
+        if (strcmp(dict->dict.entries[i].key, key) == 0) {
+            for (size_t j = i + 1; j < dict->dict.count; j++) {
+                dict->dict.entries[j - 1] = dict->dict.entries[j];
+            }
+            dict->dict.count--;
+            return;
+        }
+    }
+}
+
+TspdfReader *tspdf_reader_resize_to(TspdfReader *doc, const size_t *pages,
+                                    size_t count, double target_w, double target_h,
+                                    TspdfError *err) {
+    if (!doc || !pages || count == 0) {
+        if (err) *err = TSPDF_ERR_INVALID_ARG;
+        return NULL;
+    }
+    if (!(target_w > 0.0) || !(target_h > 0.0)) {
+        if (err) *err = TSPDF_ERR_INVALID_ARG;
+        return NULL;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (pages[i] >= doc->pages.count) {
+            if (err) *err = TSPDF_ERR_PAGE_RANGE;
+            return NULL;
+        }
+    }
+
+    size_t total = doc->pages.count;
+    size_t *all = (size_t *)malloc(sizeof(size_t) * total);
+    if (!all) { if (err) *err = TSPDF_ERR_ALLOC; return NULL; }
+    for (size_t i = 0; i < total; i++) all[i] = i;
+    TspdfReader *result = create_doc_from_pages(doc, all, total, err);
+    free(all);
+    if (!result) return NULL;
+
+    for (size_t i = 0; i < count; i++) {
+        size_t pi = pages[i];
+        TspdfReaderPage *page = &result->pages.pages[pi];
+
+        double pw = page->media_box[2] - page->media_box[0];
+        double ph = page->media_box[3] - page->media_box[1];
+        if (!(pw > 0.0) || !(ph > 0.0)) {
+            tspdf_reader_destroy(result);
+            if (err) *err = TSPDF_ERR_INVALID_ARG;
+            return NULL;
+        }
+
+        // Fit in the viewed orientation: /Rotate 90/270 swaps the axes, so the
+        // content's width is measured against the target's height.
+        int rot = ((page->rotate % 360) + 360) % 360;
+        double fit_w = (rot == 90 || rot == 270) ? target_h : target_w;
+        double fit_h = (rot == 90 || rot == 270) ? target_w : target_h;
+
+        double s = fit_w / pw;
+        double s2 = fit_h / ph;
+        if (s2 < s) s = s2;
+
+        // Translate so the scaled content (measured from the MediaBox origin)
+        // is centered within the new [0 0 target_w target_h] media, then
+        // undo the MediaBox origin so content maps from (0,0).
+        double content_w = pw * s;
+        double content_h = ph * s;
+        double tx = (fit_w - content_w) / 2.0 - page->media_box[0] * s;
+        double ty = (fit_h - content_h) / 2.0 - page->media_box[1] * s;
+
+        char prefix[96];
+        int plen = snprintf(prefix, sizeof(prefix),
+                            "q %.6g 0 0 %.6g %.6g %.6g cm\n", s, s, tx, ty);
+        if (plen < 0 || plen >= (int)sizeof(prefix)) {
+            tspdf_reader_destroy(result);
+            if (err) *err = TSPDF_ERR_INVALID_ARG;
+            return NULL;
+        }
+        const char *suffix = "\nQ\n";
+        TspdfError werr = tspdf_page_wrap_content(result, pi,
+                                                  (const uint8_t *)prefix, (size_t)plen,
+                                                  (const uint8_t *)suffix, strlen(suffix));
+        if (werr != TSPDF_OK) {
+            tspdf_reader_destroy(result);
+            if (err) *err = werr;
+            return NULL;
+        }
+
+        // Store the MediaBox so the VIEWED box equals target_w x target_h. On a
+        // /Rotate 90/270 page the viewer swaps the axes, so the stored box must
+        // carry the swapped extents [0 0 target_h target_w]; for 0/180 it is the
+        // target as-is. fit_w/fit_h already encode this swap (unrotated space),
+        // which is also the space the content-wrap centered in.
+        double mb[4] = { 0.0, 0.0, fit_w, fit_h };
+        if (!set_box_in_dict(page->page_dict, &result->arena, "MediaBox", mb)) {
+            tspdf_reader_destroy(result);
+            if (err) *err = TSPDF_ERR_ALLOC;
+            return NULL;
+        }
+        memcpy(page->media_box, mb, sizeof(mb));
+        // The old CropBox no longer maps to the resized media.
+        remove_from_dict(page->page_dict, "CropBox");
+    }
+    if (err) *err = TSPDF_OK;
+    return result;
+}
+
 TspdfReader *tspdf_reader_reorder(TspdfReader *doc, const size_t *order, size_t count, TspdfError *err) {
     if (!doc || !order || count == 0) {
         if (err) *err = TSPDF_ERR_PARSE;

@@ -150,6 +150,8 @@ CLI_SOURCES = \
 	cli/cmd_bookmark.c \
 	cli/cmd_stamp.c \
 	cli/cmd_nup.c \
+	cli/cmd_crop.c \
+	cli/cmd_scale.c \
 	cli/server.c
 
 CLI_TARGET = $(BUILDDIR)/tspdf

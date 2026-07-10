@@ -55,5 +55,7 @@ int cmd_attach(int argc, char **argv);
 int cmd_bookmark(int argc, char **argv);
 int cmd_stamp(int argc, char **argv);
 int cmd_nup(int argc, char **argv);
+int cmd_crop(int argc, char **argv);
+int cmd_scale(int argc, char **argv);
 
 #endif

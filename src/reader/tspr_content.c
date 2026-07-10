@@ -7,6 +7,8 @@
 
 // --- Helper functions for creating TspdfObj nodes ---
 
+static bool dict_set(TspdfObj *dict, TspdfArena *arena, const char *key, TspdfObj *value);
+
 static TspdfObj *make_name_obj(TspdfArena *a, const char *str) {
     TspdfObj *obj = tspdf_arena_alloc_zero(a, sizeof(TspdfObj));
     if (!obj) return NULL;
@@ -360,6 +362,65 @@ void tspdf_page_abort_content(TspdfStream *stream) {
         tspdf_stream_destroy(stream);
         free(stream);
     }
+}
+
+// Wrap a page's existing /Contents by prepending `prefix` and appending
+// `suffix` as new content streams, yielding [prefix, ...old, suffix]. Used to
+// bracket the original content in a transform such as "q <cm> ... Q" (scale).
+// Either buffer may be NULL/0 to skip that side. The page dict must already be
+// resolved (page->page_dict). Registers new stream objects on `doc`.
+TspdfError tspdf_page_wrap_content(TspdfReader *doc, size_t page_index,
+                                   const uint8_t *prefix, size_t prefix_len,
+                                   const uint8_t *suffix, size_t suffix_len) {
+    if (!doc || page_index >= doc->pages.count) return TSPDF_ERR_INVALID_ARG;
+    TspdfObj *page_dict = doc->pages.pages[page_index].page_dict;
+    if (!page_dict || page_dict->type != TSPDF_OBJ_DICT) return TSPDF_ERR_PARSE;
+    TspdfArena *arena = &doc->arena;
+
+    TspdfObj *contents = tspdf_dict_get(page_dict, "Contents");
+
+    size_t old_count = 0;
+    if (contents && contents->type == TSPDF_OBJ_ARRAY) old_count = contents->array.count;
+    else if (contents && contents->type == TSPDF_OBJ_REF) old_count = 1;
+
+    size_t n_new = (prefix ? 1 : 0) + (suffix ? 1 : 0);
+    size_t total = old_count + n_new;
+
+    TspdfObj *arr = tspdf_arena_alloc_zero(arena, sizeof(TspdfObj));
+    if (!arr) return TSPDF_ERR_ALLOC;
+    arr->type = TSPDF_OBJ_ARRAY;
+    arr->array.items = tspdf_arena_alloc_zero(arena, (total ? total : 1) * sizeof(TspdfObj));
+    if (!arr->array.items) return TSPDF_ERR_ALLOC;
+
+    size_t at = 0;
+    if (prefix) {
+        TspdfObj *s = make_stream_obj(arena, prefix, prefix_len);
+        if (!s) return TSPDF_ERR_ALLOC;
+        uint32_t num = tspdf_register_new_obj(doc, s);
+        if (num == 0) return TSPDF_ERR_ALLOC;
+        TspdfObj *ref = make_ref_obj(arena, num);
+        if (!ref) return TSPDF_ERR_ALLOC;
+        arr->array.items[at++] = *ref;
+    }
+    if (contents && contents->type == TSPDF_OBJ_ARRAY) {
+        for (size_t i = 0; i < old_count; i++) arr->array.items[at++] = contents->array.items[i];
+    } else if (contents && contents->type == TSPDF_OBJ_REF) {
+        arr->array.items[at++] = *contents;
+    }
+    if (suffix) {
+        TspdfObj *s = make_stream_obj(arena, suffix, suffix_len);
+        if (!s) return TSPDF_ERR_ALLOC;
+        uint32_t num = tspdf_register_new_obj(doc, s);
+        if (num == 0) return TSPDF_ERR_ALLOC;
+        TspdfObj *ref = make_ref_obj(arena, num);
+        if (!ref) return TSPDF_ERR_ALLOC;
+        arr->array.items[at++] = *ref;
+    }
+    arr->array.count = at;
+
+    if (!dict_set(page_dict, arena, "Contents", arr)) return TSPDF_ERR_ALLOC;
+    doc->modified = true;
+    return TSPDF_OK;
 }
 
 // --- XObject resource registration (for imported form XObjects) ---

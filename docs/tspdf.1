@@ -20,6 +20,28 @@ Split a PDF into individual pages or ranges.
 .B rotate
 Rotate pages in a PDF.
 .TP
+.B crop
+Set the CropBox of pages (clip the visible region without destroying content).
+Give one of
+.B \-\-box
+.IR x0,y0,x1,y1
+(relative to the page's MediaBox origin),
+.B \-\-margins
+.IR t,r,b,l ,
+or a uniform
+.B \-\-margin
+.IR pt .
+The box is clamped to the MediaBox.
+.TP
+.B scale
+Resize pages, scaling their content with them (not clipping). Give
+.B \-\-factor
+.I f
+for a uniform scale, or
+.B \-\-to
+.I a4|letter|legal|a3|a5
+to fit content into a named page size (aspect preserved, centered).
+.TP
 .B delete
 Delete pages from a PDF.
 .TP
@@ -158,6 +180,8 @@ tspdf form fill form.pdf \-\-set name=Ada \-o filled.pdf
 tspdf watermark doc.pdf \-o marked.pdf \-\-image logo.png \-\-opacity 0.2
 tspdf stamp report.pdf \-\-stamp approved.pdf \-o stamped.pdf
 tspdf nup 2 slides.pdf \-o handout.pdf
+tspdf crop doc.pdf \-\-margins 72,36,72,36 \-o cropped.pdf
+tspdf scale doc.pdf \-\-to a4 \-o a4.pdf
 tspdf serve \-\-port 3000
 .fi
 .SH SEE ALSO

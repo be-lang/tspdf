@@ -102,6 +102,49 @@ TspdfReader *tspdf_reader_extract(TspdfReader *doc, const size_t *pages, size_t 
 TspdfReader *tspdf_reader_delete(TspdfReader *doc, const size_t *pages, size_t count, TspdfError *err);
 TspdfReader *tspdf_reader_rotate(TspdfReader *doc, const size_t *pages, size_t count, int angle, TspdfError *err);
 TspdfReader *tspdf_reader_reorder(TspdfReader *doc, const size_t *order, size_t count, TspdfError *err);
+
+// Set the /CropBox of the given pages to `box` = [x0 y0 x1 y1] in the page's
+// default user space (the same coordinate space as the /MediaBox; not
+// relative to the MediaBox origin). This is non-destructive: page content is
+// preserved and merely clipped to the new visible region. The box is
+// intersected with each page's MediaBox (a CropBox outside the MediaBox is
+// meaningless per the spec), so the stored box never exceeds the media. A
+// degenerate box (x1<=x0 or y1<=y0, before or after clamping) yields
+// TSPDF_ERR_INVALID_ARG. Out-of-range page indices yield TSPDF_ERR_PAGE_RANGE.
+// Returns a new document (source unchanged), consistent with rotate/extract.
+TspdfReader *tspdf_reader_set_cropbox(TspdfReader *doc, const size_t *pages,
+                                      size_t count, const double box[4],
+                                      TspdfError *err);
+
+// Like tspdf_reader_set_cropbox but with a distinct box per listed page:
+// boxes[i] (four doubles) is the CropBox for pages[i]. Lets a caller crop
+// pages of differing MediaBox sizes (e.g. margin-based cropping) in one call.
+TspdfReader *tspdf_reader_set_cropboxes(TspdfReader *doc, const size_t *pages,
+                                        size_t count, const double *boxes,
+                                        TspdfError *err);
+
+// Scale the given pages by (sx, sy): the page content is wrapped in a
+// `q sx 0 0 sy 0 0 cm ... Q` transform and the /MediaBox (and any /CropBox)
+// is multiplied by the same factors, so the page grows/shrinks with its
+// content rather than being clipped. Existing box origins are scaled too.
+// A rotated page (/Rotate) is handled: the transform is applied in unrotated
+// page space, which the viewer then rotates, so content still fills the page.
+// Non-positive factors yield TSPDF_ERR_INVALID_ARG; out-of-range indices yield
+// TSPDF_ERR_PAGE_RANGE. Returns a new document (source unchanged).
+TspdfReader *tspdf_reader_scale(TspdfReader *doc, const size_t *pages,
+                                size_t count, double sx, double sy,
+                                TspdfError *err);
+
+// Resize the given pages to a target media size (target_w x target_h, in
+// points). Each page's content is uniformly scaled to fit the target while
+// preserving aspect ratio and centered, and the /MediaBox becomes
+// [0 0 target_w target_h]; any /CropBox is dropped (it no longer applies).
+// For a page whose /Rotate is 90 or 270 the target dimensions are matched in
+// the viewed orientation, so the page still fits upright. Non-positive target
+// dimensions yield TSPDF_ERR_INVALID_ARG. Returns a new document.
+TspdfReader *tspdf_reader_resize_to(TspdfReader *doc, const size_t *pages,
+                                    size_t count, double target_w, double target_h,
+                                    TspdfError *err);
 TspdfReader *tspdf_reader_merge(TspdfReader **docs, size_t count, TspdfError *err);
 
 // Save

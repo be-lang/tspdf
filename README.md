@@ -31,6 +31,8 @@ tspdf split report.pdf --pages 1-5 -o extract.pdf
 tspdf encrypt doc.pdf -o locked.pdf --password secret
 tspdf decrypt locked.pdf -o unlocked.pdf --password secret
 tspdf rotate doc.pdf --angle 90 -o rotated.pdf
+tspdf crop doc.pdf --margin 36 -o cropped.pdf
+tspdf scale doc.pdf --to a4 -o a4.pdf
 tspdf watermark doc.pdf -o draft.pdf --text "DRAFT"
 tspdf watermark doc.pdf -o marked.pdf --image logo.png
 tspdf stamp doc.pdf --stamp approved.pdf -o stamped.pdf
@@ -123,7 +125,7 @@ and conformance jobs, on every push.
 
 ## Features
 
-- **Reading**: open PDFs, extract/delete/rotate/reorder/merge pages, text extraction (plain or layout-preserving), AcroForm form fill/flatten, outline (bookmark) editing, PDF stamping, N-up imposition, watermarks, annotations, page numbers, file attachments, content overlay, AES-128/256 encryption and decryption.
+- **Reading**: open PDFs, extract/delete/rotate/reorder/merge pages, crop and scale/resize pages, text extraction (plain or layout-preserving), AcroForm form fill/flatten, outline (bookmark) editing, PDF stamping, N-up imposition, watermarks, annotations, page numbers, file attachments, content overlay, AES-128/256 encryption and decryption.
 - **Generation**: flexbox-style layout with fixed/grow/fit-content/percentage sizing, automatic page breaks with repeating headers, tables with auto-sized columns and colspan.
 - **Text**: TrueType parsing and embedding with subsetting, Unicode via CIDFont Type2 + Identity-H, wrapping, alignment, inline rich text.
 - **Graphics**: borders, shadows, opacity, clipping, transforms, vector paths, linear and radial gradients.

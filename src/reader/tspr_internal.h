@@ -191,4 +191,11 @@ TspdfObj *tspdf_dict_get(TspdfObj *dict, const char *key);
 // Deep-copy an object into a target arena
 TspdfObj *tspdf_obj_deep_copy(TspdfObj *obj, TspdfArena *dst);
 
+// Bracket a page's /Contents with new streams: [prefix, ...old, suffix].
+// Either side may be NULL to skip it. Used by page scaling to wrap the
+// existing content in a "q <cm> ... Q" transform. Defined in tspr_content.c.
+TspdfError tspdf_page_wrap_content(TspdfReader *doc, size_t page_index,
+                                   const uint8_t *prefix, size_t prefix_len,
+                                   const uint8_t *suffix, size_t suffix_len);
+
 #endif

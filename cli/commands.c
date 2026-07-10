@@ -148,6 +148,11 @@ static const char *const VALUE_FLAGS[] = {
     "--from",
     "--page",
     "--level",
+    "--box",
+    "--margins",
+    "--margin",
+    "--to",
+    "--factor",
 };
 
 static bool is_value_flag(const char *arg) {

@@ -4189,6 +4189,318 @@ TEST(test_rotate_pages_normalizes_negative_angle) {
     tspdf_reader_destroy(doc);
 }
 
+// Read a page box (MediaBox/CropBox) into out[4]; false if absent/malformed.
+static bool read_page_box(TspdfReader *doc, size_t idx, const char *key, double out[4]) {
+    TspdfReaderPage *page = tspdf_reader_get_page(doc, idx);
+    if (!page) return false;
+    TspdfObj *box = tspdf_dict_get(page->page_dict, key);
+    if (!box || box->type != TSPDF_OBJ_ARRAY || box->array.count < 4) return false;
+    for (int i = 0; i < 4; i++) {
+        TspdfObj *it = &box->array.items[i];
+        if (it->type == TSPDF_OBJ_INT) out[i] = (double)it->integer;
+        else if (it->type == TSPDF_OBJ_REAL) out[i] = it->real;
+        else return false;
+    }
+    return true;
+}
+
+TEST(test_set_cropbox_explicit_box) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/three_pages.pdf", &err);
+    ASSERT(doc != NULL);
+
+    size_t pages[] = {0, 2};
+    double box[4] = {50, 60, 400, 700};
+    TspdfReader *cropped = tspdf_reader_set_cropbox(doc, pages, 2, box, &err);
+    ASSERT(cropped != NULL);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    ASSERT_EQ_INT(tspdf_reader_save_to_memory(cropped, &out, &out_len), TSPDF_OK);
+    TspdfReader *reopened = tspdf_reader_open(out, out_len, &err);
+    ASSERT(reopened != NULL);
+
+    double cb[4];
+    ASSERT(read_page_box(reopened, 0, "CropBox", cb));
+    ASSERT(cb[0] == 50 && cb[1] == 60 && cb[2] == 400 && cb[3] == 700);
+    // Page 1 (index 1) was not selected: no CropBox.
+    double none[4];
+    ASSERT(!read_page_box(reopened, 1, "CropBox", none));
+    ASSERT(read_page_box(reopened, 2, "CropBox", cb));
+    ASSERT(cb[0] == 50 && cb[2] == 400);
+
+    // Content (text) still present — crop only clips the view.
+    const char *txt = tspdf_reader_page_text(reopened, 0, &err);
+    ASSERT(txt != NULL);
+    ASSERT(strstr(txt, "Page 1") != NULL);
+
+    tspdf_reader_destroy(reopened);
+    free(out);
+    tspdf_reader_destroy(cropped);
+    tspdf_reader_destroy(doc);
+}
+
+TEST(test_set_cropbox_clamps_to_mediabox) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/one_page.pdf", &err);
+    ASSERT(doc != NULL);
+
+    double mb[4];
+    ASSERT(read_page_box(doc, 0, "MediaBox", mb));
+
+    // Box larger than the MediaBox on all sides — must clamp to the media.
+    size_t pages[] = {0};
+    double box[4] = {-100, -100, mb[2] + 500, mb[3] + 500};
+    TspdfReader *cropped = tspdf_reader_set_cropbox(doc, pages, 1, box, &err);
+    ASSERT(cropped != NULL);
+
+    double cb[4];
+    ASSERT(read_page_box(cropped, 0, "CropBox", cb));
+    ASSERT(cb[0] == mb[0] && cb[1] == mb[1] && cb[2] == mb[2] && cb[3] == mb[3]);
+
+    tspdf_reader_destroy(cropped);
+    tspdf_reader_destroy(doc);
+}
+
+TEST(test_set_cropbox_degenerate_rejected) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/one_page.pdf", &err);
+    ASSERT(doc != NULL);
+
+    size_t pages[] = {0};
+    double box[4] = {200, 100, 100, 300};  // x1 < x0
+    err = TSPDF_OK;
+    TspdfReader *cropped = tspdf_reader_set_cropbox(doc, pages, 1, box, &err);
+    ASSERT(cropped == NULL);
+    ASSERT_EQ_INT(err, TSPDF_ERR_INVALID_ARG);
+
+    tspdf_reader_destroy(doc);
+}
+
+TEST(test_set_cropbox_out_of_range) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/one_page.pdf", &err);
+    ASSERT(doc != NULL);
+
+    size_t pages[] = {5};
+    double box[4] = {10, 10, 100, 100};
+    err = TSPDF_OK;
+    TspdfReader *cropped = tspdf_reader_set_cropbox(doc, pages, 1, box, &err);
+    ASSERT(cropped == NULL);
+    ASSERT_EQ_INT(err, TSPDF_ERR_PAGE_RANGE);
+
+    tspdf_reader_destroy(doc);
+}
+
+TEST(test_scale_factor_half) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/three_pages.pdf", &err);
+    ASSERT(doc != NULL);
+
+    double mb0[4];
+    ASSERT(read_page_box(doc, 0, "MediaBox", mb0));
+    double w0 = mb0[2] - mb0[0], h0 = mb0[3] - mb0[1];
+
+    size_t pages[] = {0};
+    TspdfReader *scaled = tspdf_reader_scale(doc, pages, 1, 0.5, 0.5, &err);
+    ASSERT(scaled != NULL);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    ASSERT_EQ_INT(tspdf_reader_save_to_memory(scaled, &out, &out_len), TSPDF_OK);
+    TspdfReader *reopened = tspdf_reader_open(out, out_len, &err);
+    ASSERT(reopened != NULL);
+
+    double mb[4];
+    ASSERT(read_page_box(reopened, 0, "MediaBox", mb));
+    double w = mb[2] - mb[0], h = mb[3] - mb[1];
+    ASSERT(w > w0 * 0.5 - 0.01 && w < w0 * 0.5 + 0.01);
+    ASSERT(h > h0 * 0.5 - 0.01 && h < h0 * 0.5 + 0.01);
+
+    // Unscaled page 1 keeps its original dimensions.
+    double mb1[4];
+    ASSERT(read_page_box(reopened, 1, "MediaBox", mb1));
+    ASSERT((mb1[2] - mb1[0]) > w0 - 0.01 && (mb1[2] - mb1[0]) < w0 + 0.01);
+
+    // Text still extractable after the content-transform wrap.
+    const char *txt = tspdf_reader_page_text(reopened, 0, &err);
+    ASSERT(txt != NULL);
+    ASSERT(strstr(txt, "Page 1") != NULL);
+
+    tspdf_reader_destroy(reopened);
+    free(out);
+    tspdf_reader_destroy(scaled);
+    tspdf_reader_destroy(doc);
+}
+
+TEST(test_scale_nonuniform_and_cropbox) {
+    TspdfError err;
+    // Page with both MediaBox and CropBox; scale must transform both.
+    const char *pdf =
+        "%PDF-1.4\n"
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+        "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 400] "
+        "/CropBox [10 20 190 380] /Contents 4 0 R >>\nendobj\n"
+        "4 0 obj\n<< /Length 8 >>\nstream\nq 1 0 0\nendstream\nendobj\n"
+        "trailer\n<< /Root 1 0 R >>\n";
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, strlen(pdf), &err);
+    ASSERT(doc != NULL);
+
+    size_t pages[] = {0};
+    TspdfReader *scaled = tspdf_reader_scale(doc, pages, 1, 2.0, 3.0, &err);
+    ASSERT(scaled != NULL);
+
+    double mb[4], cb[4];
+    ASSERT(read_page_box(scaled, 0, "MediaBox", mb));
+    ASSERT(mb[0] == 0 && mb[1] == 0 && mb[2] == 400 && mb[3] == 1200);
+    ASSERT(read_page_box(scaled, 0, "CropBox", cb));
+    ASSERT(cb[0] == 20 && cb[1] == 60 && cb[2] == 380 && cb[3] == 1140);
+
+    tspdf_reader_destroy(scaled);
+    tspdf_reader_destroy(doc);
+}
+
+TEST(test_resize_to_a4_from_letter) {
+    TspdfError err;
+    // Letter-size page (612 x 792) with text; resize to A4 (595.28 x 841.89).
+    const char *pdf =
+        "%PDF-1.4\n"
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+        "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        "/CropBox [10 10 602 782] /Contents 4 0 R >>\nendobj\n"
+        "4 0 obj\n<< /Length 12 >>\nstream\n0 0 1 1 re f\nendstream\nendobj\n"
+        "trailer\n<< /Root 1 0 R >>\n";
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, strlen(pdf), &err);
+    ASSERT(doc != NULL);
+
+    size_t pages[] = {0};
+    TspdfReader *r = tspdf_reader_resize_to(doc, pages, 1, 595.28, 841.89, &err);
+    ASSERT(r != NULL);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    double mb[4];
+    ASSERT(read_page_box(r, 0, "MediaBox", mb));
+    ASSERT(mb[0] == 0 && mb[1] == 0);
+    ASSERT(mb[2] > 595.27 && mb[2] < 595.29);
+    ASSERT(mb[3] > 841.88 && mb[3] < 841.90);
+    // CropBox dropped by resize.
+    double cb[4];
+    ASSERT(!read_page_box(r, 0, "CropBox", cb));
+
+    tspdf_reader_destroy(r);
+    tspdf_reader_destroy(doc);
+}
+
+// A /Rotate 90 page (MediaBox 400x300, viewed 300x400) resized --to A4 must
+// come out A4 PORTRAIT in the VIEWED orientation (595x842). Since /Rotate 90
+// swaps the axes, the stored MediaBox must hold the swapped extents
+// [0 0 842 595] so that viewed = 595x842.
+TEST(test_resize_to_a4_rotate90_viewed_portrait) {
+    TspdfError err;
+    const char *pdf =
+        "%PDF-1.4\n"
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+        "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] "
+        "/Rotate 90 /Contents 4 0 R >>\nendobj\n"
+        "4 0 obj\n<< /Length 12 >>\nstream\n0 0 1 1 re f\nendstream\nendobj\n"
+        "trailer\n<< /Root 1 0 R >>\n";
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, strlen(pdf), &err);
+    ASSERT(doc != NULL);
+
+    size_t pages[] = {0};
+    TspdfReader *r = tspdf_reader_resize_to(doc, pages, 1, 595.28, 841.89, &err);
+    ASSERT(r != NULL);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    // /Rotate is preserved.
+    ASSERT_EQ_INT(tspdf_reader_get_page(r, 0)->rotate, 90);
+
+    // Stored MediaBox is the SWAPPED extents (target_h x target_w).
+    double mb[4];
+    ASSERT(read_page_box(r, 0, "MediaBox", mb));
+    ASSERT(mb[0] == 0 && mb[1] == 0);
+    ASSERT(mb[2] > 841.88 && mb[2] < 841.90);   // stored width  = target_h
+    ASSERT(mb[3] > 595.27 && mb[3] < 595.29);   // stored height = target_w
+
+    // Viewed dims after applying /Rotate 90 (swap): 595.28 x 841.89 => portrait.
+    int rot = tspdf_reader_get_page(r, 0)->rotate;
+    double stored_w = mb[2] - mb[0];
+    double stored_h = mb[3] - mb[1];
+    double viewed_w = (rot == 90 || rot == 270) ? stored_h : stored_w;
+    double viewed_h = (rot == 90 || rot == 270) ? stored_w : stored_h;
+    ASSERT(viewed_w > 595.27 && viewed_w < 595.29);
+    ASSERT(viewed_h > 841.88 && viewed_h < 841.90);
+
+    tspdf_reader_destroy(r);
+    tspdf_reader_destroy(doc);
+}
+
+// Same for /Rotate 270.
+TEST(test_resize_to_a4_rotate270_viewed_portrait) {
+    TspdfError err;
+    const char *pdf =
+        "%PDF-1.4\n"
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+        "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] "
+        "/Rotate 270 /Contents 4 0 R >>\nendobj\n"
+        "4 0 obj\n<< /Length 12 >>\nstream\n0 0 1 1 re f\nendstream\nendobj\n"
+        "trailer\n<< /Root 1 0 R >>\n";
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, strlen(pdf), &err);
+    ASSERT(doc != NULL);
+
+    size_t pages[] = {0};
+    TspdfReader *r = tspdf_reader_resize_to(doc, pages, 1, 595.28, 841.89, &err);
+    ASSERT(r != NULL);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_INT(tspdf_reader_get_page(r, 0)->rotate, 270);
+
+    double mb[4];
+    ASSERT(read_page_box(r, 0, "MediaBox", mb));
+    int rot = tspdf_reader_get_page(r, 0)->rotate;
+    double stored_w = mb[2] - mb[0];
+    double stored_h = mb[3] - mb[1];
+    double viewed_w = (rot == 90 || rot == 270) ? stored_h : stored_w;
+    double viewed_h = (rot == 90 || rot == 270) ? stored_w : stored_h;
+    ASSERT(viewed_w > 595.27 && viewed_w < 595.29);
+    ASSERT(viewed_h > 841.88 && viewed_h < 841.90);
+
+    tspdf_reader_destroy(r);
+    tspdf_reader_destroy(doc);
+}
+
+TEST(test_resize_to_rejects_nonpositive) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/one_page.pdf", &err);
+    ASSERT(doc != NULL);
+    size_t pages[] = {0};
+    err = TSPDF_OK;
+    ASSERT(tspdf_reader_resize_to(doc, pages, 1, 0.0, 800.0, &err) == NULL);
+    ASSERT_EQ_INT(err, TSPDF_ERR_INVALID_ARG);
+    tspdf_reader_destroy(doc);
+}
+
+TEST(test_scale_rejects_nonpositive_factor) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/one_page.pdf", &err);
+    ASSERT(doc != NULL);
+
+    size_t pages[] = {0};
+    err = TSPDF_OK;
+    ASSERT(tspdf_reader_scale(doc, pages, 1, 0.0, 1.0, &err) == NULL);
+    ASSERT_EQ_INT(err, TSPDF_ERR_INVALID_ARG);
+    err = TSPDF_OK;
+    ASSERT(tspdf_reader_scale(doc, pages, 1, 1.0, -2.0, &err) == NULL);
+    ASSERT_EQ_INT(err, TSPDF_ERR_INVALID_ARG);
+
+    tspdf_reader_destroy(doc);
+}
+
 TEST(test_reorder_pages) {
     TspdfError err;
     TspdfReader *doc = tspdf_reader_open_file("tests/data/three_pages.pdf", &err);
@@ -11787,6 +12099,17 @@ int main(void) {
     RUN(test_delete_pages);
     RUN(test_rotate_pages);
     RUN(test_rotate_pages_normalizes_negative_angle);
+    RUN(test_set_cropbox_explicit_box);
+    RUN(test_set_cropbox_clamps_to_mediabox);
+    RUN(test_set_cropbox_degenerate_rejected);
+    RUN(test_set_cropbox_out_of_range);
+    RUN(test_scale_factor_half);
+    RUN(test_scale_nonuniform_and_cropbox);
+    RUN(test_resize_to_a4_from_letter);
+    RUN(test_resize_to_a4_rotate90_viewed_portrait);
+    RUN(test_resize_to_a4_rotate270_viewed_portrait);
+    RUN(test_resize_to_rejects_nonpositive);
+    RUN(test_scale_rejects_nonpositive_factor);
     RUN(test_reorder_pages);
     RUN(test_merge_documents);
     RUN(test_save_rejects_missing_stream_source);
