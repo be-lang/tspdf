@@ -266,6 +266,22 @@ reader_check "encrypt"  "$TMPDIR/encrypt.pdf" secret
 "$TSPDF" decrypt  "$TMPDIR/encrypt.pdf" --password secret -o "$TMPDIR/decrypt.pdf" > /dev/null 2>&1
 reader_check "decrypt"  "$TMPDIR/decrypt.pdf"
 
+# High-res print (bit 12) is meaningless without plain print (bit 3): requesting
+# print-hq must auto-enable print so both are allowed.
+if [ "$HAVE_QPDF" -eq 1 ]; then
+    "$TSPDF" encrypt "$INPUT" --password secret --permissions print-hq \
+        -o "$TMPDIR/enc_hq.pdf" > /dev/null 2>&1
+    enc=$(qpdf --show-encryption --password=secret "$TMPDIR/enc_hq.pdf" 2>/dev/null)
+    if printf '%s' "$enc" | grep -q 'print low resolution: allowed' && \
+       printf '%s' "$enc" | grep -q 'print high resolution: allowed'; then
+        echo "  PASS  encrypt --permissions print-hq implies print"
+        pass=$((pass + 1))
+    else
+        echo "  FAIL  encrypt --permissions print-hq implies print"
+        fail=$((fail + 1))
+    fi
+fi
+
 "$TSPDF" form fill tests/data/form_fields.pdf --set name=External --set agree=true \
     -o "$TMPDIR/form_fill.pdf" > /dev/null 2>&1
 reader_check "form fill" "$TMPDIR/form_fill.pdf"
