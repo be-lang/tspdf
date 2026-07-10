@@ -53,5 +53,7 @@ int cmd_pagenum(int argc, char **argv);
 int cmd_form(int argc, char **argv);
 int cmd_attach(int argc, char **argv);
 int cmd_stamp(int argc, char **argv);
+int cmd_crop(int argc, char **argv);
+int cmd_scale(int argc, char **argv);
 
 #endif

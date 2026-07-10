@@ -144,6 +144,11 @@ static const char *const VALUE_FLAGS[] = {
     "--bind",
     "--desc",
     "--name",
+    "--box",
+    "--margins",
+    "--margin",
+    "--to",
+    "--factor",
 };
 
 static bool is_value_flag(const char *arg) {

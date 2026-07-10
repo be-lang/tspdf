@@ -4363,6 +4363,49 @@ TEST(test_scale_nonuniform_and_cropbox) {
     tspdf_reader_destroy(doc);
 }
 
+TEST(test_resize_to_a4_from_letter) {
+    TspdfError err;
+    // Letter-size page (612 x 792) with text; resize to A4 (595.28 x 841.89).
+    const char *pdf =
+        "%PDF-1.4\n"
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+        "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        "/CropBox [10 10 602 782] /Contents 4 0 R >>\nendobj\n"
+        "4 0 obj\n<< /Length 12 >>\nstream\n0 0 1 1 re f\nendstream\nendobj\n"
+        "trailer\n<< /Root 1 0 R >>\n";
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, strlen(pdf), &err);
+    ASSERT(doc != NULL);
+
+    size_t pages[] = {0};
+    TspdfReader *r = tspdf_reader_resize_to(doc, pages, 1, 595.28, 841.89, &err);
+    ASSERT(r != NULL);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    double mb[4];
+    ASSERT(read_page_box(r, 0, "MediaBox", mb));
+    ASSERT(mb[0] == 0 && mb[1] == 0);
+    ASSERT(mb[2] > 595.27 && mb[2] < 595.29);
+    ASSERT(mb[3] > 841.88 && mb[3] < 841.90);
+    // CropBox dropped by resize.
+    double cb[4];
+    ASSERT(!read_page_box(r, 0, "CropBox", cb));
+
+    tspdf_reader_destroy(r);
+    tspdf_reader_destroy(doc);
+}
+
+TEST(test_resize_to_rejects_nonpositive) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/one_page.pdf", &err);
+    ASSERT(doc != NULL);
+    size_t pages[] = {0};
+    err = TSPDF_OK;
+    ASSERT(tspdf_reader_resize_to(doc, pages, 1, 0.0, 800.0, &err) == NULL);
+    ASSERT_EQ_INT(err, TSPDF_ERR_INVALID_ARG);
+    tspdf_reader_destroy(doc);
+}
+
 TEST(test_scale_rejects_nonpositive_factor) {
     TspdfError err;
     TspdfReader *doc = tspdf_reader_open_file("tests/data/one_page.pdf", &err);
@@ -11279,6 +11322,8 @@ int main(void) {
     RUN(test_set_cropbox_out_of_range);
     RUN(test_scale_factor_half);
     RUN(test_scale_nonuniform_and_cropbox);
+    RUN(test_resize_to_a4_from_letter);
+    RUN(test_resize_to_rejects_nonpositive);
     RUN(test_scale_rejects_nonpositive_factor);
     RUN(test_reorder_pages);
     RUN(test_merge_documents);

@@ -30,6 +30,8 @@ static void print_usage(void) {
     printf("  form       List, fill, or flatten PDF form fields\n");
     printf("  attach     Embed, list, extract, or remove file attachments\n");
     printf("  stamp      Overlay a PDF page onto another PDF's pages\n");
+    printf("  crop       Set the CropBox of pages (clip the visible region)\n");
+    printf("  scale      Resize pages, scaling their content\n");
     printf("\n");
     printf("Options:\n");
     printf("  --help, -h     Show this help message\n");
@@ -294,6 +296,33 @@ static void print_command_help(const char *cmd) {
         printf("  remove --name <name>   Attachment to remove\n");
         printf("  --password <pass>      Password for encrypted PDFs (or --password-file)\n");
         printf("  -o <output.pdf>        Output file path (required for add/remove)\n");
+    } else if (strcmp(cmd, "crop") == 0) {
+        printf("Usage: tspdf crop <input.pdf> -o <output.pdf>\n");
+        printf("             (--box x0,y0,x1,y1 | --margins t,r,b,l | --margin pt)\n");
+        printf("             [--pages <range>]\n");
+        printf("\n");
+        printf("Set the CropBox of pages (the visible region). Content is kept,\n");
+        printf("only the view is clipped — the safe, non-destructive crop.\n");
+        printf("\n");
+        printf("Arguments:\n");
+        printf("  --box x0,y0,x1,y1  Explicit box in points, relative to the page's\n");
+        printf("                     MediaBox origin (x1>x0, y1>y0)\n");
+        printf("  --margins t,r,b,l  Crop inward from the MediaBox by these margins\n");
+        printf("  --margin pt        Uniform inward margin on all four sides\n");
+        printf("  --pages <range>    Pages to crop (default: all)\n");
+        printf("The box is clamped to the MediaBox.\n");
+    } else if (strcmp(cmd, "scale") == 0) {
+        printf("Usage: tspdf scale <input.pdf> -o <output.pdf>\n");
+        printf("             (--factor f | --to a4|letter|legal|a3|a5)\n");
+        printf("             [--pages <range>]\n");
+        printf("\n");
+        printf("Resize pages, scaling their content with them (not clipping).\n");
+        printf("\n");
+        printf("Arguments:\n");
+        printf("  --factor f       Uniform scale of page dimensions and content (f>0)\n");
+        printf("  --to SIZE        Fit content into the named page size, aspect\n");
+        printf("                   preserved and centered; the MediaBox becomes SIZE\n");
+        printf("  --pages <range>  Pages to scale (default: all)\n");
     } else {
         /* Unknown command — fall back to general help */
         print_usage();
@@ -353,6 +382,8 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "form") == 0)     return cmd_form(sub_argc, sub_argv);
     if (strcmp(cmd, "attach") == 0)   return cmd_attach(sub_argc, sub_argv);
     if (strcmp(cmd, "stamp") == 0)    return cmd_stamp(sub_argc, sub_argv);
+    if (strcmp(cmd, "crop") == 0)     return cmd_crop(sub_argc, sub_argv);
+    if (strcmp(cmd, "scale") == 0)    return cmd_scale(sub_argc, sub_argv);
 
     fprintf(stderr, "tspdf: unknown command '%s'\n\n", cmd);
     print_usage();

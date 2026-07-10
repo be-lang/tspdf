@@ -146,6 +146,8 @@ CLI_SOURCES = \
 	cli/cmd_form.c \
 	cli/cmd_attach.c \
 	cli/cmd_stamp.c \
+	cli/cmd_crop.c \
+	cli/cmd_scale.c \
 	cli/server.c
 
 CLI_TARGET = $(BUILDDIR)/tspdf
