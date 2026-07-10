@@ -24,3 +24,6 @@ output.pdf
 # wasm build + demo outputs (make wasm / make wasm-demo)
 wasm/dist/
 wasm/demo/dist/
+
+# patch/merge backups
+*.orig
