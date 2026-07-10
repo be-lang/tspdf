@@ -39,7 +39,14 @@ View or edit PDF metadata.
 Print information about a PDF.
 .TP
 .B watermark
-Add a text watermark to a PDF.
+Add a text or image watermark to a PDF.
+.B \-\-text
+draws a diagonal text stamp;
+.B \-\-image
+draws a PNG/JPEG with
+.B \-\-scale
+and
+.BR \-\-position .
 .TP
 .B stamp
 Overlay a page of another PDF onto pages of the input (like pdftk stamp).
@@ -94,6 +101,7 @@ tspdf merge a.pdf b.pdf \-o combined.pdf
 tspdf split report.pdf \-\-pages 1\-5 \-o extract.pdf
 tspdf encrypt doc.pdf \-o locked.pdf \-\-password secret
 tspdf watermark doc.pdf \-o draft.pdf \-\-text "DRAFT"
+tspdf watermark doc.pdf \-o marked.pdf \-\-image logo.png \-\-opacity 0.2
 tspdf stamp report.pdf \-\-stamp approved.pdf \-o stamped.pdf
 tspdf serve \-\-port 3000
 .fi

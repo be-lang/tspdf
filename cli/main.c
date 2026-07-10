@@ -19,7 +19,7 @@ static void print_usage(void) {
     printf("  decrypt    Decrypt a password-protected PDF\n");
     printf("  metadata   View or edit PDF metadata\n");
     printf("  info       Print information about a PDF\n");
-    printf("  watermark  Add a text watermark to a PDF\n");
+    printf("  watermark  Add a text or image watermark to a PDF\n");
     printf("  compress   Compress a PDF to reduce file size\n");
     printf("  img2pdf    Convert images (JPEG/PNG) to a PDF\n");
     printf("  qrcode     Generate a QR code PDF\n");
@@ -135,13 +135,21 @@ static void print_command_help(const char *cmd) {
     } else if (strcmp(cmd, "watermark") == 0) {
         printf("Usage: tspdf watermark <input.pdf> -o <output.pdf> --text <text>\n");
         printf("                       [--opacity <0.0-1.0>]\n");
+        printf("       tspdf watermark <input.pdf> -o <output.pdf> --image <logo.png|jpg>\n");
+        printf("                       [--opacity <0.0-1.0>] [--scale <factor>] [--position <pos>]\n");
         printf("\n");
-        printf("Add a diagonal text watermark to all pages of a PDF.\n");
+        printf("Add a watermark to all pages of a PDF: a diagonal text stamp, or an\n");
+        printf("image (PNG or JPEG). --text and --image are mutually exclusive.\n");
         printf("\n");
         printf("Arguments:\n");
         printf("  <input.pdf>         Input PDF file\n");
-        printf("  --text <text>       Watermark text, e.g. \"DRAFT\" (required)\n");
+        printf("  --text <text>       Watermark text, e.g. \"DRAFT\"\n");
+        printf("  --image <file>      Watermark image (PNG or JPEG)\n");
         printf("  --opacity <float>   Opacity from 0.0 (invisible) to 1.0 (opaque), default: 0.3\n");
+        printf("  --scale <factor>    Image size: larger image dimension = scale x the\n");
+        printf("                      smaller page dimension (default: 0.5)\n");
+        printf("  --position <pos>    center (default), tile, top-left, top-right,\n");
+        printf("                      bottom-left, bottom-right\n");
         printf("  -o <output.pdf>     Output file path (required)\n");
     } else if (strcmp(cmd, "stamp") == 0) {
         printf("Usage: tspdf stamp <input.pdf> --stamp <stamp.pdf> -o <output.pdf>\n");

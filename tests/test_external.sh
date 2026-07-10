@@ -232,6 +232,8 @@ reader_check "metadata" "$TMPDIR/meta.pdf"
 "$TSPDF" watermark "$INPUT" --text "DRAFT" -o "$TMPDIR/watermark.pdf" > /dev/null 2>&1
 reader_check "watermark" "$TMPDIR/watermark.pdf"
 
+"$TSPDF" watermark "$INPUT" --image tests/data/img_rgba.png -o "$TMPDIR/watermark_img.pdf" > /dev/null 2>&1
+reader_check "watermark --image" "$TMPDIR/watermark_img.pdf"
 
 printf '# APPROVED\n' > "$TMPDIR/stamp_src.md"
 "$TSPDF" md2pdf "$TMPDIR/stamp_src.md" -o "$TMPDIR/stamp_src.pdf" > /dev/null 2>&1

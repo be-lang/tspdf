@@ -57,6 +57,16 @@ tspdf rotate report.pdf --pages 1,2 --angle 90 -o rotated.pdf
 tspdf watermark report.pdf --text "DRAFT" -o draft.pdf
 ```
 
+## Add an image watermark
+
+```bash
+# centered logo at 30% opacity
+tspdf watermark report.pdf --image logo.png -o marked.pdf
+
+# tiled across every page, smaller
+tspdf watermark report.pdf --image logo.png --position tile --scale 0.2 -o marked.pdf
+```
+
 ## Stamp one PDF onto another
 
 ```bash
