@@ -95,6 +95,58 @@ run_test "split result has exactly 2 pages (info output)" bash -c "$TSPDF info $
 run_test "split flag-first ordering (-o before input)" $TSPDF split -o $TMPDIR/split_ff.pdf --pages 1 $INPUT
 run_test "split flag-first result is the real input (1 page)" bash -c "$TSPDF info $TMPDIR/split_ff.pdf | grep -qE '^Pages:[[:space:]]*1$'"
 
+# page labels survive split and merge (verified through qpdf's label view)
+if command -v python3 > /dev/null 2>&1 && command -v qpdf > /dev/null 2>&1; then
+  python3 - "$TMPDIR/labeled.pdf" << 'PYEOF'
+import sys
+# five pages labeled i, ii, iii, 1, 2
+objs = [
+    b'<< /Type /Catalog /Pages 2 0 R /PageLabels 8 0 R >>',
+    b'<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 6 0 R 7 0 R] /Count 5 >>',
+] + [b'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>'] * 5 + [
+    b'<< /Nums [0 << /S /r >> 3 << /S /D >>] >>',
+]
+out = bytearray(b'%PDF-1.4\n')
+offs = []
+for i, body in enumerate(objs, 1):
+    offs.append(len(out))
+    out += (b'%d 0 obj\n' % i) + body + b'\nendobj\n'
+xref = len(out)
+out += b'xref\n0 %d\n' % (len(objs)+1) + b'0000000000 65535 f \n'
+for o in offs:
+    out += b'%010d 00000 n \n' % o
+out += b'trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n' % (len(objs)+1, xref)
+open(sys.argv[1], 'wb').write(out)
+PYEOF
+  run_test "split keeps effective page labels (iii, 1)" bash -c "
+    set -e
+    $TSPDF split $TMPDIR/labeled.pdf --pages 3-4 -o $TMPDIR/labeled_ex.pdf > /dev/null
+    qpdf --json --json-key=pagelabels $TMPDIR/labeled_ex.pdf 2>/dev/null | python3 -c '
+import json, sys
+labels = json.load(sys.stdin)[\"pagelabels\"]
+assert labels[0] == {\"index\": 0, \"label\": {\"/S\": \"/r\", \"/St\": 3}}, labels
+assert labels[1] == {\"index\": 1, \"label\": {\"/S\": \"/D\", \"/St\": 1}}, labels
+assert len(labels) == 2, labels
+'"
+  run_test "merge offsets labels, unlabeled doc gets decimal range" bash -c "
+    set -e
+    $TSPDF merge $TMPDIR/labeled.pdf $INPUT -o $TMPDIR/labeled_mg.pdf > /dev/null
+    qpdf --json --json-key=pagelabels $TMPDIR/labeled_mg.pdf 2>/dev/null | python3 -c '
+import json, sys
+labels = json.load(sys.stdin)[\"pagelabels\"]
+assert labels[0] == {\"index\": 0, \"label\": {\"/S\": \"/r\", \"/St\": 1}}, labels
+assert labels[1] == {\"index\": 3, \"label\": {\"/S\": \"/D\", \"/St\": 1}}, labels
+assert labels[2] == {\"index\": 5, \"label\": {\"/S\": \"/D\", \"/St\": 1}}, labels
+assert len(labels) == 3, labels
+'"
+  run_test "merge of unlabeled docs emits no /PageLabels" bash -c "
+    set -e
+    $TSPDF merge $INPUT $INPUT -o $TMPDIR/unlabeled_mg.pdf > /dev/null
+    ! grep -qa '/PageLabels' $TMPDIR/unlabeled_mg.pdf"
+else
+  echo "  SKIP  page label preservation assertions (python3/qpdf not found)"
+fi
+
 # merge
 run_test "merge two files" $TSPDF merge $INPUT $TMPDIR/split.pdf -o $TMPDIR/merged.pdf
 # flag-first ordering: -o output must not be counted as an input file

@@ -22,15 +22,16 @@ TspdfError tspdf_reader_make_streams_self_contained(TspdfObj *obj, const uint8_t
 TspdfError tspdf_doctree_merge_prepare(TspdfReader *src, TspdfParser *parser,
                                        bool *visited);
 
-// After the merge copy+remap passes: build the merged catalog's /Outlines
-// and /AcroForm from the per-source copies. Leaves merged->catalog NULL when
-// no source contributes either tree.
+// After the merge copy+remap passes: build the merged catalog's /Outlines,
+// /AcroForm, and /PageLabels from the per-source copies. Leaves
+// merged->catalog NULL when no source contributes any of them.
 TspdfError tspdf_doctree_merge_attach(TspdfReader *merged, TspdfReader **docs,
                                       size_t count, const size_t *xref_offsets);
 
 // After set_extract_catalog: attach /Outlines and /AcroForm pruned to the
-// kept pages onto dst->catalog. Omits either tree entirely when nothing in
-// it survives (round-1 behavior).
+// kept pages onto dst->catalog, plus a /PageLabels tree rebuilt so each
+// kept page keeps its effective source label. Omits any tree entirely when
+// nothing in it survives (round-1 behavior).
 TspdfError tspdf_doctree_extract_attach(TspdfReader *src, TspdfReader *dst);
 
 #endif

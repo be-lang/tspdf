@@ -6186,9 +6186,12 @@ TEST(test_extract_drops_document_level_trees) {
     ASSERT(!bytes_contains(out, out_len, "/Outlines"));
     ASSERT(!bytes_contains(out, out_len, "/Dests"));
     ASSERT(!bytes_contains(out, out_len, "/Names"));
-    ASSERT(!bytes_contains(out, out_len, "/PageLabels"));
     ASSERT(!bytes_contains(out, out_len, "/AcroForm"));
     ASSERT(!bytes_contains(out, out_len, "PINNEDPAYLOAD"));
+    // /PageLabels is rebuilt for the kept page (the payload dict carried no
+    // /S//P//St, so the rebuilt range is a blank label) — the marker object
+    // itself must still be unreachable.
+    ASSERT(bytes_contains(out, out_len, "/PageLabels"));
 
     // Other catalog entries survive
     ASSERT(bytes_contains(out, out_len, "/Lang"));
@@ -8636,6 +8639,244 @@ TEST(test_extract_breaks_cyclic_outline_siblings) {
 }
 
 // ============================================================
+// Page label preservation (extract/merge)
+// ============================================================
+
+// Five-page PDF labeled i, ii, iii, 1, 2 via /PageLabels
+// << /Nums [0 << /S /r >> 3 << /S /D >>] >>. When `cyclic` is set the
+// number tree root points at a kid that lists itself in /Kids forever.
+static char *pl_make_labeled_pdf(bool cyclic, size_t *out_len) {
+    char *pdf = (char *)malloc(8192);
+    if (!pdf) return NULL;
+
+    size_t pos = 0;
+    if (!appendf(pdf, 8192, &pos, "%%PDF-1.4\n")) goto fail;
+
+    size_t offs[10];
+    offs[1] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R /PageLabels 8 0 R >>\nendobj\n"))
+        goto fail;
+    offs[2] = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 6 0 R 7 0 R] "
+                 "/Count 5 >>\nendobj\n")) goto fail;
+    for (int i = 3; i <= 7; i++) {
+        offs[i] = pos;
+        if (!appendf(pdf, 8192, &pos,
+                     "%d 0 obj\n<< /Type /Page /Parent 2 0 R "
+                     "/MediaBox [0 0 612 792] >>\nendobj\n", i)) goto fail;
+    }
+    offs[8] = pos;
+    if (cyclic) {
+        if (!appendf(pdf, 8192, &pos,
+                     "8 0 obj\n<< /Kids [9 0 R] >>\nendobj\n")) goto fail;
+        offs[9] = pos;
+        if (!appendf(pdf, 8192, &pos,
+                     "9 0 obj\n<< /Kids [9 0 R 8 0 R] "
+                     "/Nums [0 << /S /r >> 3 << /S /D >>] >>\nendobj\n")) goto fail;
+    } else {
+        if (!appendf(pdf, 8192, &pos,
+                     "8 0 obj\n<< /Nums [0 << /S /r >> 3 << /S /D >>] >>\nendobj\n"))
+            goto fail;
+        offs[9] = pos;
+        if (!appendf(pdf, 8192, &pos,
+                     "9 0 obj\n<< /Unused true >>\nendobj\n")) goto fail;
+    }
+
+    size_t xref = pos;
+    if (!appendf(pdf, 8192, &pos,
+                 "xref\n0 10\n0000000000 65535 f \n")) goto fail;
+    for (int i = 1; i <= 9; i++) {
+        if (!appendf(pdf, 8192, &pos, "%010zu 00000 n \n", offs[i])) goto fail;
+    }
+    if (!appendf(pdf, 8192, &pos,
+                 "trailer\n<< /Size 10 /Root 1 0 R >>\nstartxref\n%zu\n%%%%EOF",
+                 xref)) goto fail;
+
+    *out_len = pos;
+    return pdf;
+
+fail:
+    free(pdf);
+    return NULL;
+}
+
+// Expect Nums pair `pair_idx` of `nums` to be (key, << /S style /St st >>)
+// where style 0 = no /S and st 1 = no /St (the spec default).
+static bool pl_expect_range(TspdfReader *doc, TspdfObj *nums, size_t pair_idx,
+                            int64_t key, char style, int64_t st) {
+    if (!nums || nums->type != TSPDF_OBJ_ARRAY) return false;
+    if (nums->array.count < (pair_idx + 1) * 2) return false;
+    TspdfObj *k = &nums->array.items[pair_idx * 2];
+    if (k->type != TSPDF_OBJ_INT || k->integer != key) return false;
+    TspdfObj *label = test_resolve_ref(doc, &nums->array.items[pair_idx * 2 + 1]);
+    if (!label || label->type != TSPDF_OBJ_DICT) return false;
+    TspdfObj *s = tspdf_dict_get(label, "S");
+    if (style == 0) {
+        if (s != NULL) return false;
+    } else {
+        char want[2] = {style, '\0'};
+        if (!dt_str_eq(s, want)) return false;
+    }
+    TspdfObj *stv = tspdf_dict_get(label, "St");
+    if (st == 1) {
+        if (stv != NULL) return false;
+    } else {
+        if (!stv || stv->type != TSPDF_OBJ_INT || stv->integer != st) return false;
+    }
+    return true;
+}
+
+TEST(test_extract_preserves_page_labels) {
+    size_t len = 0;
+    char *pdf = pl_make_labeled_pdf(false, &len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(doc), 5);
+
+    // Keep pages 3-4 (labels iii and 1): the rebuilt tree must pin the
+    // roman range at value 3 and restart decimal at the second page.
+    size_t pages[] = {2, 3};
+    TspdfReader *result = tspdf_reader_extract(doc, pages, 2, &err);
+    ASSERT(result != NULL);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(result, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(re), 2);
+
+    TspdfObj *root = dt_catalog_get(re, "PageLabels");
+    ASSERT(root != NULL && root->type == TSPDF_OBJ_DICT);
+    TspdfObj *nums = dt_get(re, root, "Nums");
+    ASSERT(nums != NULL && nums->type == TSPDF_OBJ_ARRAY);
+    ASSERT_EQ_SIZE(nums->array.count, 4);
+    ASSERT(pl_expect_range(re, nums, 0, 0, 'r', 3));  // page 0: iii
+    ASSERT(pl_expect_range(re, nums, 1, 1, 'D', 1));  // page 1: 1
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(result);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_merge_page_labels_labeled_plus_unlabeled) {
+    size_t len_a = 0, len_b = 0;
+    char *pdf_a = pl_make_labeled_pdf(false, &len_a);
+    uint8_t *pdf_b = dt_writer_pdf(2, false, false, "BB", "Helvetica", &len_b);
+    ASSERT(pdf_a != NULL && pdf_b != NULL);
+
+    TspdfError err;
+    TspdfReader *doc_a = tspdf_reader_open((const uint8_t *)pdf_a, len_a, &err);
+    TspdfReader *doc_b = tspdf_reader_open(pdf_b, len_b, &err);
+    ASSERT(doc_a != NULL && doc_b != NULL);
+
+    TspdfReader *docs[] = {doc_a, doc_b};
+    TspdfReader *merged = tspdf_reader_merge(docs, 2, &err);
+    ASSERT(merged != NULL);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(merged, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(re), 7);
+
+    // i, ii, iii, 1, 2 from the labeled source; the unlabeled source keeps
+    // its default decimal-from-1 numbering via an explicit range.
+    TspdfObj *root = dt_catalog_get(re, "PageLabels");
+    ASSERT(root != NULL && root->type == TSPDF_OBJ_DICT);
+    TspdfObj *nums = dt_get(re, root, "Nums");
+    ASSERT(nums != NULL && nums->type == TSPDF_OBJ_ARRAY);
+    ASSERT_EQ_SIZE(nums->array.count, 6);
+    ASSERT(pl_expect_range(re, nums, 0, 0, 'r', 1));
+    ASSERT(pl_expect_range(re, nums, 1, 3, 'D', 1));
+    ASSERT(pl_expect_range(re, nums, 2, 5, 'D', 1));
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(merged);
+    tspdf_reader_destroy(doc_a);
+    tspdf_reader_destroy(doc_b);
+    free(pdf_a);
+    free(pdf_b);
+}
+
+TEST(test_merge_without_page_labels_emits_none) {
+    size_t len_a = 0, len_b = 0;
+    uint8_t *pdf_a = dt_writer_pdf(1, false, false, "AA", "Helvetica", &len_a);
+    uint8_t *pdf_b = dt_writer_pdf(2, false, false, "BB", "Helvetica", &len_b);
+    ASSERT(pdf_a != NULL && pdf_b != NULL);
+
+    TspdfError err;
+    TspdfReader *doc_a = tspdf_reader_open(pdf_a, len_a, &err);
+    TspdfReader *doc_b = tspdf_reader_open(pdf_b, len_b, &err);
+    ASSERT(doc_a != NULL && doc_b != NULL);
+
+    TspdfReader *docs[] = {doc_a, doc_b};
+    TspdfReader *merged = tspdf_reader_merge(docs, 2, &err);
+    ASSERT(merged != NULL);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(merged, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(!bytes_contains(out, out_len, "/PageLabels"));
+
+    free(out);
+    tspdf_reader_destroy(merged);
+    tspdf_reader_destroy(doc_a);
+    tspdf_reader_destroy(doc_b);
+    free(pdf_a);
+    free(pdf_b);
+}
+
+TEST(test_extract_bounded_on_cyclic_pagelabel_tree) {
+    size_t len = 0;
+    char *pdf = pl_make_labeled_pdf(true, &len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    // The number tree's /Kids loops back on itself: the budgeted walk must
+    // terminate and still pick up the /Nums entries it saw on the way.
+    size_t pages[] = {0};
+    TspdfReader *result = tspdf_reader_extract(doc, pages, 1, &err);
+    ASSERT(result != NULL);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(result, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(re), 1);
+    TspdfObj *root = dt_catalog_get(re, "PageLabels");
+    ASSERT(root != NULL && root->type == TSPDF_OBJ_DICT);
+    TspdfObj *nums = dt_get(re, root, "Nums");
+    ASSERT(pl_expect_range(re, nums, 0, 0, 'r', 1));  // page 0 keeps label i
+
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(result);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+// ============================================================
 // Save-to-memory byte identity (wasm track)
 // ============================================================
 
@@ -8986,6 +9227,10 @@ int main(void) {
     RUN(test_extract_and_merge_bounded_on_cyclic_nametree);
     RUN(test_extract_bounded_on_cyclic_field_kids);
     RUN(test_extract_breaks_cyclic_outline_siblings);
+    RUN(test_extract_preserves_page_labels);
+    RUN(test_merge_page_labels_labeled_plus_unlabeled);
+    RUN(test_merge_without_page_labels_emits_none);
+    RUN(test_extract_bounded_on_cyclic_pagelabel_tree);
     printf("\n  Save-to-memory byte identity (wasm):\n");
     RUN(test_reader_save_to_memory_matches_file);
     RUN(test_reader_save_to_memory_with_options_matches_file);
