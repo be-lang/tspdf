@@ -148,6 +148,34 @@ run_test "info reports AES-128 R4 encryption details" bash -c "
 run_test "info reports AES-256 R6 encryption details" bash -c "
   $TSPDF info $TMPDIR/enc256.pdf --password secret | grep -qE '^Encrypted:[[:space:]]+yes \(AES-256, R6\)$'"
 
+# encrypt --permissions: listed actions allowed, everything else denied
+run_test "encrypt --permissions rejects unknown tokens" bash -c "! $TSPDF encrypt $INPUT -o $TMPDIR/encbad.pdf --password secret --permissions print,teleport > /dev/null 2>&1"
+run_test "encrypt --permissions print" $TSPDF encrypt $INPUT -o $TMPDIR/encperm.pdf --password secret --permissions print
+run_test "restricted file still opens with the user password" bash -c "
+  $TSPDF info $TMPDIR/encperm.pdf --password secret | grep -qE '^Pages:[[:space:]]*3$'"
+if command -v qpdf > /dev/null 2>&1; then
+  run_test "qpdf sees print allowed, the rest denied" bash -c "
+    set -e
+    out=\$(qpdf --password=secret --show-encryption $TMPDIR/encperm.pdf)
+    echo \"\$out\" | grep -q '^print low resolution: allowed'
+    echo \"\$out\" | grep -q '^print high resolution: not allowed'
+    echo \"\$out\" | grep -q '^extract for any purpose: not allowed'
+    echo \"\$out\" | grep -q '^modify anything: not allowed'
+    echo \"\$out\" | grep -q '^modify forms: not allowed'
+    echo \"\$out\" | grep -q '^modify document assembly: not allowed'"
+  # AES-256 (R6) carries /P into the crypt-protected Perms field too
+  run_test "qpdf sees the same restrictions on AES-256" bash -c "
+    set -e
+    $TSPDF encrypt $INPUT -o $TMPDIR/encperm256.pdf --password secret --bits 256 --permissions copy > /dev/null
+    out=\$(qpdf --password=secret --show-encryption $TMPDIR/encperm256.pdf)
+    echo \"\$out\" | grep -q '^extract for any purpose: allowed'
+    echo \"\$out\" | grep -q '^print low resolution: not allowed'"
+  run_test "default without --permissions allows everything" bash -c "
+    ! qpdf --password=secret --show-encryption $TMPDIR/enc128.pdf | grep -q 'not allowed'"
+else
+  echo "  SKIP  encrypt --permissions qpdf assertions (qpdf not found)"
+fi
+
 # metadata
 run_test "metadata view" $TSPDF metadata $INPUT
 run_test "metadata set" $TSPDF metadata $INPUT --set title="Test Title" --set author="Test Author" -o $TMPDIR/meta.pdf
