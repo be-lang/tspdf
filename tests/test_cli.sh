@@ -1005,7 +1005,7 @@ run_test "qrcode --ec-level H" $TSPDF qrcode "https://example.com" --ec-level H 
 run_test "qrcode --ec-level lowercase h" $TSPDF qrcode "https://example.com" --ec-level h -o $TMPDIR/qr_h2.pdf
 run_test "qrcode --ec-level X rejected" bash -c "! $TSPDF qrcode 'https://example.com' --ec-level X -o $TMPDIR/qr_x.pdf > /dev/null 2>&1"
 run_test "qrcode H symbol denser than L" bash -c "
-  [ \$(stat -c%s $TMPDIR/qr_h.pdf) -gt \$(stat -c%s $TMPDIR/qr_l.pdf) ]"
+  [ \$(wc -c < $TMPDIR/qr_h.pdf) -gt \$(wc -c < $TMPDIR/qr_l.pdf) ]"
 # level H shrinks capacity: 137 bytes is the v11 ceiling at H, 138 must fail
 run_test "qrcode --ec-level H capacity ceiling" bash -c "
   set -e
@@ -2812,8 +2812,8 @@ if command -v python3 >/dev/null 2>&1 && [ -f "$LOSSY_IN" ]; then
   run_test "compress --lossy shrinks a 600-dpi scan > 60%" bash -c '
     set -e
     "'"$TSPDF"'" compress --lossy '"$LOSSY_IN"' -o "'"$TMPDIR"'/lossy_out.pdf"
-    in=$(stat -c %s '"$LOSSY_IN"')
-    out=$(stat -c %s "'"$TMPDIR"'/lossy_out.pdf")
+    in=$(wc -c < '"$LOSSY_IN"')
+    out=$(wc -c < "'"$TMPDIR"'/lossy_out.pdf")
     [ $((out * 10)) -lt $((in * 4)) ]'
 
   run_test "compress --lossy converts the image to DCTDecode" bash -c '
@@ -2887,8 +2887,8 @@ if command -v python3 >/dev/null 2>&1 && [ -f "$LOSSY_IN" ]; then
   run_test "compress --image-quality 30 is smaller than the default" bash -c '
     set -e
     "'"$TSPDF"'" compress --lossy --image-quality 30 tests/data/lossy_scan_dct.pdf -o "'"$TMPDIR"'/lossy_q30.pdf"
-    q30=$(stat -c %s "'"$TMPDIR"'/lossy_q30.pdf")
-    dflt=$(stat -c %s "'"$TMPDIR"'/lossy_dct_out.pdf")
+    q30=$(wc -c < "'"$TMPDIR"'/lossy_q30.pdf")
+    dflt=$(wc -c < "'"$TMPDIR"'/lossy_dct_out.pdf")
     [ "$q30" -lt "$dflt" ]'
 
   run_test "compress rejects invalid lossy flag values" bash -c '
@@ -2906,8 +2906,8 @@ if command -v python3 >/dev/null 2>&1 && [ -f "$LOSSY_IN" ]; then
       "'"$TSPDF"'" compress --lossy "'"$TMPDIR"'/lossy_enc.pdf" -o "'"$TMPDIR"'/lossy_enc_out.pdf"
       qpdf --is-encrypted "'"$TMPDIR"'/lossy_enc_out.pdf"
       qpdf --check "'"$TMPDIR"'/lossy_enc_out.pdf" > /dev/null
-      in=$(stat -c %s "'"$TMPDIR"'/lossy_enc.pdf")
-      out=$(stat -c %s "'"$TMPDIR"'/lossy_enc_out.pdf")
+      in=$(wc -c < "'"$TMPDIR"'/lossy_enc.pdf")
+      out=$(wc -c < "'"$TMPDIR"'/lossy_enc_out.pdf")
       [ "$out" -lt $((in / 2)) ]'
   else
     echo "  SKIP  compress --lossy encrypted roundtrip (qpdf not found)"
