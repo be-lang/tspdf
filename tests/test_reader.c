@@ -9289,6 +9289,7 @@ TEST(test_form_fill_readonly_requires_force) {
     tspdf_reader_destroy(re);
     free(out);
     tspdf_reader_destroy(doc);
+    free(pdf);
 }
 
 // --- flatten ---
