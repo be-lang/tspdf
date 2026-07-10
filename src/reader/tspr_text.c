@@ -7,7 +7,10 @@
 //
 // Layout is heuristic and stays in content-stream order: a baseline jump
 // beyond 0.3 em emits a newline, a large x-gap within a line emits a space,
-// and TJ adjustments beyond ~half the space width emit a space. Robustness
+// and TJ adjustments beyond ~half the space width emit a space. Word-gap
+// thresholds are clamped to [0.15, 0.20] em because declared space widths
+// are unreliable: TeX subsets omit the space glyph entirely and TeX math
+// fonts put a wide non-space glyph at code 32. Robustness
 // beats fidelity: unknown operators are skipped, malformed CMaps degrade to
 // the next fallback, and nothing here may crash on hostile input.
 
@@ -641,6 +644,16 @@ static void tx_simple_widths(TextCtx *ctx, TextFont *f) {
         }
     }
 
+    // Space width: trust only real data (a /Widths entry for code 32 or
+    // base-14 metrics). TeX-style subsets often start /Widths past the space
+    // glyph (FirstChar 40) because inter-word gaps are TJ kerns; letting the
+    // generic 500 default stand here doubles every word-gap threshold and
+    // glues words at 0.25 em kerns. 0 = unknown; callers fall back to a
+    // 250/1000-em nominal space.
+    double sw = f->widths[32];
+    if (sw <= 0 && b14 && b14->widths[32] > 0) sw = b14->widths[32];
+    f->space_w = sw;
+
     double missing = 0;
     TspdfObj *fd = tx_resolve(ctx, tspdf_dict_get(f->dict, "FontDescriptor"));
     if (fd && fd->type == TSPDF_OBJ_DICT) {
@@ -652,7 +665,6 @@ static void tx_simple_widths(TextCtx *ctx, TextFont *f) {
         else if (b14 && b14->widths[i] > 0) f->widths[i] = b14->widths[i];
         else f->widths[i] = 500;
     }
-    f->space_w = f->widths[32];
 }
 
 static int cid_w_cmp(const void *a, const void *b) {
@@ -963,8 +975,16 @@ static void tx_pre_run(TextCtx *ctx, const TextGS *gs) {
             double size = gs->size != 0 ? fabs(gs->size) : 1.0;
             double space_w = gs->font && gs->font->space_w > 0 ? gs->font->space_w : 250;
             double thr = 0.5 * (space_w / 1000.0) * size * sx;
+            // Clamp to [0.15, 0.20] em: poppler breaks words near 0.1 em
+            // regardless of the font, and declared space widths are not
+            // reliable — TeX math fonts carry a real glyph at code 32
+            // (cmmi: 651/1000) whose width would push the threshold past
+            // a normal 0.25 em word gap and glue words together at
+            // font-change boundaries ("of dk", "with dmodel").
             double min_thr = 0.15 * ref_em;
+            double max_thr = 0.20 * ref_em;
             if (thr < min_thr) thr = min_thr;
+            if (thr > max_thr) thr = max_thr;
             if (dx > thr || dx < -ref_em) tx_space(ctx);
         }
     }
@@ -1223,6 +1243,7 @@ static void tx_interpret(TextCtx *ctx, const uint8_t *data, size_t len,
                 tx_pre_run(ctx, gs);
                 double thr = gs->font && gs->font->space_w > 0
                                  ? gs->font->space_w * 0.5 : 120.0;
+                if (thr > 200.0) thr = 200.0; // same 0.20 em cap as tx_pre_run
                 for (size_t i = 0; i < arr->array.count; i++) {
                     TspdfObj *el = &arr->array.items[i];
                     if (el->type == TSPDF_OBJ_STRING) {
