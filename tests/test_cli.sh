@@ -432,6 +432,58 @@ else
   echo "  SKIP  watermark --image qpdf checks (qpdf not found)"
 fi
 
+# overlay commands on pages whose /Resources is an INDIRECT reference (the
+# pymupdf/pdfTeX shape: shared between both pages, /Font itself indirect).
+# The resource merge used to append a duplicate /Resources key, orphaning the
+# original fonts — pages rendered near-blank in poppler. Fixture committed as
+# tests/data/indirect_resources.pdf (see gen_indirect_resources.py).
+IND_RES=tests/data/indirect_resources.pdf
+run_test "watermark --text keeps fonts of indirect-/Resources pages" bash -c "
+  set -e
+  $TSPDF watermark $IND_RES --text DRAFT -o $TMPDIR/ind_wm.pdf > /dev/null
+  $TSPDF text $TMPDIR/ind_wm.pdf --pages 1 | grep -q 'Hello page one'
+  $TSPDF text $TMPDIR/ind_wm.pdf --pages 2 | grep -q 'Hello page two'
+  $TSPDF text $TMPDIR/ind_wm.pdf --pages 1 | grep -q DRAFT"
+run_test "watermark --image keeps fonts of indirect-/Resources pages" bash -c "
+  set -e
+  $TSPDF watermark $IND_RES --image tests/data/img_rgb.png -o $TMPDIR/ind_wm_img.pdf > /dev/null
+  $TSPDF text $TMPDIR/ind_wm_img.pdf --pages 1 | grep -q 'Hello page one'
+  $TSPDF text $TMPDIR/ind_wm_img.pdf --pages 2 | grep -q 'Hello page two'"
+run_test "pagenum keeps fonts of indirect-/Resources pages" bash -c "
+  set -e
+  $TSPDF pagenum $IND_RES -o $TMPDIR/ind_pn.pdf > /dev/null
+  $TSPDF text $TMPDIR/ind_pn.pdf --pages 1 | grep -q 'Hello page one'
+  $TSPDF text $TMPDIR/ind_pn.pdf --pages 2 | grep -q 'Hello page two'
+  $TSPDF text $TMPDIR/ind_pn.pdf --pages 2 | grep -q 2"
+if command -v qpdf > /dev/null 2>&1; then
+  # qpdf exits nonzero on 'dictionary has duplicated key /Resources' warnings.
+  run_test "indirect-/Resources outputs pass qpdf --check" bash -c "
+    set -e
+    qpdf --check $TMPDIR/ind_wm.pdf > /dev/null 2>&1
+    qpdf --check $TMPDIR/ind_wm_img.pdf > /dev/null 2>&1
+    qpdf --check $TMPDIR/ind_pn.pdf > /dev/null 2>&1"
+else
+  echo "  SKIP  indirect-/Resources qpdf checks (qpdf not found)"
+fi
+if command -v pdftotext > /dev/null 2>&1; then
+  # poppler honors the LAST duplicate key, so the bug made it lose the
+  # original fonts entirely (near-blank render, no extractable text).
+  run_test "indirect-/Resources outputs keep poppler-extractable text" bash -c "
+    set -e
+    pdftotext $TMPDIR/ind_wm.pdf - | grep -q 'Hello page one'
+    pdftotext $TMPDIR/ind_wm_img.pdf - | grep -q 'Hello page two'
+    pdftotext $TMPDIR/ind_pn.pdf - | grep -q 'Hello page one'"
+else
+  echo "  SKIP  indirect-/Resources poppler text checks (pdftotext not found)"
+fi
+# Each page dict must end up with exactly ONE /Resources key: the raw output
+# is uncompressed, so the literal must appear exactly twice (once per page) —
+# the duplicate-key bug produced four.
+run_test "indirect-/Resources watermark writes a single /Resources per page" bash -c "
+  set -e
+  [ -f $TMPDIR/ind_wm.pdf ]
+  [ \$(grep -ao '/Resources' $TMPDIR/ind_wm.pdf | wc -l) -eq 2 ]"
+
 # stamp: overlay a page of one PDF onto pages of another
 printf '# APPROVED\n' > $TMPDIR/stamp_src.md
 $TSPDF md2pdf $TMPDIR/stamp_src.md -o $TMPDIR/stamp_src.pdf > /dev/null 2>&1

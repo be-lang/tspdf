@@ -8,6 +8,7 @@
 // --- Helper functions for creating TspdfObj nodes ---
 
 static bool dict_set(TspdfObj *dict, TspdfArena *arena, const char *key, TspdfObj *value);
+static TspdfObj *resolve_maybe_ref(TspdfReader *doc, TspdfObj *obj);
 
 static TspdfObj *make_name_obj(TspdfArena *a, const char *str) {
     TspdfObj *obj = tspdf_arena_alloc_zero(a, sizeof(TspdfObj));
@@ -157,6 +158,57 @@ TspdfStream *tspdf_page_begin_content(TspdfReader *doc, size_t page_index) {
     return stream;
 }
 
+// Shallow-copy a dict into a fresh arena dict (new entries array, same values).
+static TspdfObj *shallow_copy_dict(TspdfArena *a, const TspdfObj *src) {
+    TspdfObj *copy = tspdf_arena_alloc_zero(a, sizeof(TspdfObj));
+    if (!copy) return NULL;
+    copy->type = TSPDF_OBJ_DICT;
+    if (src->dict.count == 0) return copy;
+    TspdfDictEntry *entries = tspdf_arena_alloc(a, src->dict.count * sizeof(TspdfDictEntry));
+    if (!entries) return NULL;
+    memcpy(entries, src->dict.entries, src->dict.count * sizeof(TspdfDictEntry));
+    copy->dict.entries = entries;
+    copy->dict.count = src->dict.count;
+    return copy;
+}
+
+// tspdf_resources_merge only understands direct dicts. /Resources is often an
+// INDIRECT reference (pymupdf-saved and pdfTeX/arXiv files), and the merge
+// used to treat that as "no resources", appending a duplicate /Resources key
+// to the page dict: last-wins readers (poppler) then lost the original fonts
+// and rendered the page near-blank. Resolve such refs — for /Resources itself
+// and for the /Font /XObject /ExtGState sub-dicts the merge mutates — and
+// inline per-page COPIES on the page dict. The ref may be shared between
+// pages, so copying keeps each page's additions to itself (same approach as
+// form_copy_resources_for_merge in tspr_form.c). Dangling or non-dict values
+// are left alone: the merge replaces them with a fresh dict in place.
+static TspdfError inline_resources_for_merge(TspdfReader *doc, TspdfObj *page_dict) {
+    TspdfArena *arena = &doc->arena;
+    TspdfObj *res = tspdf_dict_get(page_dict, "Resources");
+    if (!res) return TSPDF_OK; // absent: the merge creates a fresh dict
+
+    if (res->type == TSPDF_OBJ_REF) {
+        TspdfObj *resolved = resolve_maybe_ref(doc, res);
+        if (!resolved || resolved->type != TSPDF_OBJ_DICT) return TSPDF_OK;
+        res = shallow_copy_dict(arena, resolved);
+        if (!res) return TSPDF_ERR_ALLOC;
+        if (!dict_set(page_dict, arena, "Resources", res)) return TSPDF_ERR_ALLOC;
+    }
+    if (res->type != TSPDF_OBJ_DICT) return TSPDF_OK;
+
+    static const char *cats[] = { "Font", "XObject", "ExtGState" };
+    for (size_t c = 0; c < sizeof(cats) / sizeof(cats[0]); c++) {
+        TspdfObj *sub = tspdf_dict_get(res, cats[c]);
+        if (!sub || sub->type != TSPDF_OBJ_REF) continue;
+        TspdfObj *resolved = resolve_maybe_ref(doc, sub);
+        if (!resolved || resolved->type != TSPDF_OBJ_DICT) continue;
+        TspdfObj *copy = shallow_copy_dict(arena, resolved);
+        if (!copy) return TSPDF_ERR_ALLOC;
+        if (!dict_set(res, arena, cats[c], copy)) return TSPDF_ERR_ALLOC;
+    }
+    return TSPDF_OK;
+}
+
 static TspdfError page_end_content_internal(TspdfReader *doc, size_t page_index,
                                             TspdfStream *stream, TspdfWriter *resource_owner,
                                             bool under) {
@@ -184,10 +236,17 @@ static TspdfError page_end_content_internal(TspdfReader *doc, size_t page_index,
         new_resources = build_new_resources(resource_owner, arena);
     }
 
-    // 3. Merge resources
+    // 3. Merge resources (after inlining any indirect /Resources refs the
+    //    merge cannot follow).
     TspdfRenameMap renames = {0};
     if (new_resources) {
-        TspdfError err = tspdf_resources_merge(page_dict, new_resources, arena, &renames);
+        TspdfError err = inline_resources_for_merge(doc, page_dict);
+        if (err != TSPDF_OK) {
+            tspdf_stream_destroy(stream);
+            free(stream);
+            return err;
+        }
+        err = tspdf_resources_merge(page_dict, new_resources, arena, &renames);
         if (err != TSPDF_OK) {
             tspdf_stream_destroy(stream);
             free(stream);

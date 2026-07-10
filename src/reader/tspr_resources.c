@@ -66,6 +66,17 @@ static TspdfObj *get_or_create_subdict(TspdfObj *dict, TspdfArena *arena, const 
     sub->type = TSPDF_OBJ_DICT;
     sub->dict.entries = NULL;
     sub->dict.count = 0;
+    // If the key already exists with a non-dict value (this layer cannot
+    // resolve indirect refs — callers inline those first; what remains is a
+    // dangling ref or garbage), REPLACE it in place: appending a second entry
+    // would create a duplicate key, and last-wins readers such as poppler
+    // would drop the original resources.
+    for (size_t i = 0; i < dict->dict.count; i++) {
+        if (strcmp(dict->dict.entries[i].key, key) == 0) {
+            dict->dict.entries[i].value = sub;
+            return sub;
+        }
+    }
     dict_add_entry(dict, arena, key, sub);
     return sub;
 }
