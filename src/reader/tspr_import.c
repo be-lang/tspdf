@@ -96,6 +96,58 @@ static bool imp_push(ImpStack *s, TspdfObj *obj) {
     return true;
 }
 
+// --- Cross-import dedup cache (see TspdfImportCache in tspr_internal.h) ---
+//
+// Sorted array + binary search: imports touch hundreds to low thousands of
+// objects, so O(log n) lookup with O(n) insert beats hash-table complexity.
+// Pointers are compared as uintptr_t (ordering unrelated pointers directly
+// is undefined behavior in C).
+
+// Index of the first entry >= (src, num); c->count if none.
+static size_t import_cache_lower_bound(const TspdfImportCache *c,
+                                       const TspdfReader *src, uint32_t num) {
+    size_t lo = 0, hi = c->count;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        const TspdfImportCacheEntry *e = &c->entries[mid];
+        if ((uintptr_t)e->src < (uintptr_t)src ||
+            ((uintptr_t)e->src == (uintptr_t)src && e->src_num < num)) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+// Destination object number of an earlier import of (src, num), or 0.
+static uint32_t import_cache_lookup(const TspdfImportCache *c,
+                                    const TspdfReader *src, uint32_t num) {
+    size_t i = import_cache_lower_bound(c, src, num);
+    if (i < c->count && c->entries[i].src == src && c->entries[i].src_num == num) {
+        return c->entries[i].dst_num;
+    }
+    return 0;
+}
+
+static bool import_cache_insert(TspdfImportCache *c, const TspdfReader *src,
+                                uint32_t num, uint32_t dst_num) {
+    if (c->count >= c->capacity) {
+        size_t cap = c->capacity == 0 ? 64 : c->capacity * 2;
+        TspdfImportCacheEntry *arr = realloc(c->entries, cap * sizeof(*arr));
+        if (!arr) return false;
+        c->entries = arr;
+        c->capacity = cap;
+    }
+    size_t i = import_cache_lower_bound(c, src, num);
+    memmove(&c->entries[i + 1], &c->entries[i], (c->count - i) * sizeof(*c->entries));
+    c->entries[i].src = src;
+    c->entries[i].src_num = num;
+    c->entries[i].dst_num = dst_num;
+    c->count++;
+    return true;
+}
+
 // deep_copy mallocs stream bytes, but the reader only frees stream data
 // reachable through obj_cache — new objects' buffers would leak. Move the
 // bytes into the destination arena instead.
@@ -153,6 +205,18 @@ static TspdfError import_remap_refs(TspdfReader *dst, TspdfReader *src,
                     cur->ref.gen = 0;
                     break;
                 }
+                // Imported by an earlier call into this destination? Reuse
+                // that copy — this is what dedups shared resources across the
+                // one-import-per-placement pattern of nup/stamp. map[] stays
+                // as the per-call fast path; the cache is the cross-call
+                // authority.
+                uint32_t cached = import_cache_lookup(&dst->import_cache, src, n);
+                if (cached != 0) {
+                    map[n] = cached;
+                    cur->ref.num = cached;
+                    cur->ref.gen = 0;
+                    break;
+                }
                 TspdfObj *resolved = tspdf_xref_resolve(&src->xref, src_parser, n,
                                                         src->obj_cache, src->crypt);
                 if (!resolved) {
@@ -167,6 +231,14 @@ static TspdfError import_remap_refs(TspdfReader *dst, TspdfReader *src,
                 // Record the mapping BEFORE walking the copy: reference
                 // cycles resolve against the map instead of recursing.
                 map[n] = num;
+                // And in the cross-call cache, so later imports from the same
+                // source reuse this copy. Only objects reached through refs
+                // are cached — the top-level form XObject built per call is
+                // unique (its content stream differs) and never enters here.
+                if (!import_cache_insert(&dst->import_cache, src, n, num)) {
+                    err = TSPDF_ERR_ALLOC;
+                    goto done;
+                }
                 cur->ref.num = num;
                 cur->ref.gen = 0;
                 if (!imp_push(&st, copy)) { err = TSPDF_ERR_ALLOC; goto done; }
