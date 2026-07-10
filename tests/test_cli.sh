@@ -1863,14 +1863,14 @@ run_test "attach extract unknown --name fails" bash -c "
   ! $TSPDF attach extract $TMPDIR/att.pdf --name no_such.bin -o $TMPDIR 2>/dev/null"
 run_test "attach remove drops one attachment" bash -c "
   $TSPDF attach remove $TMPDIR/att.pdf --name att_f.txt -o $TMPDIR/att_rm.pdf > /dev/null &&
-  [ \"\$($TSPDF attach list $TMPDIR/att_rm.pdf | wc -l)\" = 1 ] &&
+  [ \"\$($TSPDF attach list $TMPDIR/att_rm.pdf | wc -l | tr -d '[:space:]')\" = 1 ] &&
   ! $TSPDF attach list $TMPDIR/att_rm.pdf | grep -q att_f.txt"
 run_test "attach remove unknown name fails" bash -c "
   ! $TSPDF attach remove $TMPDIR/att.pdf --name no_such.bin -o $TMPDIR/att_rm2.pdf 2>/dev/null"
 run_test "attach add replaces an existing name" bash -c "
   printf 'replaced' > $TMPDIR/att_f.txt &&
   $TSPDF attach add $TMPDIR/att.pdf $TMPDIR/att_f.txt -o $TMPDIR/att_rep.pdf > /dev/null &&
-  [ \"\$($TSPDF attach list $TMPDIR/att_rep.pdf | wc -l)\" = 2 ] &&
+  [ \"\$($TSPDF attach list $TMPDIR/att_rep.pdf | wc -l | tr -d '[:space:]')\" = 2 ] &&
   rm -rf $TMPDIR/att_ex2 && mkdir $TMPDIR/att_ex2 &&
   $TSPDF attach extract $TMPDIR/att_rep.pdf --name att_f.txt -o $TMPDIR/att_ex2 > /dev/null &&
   [ \"\$(cat $TMPDIR/att_ex2/att_f.txt)\" = replaced ]"
@@ -1886,7 +1886,7 @@ run_test "attach survives merge with union" bash -c "
   $TSPDF attach add $INPUT $TMPDIR/att_f.txt -o $TMPDIR/att_m1.pdf > /dev/null &&
   $TSPDF attach add $INPUT $TMPDIR/att_blob.bin -o $TMPDIR/att_m2.pdf > /dev/null &&
   $TSPDF merge $TMPDIR/att_m1.pdf $TMPDIR/att_m2.pdf -o $TMPDIR/att_merged.pdf > /dev/null &&
-  [ \"\$($TSPDF attach list $TMPDIR/att_merged.pdf | wc -l)\" = 2 ] &&
+  [ \"\$($TSPDF attach list $TMPDIR/att_merged.pdf | wc -l | tr -d '[:space:]')\" = 2 ] &&
   $TSPDF attach list $TMPDIR/att_merged.pdf | grep -q att_f.txt &&
   $TSPDF attach list $TMPDIR/att_merged.pdf | grep -q att_blob.bin"
 
