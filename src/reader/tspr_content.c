@@ -155,8 +155,9 @@ TspdfStream *tspdf_page_begin_content(TspdfReader *doc, size_t page_index) {
     return stream;
 }
 
-TspdfError tspdf_page_end_content(TspdfReader *doc, size_t page_index,
-                                TspdfStream *stream, TspdfWriter *resource_owner) {
+static TspdfError page_end_content_internal(TspdfReader *doc, size_t page_index,
+                                            TspdfStream *stream, TspdfWriter *resource_owner,
+                                            bool under) {
     if (!doc || !stream) return TSPDF_ERR_INVALID_PDF;
     if (page_index >= doc->pages.count) return TSPDF_ERR_INVALID_PDF;
 
@@ -205,73 +206,105 @@ TspdfError tspdf_page_end_content(TspdfReader *doc, size_t page_index,
         }
     }
 
-    // 5. Create stream objects
-    // q stream (save graphics state)
-    const uint8_t q_bytes[] = "q\n";
-    TspdfObj *q_stream = make_stream_obj(arena, q_bytes, 2);
-    if (!q_stream) { tspdf_stream_destroy(stream); free(stream); return TSPDF_ERR_ALLOC; }
-
-    // Q stream (restore graphics state)
-    const uint8_t Q_bytes[] = "Q\n";
-    TspdfObj *Q_stream = make_stream_obj(arena, Q_bytes, 2);
-    if (!Q_stream) { tspdf_stream_destroy(stream); free(stream); return TSPDF_ERR_ALLOC; }
-
-    // New content stream
-    TspdfObj *new_stream = make_stream_obj(arena, final_content, final_len);
-    if (!new_stream) { tspdf_stream_destroy(stream); free(stream); return TSPDF_ERR_ALLOC; }
-
-    // 6. Register all new streams
-    uint32_t q_num = tspdf_register_new_obj(doc, q_stream);
-    uint32_t Q_num = tspdf_register_new_obj(doc, Q_stream);
-    uint32_t new_num = tspdf_register_new_obj(doc, new_stream);
-    if (q_num == 0 || Q_num == 0 || new_num == 0) {
-        tspdf_stream_destroy(stream);
-        free(stream);
-        return TSPDF_ERR_ALLOC;
-    }
-
-    // 7. Create ref objects
-    TspdfObj *q_ref = make_ref_obj(arena, q_num);
-    TspdfObj *Q_ref = make_ref_obj(arena, Q_num);
-    TspdfObj *new_ref = make_ref_obj(arena, new_num);
-
-    // 8. Update /Contents
+    // 5-8. Build the new stream object(s) and the replacement /Contents array.
     TspdfObj *contents = tspdf_dict_get(page_dict, "Contents");
 
     TspdfObj *new_contents_array = tspdf_arena_alloc_zero(arena, sizeof(TspdfObj));
     if (!new_contents_array) { tspdf_stream_destroy(stream); free(stream); return TSPDF_ERR_ALLOC; }
     new_contents_array->type = TSPDF_OBJ_ARRAY;
 
-    if (contents && contents->type == TSPDF_OBJ_ARRAY) {
-        // Already an array: [q_ref, ...old_items, Q_ref, new_ref]
-        size_t old_count = contents->array.count;
-        size_t total = old_count + 3; // q + old items + Q + new
-        new_contents_array->array.items = tspdf_arena_alloc_zero(arena, total * sizeof(TspdfObj));
-        new_contents_array->array.count = total;
+    if (under) {
+        // Under-mode: prepend one stream wrapped in q..Q, so the original
+        // content still starts from a pristine graphics state:
+        // [wrapped_new, ...old items]
+        size_t wrapped_len = 2 + final_len + 3;  // "q\n" + content + "\nQ\n"
+        uint8_t *wrapped = tspdf_arena_alloc(arena, wrapped_len);
+        if (!wrapped) { tspdf_stream_destroy(stream); free(stream); return TSPDF_ERR_ALLOC; }
+        memcpy(wrapped, "q\n", 2);
+        memcpy(wrapped + 2, final_content, final_len);
+        memcpy(wrapped + 2 + final_len, "\nQ\n", 3);
 
-        // q_ref
-        new_contents_array->array.items[0] = *q_ref;
-        // old items
-        for (size_t i = 0; i < old_count; i++) {
-            new_contents_array->array.items[1 + i] = contents->array.items[i];
-        }
-        // Q_ref
-        new_contents_array->array.items[1 + old_count] = *Q_ref;
-        // new_ref
-        new_contents_array->array.items[2 + old_count] = *new_ref;
-    } else if (contents && contents->type == TSPDF_OBJ_REF) {
-        // Single ref: [q_ref, old_ref, Q_ref, new_ref]
-        new_contents_array->array.items = tspdf_arena_alloc_zero(arena, 4 * sizeof(TspdfObj));
-        new_contents_array->array.count = 4;
-        new_contents_array->array.items[0] = *q_ref;
-        new_contents_array->array.items[1] = *contents;
-        new_contents_array->array.items[2] = *Q_ref;
-        new_contents_array->array.items[3] = *new_ref;
-    } else {
-        // No existing contents: just [new_ref]
-        new_contents_array->array.items = tspdf_arena_alloc_zero(arena, sizeof(TspdfObj));
-        new_contents_array->array.count = 1;
+        TspdfObj *new_stream = make_stream_obj(arena, wrapped, wrapped_len);
+        if (!new_stream) { tspdf_stream_destroy(stream); free(stream); return TSPDF_ERR_ALLOC; }
+        uint32_t new_num = tspdf_register_new_obj(doc, new_stream);
+        if (new_num == 0) { tspdf_stream_destroy(stream); free(stream); return TSPDF_ERR_ALLOC; }
+        TspdfObj *new_ref = make_ref_obj(arena, new_num);
+        if (!new_ref) { tspdf_stream_destroy(stream); free(stream); return TSPDF_ERR_ALLOC; }
+
+        size_t old_count = 0;
+        if (contents && contents->type == TSPDF_OBJ_ARRAY) old_count = contents->array.count;
+        else if (contents && contents->type == TSPDF_OBJ_REF) old_count = 1;
+
+        new_contents_array->array.items = tspdf_arena_alloc_zero(arena, (old_count + 1) * sizeof(TspdfObj));
+        if (!new_contents_array->array.items) { tspdf_stream_destroy(stream); free(stream); return TSPDF_ERR_ALLOC; }
+        new_contents_array->array.count = old_count + 1;
         new_contents_array->array.items[0] = *new_ref;
+        if (contents && contents->type == TSPDF_OBJ_ARRAY) {
+            for (size_t i = 0; i < old_count; i++) {
+                new_contents_array->array.items[1 + i] = contents->array.items[i];
+            }
+        } else if (contents && contents->type == TSPDF_OBJ_REF) {
+            new_contents_array->array.items[1] = *contents;
+        }
+    } else {
+        // Append-mode (overlay): wrap the ORIGINAL content in q..Q so the new
+        // content starts from a pristine graphics state:
+        // [q, ...old items, Q, new]
+        const uint8_t q_bytes[] = "q\n";
+        TspdfObj *q_stream = make_stream_obj(arena, q_bytes, 2);
+        if (!q_stream) { tspdf_stream_destroy(stream); free(stream); return TSPDF_ERR_ALLOC; }
+
+        const uint8_t Q_bytes[] = "Q\n";
+        TspdfObj *Q_stream = make_stream_obj(arena, Q_bytes, 2);
+        if (!Q_stream) { tspdf_stream_destroy(stream); free(stream); return TSPDF_ERR_ALLOC; }
+
+        TspdfObj *new_stream = make_stream_obj(arena, final_content, final_len);
+        if (!new_stream) { tspdf_stream_destroy(stream); free(stream); return TSPDF_ERR_ALLOC; }
+
+        uint32_t q_num = tspdf_register_new_obj(doc, q_stream);
+        uint32_t Q_num = tspdf_register_new_obj(doc, Q_stream);
+        uint32_t new_num = tspdf_register_new_obj(doc, new_stream);
+        if (q_num == 0 || Q_num == 0 || new_num == 0) {
+            tspdf_stream_destroy(stream);
+            free(stream);
+            return TSPDF_ERR_ALLOC;
+        }
+
+        TspdfObj *q_ref = make_ref_obj(arena, q_num);
+        TspdfObj *Q_ref = make_ref_obj(arena, Q_num);
+        TspdfObj *new_ref = make_ref_obj(arena, new_num);
+        if (!q_ref || !Q_ref || !new_ref) { tspdf_stream_destroy(stream); free(stream); return TSPDF_ERR_ALLOC; }
+
+        if (contents && contents->type == TSPDF_OBJ_ARRAY) {
+            // Already an array: [q_ref, ...old_items, Q_ref, new_ref]
+            size_t old_count = contents->array.count;
+            size_t total = old_count + 3; // q + old items + Q + new
+            new_contents_array->array.items = tspdf_arena_alloc_zero(arena, total * sizeof(TspdfObj));
+            if (!new_contents_array->array.items) { tspdf_stream_destroy(stream); free(stream); return TSPDF_ERR_ALLOC; }
+            new_contents_array->array.count = total;
+
+            new_contents_array->array.items[0] = *q_ref;
+            for (size_t i = 0; i < old_count; i++) {
+                new_contents_array->array.items[1 + i] = contents->array.items[i];
+            }
+            new_contents_array->array.items[1 + old_count] = *Q_ref;
+            new_contents_array->array.items[2 + old_count] = *new_ref;
+        } else if (contents && contents->type == TSPDF_OBJ_REF) {
+            // Single ref: [q_ref, old_ref, Q_ref, new_ref]
+            new_contents_array->array.items = tspdf_arena_alloc_zero(arena, 4 * sizeof(TspdfObj));
+            if (!new_contents_array->array.items) { tspdf_stream_destroy(stream); free(stream); return TSPDF_ERR_ALLOC; }
+            new_contents_array->array.count = 4;
+            new_contents_array->array.items[0] = *q_ref;
+            new_contents_array->array.items[1] = *contents;
+            new_contents_array->array.items[2] = *Q_ref;
+            new_contents_array->array.items[3] = *new_ref;
+        } else {
+            // No existing contents: just [new_ref]
+            new_contents_array->array.items = tspdf_arena_alloc_zero(arena, sizeof(TspdfObj));
+            if (!new_contents_array->array.items) { tspdf_stream_destroy(stream); free(stream); return TSPDF_ERR_ALLOC; }
+            new_contents_array->array.count = 1;
+            new_contents_array->array.items[0] = *new_ref;
+        }
     }
 
     // Replace /Contents in page dict
@@ -312,9 +345,116 @@ TspdfError tspdf_page_end_content(TspdfReader *doc, size_t page_index,
     return TSPDF_OK;
 }
 
+TspdfError tspdf_page_end_content(TspdfReader *doc, size_t page_index,
+                                  TspdfStream *stream, TspdfWriter *resource_owner) {
+    return page_end_content_internal(doc, page_index, stream, resource_owner, false);
+}
+
+TspdfError tspdf_page_end_content_under(TspdfReader *doc, size_t page_index,
+                                        TspdfStream *stream, TspdfWriter *resource_owner) {
+    return page_end_content_internal(doc, page_index, stream, resource_owner, true);
+}
+
 void tspdf_page_abort_content(TspdfStream *stream) {
     if (stream) {
         tspdf_stream_destroy(stream);
         free(stream);
     }
+}
+
+// --- XObject resource registration (for imported form XObjects) ---
+
+// Resolve an object that may be an indirect reference, looking in both the
+// source xref and the new-object list.
+static TspdfObj *resolve_maybe_ref(TspdfReader *doc, TspdfObj *obj) {
+    if (!obj || obj->type != TSPDF_OBJ_REF) return obj;
+    uint32_t num = obj->ref.num;
+    if (num < doc->xref.count) {
+        TspdfParser parser;
+        tspdf_parser_init(&parser, doc->data, doc->data_len, &doc->arena);
+        return tspdf_xref_resolve(&doc->xref, &parser, num, doc->obj_cache, doc->crypt);
+    }
+    size_t idx = num - doc->xref.count;
+    if (idx < doc->new_objs.count) return doc->new_objs.objs[idx];
+    return NULL;
+}
+
+// Set (replace or append) a dict entry, rebuilding the entries array in the
+// arena when appending.
+static bool dict_set(TspdfObj *dict, TspdfArena *arena, const char *key, TspdfObj *value) {
+    for (size_t i = 0; i < dict->dict.count; i++) {
+        if (strcmp(dict->dict.entries[i].key, key) == 0) {
+            dict->dict.entries[i].value = value;
+            return true;
+        }
+    }
+    size_t old_count = dict->dict.count;
+    TspdfDictEntry *entries = tspdf_arena_alloc(arena, (old_count + 1) * sizeof(TspdfDictEntry));
+    if (!entries) return false;
+    if (dict->dict.entries && old_count > 0) {
+        memcpy(entries, dict->dict.entries, old_count * sizeof(TspdfDictEntry));
+    }
+    size_t klen = strlen(key);
+    entries[old_count].key = tspdf_arena_alloc(arena, klen + 1);
+    if (!entries[old_count].key) return false;
+    memcpy(entries[old_count].key, key, klen + 1);
+    entries[old_count].value = value;
+    dict->dict.entries = entries;
+    dict->dict.count = old_count + 1;
+    return true;
+}
+
+// Get a sub-dict of `dict` under `key`, following an indirect reference;
+// creates a direct empty dict when missing or unusable.
+static TspdfObj *get_or_create_direct_subdict(TspdfReader *doc, TspdfObj *dict, const char *key) {
+    TspdfArena *arena = &doc->arena;
+    TspdfObj *sub = resolve_maybe_ref(doc, tspdf_dict_get(dict, key));
+    if (sub && sub->type == TSPDF_OBJ_DICT) return sub;
+    sub = tspdf_arena_alloc_zero(arena, sizeof(TspdfObj));
+    if (!sub) return NULL;
+    sub->type = TSPDF_OBJ_DICT;
+    if (!dict_set(dict, arena, key, sub)) return NULL;
+    return sub;
+}
+
+const char *tspdf_page_add_xobject(TspdfReader *doc, size_t page_index, uint32_t xobj_num) {
+    if (!doc || page_index >= doc->pages.count || xobj_num == 0) return NULL;
+    if ((size_t)xobj_num >= doc->xref.count + doc->new_objs.count) return NULL;
+
+    TspdfArena *arena = &doc->arena;
+    TspdfObj *page_dict = doc->pages.pages[page_index].page_dict;
+    if (!page_dict || page_dict->type != TSPDF_OBJ_DICT) return NULL;
+
+    // /Resources may be an indirect ref (possibly shared between pages);
+    // resolve and mutate the resolved dict in place — we only append names.
+    TspdfObj *resources = get_or_create_direct_subdict(doc, page_dict, "Resources");
+    if (!resources) return NULL;
+
+    TspdfObj *xobjects = get_or_create_direct_subdict(doc, resources, "XObject");
+    if (!xobjects) return NULL;
+
+    // Pick a fresh name.
+    char buf[32];
+    unsigned k = (unsigned)xobjects->dict.count + 1;
+    for (;; k++) {
+        snprintf(buf, sizeof(buf), "TsX%u", k);
+        bool taken = false;
+        for (size_t i = 0; i < xobjects->dict.count; i++) {
+            if (strcmp(xobjects->dict.entries[i].key, buf) == 0) { taken = true; break; }
+        }
+        if (!taken) break;
+    }
+
+    TspdfObj *ref = make_ref_obj(arena, xobj_num);
+    if (!ref) return NULL;
+    if (!dict_set(xobjects, arena, buf, ref)) return NULL;
+
+    // Return the arena-owned copy of the name (the dict entry key).
+    for (size_t i = 0; i < xobjects->dict.count; i++) {
+        if (strcmp(xobjects->dict.entries[i].key, buf) == 0) {
+            doc->modified = true;
+            return xobjects->dict.entries[i].key;
+        }
+    }
+    return NULL;
 }
