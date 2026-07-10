@@ -4,18 +4,59 @@
 #include <stdio.h>
 #include <string.h>
 
+// Length of the valid UTF-8 sequence starting at u (1..4), or 0 if u does not
+// begin a well-formed sequence — including overlong forms, out-of-range code
+// points, and truncated sequences (a continuation byte missing or out of the
+// 0x80..0xBF range). Metadata getters can return RAW bytes (BOM-less UTF-16BE
+// or PDFDocEncoded /Title//Author), so the input is not guaranteed UTF-8.
+static int utf8_seq_len(const unsigned char *u) {
+    unsigned char c = u[0];
+    if (c < 0x80u) return 1;
+    if (c < 0xC2u) return 0;                 // 0x80..0xBF stray cont; 0xC0/0xC1 overlong
+    if (c < 0xE0u) {                         // 2-byte
+        if ((u[1] & 0xC0u) != 0x80u) return 0;
+        return 2;
+    }
+    if (c < 0xF0u) {                         // 3-byte
+        if ((u[1] & 0xC0u) != 0x80u || (u[2] & 0xC0u) != 0x80u) return 0;
+        if (c == 0xE0u && u[1] < 0xA0u) return 0;                 // overlong
+        if (c == 0xEDu && u[1] >= 0xA0u) return 0;                // surrogate
+        return 3;
+    }
+    if (c < 0xF5u) {                         // 4-byte
+        if ((u[1] & 0xC0u) != 0x80u || (u[2] & 0xC0u) != 0x80u ||
+            (u[3] & 0xC0u) != 0x80u) return 0;
+        if (c == 0xF0u && u[1] < 0x90u) return 0;                 // overlong
+        if (c == 0xF4u && u[1] >= 0x90u) return 0;                // > U+10FFFF
+        return 4;
+    }
+    return 0;                                // 0xF5..0xFF
+}
+
 // JSON string emission (same escaping rules as the web server's writer in
-// server.c): control bytes as \u00XX, quote and backslash escaped, all
-// other bytes verbatim (metadata getters return UTF-8).
+// server.c — keep them in sync): control bytes as \u00XX, quote and backslash
+// escaped, valid UTF-8 passed through verbatim, and any byte that does not
+// form well-formed UTF-8 replaced with U+FFFD so the output is always a
+// decodable UTF-8 JSON string.
 static void json_print_string(const char *s) {
     putchar('"');
-    for (const unsigned char *u = (const unsigned char *)s; *u; u++) {
-        if (*u < 0x20u)
+    for (const unsigned char *u = (const unsigned char *)s; *u; ) {
+        if (*u < 0x20u) {
             printf("\\u%04x", (unsigned)*u);
-        else if (*u == '"' || *u == '\\')
+            u++;
+        } else if (*u == '"' || *u == '\\') {
             printf("\\%c", (char)*u);
-        else
-            putchar((char)*u);
+            u++;
+        } else {
+            int n = utf8_seq_len(u);
+            if (n == 0) {
+                fputs("\xEF\xBF\xBD", stdout);  // U+FFFD REPLACEMENT CHARACTER
+                u++;
+            } else {
+                for (int i = 0; i < n; i++) putchar((char)u[i]);
+                u += n;
+            }
+        }
     }
     putchar('"');
 }

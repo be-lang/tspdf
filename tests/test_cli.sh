@@ -292,6 +292,46 @@ assert d[\"title\"] == \"Test Title\", d
 assert d[\"created_raw\"].startswith(\"D:\"), d
 assert re.fullmatch(r\"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\", d[\"modified\"]), d
 '"
+  # Real files often store BOM-less UTF-16BE or PDFDocEncoded /Author//Title,
+  # so a metadata getter can hand back RAW, non-UTF-8 bytes. The JSON writer
+  # must still emit a decodable UTF-8 string (invalid bytes -> U+FFFD) so
+  # json.load never raises UnicodeDecodeError.
+  TMPDIR="$TMPDIR" python3 - << 'PYEOF'
+import os
+# /Author = "Ünïcödé" in PDFDocEncoding: DC 6E EF 63 F6 64 E9 (lone 0xDC etc,
+# not valid UTF-8). /Title is plain ASCII and must survive intact.
+body = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n"
+offs = {}
+def emit(i, data):
+    global body
+    offs[i] = len(body); body += data
+emit(1, b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
+emit(2, b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")
+emit(3, b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n")
+emit(4, b"4 0 obj\n<< /Author (\xDC\x6E\xEF\x63\xF6\x64\xE9) /Title (Plain ASCII) >>\nendobj\n")
+xo = len(body)
+body += b"xref\n0 5\n0000000000 65535 f \n"
+for i in range(1, 5):
+    body += b"%010d 00000 n \n" % offs[i]
+body += b"trailer\n<< /Size 5 /Root 1 0 R /Info 4 0 R >>\nstartxref\n%d\n%%%%EOF\n" % xo
+open(os.path.join(os.environ["TMPDIR"], "rawmeta.pdf"), "wb").write(body)
+PYEOF
+  run_test "info --json emits decodable UTF-8 for non-UTF-8 metadata bytes" bash -c "
+    $TSPDF info $TMPDIR/rawmeta.pdf --json | python3 -c '
+import json, sys
+d = json.load(sys.stdin)            # must not raise UnicodeDecodeError
+assert d[\"title\"] == \"Plain ASCII\", d
+# every raw high byte was replaced with U+FFFD; ASCII 0x6E/0x63/0x64 survive
+assert d[\"author\"] == \"�n�c�d�\", repr(d[\"author\"])
+'"
+  # And valid non-ASCII UTF-8 metadata must pass through the JSON unchanged.
+  $TSPDF metadata $INPUT --set title='Prüfbericht café' -o $TMPDIR/utf8meta.pdf > /dev/null 2>&1
+  run_test "info --json preserves valid UTF-8 metadata unchanged" bash -c "
+    $TSPDF info $TMPDIR/utf8meta.pdf --json | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d[\"title\"] == \"Prüfbericht café\", repr(d[\"title\"])
+'"
 else
   echo "  SKIP  info --json assertions (python3 not found)"
 fi
@@ -800,6 +840,19 @@ assert found == need, (sorted(found), sorted(need))
 import json, sys
 j = json.load(sys.stdin)
 assert j['title'] == '<img src=x onerror=1>', j['title']
+\"
+  "
+  # metadata-view must also emit decodable UTF-8 when the getter returns RAW,
+  # non-UTF-8 bytes (BOM-less UTF-16BE / PDFDocEncoded). rawmeta.pdf (crafted
+  # in the info --json block) has a PDFDocEncoded /Author with lone high bytes.
+  run_serve_test "serve metadata-view emits decodable UTF-8 for non-UTF-8 bytes" bash -c "
+    [ -f \"$TMPDIR/rawmeta.pdf\" ] &&
+    curl -sf --retry 3 --retry-delay 1 --max-time 10 -F \"pdf_file=@$TMPDIR/rawmeta.pdf\" http://localhost:${SERVE_PORT}/api/metadata-view |
+    python3 -c \"
+import json, sys
+j = json.load(sys.stdin)
+assert j['title'] == 'Plain ASCII', j['title']
+assert j['author'] == '�n�c�d�', repr(j['author'])
 \"
   "
   # json_get_string must not let a   NUL truncate the text, nor emit an
