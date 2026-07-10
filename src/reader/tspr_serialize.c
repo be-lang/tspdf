@@ -635,6 +635,33 @@ static bool filter_chain_is_strippable(TspdfObj *filter) {
     return has_armor || filter->type == TSPDF_OBJ_ARRAY;
 }
 
+// True when the stream's /DecodeParms (or /DP) is absent or fully direct —
+// null, a dict, or an array of dicts/nulls. tspdf_stream_decode looks the
+// parameters up per filter but does NOT resolve indirect references: a
+// "/DecodeParms 6 0 R" (or a ref inside the array form) silently yields no
+// parameters, so a predictor or LZW /EarlyChange 0 would be skipped and the
+// "decoded" bytes would be wrong. The armor-strip path bakes those bytes
+// into the output as plain Flate, so it must refuse any parms it cannot see.
+static bool decode_parms_fully_direct(TspdfObj *dict) {
+    TspdfObj *parms = tspdf_dict_get(dict, "DecodeParms");
+    if (!parms) {
+        parms = tspdf_dict_get(dict, "DP");
+    }
+    if (!parms || parms->type == TSPDF_OBJ_NULL || parms->type == TSPDF_OBJ_DICT) {
+        return true;
+    }
+    if (parms->type == TSPDF_OBJ_ARRAY) {
+        for (size_t i = 0; i < parms->array.count; i++) {
+            TspdfObj *entry = &parms->array.items[i];
+            if (entry->type != TSPDF_OBJ_DICT && entry->type != TSPDF_OBJ_NULL) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;  // indirect reference or unexpected type
+}
+
 static uint16_t source_object_gen(TspdfReader *doc, uint32_t obj_num) {
     if (!doc || obj_num >= doc->xref.count) {
         return 0;
@@ -773,13 +800,15 @@ static TspdfError write_stream_obj_with_options(TspdfBuffer *buf, TspdfObj *obj,
                 recompressed = NULL;
             }
         } else if (filter_chain_is_strippable(filter) &&
-                   !tspdf_dict_get(dict, "FFilter")) {
+                   !tspdf_dict_get(dict, "FFilter") &&
+                   decode_parms_fully_direct(dict)) {
             // ASCII/RunLength/LZW armor (possibly stacked on Flate): decode
             // the chain fully and re-encode as plain Flate when that is
             // smaller, replacing the whole /Filter (+/DecodeParms) — hex
             // doubles the bytes, ASCII85 adds 25%. Lossy/unknown filters
-            // never reach here (see filter_chain_is_strippable), and a
-            // failed decode keeps the stream verbatim.
+            // never reach here (see filter_chain_is_strippable), a failed
+            // decode keeps the stream verbatim, and an indirect /DecodeParms
+            // (which the decoder cannot resolve) refuses the strip entirely.
             uint8_t *decoded = NULL;
             size_t dec_len = 0;
             if (tspdf_stream_decode(dict, stream_data, stream_len,

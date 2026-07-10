@@ -851,6 +851,65 @@ else
   echo "  SKIP  compress well-compressed stream (python3 not found)"
 fi
 
+# The lossless armor-strip must refuse streams whose /DecodeParms is an
+# indirect reference: tspdf_stream_decode does not resolve refs, so it would
+# silently skip the predictor and bake the predictor-coded bytes into the
+# output as plain Flate. The committed fixture's content stream is
+# /Filter [/FlateDecode] /DecodeParms <n> 0 R -> << /Predictor 12 /Columns 32 >>
+# deflated at level 1, so a re-encode would win on size if not gated.
+# (Regenerate with tests/data/gen_armor_predref.py. The grep assertion is
+# tied to the conservative keep-verbatim gate; revisit it if indirect
+# DecodeParms refs are ever resolved during decode.)
+run_test "compress keeps /DecodeParms of an indirect-parms stream" bash -c "
+  set -e
+  $TSPDF compress tests/data/armor_predref.pdf -o $TMPDIR/predref_out.pdf > /dev/null
+  grep -aq '/DecodeParms' $TMPDIR/predref_out.pdf
+  $TSPDF info $TMPDIR/predref_out.pdf > /dev/null"
+if command -v python3 > /dev/null 2>&1; then
+  run_test "indirect-parms stream still decodes after compress" python3 - "$TMPDIR/predref_out.pdf" << 'PYEOF'
+import re, sys, zlib
+d = open(sys.argv[1], "rb").read()
+marker = b"ArmorPredRefCheck"
+def unpred_up(data, cols):
+    # PNG Up predictor, filter byte 2 per row (the fixture's declared parms).
+    out = bytearray()
+    prev = bytes(cols)
+    for off in range(0, len(data), cols + 1):
+        row = data[off:off + cols + 1]
+        if not row or row[0] != 2:
+            raise ValueError("not Up-predicted")
+        cur = bytes((row[1 + i] + prev[i]) & 0xFF for i in range(len(row) - 1))
+        out += cur
+        prev = cur
+    return bytes(out)
+# Decode every Flate stream exactly as its dict declares: plain inflate, plus
+# the fixture's PNG-Up /Columns 32 predictor when the dict carries parms. The
+# marker must survive; the pre-fix corruption dropped the parms while keeping
+# predictor-coded bytes, so no declared decoding yields it.
+found = False
+for m in re.finditer(rb"<<([^<>]*)>>\s*stream\r?\n", d):
+    dct = m.group(1)
+    lm = re.search(rb"/Length\s+(\d+)", dct)
+    if lm is None or b"/FlateDecode" not in dct:
+        continue
+    raw = d[m.end():m.end() + int(lm.group(1))]
+    try:
+        dec = zlib.decompress(raw)
+    except zlib.error:
+        continue
+    if b"/DecodeParms" in dct or b"/DP" in dct:
+        try:
+            dec = unpred_up(dec, 32)
+        except ValueError:
+            continue
+    if marker in dec:
+        found = True
+assert found, "content stream no longer decodes to the fixture marker"
+PYEOF
+else
+  echo "  SKIP  indirect-parms decode assertion (python3 not found)"
+fi
+
 # compress packs small non-stream objects into object streams (ObjStm) so
 # object-heavy files shrink instead of growing. Build a PDF with hundreds of
 # tiny objects, compress it, and check size, structure and content survive.
