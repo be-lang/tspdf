@@ -86,6 +86,24 @@ stamps the values into the page content and removes the form.
 Embed files in a PDF, or list, extract, or remove embedded files
 .RB ( "attach add" / list / extract / remove ).
 .TP
+.B bookmark
+Edit the outline (bookmarks) of an existing PDF
+.RB ( "bookmark list" / add / import / clear ).
+.B bookmark list
+prints one entry per line as
+.IR LEVEL <TAB> PAGE <TAB> TITLE
+(or JSON with
+.BR \-\-json );
+.B bookmark import
+reads that same format from a file or stdin
+.RB ( "\-\-from " \fIfile\fR ", " "\-\-from -" );
+.B bookmark add
+appends a single entry
+.RB ( "\-\-title" ", " "\-\-page" ", " \-\-level );
+.B bookmark clear
+removes the outline. Levels are 1\-based and must not jump by more than one;
+pages are 1\-based.
+.TP
 .B img2pdf
 Convert images (JPEG/PNG) to a PDF.
 .B \-\-page\-size
