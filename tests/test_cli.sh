@@ -1521,6 +1521,99 @@ run_test "pagenum help mentions --pages" bash -c "$TSPDF pagenum --help | grep -
 run_test "help pagenum shows command-specific usage" bash -c "$TSPDF help pagenum 2>/dev/null | grep -q 'Usage: tspdf pagenum'"
 run_test "help pagenum documents --pages" bash -c "$TSPDF help pagenum 2>/dev/null | grep -q -- '--pages'"
 
+# --- attach: embed / list / extract / remove file attachments ---
+printf 'attach payload line one\n' > "$TMPDIR/att_f.txt"      # 24 bytes
+head -c 2048 /dev/urandom > "$TMPDIR/att_blob.bin"
+
+run_test "attach add embeds files" $TSPDF attach add $INPUT "$TMPDIR/att_f.txt" "$TMPDIR/att_blob.bin" --desc "att desc" -o "$TMPDIR/att.pdf"
+run_test "attach list shows name, size, desc" bash -c "
+  $TSPDF attach list $TMPDIR/att.pdf | grep -q \"^att_f.txt\$(printf '\\t')24\$(printf '\\t')att desc\$\" &&
+  $TSPDF attach list $TMPDIR/att.pdf | grep -q \"^att_blob.bin\$(printf '\\t')2048\$(printf '\\t')att desc\$\""
+run_test "attach list keys come out sorted" bash -c "
+  [ \"\$($TSPDF attach list $TMPDIR/att.pdf | head -1 | cut -f1)\" = att_blob.bin ]"
+run_test "attach extract --all round-trips bytes" bash -c "
+  rm -rf $TMPDIR/att_ex && mkdir $TMPDIR/att_ex &&
+  $TSPDF attach extract $TMPDIR/att.pdf --all -o $TMPDIR/att_ex > /dev/null &&
+  cmp $TMPDIR/att_ex/att_f.txt $TMPDIR/att_f.txt &&
+  cmp $TMPDIR/att_ex/att_blob.bin $TMPDIR/att_blob.bin"
+run_test "attach extract --name picks one file" bash -c "
+  rm -rf $TMPDIR/att_ex1 && mkdir $TMPDIR/att_ex1 &&
+  $TSPDF attach extract $TMPDIR/att.pdf --name att_blob.bin -o $TMPDIR/att_ex1 > /dev/null &&
+  cmp $TMPDIR/att_ex1/att_blob.bin $TMPDIR/att_blob.bin &&
+  [ ! -e $TMPDIR/att_ex1/att_f.txt ]"
+run_test "attach extract unknown --name fails" bash -c "
+  ! $TSPDF attach extract $TMPDIR/att.pdf --name no_such.bin -o $TMPDIR 2>/dev/null"
+run_test "attach remove drops one attachment" bash -c "
+  $TSPDF attach remove $TMPDIR/att.pdf --name att_f.txt -o $TMPDIR/att_rm.pdf > /dev/null &&
+  [ \"\$($TSPDF attach list $TMPDIR/att_rm.pdf | wc -l)\" = 1 ] &&
+  ! $TSPDF attach list $TMPDIR/att_rm.pdf | grep -q att_f.txt"
+run_test "attach remove unknown name fails" bash -c "
+  ! $TSPDF attach remove $TMPDIR/att.pdf --name no_such.bin -o $TMPDIR/att_rm2.pdf 2>/dev/null"
+run_test "attach add replaces an existing name" bash -c "
+  printf 'replaced' > $TMPDIR/att_f.txt &&
+  $TSPDF attach add $TMPDIR/att.pdf $TMPDIR/att_f.txt -o $TMPDIR/att_rep.pdf > /dev/null &&
+  [ \"\$($TSPDF attach list $TMPDIR/att_rep.pdf | wc -l)\" = 2 ] &&
+  rm -rf $TMPDIR/att_ex2 && mkdir $TMPDIR/att_ex2 &&
+  $TSPDF attach extract $TMPDIR/att_rep.pdf --name att_f.txt -o $TMPDIR/att_ex2 > /dev/null &&
+  [ \"\$(cat $TMPDIR/att_ex2/att_f.txt)\" = replaced ]"
+
+# Attachments are document-level: they survive split (page extraction) and
+# merge (union across sources) through the tspdf pipeline itself.
+run_test "attach survives split --pages" bash -c "
+  $TSPDF split $TMPDIR/att_rm.pdf --pages 1 -o $TMPDIR/att_split.pdf > /dev/null &&
+  rm -rf $TMPDIR/att_ex3 && mkdir $TMPDIR/att_ex3 &&
+  $TSPDF attach extract $TMPDIR/att_split.pdf --all -o $TMPDIR/att_ex3 > /dev/null &&
+  cmp $TMPDIR/att_ex3/att_blob.bin $TMPDIR/att_blob.bin"
+run_test "attach survives merge with union" bash -c "
+  $TSPDF attach add $INPUT $TMPDIR/att_f.txt -o $TMPDIR/att_m1.pdf > /dev/null &&
+  $TSPDF attach add $INPUT $TMPDIR/att_blob.bin -o $TMPDIR/att_m2.pdf > /dev/null &&
+  $TSPDF merge $TMPDIR/att_m1.pdf $TMPDIR/att_m2.pdf -o $TMPDIR/att_merged.pdf > /dev/null &&
+  [ \"\$($TSPDF attach list $TMPDIR/att_merged.pdf | wc -l)\" = 2 ] &&
+  $TSPDF attach list $TMPDIR/att_merged.pdf | grep -q att_f.txt &&
+  $TSPDF attach list $TMPDIR/att_merged.pdf | grep -q att_blob.bin"
+
+# Hostile stored names must never escape the target directory. The name is
+# patched to \"../evil.txt\" post-save (same byte length keeps the xref valid).
+run_test "attach extract sanitizes ../ traversal names" bash -c "
+  set -e
+  printf 'evil payload\n' > $TMPDIR/xxxevil.txt
+  $TSPDF attach add $INPUT $TMPDIR/xxxevil.txt -o $TMPDIR/att_pre_evil.pdf > /dev/null
+  LC_ALL=C sed 's|xxxevil.txt|../evil.txt|g' $TMPDIR/att_pre_evil.pdf > $TMPDIR/att_evil.pdf
+  $TSPDF attach list $TMPDIR/att_evil.pdf | grep -q '^\.\./evil\.txt'
+  rm -rf $TMPDIR/att_evil_dir $TMPDIR/evil.txt
+  mkdir $TMPDIR/att_evil_dir
+  $TSPDF attach extract $TMPDIR/att_evil.pdf --all -o $TMPDIR/att_evil_dir > /dev/null
+  cmp $TMPDIR/att_evil_dir/evil.txt $TMPDIR/xxxevil.txt
+  [ ! -e $TMPDIR/evil.txt ]"
+
+# Encrypted PDFs: attachment streams decrypt like any other stream.
+run_test "attach list/extract work with --password" bash -c "
+  $TSPDF encrypt $TMPDIR/att.pdf --password attsecret -o $TMPDIR/att_enc.pdf > /dev/null &&
+  ! $TSPDF attach list $TMPDIR/att_enc.pdf < /dev/null > /dev/null 2>&1 &&
+  $TSPDF attach list $TMPDIR/att_enc.pdf --password attsecret | grep -q att_blob.bin &&
+  rm -rf $TMPDIR/att_ex4 && mkdir $TMPDIR/att_ex4 &&
+  $TSPDF attach extract $TMPDIR/att_enc.pdf --all -o $TMPDIR/att_ex4 --password attsecret > /dev/null &&
+  cmp $TMPDIR/att_ex4/att_blob.bin $TMPDIR/att_blob.bin"
+
+if command -v python3 > /dev/null 2>&1; then
+  cat > "$TMPDIR/att_check.py" <<'PYEOT'
+import json, sys
+entries = json.load(sys.stdin)
+by_name = {e["name"]: e for e in entries}
+assert list(by_name) == sorted(by_name), "names not sorted"
+assert by_name["att_f.txt"]["size"] == 24
+assert by_name["att_f.txt"]["desc"] == "att desc"
+assert by_name["att_blob.bin"]["size"] == 2048
+assert "mime" in by_name["att_f.txt"]
+PYEOT
+  run_test "attach list --json is valid and complete" bash -c "
+    $TSPDF attach list $TMPDIR/att.pdf --json | python3 $TMPDIR/att_check.py"
+fi
+
+run_test "attach listed in main help" bash -c "$TSPDF --help | grep -q '^  attach'"
+run_test "help attach shows subcommand usage" bash -c "$TSPDF help attach 2>/dev/null | grep -q 'Usage: tspdf attach add'"
+run_test "attach unknown subcommand fails" bash -c "! $TSPDF attach frobnicate 2>/dev/null"
+
 # md2pdf emphasis: *x*/_x_ italic, **x** bold; literal markers must not leak.
 if command -v qpdf > /dev/null 2>&1; then
   run_test "md2pdf emphasis styles text without literal markers" bash -c "

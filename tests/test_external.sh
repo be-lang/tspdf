@@ -260,6 +260,69 @@ if [ "$HAVE_QPDF" -eq 1 ]; then
     fi
 fi
 
+# --- Attachments: qpdf interop in both directions ---
+
+echo ""
+echo "  Attachments:"
+
+printf 'external attachment payload\n' > "$TMPDIR/att.txt"
+
+"$TSPDF" attach add "$INPUT" "$TMPDIR/att.txt" --desc "gate" -o "$TMPDIR/att_out.pdf" > /dev/null 2>&1
+reader_check "attach add" "$TMPDIR/att_out.pdf"
+
+"$TSPDF" attach remove "$TMPDIR/att_out.pdf" --name att.txt -o "$TMPDIR/att_removed.pdf" > /dev/null 2>&1
+reader_check "attach remove" "$TMPDIR/att_removed.pdf"
+
+if [ "$HAVE_QPDF" -eq 1 ]; then
+    # tspdf -> qpdf: qpdf must see the attachment and read back identical bytes.
+    if qpdf --list-attachments "$TMPDIR/att_out.pdf" 2>/dev/null | grep -q '^att.txt'; then
+        echo "  PASS  qpdf lists tspdf-added attachment"; pass=$((pass + 1))
+    else
+        echo "  FAIL  qpdf lists tspdf-added attachment"; fail=$((fail + 1))
+    fi
+    if qpdf --show-attachment=att.txt "$TMPDIR/att_out.pdf" > "$TMPDIR/att_shown.txt" 2>/dev/null \
+       && cmp -s "$TMPDIR/att_shown.txt" "$TMPDIR/att.txt"; then
+        echo "  PASS  qpdf reads back identical attachment bytes"; pass=$((pass + 1))
+    else
+        echo "  FAIL  qpdf reads back identical attachment bytes"; fail=$((fail + 1))
+    fi
+    if qpdf --list-attachments "$TMPDIR/att_removed.pdf" 2>/dev/null | grep -q '^att.txt'; then
+        echo "  FAIL  qpdf no longer lists removed attachment"; fail=$((fail + 1))
+    else
+        echo "  PASS  qpdf no longer lists removed attachment"; pass=$((pass + 1))
+    fi
+
+    # qpdf -> tspdf: extract a qpdf-added attachment byte-identically.
+    mkdir -p "$TMPDIR/att_ex"
+    if qpdf "$INPUT" --add-attachment "$TMPDIR/att.txt" -- "$TMPDIR/att_qpdf.pdf" 2>/dev/null \
+       && "$TSPDF" attach extract "$TMPDIR/att_qpdf.pdf" --all -o "$TMPDIR/att_ex" > /dev/null 2>&1 \
+       && cmp -s "$TMPDIR/att_ex/att.txt" "$TMPDIR/att.txt"; then
+        echo "  PASS  tspdf extracts qpdf-added attachment"; pass=$((pass + 1))
+    else
+        echo "  FAIL  tspdf extracts qpdf-added attachment"; fail=$((fail + 1))
+    fi
+
+    # Attachments survive page extraction and merge; qpdf is the witness.
+    "$TSPDF" split "$TMPDIR/att_out.pdf" --pages 1 -o "$TMPDIR/att_split.pdf" > /dev/null 2>&1
+    reader_check "split keeps attachment (qpdf-validated)" "$TMPDIR/att_split.pdf"
+    if qpdf --list-attachments "$TMPDIR/att_split.pdf" 2>/dev/null | grep -q '^att.txt'; then
+        echo "  PASS  qpdf lists attachment after split"; pass=$((pass + 1))
+    else
+        echo "  FAIL  qpdf lists attachment after split"; fail=$((fail + 1))
+    fi
+
+    printf 'second attachment\n' > "$TMPDIR/att2.txt"
+    "$TSPDF" attach add "$INPUT" "$TMPDIR/att2.txt" -o "$TMPDIR/att_out2.pdf" > /dev/null 2>&1
+    "$TSPDF" merge "$TMPDIR/att_out.pdf" "$TMPDIR/att_out2.pdf" -o "$TMPDIR/att_merged.pdf" > /dev/null 2>&1
+    reader_check "merge keeps attachments (qpdf-validated)" "$TMPDIR/att_merged.pdf"
+    if qpdf --list-attachments "$TMPDIR/att_merged.pdf" 2>/dev/null | grep -q '^att.txt' \
+       && qpdf --list-attachments "$TMPDIR/att_merged.pdf" 2>/dev/null | grep -q '^att2.txt'; then
+        echo "  PASS  qpdf lists both attachments after merge"; pass=$((pass + 1))
+    else
+        echo "  FAIL  qpdf lists both attachments after merge"; fail=$((fail + 1))
+    fi
+fi
+
 echo ""
 if [ "$pending" -gt 0 ]; then
     echo "$pass passed, $fail failed, $pending pending (T19: reader trailer still emits /TspdfSize)"

@@ -1,5 +1,6 @@
 #include "tspr_internal.h"
 #include "tspr_doctree.h"
+#include "tspr_attach.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -861,6 +862,14 @@ TspdfReader *tspdf_reader_extract(TspdfReader *doc, const size_t *pages, size_t 
         if (err) *err = trees_err;
         return NULL;
     }
+
+    // Attachments are document-level, not page-level: every one survives.
+    TspdfError attach_err = tspdf_attach_extract_attach(doc, result);
+    if (attach_err != TSPDF_OK) {
+        tspdf_reader_destroy(result);
+        if (err) *err = attach_err;
+        return NULL;
+    }
     return result;
 }
 
@@ -1408,6 +1417,18 @@ TspdfReader *tspdf_reader_merge(TspdfReader **docs, size_t count, TspdfError *er
         free(doc->new_objs.objs);
         free(doc);
         if (err) *err = trees_err;
+        return NULL;
+    }
+
+    // Union the sources' embedded-file attachments (first source wins on a
+    // name collision).
+    TspdfError attach_err = tspdf_attach_merge_attach(doc, docs, count);
+    if (attach_err != TSPDF_OK) {
+        tspdf_arena_destroy(&doc->arena);
+        free(xref_offsets);
+        free(doc->new_objs.objs);
+        free(doc);
+        if (err) *err = attach_err;
         return NULL;
     }
 

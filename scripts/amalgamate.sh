@@ -57,6 +57,7 @@ src/qr/qr_encode.h
 src/util/pdftext.h
 src/reader/tspr_internal.h
 src/reader/tspr_doctree.h
+src/reader/tspr_attach.h
 src/reader/tspr_text.h
 "
 
@@ -84,6 +85,7 @@ src/reader/tspr_serialize.c
 src/reader/tspr_crypt.c
 src/reader/tspr_document.c
 src/reader/tspr_doctree.c
+src/reader/tspr_attach.c
 src/reader/tspr_metadata.c
 src/reader/tspr_content.c
 src/reader/tspr_resources.c

@@ -20,6 +20,7 @@ const char *tspdf_error_string(TspdfError err) {
         case TSPDF_ERR_ENCRYPTED:   return "PDF is encrypted, password required";
         case TSPDF_ERR_BAD_PASSWORD: return "wrong password";
         case TSPDF_ERR_PAGE_RANGE:  return "page index out of range";
+        case TSPDF_ERR_NOT_FOUND:   return "not found";
     }
     return "unknown error";
 }

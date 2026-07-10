@@ -28,6 +28,7 @@ static void print_usage(void) {
     printf("  text       Extract text from a PDF\n");
     printf("  pagenum    Stamp page numbers onto a PDF\n");
     printf("  form       List, fill, or flatten PDF form fields\n");
+    printf("  attach     Embed, list, extract, or remove file attachments\n");
     printf("\n");
     printf("Options:\n");
     printf("  --help, -h     Show this help message\n");
@@ -246,6 +247,25 @@ static void print_command_help(const char *cmd) {
         printf("Checkboxes and radio groups accept an \"on\" state name (see options in\n");
         printf("`form list`), \"Off\", or true/false. Filled text fields get a single-line\n");
         printf("appearance (no comb or multiline layout).\n");
+    } else if (strcmp(cmd, "attach") == 0) {
+        printf("Usage: tspdf attach add <input.pdf> <file> [<file2> ...] [--desc <text>] -o <output.pdf>\n");
+        printf("       tspdf attach list <input.pdf> [--json]\n");
+        printf("       tspdf attach extract <input.pdf> [--name <name> | --all] [-o <dir>]\n");
+        printf("       tspdf attach remove <input.pdf> --name <name> -o <output.pdf>\n");
+        printf("\n");
+        printf("Embed files in a PDF, or list/extract/remove embedded files.\n");
+        printf("Attachments are document-level and survive split/merge/rotate.\n");
+        printf("\n");
+        printf("Arguments:\n");
+        printf("  add <file> [...]       Files to embed (stored under their base names)\n");
+        printf("  --desc <text>          Description stored with each added file\n");
+        printf("  list --json            Machine-readable listing\n");
+        printf("  extract --name <name>  Extract one attachment by stored name\n");
+        printf("  extract --all          Extract every attachment (default)\n");
+        printf("  extract -o <dir>       Target directory (default: current directory)\n");
+        printf("  remove --name <name>   Attachment to remove\n");
+        printf("  --password <pass>      Password for encrypted PDFs (or --password-file)\n");
+        printf("  -o <output.pdf>        Output file path (required for add/remove)\n");
     } else {
         /* Unknown command — fall back to general help */
         print_usage();
@@ -303,6 +323,7 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "text") == 0)    return cmd_text(sub_argc, sub_argv);
     if (strcmp(cmd, "pagenum") == 0)  return cmd_pagenum(sub_argc, sub_argv);
     if (strcmp(cmd, "form") == 0)     return cmd_form(sub_argc, sub_argv);
+    if (strcmp(cmd, "attach") == 0)   return cmd_attach(sub_argc, sub_argv);
 
     fprintf(stderr, "tspdf: unknown command '%s'\n\n", cmd);
     print_usage();

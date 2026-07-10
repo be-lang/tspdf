@@ -45,5 +45,6 @@ int cmd_serve(int argc, char **argv);
 int cmd_text(int argc, char **argv);
 int cmd_pagenum(int argc, char **argv);
 int cmd_form(int argc, char **argv);
+int cmd_attach(int argc, char **argv);
 
 #endif
