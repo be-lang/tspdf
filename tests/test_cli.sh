@@ -155,6 +155,42 @@ run_test "metadata set" $TSPDF metadata $INPUT --set title="Test Title" --set au
 run_test "metadata flag-first ordering (-o/--set before input)" $TSPDF metadata -o $TMPDIR/meta_ff.pdf --set title="FF" $INPUT
 run_test "metadata flag-first applied the title" bash -c "$TSPDF metadata $TMPDIR/meta_ff.pdf | grep -qi 'FF'"
 
+# metadata prints PDF dates human-readable (D:YYYYMMDDHHmmSS -> ISO-ish);
+# meta.pdf just got a fresh ModDate from the --set save above.
+run_test "metadata prints dates human-readable" bash -c "$TSPDF metadata $TMPDIR/meta.pdf | grep -qE '^Modified:[[:space:]]+[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\$'"
+
+# info --json
+if command -v python3 > /dev/null 2>&1; then
+  run_test "info --json is valid JSON with the expected fields" bash -c "
+    $TSPDF info $INPUT --json | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d[\"pages\"] == 3, d
+assert d[\"encrypted\"] is False and d[\"encryption\"] is None, d
+assert d[\"outlines\"] is False and d[\"acroform\"] is False, d
+assert d[\"version\"] == \"1.7\", d
+# uniform A4 pages collapse to a single [w, h] pair
+assert d[\"page_sizes\"] == [595.28, 841.89], d
+assert \"title\" in d and \"producer\" in d, d
+'"
+  run_test "info --json reports outlines/acroform" bash -c "
+    $TSPDF info tests/data/outline_form.pdf --json | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d[\"outlines\"] is True and d[\"acroform\"] is True, d
+'"
+  run_test "info --json formats dates and keeps the raw value" bash -c "
+    $TSPDF info $TMPDIR/meta.pdf --json | python3 -c '
+import json, re, sys
+d = json.load(sys.stdin)
+assert d[\"title\"] == \"Test Title\", d
+assert d[\"created_raw\"].startswith(\"D:\"), d
+assert re.fullmatch(r\"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\", d[\"modified\"]), d
+'"
+else
+  echo "  SKIP  info --json assertions (python3 not found)"
+fi
+
 # watermark
 run_test "watermark" $TSPDF watermark $INPUT -o $TMPDIR/watermark.pdf --text "DRAFT"
 # flag-first ordering: -o output and --text value must not be swallowed as input
