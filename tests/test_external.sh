@@ -334,6 +334,53 @@ if [ "$HAVE_QPDF" -eq 1 ]; then
     fi
 fi
 
+# --- Bookmarks (outlines): qpdf interop in both directions ---
+
+echo ""
+echo "  Bookmarks:"
+
+printf '1\t1\tIntro\n2\t2\tBackground\n1\t3\tResults\n' > "$TMPDIR/toc.txt"
+"$TSPDF" bookmark import "$INPUT" --from "$TMPDIR/toc.txt" -o "$TMPDIR/bm_out.pdf" > /dev/null 2>&1
+reader_check "bookmark import" "$TMPDIR/bm_out.pdf"
+
+# Round-trip: listing the imported file reproduces the TOC exactly.
+if "$TSPDF" bookmark list "$TMPDIR/bm_out.pdf" 2>/dev/null | cmp -s - "$TMPDIR/toc.txt"; then
+    echo "  PASS  bookmark list round-trips the imported TOC"; pass=$((pass + 1))
+else
+    echo "  FAIL  bookmark list round-trips the imported TOC"; fail=$((fail + 1))
+fi
+
+"$TSPDF" bookmark clear "$TMPDIR/bm_out.pdf" -o "$TMPDIR/bm_cleared.pdf" > /dev/null 2>&1
+reader_check "bookmark clear" "$TMPDIR/bm_cleared.pdf"
+
+if [ "$HAVE_QPDF" -eq 1 ]; then
+    # tspdf -> qpdf: qpdf's outline JSON must show the three titles and the
+    # nested item's parent (Background sits under Intro).
+    bmjson=$(qpdf --json --json-key=outlines "$TMPDIR/bm_out.pdf" 2>/dev/null)
+    if printf '%s' "$bmjson" | grep -q '"Intro"' \
+       && printf '%s' "$bmjson" | grep -q '"Background"' \
+       && printf '%s' "$bmjson" | grep -q '"Results"'; then
+        echo "  PASS  qpdf lists tspdf-imported bookmarks"; pass=$((pass + 1))
+    else
+        echo "  FAIL  qpdf lists tspdf-imported bookmarks"; fail=$((fail + 1))
+    fi
+    # cleared file: qpdf reports no outlines.
+    if [ "$(qpdf --json --json-key=outlines "$TMPDIR/bm_cleared.pdf" 2>/dev/null | tr -d ' \n' | grep -c '"outlines":\[\]')" -ge 1 ]; then
+        echo "  PASS  qpdf shows no outlines after clear"; pass=$((pass + 1))
+    else
+        echo "  FAIL  qpdf shows no outlines after clear"; fail=$((fail + 1))
+    fi
+
+    # qpdf -> tspdf: qpdf rewrites our bookmarked file (its own object graph and
+    # numbering); tspdf must still list the outline unchanged from that copy.
+    if qpdf "$TMPDIR/bm_out.pdf" "$TMPDIR/bm_qpdf.pdf" 2>/dev/null \
+       && "$TSPDF" bookmark list "$TMPDIR/bm_qpdf.pdf" 2>/dev/null | cmp -s - "$TMPDIR/toc.txt"; then
+        echo "  PASS  tspdf lists outline from a qpdf-rewritten copy"; pass=$((pass + 1))
+    else
+        echo "  FAIL  tspdf lists outline from a qpdf-rewritten copy"; fail=$((fail + 1))
+    fi
+fi
+
 echo ""
 if [ "$pending" -gt 0 ]; then
     echo "$pass passed, $fail failed, $pending pending (T19: reader trailer still emits /TspdfSize)"
