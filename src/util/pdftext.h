@@ -68,6 +68,31 @@ void tspdf_pdftext_write_info_string(TspdfBuffer *buf, const char *value);
 // NULL when there is no BOM (caller keeps the raw bytes) or on alloc failure.
 char *tspdf_utf16be_to_utf8(const uint8_t *data, size_t len, TspdfArena *arena);
 
+// PDFDocEncoding byte -> Unicode code point (ISO 32000 Annex D). ASCII and
+// the Latin-1 rows map to themselves; the specials in 0x18-0x1F (accents)
+// and 0x80-0xA0 (typography, ligatures, euro) map per the table; undefined
+// slots (0x7F, 0x9F, 0xAD) become U+FFFD.
+uint32_t tspdf_pdfdoc_to_codepoint(uint8_t b);
+
+// Decode a PDF text string (ISO 32000 §7.9.2.2) to a NUL-terminated UTF-8
+// string allocated from `arena`:
+//   - FE FF BOM        -> UTF-16BE (lone surrogates become '?')
+//   - EF BB BF BOM     -> UTF-8 (malformed sequences become U+FFFD)
+//   - no BOM           -> kept as-is when the bytes already form valid UTF-8
+//                         (pure ASCII, or a non-conformant UTF-8 writer),
+//                         otherwise decoded as PDFDocEncoding
+// The result is always valid UTF-8. Returns NULL only on alloc failure.
+char *tspdf_pdf_text_to_utf8(const uint8_t *data, size_t len, TspdfArena *arena);
+
+// Encode a NUL-terminated UTF-8 string as PDF text-string bytes allocated
+// from `arena`: pure ASCII is copied verbatim; other valid UTF-8 becomes
+// UTF-16BE with a FE FF BOM (astral code points as surrogate pairs). Byte
+// strings that are not valid UTF-8 are copied verbatim so nothing is
+// reinterpreted. *out_len receives the byte length (the buffer is also
+// NUL-terminated, but UTF-16BE output contains interior NUL bytes — always
+// use *out_len). Returns NULL only on alloc failure.
+uint8_t *tspdf_utf8_to_pdf_text(const char *utf8, size_t *out_len, TspdfArena *arena);
+
 #ifdef __cplusplus
 }
 #endif

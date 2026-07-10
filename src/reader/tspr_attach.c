@@ -18,6 +18,7 @@
 #include "tspr_attach.h"
 #include "tspr_doctree.h"
 #include "../compress/deflate.h"
+#include "../util/pdftext.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -126,6 +127,29 @@ static bool att_list_find(const AttList *l, const uint8_t *key, size_t key_len,
     for (size_t i = 0; i < l->count; i++) {
         if (l->items[i].key_len == key_len &&
             memcmp(l->items[i].key, key, key_len) == 0) {
+            if (out_idx) *out_idx = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Stored keys are PDF text strings in whatever encoding the producing tool
+// chose (ASCII/PDFDocEncoding literal or UTF-16BE with BOM). Users address
+// attachments by UTF-8 name, so matching compares decoded forms — a lookup
+// for "ünïcode.txt" finds the entry no matter how its key is encoded.
+// Returns false on alloc failure with *oom set.
+static bool att_list_find_utf8(TspdfArena *arena, const AttList *l,
+                               const char *utf8_name, size_t *out_idx,
+                               bool *oom) {
+    for (size_t i = 0; i < l->count; i++) {
+        char *k = tspdf_pdf_text_to_utf8(l->items[i].key, l->items[i].key_len,
+                                         arena);
+        if (!k) {
+            if (oom) *oom = true;
+            return false;
+        }
+        if (strcmp(k, utf8_name) == 0) {
             if (out_idx) *out_idx = i;
             return true;
         }
@@ -497,10 +521,21 @@ static TspdfError att_add_internal(TspdfReader *doc,
         return TSPDF_ERR_ALLOC;
     }
 
+    // Add = replace: match existing entries by decoded name, so adding
+    // "café.txt" replaces a same-named entry even when the stored key uses a
+    // different text-string encoding.
+    char *uname = tspdf_pdf_text_to_utf8(name, name_len, &doc->arena);
+    bool oom = false;
     size_t existing;
-    if (att_list_find(&list, name, name_len, &existing)) {
-        list.items[existing].value = fs_ref;    // replace in place
-    } else if (!att_list_push(&list, name, name_len, fs_ref)) {
+    if (!uname) {
+        free(list.items);
+        return TSPDF_ERR_ALLOC;
+    }
+    if (att_list_find_utf8(&doc->arena, &list, uname, &existing, &oom)) {
+        list.items[existing].key = name;        // replace key bytes too: the
+        list.items[existing].key_len = name_len;  // new encoding wins
+        list.items[existing].value = fs_ref;
+    } else if (oom || !att_list_push(&list, name, name_len, fs_ref)) {
         free(list.items);
         return TSPDF_ERR_ALLOC;
     }
@@ -543,8 +578,11 @@ TspdfError tspdf_reader_attachments(TspdfReader *doc, TspdfAttachmentInfo **out,
         TspdfObj *stream = att_ef_stream(doc, &parser, fs, &snum);
         if (!stream) continue;  // broken Filespec: skip
 
-        infos[n].name = att_arena_strndup(&doc->arena, list.items[i].key,
-                                          list.items[i].key_len);
+        // Keys and /Desc are PDF text strings: decode to UTF-8 for display
+        // (and so the name round-trips back into attachment_get).
+        infos[n].name = tspdf_pdf_text_to_utf8(list.items[i].key,
+                                               list.items[i].key_len,
+                                               &doc->arena);
         if (!infos[n].name) {
             free(list.items);
             return TSPDF_ERR_ALLOC;
@@ -552,8 +590,9 @@ TspdfError tspdf_reader_attachments(TspdfReader *doc, TspdfAttachmentInfo **out,
 
         TspdfObj *desc = tspdf_dict_get(fs, "Desc");
         if (desc && desc->type == TSPDF_OBJ_STRING) {
-            infos[n].desc = att_arena_strndup(&doc->arena, desc->string.data,
-                                              desc->string.len);
+            infos[n].desc = tspdf_pdf_text_to_utf8(desc->string.data,
+                                                   desc->string.len,
+                                                   &doc->arena);
         }
         TspdfObj *st = tspdf_dict_get(stream->stream.dict, "Subtype");
         if (st && st->type == TSPDF_OBJ_NAME) {
@@ -598,9 +637,10 @@ TspdfError tspdf_reader_attachment_get(TspdfReader *doc, const char *name,
     if (err != TSPDF_OK) return err;
 
     size_t idx;
-    if (!att_list_find(&list, (const uint8_t *)name, strlen(name), &idx)) {
+    bool oom = false;
+    if (!att_list_find_utf8(&doc->arena, &list, name, &idx, &oom)) {
         free(list.items);
-        return TSPDF_ERR_NOT_FOUND;
+        return oom ? TSPDF_ERR_ALLOC : TSPDF_ERR_NOT_FOUND;
     }
 
     TspdfObj *fs = att_filespec(doc, &parser, list.items[idx].value);
@@ -618,10 +658,20 @@ TspdfError tspdf_reader_attachment_add(TspdfReader *doc, const char *name,
     if (!doc || !name || name[0] == '\0' || (!data && len > 0)) {
         return TSPDF_ERR_INVALID_ARG;
     }
-    return att_add_internal(doc, (const uint8_t *)name, strlen(name),
-                            data, len,
-                            (const uint8_t *)desc, desc ? strlen(desc) : 0,
-                            NULL, 0, NULL);
+    // Names and descriptions are PDF text strings (ISO 32000 §7.9.2.2):
+    // ASCII is stored as-is, anything else as UTF-16BE with BOM — never raw
+    // UTF-8, which other tools would misread as PDFDocEncoding.
+    size_t enc_name_len = 0;
+    uint8_t *enc_name = tspdf_utf8_to_pdf_text(name, &enc_name_len, &doc->arena);
+    if (!enc_name) return TSPDF_ERR_ALLOC;
+    size_t enc_desc_len = 0;
+    uint8_t *enc_desc = NULL;
+    if (desc) {
+        enc_desc = tspdf_utf8_to_pdf_text(desc, &enc_desc_len, &doc->arena);
+        if (!enc_desc) return TSPDF_ERR_ALLOC;
+    }
+    return att_add_internal(doc, enc_name, enc_name_len, data, len,
+                            enc_desc, enc_desc_len, NULL, 0, NULL);
 }
 
 TspdfError tspdf_reader_attachment_remove(TspdfReader *doc, const char *name) {
@@ -635,9 +685,10 @@ TspdfError tspdf_reader_attachment_remove(TspdfReader *doc, const char *name) {
     if (err != TSPDF_OK) return err;
 
     size_t idx;
-    if (!att_list_find(&list, (const uint8_t *)name, strlen(name), &idx)) {
+    bool oom = false;
+    if (!att_list_find_utf8(&doc->arena, &list, name, &idx, &oom)) {
         free(list.items);
-        return TSPDF_ERR_NOT_FOUND;
+        return oom ? TSPDF_ERR_ALLOC : TSPDF_ERR_NOT_FOUND;
     }
     memmove(&list.items[idx], &list.items[idx + 1],
             sizeof(AttEntry) * (list.count - idx - 1));
@@ -731,9 +782,22 @@ TspdfError tspdf_attach_merge_attach(TspdfReader *merged, TspdfReader **docs,
         }
 
         for (size_t i = 0; i < list.count && err == TSPDF_OK; i++) {
-            if (att_list_find(&have, list.items[i].key, list.items[i].key_len,
-                              NULL)) {
-                continue;  // first source wins
+            // First source wins, comparing decoded names so the same name in
+            // different text-string encodings still deduplicates.
+            char *uname = tspdf_pdf_text_to_utf8(list.items[i].key,
+                                                 list.items[i].key_len,
+                                                 &src->arena);
+            bool oom = false;
+            if (!uname) {
+                err = TSPDF_ERR_ALLOC;
+                break;
+            }
+            if (att_list_find_utf8(&merged->arena, &have, uname, NULL, &oom)) {
+                continue;
+            }
+            if (oom) {
+                err = TSPDF_ERR_ALLOC;
+                break;
             }
             err = att_copy_entry(src, &sp, &list.items[i], merged);
         }

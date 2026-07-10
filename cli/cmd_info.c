@@ -7,8 +7,9 @@
 // Length of the valid UTF-8 sequence starting at u (1..4), or 0 if u does not
 // begin a well-formed sequence — including overlong forms, out-of-range code
 // points, and truncated sequences (a continuation byte missing or out of the
-// 0x80..0xBF range). Metadata getters can return RAW bytes (BOM-less UTF-16BE
-// or PDFDocEncoded /Title//Author), so the input is not guaranteed UTF-8.
+// 0x80..0xBF range). Metadata getters decode PDF text strings to UTF-8
+// (src/util/pdftext.c), so this is a defensive second layer for strings from
+// any other source.
 static int utf8_seq_len(const unsigned char *u) {
     unsigned char c = u[0];
     if (c < 0x80u) return 1;
