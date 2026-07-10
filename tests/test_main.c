@@ -533,6 +533,139 @@ TEST(test_deflate_rejects_truncated_stream) {
     free(data);
 }
 
+// --- deflate_compress_best: same contract as deflate_compress, more search
+// effort. Round-trips must be exact through the in-repo inflater. ---
+
+// Shared helper: compress with deflate_compress_best, decompress, compare.
+// void because ASSERT bails with a bare return; on failure *out_comp_len
+// stays 0 and _test_failed is set, so callers must return early themselves.
+static void deflate_best_roundtrip_check(const uint8_t *data, size_t len,
+                                         size_t *out_comp_len) {
+    *out_comp_len = 0;
+    size_t comp_len = 0;
+    uint8_t *comp = deflate_compress_best(data, len, &comp_len);
+    ASSERT(comp != NULL);
+    ASSERT(comp_len > 0);
+
+    size_t decomp_len = len ? 0 : 12345;
+    uint8_t *decomp = deflate_decompress(comp, comp_len, &decomp_len);
+    ASSERT(decomp != NULL);
+    ASSERT(decomp_len == len);
+    if (len > 0) ASSERT(memcmp(decomp, data, len) == 0);
+
+    free(comp);
+    free(decomp);
+    *out_comp_len = comp_len;
+}
+
+TEST(test_deflate_best_roundtrip_empty) {
+    size_t comp_len;
+    deflate_best_roundtrip_check((const uint8_t *)"", 0, &comp_len);
+}
+
+TEST(test_deflate_best_roundtrip_one_byte) {
+    uint8_t b = 0x42;
+    size_t comp_len;
+    deflate_best_roundtrip_check(&b, 1, &comp_len);
+}
+
+TEST(test_deflate_best_roundtrip_all_same) {
+    size_t len = 100000;
+    uint8_t *data = (uint8_t *)malloc(len);
+    ASSERT(data != NULL);
+    memset(data, 'A', len);
+    size_t comp_len;
+    deflate_best_roundtrip_check(data, len, &comp_len);
+    free(data);
+    if (_test_failed) return;
+    // Runs of maximum-length matches; more than a few hundred bytes means
+    // match emission is broken.
+    ASSERT(comp_len < 600);
+}
+
+// Incompressible input: output must still round-trip exactly, and stored-block
+// fallback must cap expansion to a small overhead over the raw size.
+TEST(test_deflate_best_roundtrip_random_incompressible) {
+    size_t len = 262144;
+    uint8_t *data = (uint8_t *)malloc(len);
+    ASSERT(data != NULL);
+    uint32_t s = 0x9E3779B9u;  // xorshift32: deterministic pseudo-random bytes
+    for (size_t i = 0; i < len; i++) {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        data[i] = (uint8_t)s;
+    }
+    size_t comp_len;
+    deflate_best_roundtrip_check(data, len, &comp_len);
+    free(data);
+    if (_test_failed) return;
+    ASSERT(comp_len < len + len / 100 + 64);
+}
+
+// ~1MB of deterministic English-like text: several 64K-symbol blocks and
+// window wraps, plus the "best <= fast" size guarantee on text.
+TEST(test_deflate_best_roundtrip_english_text) {
+    static const char *words[] = {
+        "the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog",
+        "compression", "attention", "is", "all", "you", "need", "transformer",
+        "model", "sequence", "encoder", "decoder", "layer", "output", "input",
+    };
+    size_t nwords = sizeof words / sizeof words[0];
+    size_t cap = 1024 * 1024 + 64;
+    char *text = (char *)malloc(cap);
+    ASSERT(text != NULL);
+    size_t n = 0;
+    uint32_t s = 12345;
+    while (n + 32 < 1024 * 1024) {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        const char *w = words[s % nwords];
+        size_t wl = strlen(w);
+        memcpy(text + n, w, wl);
+        n += wl;
+        text[n++] = (s & 0x70) ? ' ' : '\n';
+    }
+
+    size_t best_len;
+    deflate_best_roundtrip_check((const uint8_t *)text, n, &best_len);
+    if (_test_failed) { free(text); return; }
+    ASSERT(best_len < n / 3);  // English-like text must compress well
+
+    size_t fast_len = 0;
+    uint8_t *fast = deflate_compress((const uint8_t *)text, n, &fast_len);
+    ASSERT(fast != NULL);
+    ASSERT(best_len <= fast_len);  // more effort must never cost bytes here
+
+    free(fast);
+    free(text);
+}
+
+// Repetitive structured text (PDF-ish operator soup with counters), same
+// shape as test_deflate_roundtrip_text_corpus.
+TEST(test_deflate_best_roundtrip_structured_text) {
+    size_t cap = 300000;
+    char *text = (char *)malloc(cap);
+    ASSERT(text != NULL);
+    size_t n = 0;
+    for (int i = 0; n + 128 < cap; i++) {
+        n += (size_t)snprintf(text + n, cap - n,
+                              "%d 0 obj << /Type /Page /Parent %d 0 R /Contents %d 0 R >> "
+                              "BT /F1 %d Tf 72 %d Td (line of page text) Tj ET\n",
+                              i, i / 8, i + 1, 8 + i % 4, i % 700);
+    }
+
+    size_t best_len;
+    deflate_best_roundtrip_check((const uint8_t *)text, n, &best_len);
+    if (_test_failed) { free(text); return; }
+    ASSERT(best_len < n / 4);
+
+    size_t fast_len = 0;
+    uint8_t *fast = deflate_compress((const uint8_t *)text, n, &fast_len);
+    ASSERT(fast != NULL);
+    ASSERT(best_len <= fast_len);
+
+    free(fast);
+    free(text);
+}
+
 // A header-only zlib stream (no block payload at all) is truncated and must
 // fail rather than return an empty/garbage buffer.
 TEST(test_deflate_rejects_header_only_stream) {
@@ -3209,6 +3342,12 @@ int main(void) {
     RUN(test_deflate_rejects_output_over_max);
     RUN(test_deflate_rejects_truncated_stream);
     RUN(test_deflate_rejects_header_only_stream);
+    RUN(test_deflate_best_roundtrip_empty);
+    RUN(test_deflate_best_roundtrip_one_byte);
+    RUN(test_deflate_best_roundtrip_all_same);
+    RUN(test_deflate_best_roundtrip_random_incompressible);
+    RUN(test_deflate_best_roundtrip_english_text);
+    RUN(test_deflate_best_roundtrip_structured_text);
 
     printf("\n  PNG decoder:\n");
     RUN(test_png_rejects_zero_width);
