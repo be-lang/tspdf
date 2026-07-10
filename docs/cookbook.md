@@ -156,15 +156,19 @@ tspdf text report.pdf --pages 1-3 -o report.txt
 tspdf compress report.pdf -o smaller.pdf
 
 # scans and photo-heavy files: also downsample images and re-encode as JPEG
+# (photos) or CCITT G4 (black-and-white scans)
 tspdf compress --lossy scan.pdf -o small.pdf
 
-# tune it (defaults: 150 dpi, quality 75)
+# tune it (defaults: photos 150 dpi quality 75, black-and-white 300 dpi)
 tspdf compress --lossy --image-dpi 100 --image-quality 60 scan.pdf -o tiny.pdf
+tspdf compress --lossy --mono-dpi 200 book-scan.pdf -o small-book.pdf
 ```
 
 `--lossy` reduces image quality. Images with transparency or unusual color
 spaces are left alone, as is anything within 1.3x of the target dpi (too
-close to be worth re-encoding).
+close to be worth re-encoding). Black-and-white images get their own
+`--mono-dpi` target because text needs more resolution than photos to stay
+readable.
 
 ## Fill form fields
 

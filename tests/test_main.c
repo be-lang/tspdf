@@ -13,6 +13,7 @@
 #include "../src/compress/deflate.h"
 #include "../src/image/png_decoder.h"
 #include "../src/image/jpeg_codec.h"
+#include "../src/image/ccitt_codec.h"
 #include "../src/pdf/pdf_base14.h"
 #include "../src/layout/layout.h"
 #include "../src/pdf/tspdf_writer.h"
@@ -3168,6 +3169,463 @@ TEST(test_jpeg_encode_external_decoder_oracle) {
 }
 
 // ============================================================
+// CCITT codec (src/image/ccitt_codec.c)
+// ============================================================
+//
+// Decoder oracle: coded streams produced by two independent known-good
+// encoders — Pillow/libtiff (TIFF group3/group4 strip bytes) and
+// Ghostscript's CCITTFaxEncode filter (K = 0 / K > 0 / EncodedByteAlign /
+// BlackIs1 variants). Source bitmaps are committed as PBM (P4) next to the
+// coded fixtures; tests/data/gen_ccitt_fixtures.py regenerates everything.
+// The two ccitt_runs_* fixtures exercise every white and black terminating
+// and makeup code, so a single wrong table entry fails them.
+
+// Read tests/data/<name> as a P4 (packed, binary) PBM into 0/255 bytes
+// (0 = black, matching the codec's pixel convention).
+static uint8_t *test_ccitt_read_pbm(const char *name, int *out_w, int *out_h) {
+    char path[128];
+    snprintf(path, sizeof(path), "tests/data/%s", name);
+    size_t len;
+    uint8_t *raw = test_jpeg_read_file(path, &len);
+    if (!raw) return NULL;
+    int w = 0, h = 0;
+    size_t pos = 0;
+    if (len < 3 || raw[0] != 'P' || raw[1] != '4') { free(raw); return NULL; }
+    pos = 2;
+    for (int field = 0; field < 2; field++) {
+        while (pos < len && (raw[pos] == ' ' || raw[pos] == '\n' ||
+                             raw[pos] == '\t' || raw[pos] == '\r'))
+            pos++;
+        int v = 0;
+        while (pos < len && raw[pos] >= '0' && raw[pos] <= '9') {
+            v = v * 10 + (raw[pos] - '0');
+            pos++;
+        }
+        if (field == 0) w = v;
+        else h = v;
+    }
+    pos++;  // single whitespace after the header
+    size_t stride = ((size_t)w + 7) / 8;
+    if (w <= 0 || h <= 0 || pos + stride * (size_t)h > len) {
+        free(raw);
+        return NULL;
+    }
+    uint8_t *px = (uint8_t *)malloc((size_t)w * (size_t)h);
+    if (!px) { free(raw); return NULL; }
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            int bit = (raw[pos + (size_t)y * stride + (size_t)x / 8] >>
+                       (7 - (x & 7))) & 1;
+            px[(size_t)y * (size_t)w + x] = bit ? 0 : 255;  // PBM: 1 = black
+        }
+    }
+    free(raw);
+    *out_w = w;
+    *out_h = h;
+    return px;
+}
+
+// Decode tests/data/<fixture> with the given params and require an exact
+// pixel match against tests/data/<pbm>. When invert is set the expected
+// pixels flip (BlackIs1 semantics: black decodes to sample 1 = white).
+static bool test_ccitt_check_fixture(const char *fixture, const char *pbm,
+                                     const TspdfCcittParams *params,
+                                     bool invert) {
+    int w = 0, h = 0;
+    uint8_t *want = test_ccitt_read_pbm(pbm, &w, &h);
+    if (!want) return false;
+    char path[128];
+    snprintf(path, sizeof(path), "tests/data/%s", fixture);
+    size_t clen;
+    uint8_t *coded = test_jpeg_read_file(path, &clen);
+    if (!coded) { free(want); return false; }
+
+    TspdfCcittParams p = *params;
+    p.columns = w;
+    p.rows = h;
+    TspdfArena arena = tspdf_arena_create(1 << 20);
+    TspdfCcittBitmap bm;
+    bool ok = tspdf_ccitt_decode(coded, clen, &p, &arena, &bm);
+    if (ok) ok = bm.width == w && bm.height == h;
+    if (ok) {
+        for (size_t i = 0; i < (size_t)w * (size_t)h && ok; i++) {
+            uint8_t e = invert ? (uint8_t)(255 - want[i]) : want[i];
+            if (bm.pixels[i] != e) ok = false;
+        }
+    }
+    tspdf_arena_destroy(&arena);
+    free(coded);
+    free(want);
+    return ok;
+}
+
+TEST(test_ccitt_decode_pil_g3_white_runs) {
+    TspdfCcittParams p;
+    tspdf_ccitt_params_default(&p);
+    p.k = 0;  // libtiff group3 default: 1-D with EOLs
+    p.end_of_line = true;
+    ASSERT(test_ccitt_check_fixture("ccitt_runs_white.g3", "ccitt_runs_white.pbm",
+                                    &p, false));
+}
+
+TEST(test_ccitt_decode_pil_g3_black_runs) {
+    TspdfCcittParams p;
+    tspdf_ccitt_params_default(&p);
+    p.k = 0;
+    p.end_of_line = true;
+    ASSERT(test_ccitt_check_fixture("ccitt_runs_black.g3", "ccitt_runs_black.pbm",
+                                    &p, false));
+}
+
+TEST(test_ccitt_decode_pil_g4_text) {
+    TspdfCcittParams p;
+    tspdf_ccitt_params_default(&p);
+    p.k = -1;
+    ASSERT(test_ccitt_check_fixture("ccitt_text.g4", "ccitt_text.pbm", &p, false));
+}
+
+TEST(test_ccitt_decode_gs_k0_noeol) {
+    TspdfCcittParams p;
+    tspdf_ccitt_params_default(&p);
+    p.k = 0;
+    ASSERT(test_ccitt_check_fixture("ccitt_text_k0.bin", "ccitt_text.pbm", &p, false));
+}
+
+TEST(test_ccitt_decode_gs_k0_byte_align) {
+    TspdfCcittParams p;
+    tspdf_ccitt_params_default(&p);
+    p.k = 0;
+    p.encoded_byte_align = true;
+    ASSERT(test_ccitt_check_fixture("ccitt_text_k0_align.bin", "ccitt_text.pbm",
+                                    &p, false));
+}
+
+TEST(test_ccitt_decode_gs_k2_eol) {
+    TspdfCcittParams p;
+    tspdf_ccitt_params_default(&p);
+    p.k = 2;
+    p.end_of_line = true;
+    ASSERT(test_ccitt_check_fixture("ccitt_text_k2_eol.bin", "ccitt_text.pbm",
+                                    &p, false));
+}
+
+TEST(test_ccitt_decode_gs_k4_noeol) {
+    // No EOLs, so no 1-D/2-D tag bits either: the decoder must fall back to
+    // the one-1-D-line-every-K cadence.
+    TspdfCcittParams p;
+    tspdf_ccitt_params_default(&p);
+    p.k = 4;
+    ASSERT(test_ccitt_check_fixture("ccitt_text_k4_noeol.bin", "ccitt_text.pbm",
+                                    &p, false));
+}
+
+TEST(test_ccitt_decode_gs_g4_byte_align) {
+    TspdfCcittParams p;
+    tspdf_ccitt_params_default(&p);
+    p.k = -1;
+    p.encoded_byte_align = true;
+    ASSERT(test_ccitt_check_fixture("ccitt_text_g4_align.bin", "ccitt_text.pbm",
+                                    &p, false));
+}
+
+TEST(test_ccitt_decode_gs_g4_blackis1) {
+    // The fixture was encoded by gs with /BlackIs1 true from the same packed
+    // bits as the plain G4 fixture, so BlackIs1 flips the coding polarity on
+    // both sides and the visible pixels come back unchanged — exactly the
+    // filter round-trip a PDF viewer performs.
+    TspdfCcittParams p;
+    tspdf_ccitt_params_default(&p);
+    p.k = -1;
+    p.black_is_1 = true;
+    ASSERT(test_ccitt_check_fixture("ccitt_text_g4_black1.bin", "ccitt_text.pbm",
+                                    &p, false));
+    // And on a canonically-coded stream, black_is_1 inverts the output
+    // (coded black -> sample 1 -> /DeviceGray white).
+    p.black_is_1 = true;
+    ASSERT(test_ccitt_check_fixture("ccitt_text.g4", "ccitt_text.pbm", &p, true));
+}
+
+TEST(test_ccitt_decode_rows_unknown) {
+    // rows = 0: decode until EOFB (gs writes one) and report the height.
+    size_t clen;
+    uint8_t *coded = test_jpeg_read_file("tests/data/ccitt_text_g4_black1.bin",
+                                         &clen);
+    ASSERT(coded != NULL);
+    TspdfCcittParams p;
+    tspdf_ccitt_params_default(&p);
+    p.k = -1;
+    p.columns = 400;
+    p.rows = 0;
+    p.black_is_1 = true;
+    TspdfArena arena = tspdf_arena_create(1 << 20);
+    TspdfCcittBitmap bm;
+    ASSERT(tspdf_ccitt_decode(coded, clen, &p, &arena, &bm));
+    ASSERT_EQ_INT(bm.width, 400);
+    ASSERT_EQ_INT(bm.height, 120);
+    tspdf_arena_destroy(&arena);
+    free(coded);
+}
+
+TEST(test_ccitt_decode_end_of_block_false) {
+    // /EndOfBlock false: the decoder must stop after /Rows lines and not
+    // insist on an EOFB (PIL/libtiff G4 strips carry none).
+    size_t clen;
+    uint8_t *coded = test_jpeg_read_file("tests/data/ccitt_text.g4", &clen);
+    ASSERT(coded != NULL);
+    TspdfCcittParams p;
+    tspdf_ccitt_params_default(&p);
+    p.k = -1;
+    p.columns = 400;
+    p.rows = 120;
+    p.end_of_block = false;
+    TspdfArena arena = tspdf_arena_create(1 << 20);
+    TspdfCcittBitmap bm;
+    ASSERT(tspdf_ccitt_decode(coded, clen, &p, &arena, &bm));
+    ASSERT_EQ_INT(bm.height, 120);
+    tspdf_arena_destroy(&arena);
+    free(coded);
+}
+
+// Fill a text-like deterministic pattern (strokes + baseline).
+static void test_ccitt_fill_text(uint8_t *px, int w, int h) {
+    memset(px, 255, (size_t)w * h);
+    uint32_t lcg = 7;
+    for (int y = 2; y + 7 < h; y += 9) {
+        for (int x = 3; x + 12 < w; x += 14) {
+            lcg = lcg * 1664525u + 1013904223u;
+            int ww = 6 + (int)((lcg >> 24) % 7);
+            for (int yy = y; yy < y + 6; yy++)
+                for (int xx = x; xx < x + ww; xx++)
+                    if ((xx - x) % 4 < 2 || yy == y + 5)
+                        px[(size_t)yy * w + xx] = 0;
+        }
+    }
+}
+
+// Encode with our G4 encoder, decode with our decoder, require exactness.
+static bool test_ccitt_roundtrip(const uint8_t *px, int w, int h) {
+    TspdfArena arena = tspdf_arena_create(1 << 20);
+    uint8_t *enc = NULL;
+    size_t enc_len = 0;
+    bool ok = tspdf_ccitt_encode_g4(px, w, h, &arena, &enc, &enc_len);
+    if (ok) {
+        TspdfCcittParams p;
+        tspdf_ccitt_params_default(&p);
+        p.k = -1;
+        p.columns = w;
+        p.rows = h;
+        TspdfCcittBitmap bm;
+        ok = tspdf_ccitt_decode(enc, enc_len, &p, &arena, &bm) &&
+             bm.width == w && bm.height == h &&
+             memcmp(bm.pixels, px, (size_t)w * h) == 0;
+    }
+    tspdf_arena_destroy(&arena);
+    return ok;
+}
+
+TEST(test_ccitt_g4_roundtrip_patterns) {
+    enum { W = 61, H = 33 };  // width deliberately not a multiple of 8
+    uint8_t *px = (uint8_t *)malloc((size_t)W * H);
+    ASSERT(px != NULL);
+
+    memset(px, 255, (size_t)W * H);  // all white
+    ASSERT(test_ccitt_roundtrip(px, W, H));
+
+    memset(px, 0, (size_t)W * H);  // all black
+    ASSERT(test_ccitt_roundtrip(px, W, H));
+
+    for (int y = 0; y < H; y++)  // alternating columns (max changes per line)
+        for (int x = 0; x < W; x++)
+            px[(size_t)y * W + x] = (x & 1) ? 0 : 255;
+    ASSERT(test_ccitt_roundtrip(px, W, H));
+
+    for (int y = 0; y < H; y++)  // checkerboard (vertical modes both ways)
+        for (int x = 0; x < W; x++)
+            px[(size_t)y * W + x] = ((x + y) & 1) ? 0 : 255;
+    ASSERT(test_ccitt_roundtrip(px, W, H));
+
+    test_ccitt_fill_text(px, W, H);  // text-like strokes
+    ASSERT(test_ccitt_roundtrip(px, W, H));
+
+    uint32_t lcg = 99;  // deterministic noise (horizontal-mode heavy)
+    for (size_t i = 0; i < (size_t)W * H; i++) {
+        lcg = lcg * 1664525u + 1013904223u;
+        px[i] = (lcg >> 24) & 1 ? 0 : 255;
+    }
+    ASSERT(test_ccitt_roundtrip(px, W, H));
+    free(px);
+
+    // Degenerate sizes.
+    uint8_t one[3] = {0, 255, 0};
+    ASSERT(test_ccitt_roundtrip(one, 1, 1));
+    ASSERT(test_ccitt_roundtrip(one, 3, 1));
+    ASSERT(test_ccitt_roundtrip(one, 1, 3));
+}
+
+TEST(test_ccitt_g4_roundtrip_long_runs) {
+    // Wide bitmap with runs beyond the largest single makeup code (2560):
+    // the encoder must chain makeups and the decoder must sum them.
+    enum { W = 6001, H = 5 };
+    uint8_t *px = (uint8_t *)malloc((size_t)W * H);
+    ASSERT(px != NULL);
+    memset(px, 255, (size_t)W * H);
+    for (int x = 2900; x < W; x++) px[(size_t)0 * W + x] = 0;  // black 3101
+    for (int x = 0; x < 2700; x++) px[(size_t)1 * W + x] = 0;  // white 3301 tail
+    // row 2 all white (run 6001), row 3 all black, row 4 single black pixel
+    memset(px + (size_t)3 * W, 0, W);
+    px[(size_t)4 * W + 3000] = 0;
+    ASSERT(test_ccitt_roundtrip(px, W, H));
+    free(px);
+}
+
+TEST(test_ccitt_g4_encode_matches_external_decoder) {
+    // Our encoder's output must decode in an independent implementation:
+    // Ghostscript's CCITTFaxDecode filter reproduces the source bitmap
+    // exactly. (Rendering through pdftoppm/mutool is covered in
+    // tests/test_cli.sh.)
+    if (system("command -v gs > /dev/null 2>&1") != 0) {
+        SKIP("gs not installed");
+    }
+    enum { W = 200, H = 60 };
+    uint8_t *px = (uint8_t *)malloc((size_t)W * H);
+    ASSERT(px != NULL);
+    test_ccitt_fill_text(px, W, H);
+
+    TspdfArena arena = tspdf_arena_create(1 << 20);
+    uint8_t *enc = NULL;
+    size_t enc_len = 0;
+    ASSERT(tspdf_ccitt_encode_g4(px, W, H, &arena, &enc, &enc_len));
+
+    const char *g4_path = "/tmp/tspdf_test_ccitt_ext.g4";
+    const char *raw_path = "/tmp/tspdf_test_ccitt_ext.raw";
+    FILE *f = fopen(g4_path, "wb");
+    ASSERT(f != NULL);
+    ASSERT(fwrite(enc, 1, enc_len, f) == enc_len);
+    fclose(f);
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
+             "gs -q -dNODISPLAY -dBATCH -dNOSAFER -c '/inf (%s) (r) file def "
+             "/dec inf << /K -1 /Columns %d /Rows %d >> /CCITTFaxDecode filter def "
+             "/outf (%s) (w) file def /buf 4096 string def "
+             "{ dec buf readstring exch outf exch writestring not { exit } if } loop "
+             "outf closefile quit' 2>/dev/null",
+             g4_path, W, H, raw_path);
+    ASSERT(system(cmd) == 0);
+
+    size_t raw_len = 0;
+    uint8_t *raw = test_jpeg_read_file(raw_path, &raw_len);
+    ASSERT(raw != NULL);
+    ASSERT_EQ_SIZE(raw_len, (size_t)(W + 7) / 8 * H);
+    bool same = true;
+    for (int y = 0; y < H && same; y++)
+        for (int x = 0; x < W && same; x++) {
+            int bit = (raw[(size_t)y * ((W + 7) / 8) + x / 8] >> (7 - (x & 7))) & 1;
+            // gs raw output: 0 bit = black (default BlackIs1 false)
+            if ((bit ? 255 : 0) != px[(size_t)y * W + x]) same = false;
+        }
+    ASSERT(same);
+    remove(g4_path);
+    remove(raw_path);
+    free(raw);
+    free(px);
+    tspdf_arena_destroy(&arena);
+}
+
+TEST(test_ccitt_decode_rejects_malformed) {
+    TspdfArena arena = tspdf_arena_create(1 << 16);
+    TspdfCcittParams p;
+    tspdf_ccitt_params_default(&p);
+    p.k = -1;
+    p.columns = 64;
+    p.rows = 8;
+    TspdfCcittBitmap bm;
+    // Empty and absurd-parameter inputs.
+    uint8_t byte = 0x80;
+    ASSERT(!tspdf_ccitt_decode(NULL, 1, &p, &arena, &bm));
+    ASSERT(!tspdf_ccitt_decode(&byte, 0, &p, &arena, &bm));
+    p.columns = 0;
+    ASSERT(!tspdf_ccitt_decode(&byte, 1, &p, &arena, &bm));
+    p.columns = (1 << 20) + 1;
+    ASSERT(!tspdf_ccitt_decode(&byte, 1, &p, &arena, &bm));
+    p.columns = 64;
+    p.rows = -1;
+    ASSERT(!tspdf_ccitt_decode(&byte, 1, &p, &arena, &bm));
+    p.rows = 1 << 21;
+    ASSERT(!tspdf_ccitt_decode(&byte, 1, &p, &arena, &bm));
+    // Truncated stream with /Rows given: hard error, not a short image.
+    size_t clen;
+    uint8_t *coded = test_jpeg_read_file("tests/data/ccitt_text.g4", &clen);
+    ASSERT(coded != NULL);
+    p.columns = 400;
+    p.rows = 120;
+    ASSERT(!tspdf_ccitt_decode(coded, clen / 2, &p, &arena, &bm));
+    // Repeated 0000001x: the T.4 extension escape (uncompressed mode),
+    // which we reject; must fail cleanly, not hang. (All-ones, by contrast,
+    // is a *valid* G4 stream: V0 per line = all white.)
+    uint8_t ext[64];
+    memset(ext, 0x02, sizeof(ext));
+    p.rows = 8;
+    p.columns = 64;
+    ASSERT(!tspdf_ccitt_decode(ext, sizeof(ext), &p, &arena, &bm));
+    free(coded);
+    tspdf_arena_destroy(&arena);
+}
+
+TEST(test_ccitt_decode_fuzz_mutations_no_crash) {
+    // 500 deterministic corruptions of a valid G4 stream (fixed-seed
+    // xorshift): decode must neither crash nor hang, with /Rows known and
+    // unknown. Run under ASan/UBSan via `make test-asan`.
+    size_t clen;
+    uint8_t *coded = test_jpeg_read_file("tests/data/ccitt_text.g4", &clen);
+    ASSERT(coded != NULL);
+    uint8_t *mut = (uint8_t *)malloc(clen);
+    ASSERT(mut != NULL);
+    uint32_t x = 0x9E3779B9u;  // fixed seed, no time()
+    TspdfArena arena = tspdf_arena_create(1 << 16);
+    for (int iter = 0; iter < 500; iter++) {
+        memcpy(mut, coded, clen);
+        // xorshift32
+        int flips = 1 + (iter % 8);
+        for (int i = 0; i < flips; i++) {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            mut[x % clen] ^= (uint8_t)(1u << ((x >> 8) & 7));
+        }
+        size_t len = clen;
+        if (iter % 5 == 0) len = 1 + (x % clen);  // truncate too
+        TspdfCcittParams p;
+        tspdf_ccitt_params_default(&p);
+        p.k = (iter % 3 == 0) ? -1 : (iter % 3 == 1) ? 0 : 2;
+        p.columns = 400;
+        p.rows = (iter & 1) ? 120 : 0;
+        p.encoded_byte_align = (iter % 7) == 0;
+        TspdfCcittBitmap bm;
+        (void)tspdf_ccitt_decode(mut, len, &p, &arena, &bm);
+        tspdf_arena_reset(&arena);
+    }
+    tspdf_arena_destroy(&arena);
+    free(mut);
+    free(coded);
+}
+
+TEST(test_ccitt_encode_rejects_bad_args) {
+    TspdfArena arena = tspdf_arena_create(1 << 12);
+    uint8_t px[4] = {0, 255, 255, 0};
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    ASSERT(!tspdf_ccitt_encode_g4(NULL, 2, 2, &arena, &out, &out_len));
+    ASSERT(!tspdf_ccitt_encode_g4(px, 0, 2, &arena, &out, &out_len));
+    ASSERT(!tspdf_ccitt_encode_g4(px, 2, 0, &arena, &out, &out_len));
+    ASSERT(!tspdf_ccitt_encode_g4(px, (1 << 20) + 1, 1, &arena, &out, &out_len));
+    ASSERT(!tspdf_ccitt_encode_g4(px, 2, 2, &arena, NULL, &out_len));
+    ASSERT(!tspdf_ccitt_encode_g4(px, 2, 2, &arena, &out, NULL));
+    ASSERT(tspdf_ccitt_encode_g4(px, 2, 2, &arena, &out, &out_len));
+    ASSERT(out != NULL && out_len > 0);
+    tspdf_arena_destroy(&arena);
+}
+
+// ============================================================
 // Main
 // ============================================================
 
@@ -3344,6 +3802,25 @@ int main(void) {
     RUN(test_jpeg_encode_odd_dimensions);
     RUN(test_jpeg_encode_rejects_bad_args);
     RUN(test_jpeg_encode_external_decoder_oracle);
+
+    printf("\n  CCITT codec:\n");
+    RUN(test_ccitt_decode_pil_g3_white_runs);
+    RUN(test_ccitt_decode_pil_g3_black_runs);
+    RUN(test_ccitt_decode_pil_g4_text);
+    RUN(test_ccitt_decode_gs_k0_noeol);
+    RUN(test_ccitt_decode_gs_k0_byte_align);
+    RUN(test_ccitt_decode_gs_k2_eol);
+    RUN(test_ccitt_decode_gs_k4_noeol);
+    RUN(test_ccitt_decode_gs_g4_byte_align);
+    RUN(test_ccitt_decode_gs_g4_blackis1);
+    RUN(test_ccitt_decode_rows_unknown);
+    RUN(test_ccitt_decode_end_of_block_false);
+    RUN(test_ccitt_g4_roundtrip_patterns);
+    RUN(test_ccitt_g4_roundtrip_long_runs);
+    RUN(test_ccitt_g4_encode_matches_external_decoder);
+    RUN(test_ccitt_decode_rejects_malformed);
+    RUN(test_ccitt_decode_fuzz_mutations_no_crash);
+    RUN(test_ccitt_encode_rejects_bad_args);
 
     printf("\n  QR encoder:\n");
     RUN(test_qr_ecc_table_consistent);

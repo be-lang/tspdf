@@ -3167,6 +3167,104 @@ run_test "form fill validates inherited /Opt (parent-held options)" bash -c '
   fi
   grep -q "not an option" "'"$TMPDIR"'/fb_opt_err.txt"'
 
+# --- compress --lossy: bilevel (CCITT G4) images ---
+# Fixtures are committed (regenerate with tests/data/gen_mono_fixtures.py):
+# a 600-dpi scanned-text-like G4 page, a 300-dpi one (passthrough), and a
+# 300-dpi 1-bpp FlateDecode one (converted to G4 1:1, pixel-identical).
+# Helper: mean absolute difference of two equal-size P5 (PGM) renders.
+cat > "$TMPDIR/pgmdiff.py" <<'PYEOF'
+import sys
+def read(p):
+    d = open(p, 'rb').read()
+    head, rest = d.split(b'\n', 1)
+    assert head == b'P5', head
+    dims, rest = rest.split(b'\n', 1)
+    maxv, rest = rest.split(b'\n', 1)
+    w, h = map(int, dims.split())
+    return w, h, rest[:w*h]
+w1, h1, a = read(sys.argv[1])
+w2, h2, b = read(sys.argv[2])
+assert (w1, h1) == (w2, h2), 'size mismatch'
+mad = sum(abs(x - y) for x, y in zip(a, b)) / len(a)
+print('%.3f' % mad)
+assert mad <= float(sys.argv[3]), 'mean abs diff %.3f > %s' % (mad, sys.argv[3])
+PYEOF
+
+MONO_IN=tests/data/lossy_mono.pdf
+if command -v python3 >/dev/null 2>&1 && [ -f "$MONO_IN" ]; then
+  run_test "compress --lossy shrinks a 600-dpi bilevel scan > 40%" bash -c '
+    set -e
+    "'"$TSPDF"'" compress --lossy '"$MONO_IN"' -o "'"$TMPDIR"'/mono_out.pdf"
+    in=$(wc -c < '"$MONO_IN"')
+    out=$(wc -c < "'"$TMPDIR"'/mono_out.pdf")
+    [ $((out * 10)) -lt $((in * 6)) ]'
+
+  run_test "compress --lossy keeps the bilevel image CCITT, downsampled to 300 dpi" bash -c '
+    set -e
+    info=$(python3 "'"$TMPDIR"'/imgstream.py" "'"$TMPDIR"'/mono_out.pdf")
+    case "$info" in "CCITTFaxDecode 450 450 DeviceGray") ;; *) echo "got: $info"; exit 1;; esac'
+
+  run_test "compress --lossy reports the bilevel recompression" bash -c '
+    "'"$TSPDF"'" compress --lossy '"$MONO_IN"' -o "'"$TMPDIR"'/mono_out2.pdf" \
+      | grep -q "1 as CCITT G4"'
+
+  if command -v qpdf >/dev/null 2>&1; then
+    run_test "compress --lossy bilevel output passes qpdf --check" \
+      qpdf --check "$TMPDIR/mono_out.pdf"
+  else
+    echo "  SKIP  compress --lossy bilevel qpdf --check (qpdf not found)"
+  fi
+
+  if command -v pdftoppm >/dev/null 2>&1; then
+    run_test "compress --lossy bilevel output renders nonblank and close to the input" bash -c '
+      set -e
+      pdftoppm -r 150 -gray -singlefile '"$MONO_IN"' "'"$TMPDIR"'/mono_in_r"
+      pdftoppm -r 150 -gray -singlefile "'"$TMPDIR"'/mono_out.pdf" "'"$TMPDIR"'/mono_out_r"
+      python3 "'"$TMPDIR"'/nonblank.py" "'"$TMPDIR"'/mono_out_r.pgm"
+      python3 "'"$TMPDIR"'/pgmdiff.py" "'"$TMPDIR"'/mono_in_r.pgm" "'"$TMPDIR"'/mono_out_r.pgm" 3.0 > /dev/null'
+
+    run_test "compress --lossy converts 1-bpp flate to G4 rendering pixel-identically" bash -c '
+      set -e
+      "'"$TSPDF"'" compress --lossy tests/data/lossy_mono_flate.pdf -o "'"$TMPDIR"'/mono_flate_out.pdf"
+      info=$(python3 "'"$TMPDIR"'/imgstream.py" "'"$TMPDIR"'/mono_flate_out.pdf")
+      case "$info" in "CCITTFaxDecode 450 450 DeviceGray") ;; *) echo "got: $info"; exit 1;; esac
+      pdftoppm -r 300 -gray -singlefile tests/data/lossy_mono_flate.pdf "'"$TMPDIR"'/mf_in_r"
+      pdftoppm -r 300 -gray -singlefile "'"$TMPDIR"'/mono_flate_out.pdf" "'"$TMPDIR"'/mf_out_r"
+      cmp -s "'"$TMPDIR"'/mf_in_r.pgm" "'"$TMPDIR"'/mf_out_r.pgm"'
+  else
+    echo "  SKIP  compress --lossy bilevel render checks (pdftoppm not found)"
+  fi
+
+  MUTOOL=/tmp/tspdf-bench/mupdf/usr/bin/mutool
+  if [ -x "$MUTOOL" ]; then
+    run_test "compress --lossy bilevel output renders in mutool" bash -c '
+      LD_LIBRARY_PATH=/tmp/tspdf-bench/mupdf/usr/lib '"$MUTOOL"' draw -F ppm \
+        -o /dev/null "'"$TMPDIR"'/mono_out.pdf" 2>/dev/null'
+  fi
+
+  run_test "compress --lossy leaves a 300-dpi CCITT image byte-identical" bash -c '
+    set -e
+    "'"$TSPDF"'" compress --lossy tests/data/lossy_mono_low.pdf -o "'"$TMPDIR"'/mono_low_out.pdf"
+    python3 "'"$TMPDIR"'/imgstream.py" tests/data/lossy_mono_low.pdf "'"$TMPDIR"'/mono_low_in.bin" > /dev/null
+    python3 "'"$TMPDIR"'/imgstream.py" "'"$TMPDIR"'/mono_low_out.pdf" "'"$TMPDIR"'/mono_low_out.bin" > /dev/null
+    cmp -s "'"$TMPDIR"'/mono_low_in.bin" "'"$TMPDIR"'/mono_low_out.bin"'
+
+  run_test "compress --lossy --mono-dpi 600 leaves the 600-dpi scan untouched" bash -c '
+    set -e
+    "'"$TSPDF"'" compress --lossy --mono-dpi 600 '"$MONO_IN"' -o "'"$TMPDIR"'/mono_600_out.pdf"
+    python3 "'"$TMPDIR"'/imgstream.py" '"$MONO_IN"' "'"$TMPDIR"'/mono_600_in.bin" > /dev/null
+    python3 "'"$TMPDIR"'/imgstream.py" "'"$TMPDIR"'/mono_600_out.pdf" "'"$TMPDIR"'/mono_600_out.bin" > /dev/null
+    cmp -s "'"$TMPDIR"'/mono_600_in.bin" "'"$TMPDIR"'/mono_600_out.bin"'
+
+  run_test "compress rejects invalid --mono-dpi values" bash -c '
+    ! "'"$TSPDF"'" compress --lossy --mono-dpi 0 '"$MONO_IN"' -o "'"$TMPDIR"'/x.pdf" 2>/dev/null || exit 1
+    ! "'"$TSPDF"'" compress --lossy --mono-dpi 4801 '"$MONO_IN"' -o "'"$TMPDIR"'/x.pdf" 2>/dev/null || exit 1
+    ! "'"$TSPDF"'" compress --lossy --mono-dpi abc '"$MONO_IN"' -o "'"$TMPDIR"'/x.pdf" 2>/dev/null || exit 1
+    ! "'"$TSPDF"'" compress --mono-dpi 300 '"$MONO_IN"' -o "'"$TMPDIR"'/x.pdf" 2>/dev/null || exit 1'
+else
+  echo "  SKIP  compress --lossy bilevel tests (python3 or fixtures missing)"
+fi
+
 # `make amalgamation` generates build/amalgamation/tspdf.{c,h} and proves them:
 # standalone -Werror compile, link + run examples/minimal.c against them, and
 # qpdf --check on the produced PDF (inside the make target, when qpdf exists).

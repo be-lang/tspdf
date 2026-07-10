@@ -468,27 +468,42 @@ TspdfReader *tspdf_reader_nup(TspdfReader *src, const TspdfNupOptions *opts,
 // --- Lossy image recompression ---
 
 typedef struct {
-    size_t images_recompressed; // raster images downsampled + JPEG re-encoded
+    size_t images_recompressed; // raster images downsampled + re-encoded
+    size_t images_mono;         // of those: bilevel images re-encoded as G4
     size_t images_skipped;      // drawn raster images examined but left as-is
     size_t bytes_before;        // stored (encoded) bytes of recompressed images
     size_t bytes_after;         // their new stored bytes
 } TspdfLossyStats;
 
-// Downsample and JPEG-re-encode the document's raster images in place, for
+// Downsample and re-encode the document's raster images in place, for
 // `tspdf compress --lossy`. Eligible images are 8-bit /DeviceRGB or
 // /DeviceGray XObjects stored as plain FlateDecode (PNG/TIFF predictors
-// honored) or baseline DCTDecode, at least 65536 pixels, without
+// honored) or baseline DCTDecode, plus 1-bit /DeviceGray XObjects stored as
+// CCITTFaxDecode or FlateDecode; always at least 65536 pixels, without
 // /SMask//Mask//ImageMask or a non-default /Decode. Each image's rendered
 // size is measured by walking the page content streams (CTM tracking, Form
 // XObjects included); the placement needing the most pixels wins, and the
 // image is only rewritten when it carries more than 1.3x the pixels needed
-// at target_dpi AND the re-encoded stream is at least 10% smaller than the
-// original stored stream. RGB images whose pixels are all near-gray
-// (max channel delta <= 8) are converted to /DeviceGray. Images never drawn
-// are left alone. quality is 1..100 (JPEG). The document must be saved
-// afterwards for the change to persist; encryption is preserved as usual.
+// at its target dpi AND the re-encoded stream is at least 10% smaller than
+// the original stored stream.
+//
+// 8-bit images downsample to target_dpi (box filter) and re-encode as
+// baseline JPEG at `quality` (1..100); RGB images whose pixels are all
+// near-gray (max channel delta <= 8) are converted to /DeviceGray.
+//
+// 1-bit images downsample to mono_dpi — box-averaged to gray, then
+// re-thresholded at 50% (ties to black, to keep stroke weight) — and
+// re-encode as CCITT G4. mono_dpi is higher than target_dpi by convention
+// (text needs more dpi than photos to stay legible; Ghostscript's /ebook
+// uses 300). CCITT images already at or below 1.3x mono_dpi pass through
+// byte-identical; 1-bit Flate images below that threshold are still
+// re-encoded 1:1 as G4 when that is at least 10% smaller.
+//
+// Images never drawn are left alone. The document must be saved afterwards
+// for the change to persist; encryption is preserved as usual.
 TspdfError tspdf_reader_lossy_images(TspdfReader *doc, int target_dpi,
-                                     int quality, TspdfLossyStats *stats);
+                                     int quality, int mono_dpi,
+                                     TspdfLossyStats *stats);
 
 // --- Annotations ---
 

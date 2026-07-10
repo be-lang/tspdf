@@ -95,6 +95,7 @@ LIB_SOURCES = \
 	$(SRCDIR)/layout/layout.c \
 	$(SRCDIR)/image/jpeg_embed.c \
 	$(SRCDIR)/image/jpeg_codec.c \
+	$(SRCDIR)/image/ccitt_codec.c \
 	$(SRCDIR)/image/png_decoder.c \
 	$(SRCDIR)/compress/deflate.c \
 	$(SRCDIR)/qr/qr_encode.c \
