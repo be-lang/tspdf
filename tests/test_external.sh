@@ -323,6 +323,25 @@ reader_check "encrypt"  "$TMPDIR/encrypt.pdf" secret
 "$TSPDF" decrypt  "$TMPDIR/encrypt.pdf" --password secret -o "$TMPDIR/decrypt.pdf" > /dev/null 2>&1
 reader_check "decrypt"  "$TMPDIR/decrypt.pdf"
 
+# Encrypting a file with metadata must keep its Info dict (strings encrypted,
+# so a real reader shows the original Title), and decrypt must round-trip it.
+HAVE_PDFINFO=0
+command -v pdfinfo > /dev/null 2>&1 && HAVE_PDFINFO=1
+if [ "$HAVE_PDFINFO" -eq 1 ]; then
+    "$TSPDF" metadata "$INPUT" --set title="MetaKeepTitle" -o "$TMPDIR/meta_src.pdf" > /dev/null 2>&1
+    "$TSPDF" encrypt "$TMPDIR/meta_src.pdf" --password secret -o "$TMPDIR/meta_enc.pdf" > /dev/null 2>&1
+    "$TSPDF" decrypt "$TMPDIR/meta_enc.pdf" --password secret -o "$TMPDIR/meta_dec.pdf" > /dev/null 2>&1
+    if pdfinfo -upw secret "$TMPDIR/meta_enc.pdf" 2>/dev/null | grep -q 'MetaKeepTitle' && \
+       pdfinfo "$TMPDIR/meta_dec.pdf" 2>/dev/null | grep -q 'MetaKeepTitle'; then
+        echo "  PASS  encrypt keeps Info metadata (pdfinfo Title, decrypt round-trip)"
+        pass=$((pass + 1))
+    else
+        echo "  FAIL  encrypt keeps Info metadata (pdfinfo Title, decrypt round-trip)"
+        fail=$((fail + 1))
+    fi
+    strict_check "encrypt with metadata validates" "$TMPDIR/meta_enc.pdf" secret
+fi
+
 # High-res print (bit 12) is meaningless without plain print (bit 3): requesting
 # print-hq must auto-enable print so both are allowed.
 if [ "$HAVE_QPDF" -eq 1 ]; then

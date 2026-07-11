@@ -3392,6 +3392,37 @@ static bool test_ccitt_check_fixture(const char *fixture, const char *pbm,
     return ok;
 }
 
+#if defined(__unix__) || defined(__APPLE__)
+#include <pthread.h>
+
+static void *ccitt_thread_decode(void *arg) {
+    TspdfCcittParams p;
+    tspdf_ccitt_params_default(&p);
+    p.k = -1;
+    bool *ok = (bool *)arg;
+    *ok = test_ccitt_check_fixture("ccitt_text.g4", "ccitt_text.pbm", &p, false);
+    return NULL;
+}
+
+TEST(test_ccitt_decode_concurrent_first_use) {
+    // First-use initialization of the decode LUTs must be safe when several
+    // threads race into the decoder; this runs before any other CCITT test
+    // so the tables are still cold. The pre-fix unsynchronized ready flag is
+    // a data race only TSan diagnoses directly, but every thread must still
+    // produce an exact decode here.
+    enum { CCITT_NTHREADS = 8 };
+    pthread_t tids[CCITT_NTHREADS];
+    bool ok[CCITT_NTHREADS] = {false};
+    for (int i = 0; i < CCITT_NTHREADS; i++) {
+        ASSERT(pthread_create(&tids[i], NULL, ccitt_thread_decode, &ok[i]) == 0);
+    }
+    for (int i = 0; i < CCITT_NTHREADS; i++) {
+        pthread_join(tids[i], NULL);
+        ASSERT(ok[i]);
+    }
+}
+#endif
+
 TEST(test_ccitt_decode_pil_g3_white_runs) {
     TspdfCcittParams p;
     tspdf_ccitt_params_default(&p);
@@ -3943,6 +3974,9 @@ int main(void) {
     RUN(test_jpeg_encode_external_decoder_oracle);
 
     printf("\n  CCITT codec:\n");
+#if defined(__unix__) || defined(__APPLE__)
+    RUN(test_ccitt_decode_concurrent_first_use);  // must run first: cold LUTs
+#endif
     RUN(test_ccitt_decode_pil_g3_white_runs);
     RUN(test_ccitt_decode_pil_g3_black_runs);
     RUN(test_ccitt_decode_pil_g4_text);

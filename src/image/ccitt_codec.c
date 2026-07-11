@@ -29,6 +29,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if !defined(__STDC_NO_ATOMICS__)
+#include <stdatomic.h>
+#endif
+
 // --- Safety caps ---
 
 #define CCITT_MAX_COLUMNS (1 << 20)
@@ -126,7 +130,6 @@ typedef struct {
 
 static CcittLutEntry ccitt_white_lut[1 << CCITT_WHITE_BITS];
 static CcittLutEntry ccitt_black_lut[1 << CCITT_BLACK_BITS];
-static bool ccitt_lut_ready = false;
 
 static void ccitt_lut_fill(CcittLutEntry *lut, int lut_bits,
                            const CcittCode *codes, size_t n) {
@@ -141,9 +144,7 @@ static void ccitt_lut_fill(CcittLutEntry *lut, int lut_bits,
     }
 }
 
-static void ccitt_lut_init(void) {
-    // Idempotent; a benign race writes identical values.
-    if (ccitt_lut_ready) return;
+static void ccitt_lut_fill_all(void) {
     for (size_t i = 0; i < (1u << CCITT_WHITE_BITS); i++)
         ccitt_white_lut[i].run = -1;
     for (size_t i = 0; i < (1u << CCITT_BLACK_BITS); i++)
@@ -152,8 +153,42 @@ static void ccitt_lut_init(void) {
     ccitt_lut_fill(ccitt_white_lut, CCITT_WHITE_BITS, ccitt_ext, CCITT_NEXT);
     ccitt_lut_fill(ccitt_black_lut, CCITT_BLACK_BITS, ccitt_black, CCITT_NBLACK);
     ccitt_lut_fill(ccitt_black_lut, CCITT_BLACK_BITS, ccitt_ext, CCITT_NEXT);
+}
+
+#if !defined(__STDC_NO_ATOMICS__)
+// call_once-style guard (C11 atomics; no dependency on threads.h, which
+// macOS gained late): exactly one thread fills the tables, latecomers spin
+// on the acquire load until the release store publishes them. The fill is
+// a few microseconds, so the spin is bounded and cheap.
+static atomic_int ccitt_lut_state;  // 0 = uninit, 1 = filling, 2 = ready
+
+static void ccitt_lut_init(void) {
+    int state = atomic_load_explicit(&ccitt_lut_state, memory_order_acquire);
+    if (state == 2) return;
+    int expected = 0;
+    if (atomic_compare_exchange_strong_explicit(&ccitt_lut_state, &expected, 1,
+                                                memory_order_acq_rel,
+                                                memory_order_acquire)) {
+        ccitt_lut_fill_all();
+        atomic_store_explicit(&ccitt_lut_state, 2, memory_order_release);
+    } else {
+        while (atomic_load_explicit(&ccitt_lut_state, memory_order_acquire) != 2) {
+            // spin: the winner is mid-fill
+        }
+    }
+}
+#else
+// No C11 atomics (e.g. some MSVC modes): keep the old idempotent init.
+// Single-threaded use is unaffected; concurrent first use is the caller's
+// responsibility on such toolchains.
+static bool ccitt_lut_ready = false;
+
+static void ccitt_lut_init(void) {
+    if (ccitt_lut_ready) return;
+    ccitt_lut_fill_all();
     ccitt_lut_ready = true;
 }
+#endif
 
 // --- Bit reader (MSB-first, zero-fill past end, exhaustion tracked) ---
 
