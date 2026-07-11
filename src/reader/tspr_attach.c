@@ -611,18 +611,22 @@ TspdfError tspdf_reader_attachments(TspdfReader *doc, TspdfAttachmentInfo **out,
                                               st->string.len);
         }
 
-        TspdfObj *params = tspdf_doctree_resolve(doc, &parser,
-                                                 tspdf_dict_get(stream->stream.dict,
-                                                                "Params"));
-        TspdfObj *size = params ? tspdf_dict_get(params, "Size") : NULL;
-        if (size && size->type == TSPDF_OBJ_INT && size->integer >= 0) {
-            infos[n].size = (size_t)size->integer;
+        // /Params /Size is unverified input (a crafted file can lie), so
+        // report the real decoded length whenever the stream decodes; the
+        // /Params claim is only the fallback for undecodable streams (e.g.
+        // an unsupported filter).
+        uint8_t *bytes = NULL;
+        size_t blen = 0;
+        if (att_stream_decoded(doc, stream, snum, &bytes, &blen) == TSPDF_OK) {
+            infos[n].size = blen;
+            free(bytes);
         } else {
-            uint8_t *bytes = NULL;
-            size_t blen = 0;
-            if (att_stream_decoded(doc, stream, snum, &bytes, &blen) == TSPDF_OK) {
-                infos[n].size = blen;
-                free(bytes);
+            TspdfObj *params = tspdf_doctree_resolve(doc, &parser,
+                                                     tspdf_dict_get(stream->stream.dict,
+                                                                    "Params"));
+            TspdfObj *size = params ? tspdf_dict_get(params, "Size") : NULL;
+            if (size && size->type == TSPDF_OBJ_INT && size->integer >= 0) {
+                infos[n].size = (size_t)size->integer;
             }
         }
         n++;

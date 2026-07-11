@@ -2,6 +2,7 @@
 #include "../util/buffer.h"
 #include "../util/pdftext.h"
 #include "../compress/deflate.h"
+#include "../crypto/md5.h"
 #include "../../include/tspdf/version.h"
 #include <stdlib.h>
 #include <string.h>
@@ -12,6 +13,8 @@
 // --- Forward declarations for write helpers (defined later) ---
 static void write_string_escaped(TspdfBuffer *buf, const uint8_t *data, size_t len);
 static void write_hex_string(TspdfBuffer *buf, const uint8_t *data, size_t len);
+static void write_trailer_id_array(TspdfBuffer *buf, const uint8_t *file_id,
+                                   size_t file_id_len);
 static void write_name(TspdfBuffer *buf, const uint8_t *data, size_t len);
 static bool is_xmp_metadata(TspdfObj *obj);
 static bool stream_dict_type_is(TspdfObj *obj, const char *type_name);
@@ -47,6 +50,22 @@ static bool metadata_has_changes(const TspdfReaderMetadata *m) {
     if (!m) return false;
     return m->title_set || m->author_set || m->subject_set ||
            m->keywords_set || m->creator_set || m->producer_set;
+}
+
+// Resolve the source document's Info dict (trailer /Info), NULL when absent
+// or not a dict. Resolves with the document's own crypt so values from an
+// encrypted source arrive decrypted.
+static TspdfObj *source_info_dict(TspdfReader *doc, TspdfParser *parser) {
+    if (!doc->xref.trailer) return NULL;
+    TspdfObj *info_ref = tspdf_dict_get(doc->xref.trailer, "Info");
+    if (!info_ref) return NULL;
+    if (info_ref->type == TSPDF_OBJ_REF) {
+        if (info_ref->ref.num >= doc->xref.count) return NULL;
+        TspdfObj *o = tspdf_xref_resolve(&doc->xref, parser, info_ref->ref.num,
+                                         doc->obj_cache, doc->crypt);
+        return o && o->type == TSPDF_OBJ_DICT ? o : NULL;
+    }
+    return info_ref->type == TSPDF_OBJ_DICT ? info_ref : NULL;
 }
 
 // Write one Info-dict string value. In an encrypted file every string outside
@@ -94,23 +113,10 @@ static void write_info_utf8_value(TspdfBuffer *buf, TspdfCrypt *crypt,
 // file: every string value is encrypted with the Info object's own key.
 static void write_info_dict_obj(TspdfBuffer *buf, TspdfReader *doc, TspdfParser *parser,
                                  uint32_t info_obj_num, TspdfCrypt *crypt) {
-    // Resolve original Info dict if present. Resolve with the document's own
+    // Resolve original Info dict if present. Resolved with the document's own
     // crypt so preserved values from an encrypted source arrive decrypted
     // (they are re-encrypted with the new object's key on write below).
-    TspdfObj *orig_info = NULL;
-    if (doc->xref.trailer) {
-        TspdfObj *info_ref = tspdf_dict_get(doc->xref.trailer, "Info");
-        if (info_ref) {
-            if (info_ref->type == TSPDF_OBJ_REF) {
-                uint32_t num = info_ref->ref.num;
-                if (num < doc->xref.count) {
-                    orig_info = tspdf_xref_resolve(&doc->xref, parser, num, doc->obj_cache, doc->crypt);
-                }
-            } else if (info_ref->type == TSPDF_OBJ_DICT) {
-                orig_info = info_ref;
-            }
-        }
-    }
+    TspdfObj *orig_info = source_info_dict(doc, parser);
 
     TspdfReaderMetadata *m = doc->metadata;
 
@@ -1131,9 +1137,7 @@ static TspdfError write_xref_stream(TspdfBuffer *buf, size_t *offsets, uint32_t 
     }
     if (encrypt_obj_num != 0) {
         tspdf_buffer_printf(buf, " /Encrypt %u 0 R /ID [ ", encrypt_obj_num);
-        write_hex_string(buf, file_id, file_id_len);
-        tspdf_buffer_append_byte(buf, ' ');
-        write_hex_string(buf, file_id, file_id_len);
+        write_trailer_id_array(buf, file_id, file_id_len);
         tspdf_buffer_append_str(buf, " ]");
     }
     tspdf_buffer_printf(buf, " /Length %zu /Filter /FlateDecode >>\nstream\n", comp_len);
@@ -1406,6 +1410,23 @@ TspdfError tspdf_serialize_with_options(TspdfReader *doc, uint8_t **out_buf, siz
 
     // ========== STANDARD RE-SERIALIZATION PATH ==========
 
+    // When this save writes no fresh Info object (no metadata edits, no
+    // Producer stamp) the source Info dict is carried over and the trailer
+    // keeps referencing it; dropping the reference threw the document's
+    // Title/Author away. The slow-collect walk never reaches Info (it hangs
+    // off the trailer, not the page tree), so mark it reachable here.
+    bool reference_source_info = !opts->strip_metadata && !opts->update_producer &&
+                                 !metadata_has_changes(doc->metadata) &&
+                                 source_info_num > 0;
+    if (reference_source_info) {
+        TspdfObj *cand = resolve_for_collect(doc, source_info_num, &parser);
+        if (cand && cand->type == TSPDF_OBJ_DICT) {
+            visited[source_info_num] = true;
+        } else {
+            reference_source_info = false;
+        }
+    }
+
     // 2. Build renumbering map
     RenumberMap map;
     map.map_size = total_objs;
@@ -1485,6 +1506,9 @@ TspdfError tspdf_serialize_with_options(TspdfReader *doc, uint8_t **out_buf, siz
     uint32_t info_obj_num = 0;
     if (write_info) {
         info_obj_num = next_num++;
+    } else if (reference_source_info) {
+        // The carried-over source Info object, at its new number.
+        info_obj_num = map.old_to_new[source_info_num];
     }
 
     uint32_t total_objects = next_num - 1;
@@ -1608,8 +1632,24 @@ TspdfError tspdf_serialize_with_options(TspdfReader *doc, uint8_t **out_buf, siz
         if (metadata_has_changes(doc->metadata)) {
             write_info_dict_obj(&buf, doc, &parser, info_obj_num, NULL);
         } else if (opts->update_producer) {
-            // Just write a simple Info dict with /Producer
-            tspdf_buffer_printf(&buf, "%u 0 obj\n<< /Producer (tspdf " TSPDF_VERSION_STRING ") >>\nendobj\n", info_obj_num);
+            // Producer refresh must not cost the document the rest of its
+            // Info: copy the original string fields (minus /Producer) and
+            // stamp the new Producer, mirroring the preserve-ids path.
+            tspdf_buffer_printf(&buf, "%u 0 obj\n<< ", info_obj_num);
+            TspdfObj *orig_info = source_info_dict(doc, &parser);
+            if (orig_info) {
+                for (size_t j = 0; j < orig_info->dict.count; j++) {
+                    const char *key = orig_info->dict.entries[j].key;
+                    TspdfObj *val = orig_info->dict.entries[j].value;
+                    if (strcmp(key, "Producer") == 0) continue;
+                    if (!val || val->type != TSPDF_OBJ_STRING) continue;
+                    write_name(&buf, (const uint8_t *)key, strlen(key));
+                    tspdf_buffer_append_byte(&buf, ' ');
+                    write_string_escaped(&buf, val->string.data, val->string.len);
+                    tspdf_buffer_append_byte(&buf, ' ');
+                }
+            }
+            tspdf_buffer_append_str(&buf, "/Producer (tspdf " TSPDF_VERSION_STRING ") >>\nendobj\n");
         }
     }
 
@@ -1637,7 +1677,7 @@ TspdfError tspdf_serialize_with_options(TspdfReader *doc, uint8_t **out_buf, siz
     // Xref table or xref stream
     if (use_xref_stream) {
         TspdfError xref_err = write_xref_stream(&buf, offsets, total_with_objstms, 1,
-                                                 info_obj_num, write_info, opts,
+                                                 info_obj_num, info_obj_num != 0, opts,
                                                  objstm_of, objstm_idx, 0, NULL, 0);
         if (xref_err != TSPDF_OK) {
             tspdf_buffer_destroy(&buf);
@@ -1665,7 +1705,7 @@ TspdfError tspdf_serialize_with_options(TspdfReader *doc, uint8_t **out_buf, siz
             }
         }
 
-        if (write_info) {
+        if (info_obj_num != 0) {
             tspdf_buffer_printf(&buf, "trailer\n<< /Size %u /Root 1 0 R /Info %u 0 R >>\n",
                           total_objects + 1, info_obj_num);
         } else {
@@ -1706,6 +1746,22 @@ static void write_hex_string(TspdfBuffer *buf, const uint8_t *data, size_t len) 
         tspdf_buffer_printf(buf, "%02X", data[i]);
     }
     tspdf_buffer_append_byte(buf, '>');
+}
+
+// Trailer /ID entries. The first is the crypt's file id — for V<5 handlers it
+// is key material (MD5'd into every object key), so preserved re-encrypts
+// must keep it byte-identical or the original passwords stop working. The
+// second is the "changed when the file is updated" half (ISO 32000 §14.4):
+// derive it from the bytes serialized so far, which makes it distinct from
+// the first yet deterministic (no time()/rand()), so saves whose content is
+// byte-identical stay byte-identical.
+static void write_trailer_id_array(TspdfBuffer *buf, const uint8_t *file_id,
+                                   size_t file_id_len) {
+    uint8_t second[16];
+    md5_hash(buf->data, buf->len, second);
+    write_hex_string(buf, file_id, file_id_len);
+    tspdf_buffer_append_byte(buf, ' ');
+    write_hex_string(buf, second, sizeof(second));
 }
 
 static void write_obj_encrypted(TspdfBuffer *buf, TspdfObj *obj, const RenumberMap *map,
@@ -2003,6 +2059,30 @@ TspdfError tspdf_serialize_encrypted(TspdfReader *doc, TspdfCrypt *crypt,
         visited[doc->crypt->src_encrypt_num] = false;
     }
 
+    /* Existing Info must survive encryption. With metadata edits a merged
+     * Info object is written below (write_info); without them the source
+     * Info object is carried over — written like any other collected object,
+     * so its strings are encrypted with its own key — and the trailer keeps
+     * referencing it. The slow-collect walk never reaches Info (it hangs off
+     * the trailer, not the page tree), so mark it reachable here. */
+    bool write_info = metadata_has_changes(doc->metadata);
+    uint32_t source_info_num = 0;
+    if (!write_info && doc->xref.trailer) {
+        TspdfObj *info_ref = tspdf_dict_get(doc->xref.trailer, "Info");
+        if (info_ref && info_ref->type == TSPDF_OBJ_REF &&
+            info_ref->ref.num < total_objs) {
+            TspdfObj *cand = resolve_for_collect(doc, info_ref->ref.num, &parser);
+            if (cand && cand->type == TSPDF_OBJ_DICT) {
+                source_info_num = info_ref->ref.num;
+                visited[source_info_num] = true;
+            }
+        } else if (info_ref && info_ref->type == TSPDF_OBJ_DICT) {
+            /* Direct (non-indirect) trailer Info dict: rebuild it as a fresh
+             * indirect object via the merge writer. */
+            write_info = true;
+        }
+    }
+
     /* 2. Build renumbering map */
     RenumberMap map;
     map.map_size = total_objs;
@@ -2045,11 +2125,13 @@ TspdfError tspdf_serialize_encrypted(TspdfReader *doc, TspdfCrypt *crypt,
 
     uint32_t encrypt_obj_num = next_num++; /* The /Encrypt dict object */
 
-    /* Info dict object (if metadata was modified) */
-    bool write_info = metadata_has_changes(doc->metadata);
+    /* Info dict object: freshly merged (write_info) or the carried-over
+     * source object at its new number. */
     uint32_t info_obj_num = 0;
     if (write_info) {
         info_obj_num = next_num++;
+    } else if (source_info_num > 0) {
+        info_obj_num = map.old_to_new[source_info_num];
     }
 
     uint32_t total_objects = next_num - 1;
@@ -2292,7 +2374,7 @@ TspdfError tspdf_serialize_encrypted(TspdfReader *doc, TspdfCrypt *crypt,
         /* Type-2 entries need an xref stream; it carries the trailer keys
          * (/Encrypt, /ID) and is itself never encrypted. */
         TspdfError xref_err = write_xref_stream(&buf, offsets, total_with_objstms, 1,
-                                                 info_obj_num, write_info, NULL,
+                                                 info_obj_num, info_obj_num != 0, NULL,
                                                  objstm_of, objstm_idx, encrypt_obj_num,
                                                  crypt->file_id, crypt->file_id_len);
         if (xref_err != TSPDF_OK) {
@@ -2321,16 +2403,14 @@ TspdfError tspdf_serialize_encrypted(TspdfReader *doc, TspdfCrypt *crypt,
         }
 
         /* Trailer with /Encrypt and /ID */
-        if (write_info) {
+        if (info_obj_num != 0) {
             tspdf_buffer_printf(&buf, "trailer\n<< /Size %u /Root 1 0 R /Encrypt %u 0 R /Info %u 0 R /ID [ ",
                         total_objects + 1, encrypt_obj_num, info_obj_num);
         } else {
             tspdf_buffer_printf(&buf, "trailer\n<< /Size %u /Root 1 0 R /Encrypt %u 0 R /ID [ ",
                         total_objects + 1, encrypt_obj_num);
         }
-        write_hex_string(&buf, crypt->file_id, crypt->file_id_len);
-        tspdf_buffer_append_byte(&buf, ' ');
-        write_hex_string(&buf, crypt->file_id, crypt->file_id_len);
+        write_trailer_id_array(&buf, crypt->file_id, crypt->file_id_len);
         tspdf_buffer_append_str(&buf, " ] >>\n");
         tspdf_buffer_printf(&buf, "startxref\n%zu\n%%%%EOF\n", xref_offset);
     }

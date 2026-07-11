@@ -19,6 +19,7 @@
 #include "../src/font/ttf_parser.h"
 #include "../src/font/font_fallback.h"
 #include "../src/crypto/md5.h"
+#include "../include/tspdf/version.h"
 
 static bool bytes_contains(const uint8_t *haystack, size_t haystack_len, const char *needle) {
     if (!haystack || !needle) {
@@ -8646,6 +8647,248 @@ TEST(test_encrypted_info_strings_are_encrypted) {
     free(pdf);
 }
 
+// Hand-built one-page PDF whose trailer /Info carries /Title and /Author.
+static char *make_titled_info_pdf(size_t *out_len) {
+    char *pdf = (char *)malloc(4096);
+    if (!pdf) return NULL;
+    size_t pos = 0;
+    size_t off[8] = {0};
+
+    if (!appendf(pdf, 4096, &pos, "%%PDF-1.4\n")) goto fail;
+    off[1] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")) goto fail;
+    off[2] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")) goto fail;
+    off[3] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n")) goto fail;
+    off[4] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "4 0 obj\n<< /Title (KeepMeTitle99) /Author (Ann Author) >>\nendobj\n")) goto fail;
+
+    size_t xref = pos;
+    if (!appendf(pdf, 4096, &pos, "xref\n0 5\n0000000000 65535 f \n")) goto fail;
+    for (int i = 1; i <= 4; i++) {
+        if (!appendf(pdf, 4096, &pos, "%010zu 00000 n \n", off[i])) goto fail;
+    }
+    if (!appendf(pdf, 4096, &pos,
+                 "trailer\n<< /Size 5 /Root 1 0 R /Info 4 0 R >>\nstartxref\n%zu\n%%%%EOF",
+                 xref)) goto fail;
+    *out_len = pos;
+    return pdf;
+fail:
+    free(pdf);
+    return NULL;
+}
+
+TEST(test_encrypt_preserves_source_info) {
+    // Encrypting a file with untouched metadata must not drop its Info dict:
+    // the trailer keeps /Info and the strings are encrypted like any other.
+    size_t len = 0;
+    char *pdf = make_titled_info_pdf(&len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory_encrypted(doc, &out, &out_len,
+                                                "user123", "owner456", 0xFFFFFFFC, 128);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    // Info strings must be encrypted, not stored in the clear.
+    ASSERT(!bytes_contains(out, out_len, "KeepMeTitle99"));
+
+    TspdfReader *doc2 = tspdf_reader_open_with_password(out, out_len, "user123", &err);
+    ASSERT(doc2 != NULL);
+    const char *title = tspdf_reader_get_title(doc2);
+    ASSERT(title != NULL);
+    ASSERT_EQ_STR(title, "KeepMeTitle99");
+    const char *author = tspdf_reader_get_author(doc2);
+    ASSERT(author != NULL);
+    ASSERT_EQ_STR(author, "Ann Author");
+
+    // Preserved-crypt re-save (plain save of an opened encrypted document)
+    // must carry the Info through as well.
+    uint8_t *out2 = NULL;
+    size_t out2_len = 0;
+    err = tspdf_reader_save_to_memory(doc2, &out2, &out2_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(!bytes_contains(out2, out2_len, "KeepMeTitle99"));
+    TspdfReader *doc3 = tspdf_reader_open_with_password(out2, out2_len, "user123", &err);
+    ASSERT(doc3 != NULL);
+    title = tspdf_reader_get_title(doc3);
+    ASSERT(title != NULL);
+    ASSERT_EQ_STR(title, "KeepMeTitle99");
+
+    // Decrypt round-trip: the unlocked output shows the original metadata.
+    TspdfSaveOptions unlock_opts = tspdf_save_options_default();
+    unlock_opts.decrypt = true;
+    uint8_t *plain = NULL;
+    size_t plain_len = 0;
+    err = tspdf_reader_save_to_memory_with_options(doc3, &plain, &plain_len, &unlock_opts);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    TspdfReader *doc4 = tspdf_reader_open(plain, plain_len, &err);
+    ASSERT(doc4 != NULL);
+    title = tspdf_reader_get_title(doc4);
+    ASSERT(title != NULL);
+    ASSERT_EQ_STR(title, "KeepMeTitle99");
+    author = tspdf_reader_get_author(doc4);
+    ASSERT(author != NULL);
+    ASSERT_EQ_STR(author, "Ann Author");
+
+    tspdf_reader_destroy(doc4);
+    free(plain);
+    tspdf_reader_destroy(doc3);
+    free(out2);
+    tspdf_reader_destroy(doc2);
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_plain_save_update_producer_keeps_info) {
+    // The default save (update_producer) rewrites the Info dict for the
+    // Producer stamp; that must merge the original fields, not drop them.
+    size_t len = 0;
+    char *pdf = make_titled_info_pdf(&len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(bytes_contains(out, out_len, "/Producer (tspdf " TSPDF_VERSION_STRING ")"));
+
+    TspdfReader *doc2 = tspdf_reader_open(out, out_len, &err);
+    ASSERT(doc2 != NULL);
+    const char *title = tspdf_reader_get_title(doc2);
+    ASSERT(title != NULL);
+    ASSERT_EQ_STR(title, "KeepMeTitle99");
+    const char *author = tspdf_reader_get_author(doc2);
+    ASSERT(author != NULL);
+    ASSERT_EQ_STR(author, "Ann Author");
+
+    tspdf_reader_destroy(doc2);
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_plain_save_no_producer_keeps_info) {
+    // With update_producer off and no metadata edits the source Info object
+    // is carried over and stays referenced from the trailer.
+    size_t len = 0;
+    char *pdf = make_titled_info_pdf(&len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    TspdfSaveOptions opts = tspdf_save_options_default();
+    opts.update_producer = false;
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory_with_options(doc, &out, &out_len, &opts);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    TspdfReader *doc2 = tspdf_reader_open(out, out_len, &err);
+    ASSERT(doc2 != NULL);
+    const char *title = tspdf_reader_get_title(doc2);
+    ASSERT(title != NULL);
+    ASSERT_EQ_STR(title, "KeepMeTitle99");
+
+    tspdf_reader_destroy(doc2);
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+// Extract the two /ID array entries (hex strings) from a serialized PDF.
+// Returns false when no "/ID [ <...> <...> ]" is found or a value overflows.
+static bool find_id_halves(const uint8_t *buf, size_t len,
+                           char *id0, char *id1, size_t cap) {
+    for (size_t i = 0; i + 4 < len; i++) {
+        if (memcmp(buf + i, "/ID", 3) != 0) continue;
+        size_t p = i + 3;
+        char *dst[2] = {id0, id1};
+        for (int half = 0; half < 2; half++) {
+            while (p < len && buf[p] != '<') p++;
+            if (p >= len) return false;
+            p++;
+            size_t n = 0;
+            while (p < len && buf[p] != '>') {
+                if (n + 1 >= cap) return false;
+                dst[half][n++] = (char)buf[p++];
+            }
+            if (p >= len) return false;
+            dst[half][n] = '\0';
+            p++;
+        }
+        return true;
+    }
+    return false;
+}
+
+TEST(test_encrypted_save_id_halves_differ) {
+    // ISO 32000 7.5.5: the second /ID entry is updated when the file is
+    // written, so it should differ from the first. The FIRST half is key
+    // material (RC4/AESV2 key derivation) and must stay what the crypt says.
+    size_t len = 0;
+    char *pdf = make_titled_info_pdf(&len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory_encrypted(doc, &out, &out_len,
+                                                "user123", "owner456", 0xFFFFFFFC, 128);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    char id0[128], id1[128];
+    ASSERT(find_id_halves(out, out_len, id0, id1, sizeof(id0)));
+    ASSERT(strlen(id0) == 32);  // 16 random bytes, hex-encoded
+    ASSERT(strlen(id1) > 0);
+    ASSERT(strcmp(id0, id1) != 0);
+
+    // Preserved-crypt re-save: the first half is key material and must stay
+    // the ORIGINAL value, or the original password stops working.
+    TspdfReader *doc2 = tspdf_reader_open_with_password(out, out_len, "user123", &err);
+    ASSERT(doc2 != NULL);
+    uint8_t *out2 = NULL;
+    size_t out2_len = 0;
+    err = tspdf_reader_save_to_memory(doc2, &out2, &out2_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    char rid0[128], rid1[128];
+    ASSERT(find_id_halves(out2, out2_len, rid0, rid1, sizeof(rid0)));
+    ASSERT_EQ_STR(rid0, id0);
+    ASSERT(strcmp(rid0, rid1) != 0);
+
+    // The re-saved file still opens with the original password.
+    TspdfReader *doc3 = tspdf_reader_open_with_password(out2, out2_len, "user123", &err);
+    ASSERT(doc3 != NULL);
+
+    tspdf_reader_destroy(doc3);
+    free(out2);
+    tspdf_reader_destroy(doc2);
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
 TEST(test_delete_keeps_document_level_trees) {
     size_t len = 0;
     char *pdf = make_pinned_trees_pdf(&len);
@@ -11289,6 +11532,97 @@ TEST(test_attach_cyclic_embeddedfiles_tree_bounded) {
     tspdf_reader_destroy(re);
     free(out);
     tspdf_reader_destroy(result);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+// Hand-built one-page PDF with a single embedded file whose /Params dict is
+// caller-controlled (the /Size there can lie about the payload).
+static char *att_make_params_pdf(size_t *out_len, const char *stream_dict_extra) {
+    char *pdf = (char *)malloc(4096);
+    if (!pdf) return NULL;
+    size_t pos = 0;
+    size_t off[8] = {0};
+
+    if (!appendf(pdf, 4096, &pos, "%%PDF-1.4\n")) goto fail;
+    off[1] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R "
+                 "/Names << /EmbeddedFiles 4 0 R >> >>\nendobj\n")) goto fail;
+    off[2] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")) goto fail;
+    off[3] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n")) goto fail;
+    off[4] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "4 0 obj\n<< /Names [(liar.bin) 5 0 R] >>\nendobj\n")) goto fail;
+    off[5] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "5 0 obj\n<< /Type /Filespec /F (liar.bin) /UF (liar.bin) "
+                 "/EF << /F 6 0 R >> >>\nendobj\n")) goto fail;
+    off[6] = pos;
+    if (!appendf(pdf, 4096, &pos,
+                 "6 0 obj\n<< /Type /EmbeddedFile /Length 9 %s >>\nstream\n"
+                 "REALBYTES\nendstream\nendobj\n", stream_dict_extra)) goto fail;
+
+    size_t xref = pos;
+    if (!appendf(pdf, 4096, &pos, "xref\n0 7\n0000000000 65535 f \n")) goto fail;
+    for (int i = 1; i <= 6; i++) {
+        if (!appendf(pdf, 4096, &pos, "%010zu 00000 n \n", off[i])) goto fail;
+    }
+    if (!appendf(pdf, 4096, &pos,
+                 "trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n%zu\n%%%%EOF",
+                 xref)) goto fail;
+
+    *out_len = pos;
+    return pdf;
+fail:
+    free(pdf);
+    return NULL;
+}
+
+TEST(test_attach_list_size_ignores_lying_params) {
+    // /Params /Size is unverified input; the listing must report the real
+    // decoded payload length when the stream decodes.
+    size_t len = 0;
+    char *pdf = att_make_params_pdf(&len, "/Params << /Size 999999 >>");
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    TspdfAttachmentInfo *infos = NULL;
+    size_t count = 0;
+    ASSERT_EQ_INT(tspdf_reader_attachments(doc, &infos, &count), TSPDF_OK);
+    ASSERT_EQ_SIZE(count, 1);
+    ASSERT_EQ_STR(infos[0].name, "liar.bin");
+    ASSERT_EQ_SIZE(infos[0].size, 9);
+
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_attach_list_size_params_fallback_when_undecodable) {
+    // When the stream cannot be decoded (unsupported filter) the /Params
+    // /Size claim is still better than nothing.
+    size_t len = 0;
+    char *pdf = att_make_params_pdf(&len,
+                                    "/Filter /JBIG2Decode /Params << /Size 12345 >>");
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    TspdfAttachmentInfo *infos = NULL;
+    size_t count = 0;
+    ASSERT_EQ_INT(tspdf_reader_attachments(doc, &infos, &count), TSPDF_OK);
+    ASSERT_EQ_SIZE(count, 1);
+    ASSERT_EQ_SIZE(infos[0].size, 12345);
+
     tspdf_reader_destroy(doc);
     free(pdf);
 }
@@ -15548,6 +15882,10 @@ int main(void) {
     RUN(test_default_save_classic_input_stays_classic);
     RUN(test_encrypted_save_repacks_objstm_input);
     RUN(test_encrypted_info_strings_are_encrypted);
+    RUN(test_encrypt_preserves_source_info);
+    RUN(test_plain_save_update_producer_keeps_info);
+    RUN(test_plain_save_no_producer_keeps_info);
+    RUN(test_encrypted_save_id_halves_differ);
 
     printf("\n  Encoding/i18n:\n");
     RUN(test_pdftext_cp1252_from_codepoint);
@@ -15622,6 +15960,8 @@ int main(void) {
     RUN(test_attach_add_replaces_same_name);
     RUN(test_attach_remove);
     RUN(test_attach_cyclic_embeddedfiles_tree_bounded);
+    RUN(test_attach_list_size_ignores_lying_params);
+    RUN(test_attach_list_size_params_fallback_when_undecodable);
     RUN(test_attach_extract_keeps_all_attachments);
     RUN(test_attach_merge_unions_first_wins);
     RUN(test_attach_delete_pages_keeps_attachments);

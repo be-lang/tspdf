@@ -7,6 +7,21 @@ on 0.x, the CLI is considered stable but the low-level C API may still change.
 
 ## [Unreleased]
 
+### Fixed
+- `encrypt` no longer drops the document's Info metadata (Title, Author, ...):
+  the existing Info dict is carried into the encrypted output with its strings
+  encrypted, and `decrypt` round-trips it. Plain saves that only refresh the
+  Producer stamp also keep the other Info fields now.
+- `attach list` reports the real decoded size of an attachment instead of
+  trusting the embedded /Params /Size, which a crafted file can fake. /Params
+  is only used when the stream cannot be decoded.
+- The two halves of the trailer /ID now differ on encrypted saves, as the spec
+  intends for updated files. The first half is unchanged (it is key material
+  for RC4/AES-128 files); the second is derived from the output bytes, so
+  saves stay deterministic.
+- CCITT decoder: the one-time lookup-table setup is now thread-safe (C11
+  atomics) instead of relying on a benign data race.
+
 ## [0.4.0] - 2026-07-11
 
 ### Added
