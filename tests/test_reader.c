@@ -9418,6 +9418,50 @@ TEST(test_text_xgap_emits_space) {
     free(pdf);
 }
 
+TEST(test_text_superscript_joins_line) {
+    // A superscript run (smaller font, baseline raised ~0.35 em of the base
+    // font) must stay on the current line, and text returning to the base
+    // baseline right after must too: "1.0 x 10" + sup "20" + "rest" is one
+    // line, not three. Base run ends at x = 72 + 3.580 * 12 = 114.96, so the
+    // superscript at x=115 attaches without a space; "rest" at x=130 sits a
+    // real gap after the superscript's end (~123.9) and gets one space.
+    size_t len = 0;
+    char *pdf = make_text_pdf(TEXT_HELV_FONT,
+        "BT /F1 12 Tf 72 700 Td (1.0 x 10) Tj ET "
+        "BT /F1 8 Tf 115 704.2 Td (20) Tj ET "
+        "BT /F1 12 Tf 130 700 Td (rest) Tj ET", &len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    const char *text = tspdf_reader_page_text(doc, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT_EQ_STR(text, "1.0 x 1020 rest\n");
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_text_close_lines_stay_distinct) {
+    // Genuinely distinct close-set lines must not be glued by the superscript
+    // tolerance: 12 pt lines 6.6 pt apart (0.55 em, tighter than any real
+    // leading) and an 8 pt footnote line 8 pt below (0.67 of the larger em)
+    // each stay on their own line.
+    size_t len = 0;
+    char *pdf = make_text_pdf(TEXT_HELV_FONT,
+        "BT /F1 12 Tf 72 700 Td (First) Tj ET "
+        "BT /F1 12 Tf 72 693.4 Td (Second) Tj ET "
+        "BT /F1 8 Tf 72 685.4 Td (Third) Tj ET", &len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    const char *text = tspdf_reader_page_text(doc, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT_EQ_STR(text, "First\nSecond\nThird\n");
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
 // Font body for a TeX-style subset font whose /Widths start past the space
 // glyph (FirstChar 40): code 32 has no width entry, so the space width is
 // unknown. All listed glyphs are 500/1000 wide.
@@ -10041,6 +10085,38 @@ TEST(test_text_layout_y_jitter_merges_line) {
     for (const char *p = text; *p; p++)
         if (*p == '\n') newlines++;
     ASSERT_EQ_SIZE(newlines, 1);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_text_layout_cell_block_contiguous) {
+    // Table-cell geometry from the syscard corpus: a label column with 14 pt
+    // leading next to a content column with 16 pt leading drifts apart until
+    // one visual row holds baselines 4.1 pt apart (0.37 em at 11 pt). Layout
+    // mode must keep that row on one output line, and the merge must not
+    // manufacture a blank line before the next row (the vertical gap is
+    // measured from the merged line's lowest baseline, not its highest).
+    size_t len = 0;
+    char *pdf = make_text_pdf(TEXT_HELV_FONT,
+        "BT /F1 11 Tf 72 700 Td (Representations) Tj ET "
+        "BT /F1 11 Tf 200 695.907 Td (exasperated) Tj ET "
+        "BT /F1 11 Tf 200 679.735 Td (+0.39) Tj ET", &len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    const char *text = tspdf_reader_page_text_layout(doc, 0, &err);
+    ASSERT(text != NULL);
+    char l1[256], l2[256];
+    ASSERT(text_line(text, 0, l1, sizeof(l1)));
+    ASSERT(text_line(text, 1, l2, sizeof(l2)));
+    ASSERT(strstr(l1, "Representations") != NULL);
+    ASSERT(strstr(l1, "exasperated") != NULL);
+    ASSERT(strstr(l2, "+0.39") != NULL);
+    size_t newlines = 0;
+    for (const char *p = text; *p; p++)
+        if (*p == '\n') newlines++;
+    ASSERT_EQ_SIZE(newlines, 2); // two rows, no blank line between them
     tspdf_reader_destroy(doc);
     free(pdf);
 }
@@ -15906,6 +15982,8 @@ int main(void) {
     RUN(test_text_tj_kerning_spacing);
     RUN(test_text_multiline_td_tstar);
     RUN(test_text_xgap_emits_space);
+    RUN(test_text_superscript_joins_line);
+    RUN(test_text_close_lines_stay_distinct);
     RUN(test_text_tj_kern_space_missing_space_glyph);
     RUN(test_text_font_switch_gap_space);
     RUN(test_text_font_switch_bogus_space_width);
@@ -15929,6 +16007,7 @@ int main(void) {
     RUN(test_text_layout_two_columns);
     RUN(test_text_layout_table_grid);
     RUN(test_text_layout_y_jitter_merges_line);
+    RUN(test_text_layout_cell_block_contiguous);
     RUN(test_text_layout_blank_lines_bounded);
     RUN(test_text_layout_hostile_x_clamped);
     RUN(test_text_layout_empty_page);

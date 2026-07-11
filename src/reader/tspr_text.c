@@ -5,8 +5,9 @@
 // AGL subset), then StandardEncoding. Type0 fonts use 2-byte codes; without
 // /ToUnicode each glyph becomes U+FFFD (counted in TspdfTextStats).
 //
-// Layout is heuristic and stays in content-stream order: a baseline jump
-// beyond 0.3 em emits a newline, a large x-gap within a line emits a space,
+// Layout is heuristic and stays in content-stream order: a baseline more
+// than 0.5 em off the current line's first run emits a newline (super- and
+// subscripts stay on the line), a large x-gap within a line emits a space,
 // and TJ adjustments beyond ~half the space width emit a space. Word-gap
 // thresholds are clamped to [0.15, 0.20] em because declared space widths
 // are unreliable: TeX subsets omit the space glyph entirely and TeX math
@@ -288,6 +289,7 @@ typedef struct {
     double w;          // width (>= 0)
     double em;         // font size in device units
     size_t seq;        // content-stream order (stable sort tie-break)
+    size_t line;       // content-order line id (tx_pre_run anchor rule)
 } TextFrag;
 
 typedef struct {
@@ -300,6 +302,8 @@ typedef struct {
     size_t glyphs, replacements;
     bool have_last;
     double last_x, last_y, last_em;
+    double line_y, line_em;  // current line's first run (baseline anchor)
+    size_t line_id;          // content-order line counter (layout mode)
     bool layout;             // collect fragments instead of emitting inline
     TextFrag *frags;         // scratch-arena, doubling
     size_t nfrags, frag_cap;
@@ -954,24 +958,36 @@ static void tx_frag_push(TextCtx *ctx, size_t off, double x0, double x1,
     f->w = fabs(x1 - x0);
     f->em = isfinite(em) && em > 0 ? em : 0;
     f->seq = ctx->nfrags;
+    f->line = ctx->line_id;
     ctx->nfrags++;
 }
 
-// Compare the run start against the previous run end: y-jump beyond 0.3 em
-// emits a newline, an x-gap wider than ~half a space emits a space.
-// Layout mode skips both heuristics: spacing comes from fragment geometry.
+// Compare the run start against the current line: a baseline more than
+// 0.5 em off the line's first run emits a newline, an x-gap wider than
+// ~half a space emits a space. 0.5 em is poppler's maxIntraLineDelta;
+// anchoring at the line's first run instead of the previous run keeps
+// super-/subscripts (10^20 exponents, footnote markers, both also on
+// large headings, 0.35-0.50 em off the baseline) on the line and still
+// lets a raised marker that *starts* a line (footnote text: small
+// anchor, small tolerance) keep its own line, exactly like pdftotext.
+// Real leading even in dense tables and footnotes stays above 0.8 em.
+// Layout mode runs the same line bookkeeping (fragments carry the line id
+// so assembly can group them in content order) but emits nothing here:
+// spacing comes from fragment geometry.
 static void tx_pre_run(TextCtx *ctx, const TextGS *gs) {
-    if (ctx->layout) return;
     double x, y, em, sx;
     tx_device_state(gs, &x, &y, &em, &sx);
+    bool starts_line = true;
     if (ctx->have_last && ctx->out.len > 0) {
         double ref_em = em > ctx->last_em ? em : ctx->last_em;
         if (ref_em <= 0) ref_em = 1.0;
-        double dy = fabs(y - ctx->last_y);
+        double anchor_em = ctx->line_em > 0 ? ctx->line_em : ref_em;
+        double dy = fabs(y - ctx->line_y);
         double dx = x - ctx->last_x;
-        if (dy > 0.3 * ref_em) {
-            tx_newline(ctx);
+        if (dy > 0.5 * anchor_em) {
+            if (!ctx->layout) tx_newline(ctx);
         } else {
+            starts_line = false;
             double size = gs->size != 0 ? fabs(gs->size) : 1.0;
             double space_w = gs->font && gs->font->space_w > 0 ? gs->font->space_w : 250;
             double thr = 0.5 * (space_w / 1000.0) * size * sx;
@@ -985,13 +1001,29 @@ static void tx_pre_run(TextCtx *ctx, const TextGS *gs) {
             double max_thr = 0.20 * ref_em;
             if (thr < min_thr) thr = min_thr;
             if (thr > max_thr) thr = max_thr;
-            if (dx > thr || dx < -ref_em) tx_space(ctx);
+            // Super-/subscript boundary (the baseline moved but stayed on
+            // the line): word gaps here are set in the smaller script size,
+            // so use poppler's minWordBreakSpace, 0.1 of the smaller em.
+            // Keeps a raised "T" a word ("QK T", pdftotext does the same)
+            // while an exponent or marker drawn flush against its word
+            // ("Vaswani*", "1.0-10" + "20" -> "1.0-1020") stays glued.
+            double dy_prev = fabs(y - ctx->last_y);
+            if (dy_prev > 0.1 * ref_em) {
+                double small_em = em > 0 && (ctx->last_em <= 0 || em < ctx->last_em)
+                                      ? em : ctx->last_em;
+                if (small_em > 0) thr = 0.1 * small_em;
+            }
+            if (!ctx->layout && (dx > thr || dx < -ref_em)) tx_space(ctx);
         }
+    }
+    if (starts_line) {
+        ctx->line_y = y;
+        ctx->line_em = em;
+        ctx->line_id++;
     }
 }
 
 static void tx_post_run(TextCtx *ctx, const TextGS *gs) {
-    if (ctx->layout) return;
     double x, y, em, sx;
     tx_device_state(gs, &x, &y, &em, &sx);
     ctx->last_x = x;
@@ -1302,15 +1334,23 @@ static size_t tx_utf8_chars(const uint8_t *s, size_t n) {
     return c;
 }
 
-// Sort keys: baseline y descending (top of page first), then x ascending,
-// then content order — deterministic under qsort's instability.
-static int frag_cmp_y(const void *a, const void *b) {
-    const TextFrag *fa = (const TextFrag *)a, *fb = (const TextFrag *)b;
-    if (fa->y > fb->y) return -1;
-    if (fa->y < fb->y) return 1;
-    if (fa->x < fb->x) return -1;
-    if (fa->x > fb->x) return 1;
-    return fa->seq < fb->seq ? -1 : fa->seq > fb->seq ? 1 : 0;
+// One content-order line: a contiguous fragment range (fragments are
+// recorded in content order and line ids never decrease) plus baseline
+// aggregates. y/em are the line's first fragment — the anchor tx_pre_run
+// grouped the line around.
+typedef struct {
+    size_t start, end;   // fragment index range [start, end)
+    double y, em;        // anchor baseline and font size
+    double y_min, y_max; // baseline extremes across the line
+    double em_max;
+} TextLine;
+
+// Anchor baseline descending (top of page first), content order on ties.
+static int line_cmp_y(const void *a, const void *b) {
+    const TextLine *la = (const TextLine *)a, *lb = (const TextLine *)b;
+    if (la->y > lb->y) return -1;
+    if (la->y < lb->y) return 1;
+    return la->start < lb->start ? -1 : la->start > lb->start ? 1 : 0;
 }
 
 static int frag_cmp_x(const void *a, const void *b) {
@@ -1364,44 +1404,79 @@ static double tx_layout_char_width(TextCtx *ctx) {
     return cw;
 }
 
-// Place fragments on a character grid, top line first:
-//   line   = fragments whose baselines agree within ~em/3 (y jitter)
-//   column = round((x - page_min_x) / char_width), clamped to the grid cap
-// Fragments in a line go left to right; padding spaces carry them to their
-// column, with at least one space kept between separated fragments and a
-// single space when fragments overlap. Vertical gaps beyond ~1.8 line
-// heights become blank lines (at most 2). Result is appended to `dst`.
+// Place fragments on a character grid, top row first. pdftotext-layout
+// architecture in miniature: fragments were grouped into content-order
+// lines during interpretation (0.5 em anchor rule, so super-/subscripts
+// belong to the line that was already open), and here whole lines merge
+// into one visual row when a lower line's anchor baseline is within
+// 0.5 em (poppler's maxIntraLineDelta) of the row's top line anchor.
+// That covers y jitter and table rows whose cell columns use different
+// leading and drift a few points apart (the syscard corpus), while a
+// raised footnote marker that opened its own tiny-anchor line keeps its
+// own row, exactly like pdftotext -layout. Real leading stays above
+// 0.8 em. Column = round((x - page_min_x) / char_width), clamped to the
+// grid cap. Fragments in a row go left to right; padding spaces carry
+// them to their column, with at least one space kept between separated
+// fragments and a single space when fragments overlap. Vertical gaps
+// beyond ~1.8 line heights, measured from the previous row's lowest
+// baseline so a merged multi-baseline row does not open a gap by
+// itself, become blank lines (at most 2). Result is appended to `dst`.
 static void tx_layout_assemble(TextCtx *ctx, TspdfBuffer *dst) {
     size_t n = ctx->nfrags;
     if (n == 0) return;
     TextFrag *frags = ctx->frags;
-    qsort(frags, n, sizeof(TextFrag), frag_cmp_y);
 
     double cw = tx_layout_char_width(ctx);
     double min_x = frags[0].x;
     for (size_t i = 1; i < n; i++)
         if (frags[i].x < min_x) min_x = frags[i].x;
 
+    TextLine *lines = (TextLine *)tspdf_arena_alloc(&ctx->scratch,
+                                                    n * sizeof(TextLine));
+    TextFrag *row = (TextFrag *)tspdf_arena_alloc(&ctx->scratch,
+                                                  n * sizeof(TextFrag));
+    if (!lines || !row) return;
+    size_t nlines = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (nlines == 0 || frags[i].line != frags[lines[nlines - 1].start].line) {
+            TextLine *nl = &lines[nlines++];
+            nl->start = i;
+            nl->y = nl->y_min = nl->y_max = frags[i].y;
+            nl->em = nl->em_max = frags[i].em;
+        }
+        TextLine *l = &lines[nlines - 1];
+        l->end = i + 1;
+        if (frags[i].y < l->y_min) l->y_min = frags[i].y;
+        if (frags[i].y > l->y_max) l->y_max = frags[i].y;
+        if (frags[i].em > l->em_max) l->em_max = frags[i].em;
+    }
+    qsort(lines, nlines, sizeof(TextLine), line_cmp_y);
+
     double prev_y = 0, prev_em = 0;
     bool have_prev = false;
     size_t li = 0;
-    while (li < n) {
-        double line_y = frags[li].y;
-        double line_em = frags[li].em;
+    while (li < nlines) {
+        double row_tol = lines[li].em > 0 ? 0.5 * lines[li].em : 2.0;
+        double row_top = lines[li].y_max;
+        double row_bottom = lines[li].y_min;
+        double row_em = lines[li].em_max;
         size_t lj = li + 1;
-        while (lj < n) {
-            double em = frags[lj].em > line_em ? frags[lj].em : line_em;
-            double tol = em > 0 ? em / 3.0 : 2.0;
-            if (line_y - frags[lj].y > tol) break;
-            if (frags[lj].em > line_em) line_em = frags[lj].em;
+        while (lj < nlines && lines[li].y - lines[lj].y <= row_tol) {
+            if (lines[lj].y_max > row_top) row_top = lines[lj].y_max;
+            if (lines[lj].y_min < row_bottom) row_bottom = lines[lj].y_min;
+            if (lines[lj].em_max > row_em) row_em = lines[lj].em_max;
             lj++;
         }
-        qsort(frags + li, lj - li, sizeof(TextFrag), frag_cmp_x);
+        size_t rn = 0;
+        for (size_t l = li; l < lj; l++)
+            for (size_t i = lines[l].start; i < lines[l].end; i++)
+                row[rn++] = frags[i];
+        qsort(row, rn, sizeof(TextFrag), frag_cmp_x);
 
         if (have_prev) {
-            double lh = prev_em > line_em ? prev_em : line_em;
+            double lh = prev_em > row_em ? prev_em : row_em;
             if (lh > 0) {
-                double gap = prev_y - line_y;
+                double gap = prev_y - row_top;
                 if (gap > 1.8 * lh)
                     tspdf_buffer_append(dst, gap > 3.2 * lh ? "\n\n" : "\n",
                                         gap > 3.2 * lh ? 2 : 1);
@@ -1411,14 +1486,14 @@ static void tx_layout_assemble(TextCtx *ctx, TspdfBuffer *dst) {
         size_t line_start = dst->len;
         size_t cur_col = 0;
         double cur_end = 0;
-        for (size_t k = li; k < lj; k++) {
-            const TextFrag *f = &frags[k];
+        for (size_t k = 0; k < rn; k++) {
+            const TextFrag *f = &row[k];
             double rel = (f->x - min_x) / cw;
             size_t col = rel <= 0 ? 0
                        : rel >= (double)(LAYOUT_MAX_COLS - 1) ? LAYOUT_MAX_COLS - 1
                        : (size_t)(rel + 0.5);
             size_t pad;
-            if (k == li) {
+            if (k == 0) {
                 pad = col;
             } else {
                 double gap = f->x - cur_end;
@@ -1428,6 +1503,19 @@ static void tx_layout_assemble(TextCtx *ctx, TspdfBuffer *dst) {
                     pad = 0;                                 // contiguous run
                 else
                     pad = 1;                                 // overlap: merge
+                // Super-/subscript boundary within the row: a small but
+                // real gap is a word break at the script size (poppler's
+                // minWordBreakSpace, 0.1 em of the smaller fragment).
+                if (pad == 0 && gap > 0) {
+                    const TextFrag *pf = &row[k - 1];
+                    double big_em = f->em > pf->em ? f->em : pf->em;
+                    double small_em = f->em > 0 && (pf->em <= 0 || f->em < pf->em)
+                                          ? f->em : pf->em;
+                    if (big_em > 0 && small_em > 0 &&
+                        fabs(f->y - pf->y) > 0.1 * big_em &&
+                        gap > 0.1 * small_em)
+                        pad = 1;
+                }
             }
             if (pad > LAYOUT_MAX_COLS) pad = LAYOUT_MAX_COLS;
             for (size_t sp = 0; sp < pad; sp++)
@@ -1435,15 +1523,15 @@ static void tx_layout_assemble(TextCtx *ctx, TspdfBuffer *dst) {
             tspdf_buffer_append(dst, ctx->out.data + f->off, f->len);
             cur_col += pad + tx_utf8_chars(ctx->out.data + f->off, f->len);
             double end = f->x + f->w;
-            if (k == li || end > cur_end) cur_end = end;
+            if (k == 0 || end > cur_end) cur_end = end;
         }
         while (dst->len > line_start && dst->data[dst->len - 1] == ' ')
             dst->len--;
         tspdf_buffer_append_byte(dst, '\n');
 
         have_prev = true;
-        prev_y = line_y;
-        prev_em = line_em;
+        prev_y = row_bottom;
+        prev_em = row_em;
         li = lj;
     }
 }

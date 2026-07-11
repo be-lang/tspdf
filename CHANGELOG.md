@@ -21,6 +21,19 @@ on 0.x, the CLI is considered stable but the low-level C API may still change.
   saves stay deterministic.
 - CCITT decoder: the one-time lookup-table setup is now thread-safe (C11
   atomics) instead of relying on a benign data race.
+- `text`: super- and subscripts no longer break the line. A run whose
+  baseline stays within 0.5 em of the line's first run (poppler's
+  tolerance) joins it, so `1.0·10` + `20` comes out as `1.0·1020` and
+  footnote markers stay attached (`sampling,13 misalignment-related`).
+  At such a boundary a gap wider than 0.1 em of the smaller script still
+  becomes a space (`QK T`), and a raised marker that starts a line keeps
+  its own line (footnote blocks), both matching pdftotext.
+- `text --layout`: rows are built from content-order lines merged by
+  baseline, so table cells whose columns use slightly different leading
+  are no longer split into staggered rows (the syscard
+  `Top 3 Correlated Emotion Representations` block), and the blank-line
+  gap below a merged row is measured from its lowest baseline so the
+  merge cannot open a spurious gap.
 
 ## [0.4.0] - 2026-07-11
 
