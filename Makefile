@@ -363,7 +363,9 @@ test-asan-reader-bin: $(BUILDDIR)/test_reader
 #
 # Compiler-only — the fuzzing runtime ships with clang, so zero vendored deps.
 FUZZ_TARGETS = $(FUZZ_BIN)/fuzz_reader $(FUZZ_BIN)/fuzz_inflate \
-               $(FUZZ_BIN)/fuzz_deflate $(FUZZ_BIN)/fuzz_ttf $(FUZZ_BIN)/fuzz_png
+               $(FUZZ_BIN)/fuzz_deflate $(FUZZ_BIN)/fuzz_deflate_best \
+               $(FUZZ_BIN)/fuzz_ttf $(FUZZ_BIN)/fuzz_png \
+               $(FUZZ_BIN)/fuzz_jpeg $(FUZZ_BIN)/fuzz_ccitt
 
 fuzz: $(FUZZ_TARGETS) fuzz-corpus
 
@@ -376,6 +378,18 @@ $(FUZZ_BIN)/fuzz_inflate: fuzz/fuzz_inflate.c $(SRCDIR)/compress/deflate.c $(SRC
 	$(FUZZ_CC) $(CPPFLAGS) $(FUZZ_CFLAGS) $(LDFLAGS) -o $@ $^ -lm
 
 $(FUZZ_BIN)/fuzz_deflate: fuzz/fuzz_deflate.c $(SRCDIR)/compress/deflate.c $(SRCDIR)/util/buffer.c
+	@mkdir -p $(FUZZ_BIN)
+	$(FUZZ_CC) $(CPPFLAGS) $(FUZZ_CFLAGS) $(LDFLAGS) -o $@ $^ -lm
+
+$(FUZZ_BIN)/fuzz_deflate_best: fuzz/fuzz_deflate_best.c $(SRCDIR)/compress/deflate.c $(SRCDIR)/util/buffer.c
+	@mkdir -p $(FUZZ_BIN)
+	$(FUZZ_CC) $(CPPFLAGS) $(FUZZ_CFLAGS) $(LDFLAGS) -o $@ $^ -lm
+
+$(FUZZ_BIN)/fuzz_jpeg: fuzz/fuzz_jpeg.c $(SRCDIR)/image/jpeg_codec.c $(SRCDIR)/util/arena.c
+	@mkdir -p $(FUZZ_BIN)
+	$(FUZZ_CC) $(CPPFLAGS) $(FUZZ_CFLAGS) $(LDFLAGS) -o $@ $^ -lm
+
+$(FUZZ_BIN)/fuzz_ccitt: fuzz/fuzz_ccitt.c $(SRCDIR)/image/ccitt_codec.c $(SRCDIR)/util/arena.c
 	@mkdir -p $(FUZZ_BIN)
 	$(FUZZ_CC) $(CPPFLAGS) $(FUZZ_CFLAGS) $(LDFLAGS) -o $@ $^ -lm
 
@@ -399,6 +413,12 @@ fuzz-corpus:
 		cp -f tests/data/one_page.pdf fuzz/corpus/reader/; fi
 	@if [ -f tests/data/three_pages.pdf ]; then \
 		cp -f tests/data/three_pages.pdf fuzz/corpus/reader/; fi
+	@mkdir -p fuzz/corpus/jpeg fuzz/corpus/ccitt fuzz/corpus/deflate fuzz/corpus/deflate_best
+	@cp -f tests/data/jpg_*.jpg fuzz/corpus/jpeg/ 2>/dev/null || true
+	@cp -f tests/data/ccitt_*.g3 tests/data/ccitt_*.g4 tests/data/ccitt_*.bin fuzz/corpus/ccitt/ 2>/dev/null || true
+	@cp -f README.md fuzz/corpus/deflate/seed_text 2>/dev/null || true
+	@cp -f tests/data/jpg_rgb_flat.raw fuzz/corpus/deflate/seed_raw 2>/dev/null || true
+	@cp -f fuzz/corpus/deflate/* fuzz/corpus/deflate_best/ 2>/dev/null || true
 	@echo "Seed corpus ready under fuzz/corpus/ (run 'make generate-test-pdfs' if reader seeds are missing)"
 
 # --- CI gate ---
