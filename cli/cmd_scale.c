@@ -4,6 +4,7 @@
 
 #include "commands.h"
 #include "../include/tspdf.h"
+#include "password_input.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +30,8 @@ static void print_scale_help(void) {
     printf("  --to SIZE    fit content into the named page size, aspect preserved\n");
     printf("               and centered; the MediaBox becomes that size\n");
     printf("If --pages is omitted, all pages are scaled.\n");
+    printf("Encrypted files: pass --password <pass> or --password-file <file>;\n");
+    printf("the output keeps the original encryption.\n");
 }
 
 int cmd_scale(int argc, char **argv) {
@@ -77,10 +80,22 @@ int cmd_scale(int argc, char **argv) {
         }
     }
 
+    static char pwbuf[TSPDF_PASSWORD_MAX];
+    const char *password = tspdf_resolve_password(argc, argv,
+                                                  "--password", "--password-file",
+                                                  "scale", "Password: ",
+                                                  false, pwbuf, sizeof(pwbuf));
+
     TspdfError err = TSPDF_OK;
-    TspdfReader *doc = tspdf_reader_open_file(input, &err);
+    TspdfReader *doc = password
+        ? tspdf_reader_open_file_with_password(input, password, &err)
+        : tspdf_reader_open_file(input, &err);
     if (!doc) {
-        fprintf(stderr, "tspdf scale: failed to open '%s': %s\n", input, tspdf_error_string(err));
+        if (err == TSPDF_ERR_ENCRYPTED) {
+            fprintf(stderr, "tspdf scale: '%s' is encrypted; use --password or --password-file\n", input);
+        } else {
+            fprintf(stderr, "tspdf scale: failed to open '%s': %s\n", input, tspdf_error_string(err));
+        }
         return 1;
     }
 

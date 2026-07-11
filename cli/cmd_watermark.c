@@ -1,6 +1,7 @@
 #include "commands.h"
 #include "../include/tspdf_overlay.h"
 #include "../src/util/pdftext.h"
+#include "password_input.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,6 +28,25 @@ static void print_watermark_help(void) {
     printf("\nAdd a watermark to all pages: diagonal text, or an image (PNG/JPEG).\n");
     printf("Positions: center (default), tile, top-left, top-right,\n");
     printf("           bottom-left, bottom-right\n");
+    printf("Encrypted files: pass --password <pass> or --password-file <file>;\n");
+    printf("the output keeps the original encryption.\n");
+}
+
+// Open `input`, honoring an optional password; prints the error (with the
+// standard --password hint for encrypted files) on failure.
+static TspdfReader *watermark_open(const char *input, const char *password) {
+    TspdfError err = TSPDF_OK;
+    TspdfReader *doc = password
+        ? tspdf_reader_open_file_with_password(input, password, &err)
+        : tspdf_reader_open_file(input, &err);
+    if (!doc) {
+        if (err == TSPDF_ERR_ENCRYPTED) {
+            fprintf(stderr, "tspdf watermark: '%s' is encrypted; use --password or --password-file\n", input);
+        } else {
+            fprintf(stderr, "tspdf watermark: failed to open '%s': %s\n", input, tspdf_error_string(err));
+        }
+    }
+    return doc;
 }
 
 // Build a one-page PDF holding just the image at its pixel size (72 dpi) and
@@ -90,7 +110,8 @@ static uint8_t *build_image_pdf(const char *path, size_t *out_len,
 }
 
 static int watermark_image(const char *input, const char *output, const char *image_path,
-                           double opacity, double scale, WatermarkPosition pos) {
+                           double opacity, double scale, WatermarkPosition pos,
+                           const char *password) {
     const char *fail_reason = NULL;
     size_t img_pdf_len = 0;
     uint8_t *img_pdf = build_image_pdf(image_path, &img_pdf_len, &fail_reason);
@@ -101,9 +122,8 @@ static int watermark_image(const char *input, const char *output, const char *im
     }
 
     TspdfError err = TSPDF_OK;
-    TspdfReader *doc = tspdf_reader_open_file(input, &err);
+    TspdfReader *doc = watermark_open(input, password);
     if (!doc) {
-        fprintf(stderr, "tspdf watermark: failed to open '%s': %s\n", input, tspdf_error_string(err));
         free(img_pdf);
         return 1;
     }
@@ -231,7 +251,7 @@ static int watermark_image(const char *input, const char *output, const char *im
 }
 
 static int watermark_text(const char *input, const char *output, const char *text,
-                          double opacity) {
+                          double opacity, const char *password) {
     // The watermark is drawn with the built-in Helvetica font, which uses
     // WinAnsiEncoding (cp1252): re-encode the UTF-8 input up front so the
     // content stream carries cp1252 bytes instead of raw UTF-8 mojibake.
@@ -257,9 +277,8 @@ static int watermark_text(const char *input, const char *output, const char *tex
     }
 
     TspdfError err = TSPDF_OK;
-    TspdfReader *doc = tspdf_reader_open_file(input, &err);
+    TspdfReader *doc = watermark_open(input, password);
     if (!doc) {
-        fprintf(stderr, "tspdf watermark: failed to open '%s': %s\n", input, tspdf_error_string(err));
         free(wa_text);
         return 1;
     }
@@ -399,8 +418,14 @@ int cmd_watermark(int argc, char **argv) {
         }
     }
 
+    static char pwbuf[TSPDF_PASSWORD_MAX];
+    const char *password = tspdf_resolve_password(argc, argv,
+                                                  "--password", "--password-file",
+                                                  "watermark", "Password: ",
+                                                  false, pwbuf, sizeof(pwbuf));
+
     if (text) {
-        return watermark_text(input, output, text, opacity);
+        return watermark_text(input, output, text, opacity, password);
     }
 
     double scale = 0.5;
@@ -428,5 +453,5 @@ int cmd_watermark(int argc, char **argv) {
         }
     }
 
-    return watermark_image(input, output, image, opacity, scale, pos);
+    return watermark_image(input, output, image, opacity, scale, pos, password);
 }

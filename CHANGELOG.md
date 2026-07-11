@@ -8,6 +8,11 @@ on 0.x, the CLI is considered stable but the low-level C API may still change.
 ## [Unreleased]
 
 ### Fixed
+- Every command that reads a PDF now takes `--password`/`--password-file`:
+  `rotate`, `delete`, `reorder`, `split`, `merge`, `crop`, `scale`, `pagenum`,
+  `watermark`, and `compress` gained both (they could not open encrypted files
+  at all); `text`, `info`, and `form` gained `--password-file`. Outputs keep
+  the original encryption; `merge` tries the one password on every input.
 - `encrypt` no longer drops the document's Info metadata (Title, Author, ...):
   the existing Info dict is carried into the encrypted output with its strings
   encrypted, and `decrypt` round-trips it. Plain saves that only refresh the

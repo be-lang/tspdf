@@ -1,5 +1,6 @@
 #include "commands.h"
 #include "../include/tspdf.h"
+#include "password_input.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,6 +9,9 @@ int cmd_merge(int argc, char **argv) {
     if (argc == 0 || has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
         printf("Usage: tspdf merge <file1.pdf> <file2.pdf> [...] -o <output.pdf>\n");
         printf("\nMerge multiple PDF files into one.\n");
+        printf("Encrypted files: pass --password <pass> or --password-file <file>.\n");
+        printf("The one password is tried on every input (unencrypted inputs ignore\n");
+        printf("it); an input it does not unlock is an error.\n");
         return argc == 0 ? 1 : 0;
     }
 
@@ -41,14 +45,33 @@ int cmd_merge(int argc, char **argv) {
         return 1;
     }
 
+    // A single --password/--password-file is tried on every input: harmless
+    // for unencrypted inputs (the password is ignored), and a clear error
+    // names the input it fails to unlock.
+    static char pwbuf[TSPDF_PASSWORD_MAX];
+    const char *password = tspdf_resolve_password(argc, argv,
+                                                  "--password", "--password-file",
+                                                  "merge", "Password: ",
+                                                  false, pwbuf, sizeof(pwbuf));
+
     int ret = 0;
     TspdfError err = TSPDF_OK;
 
     for (int i = 0; i < npos; i++) {
-        docs[i] = tspdf_reader_open_file(inputs[i], &err);
+        docs[i] = password
+            ? tspdf_reader_open_file_with_password(inputs[i], password, &err)
+            : tspdf_reader_open_file(inputs[i], &err);
         if (!docs[i]) {
-            fprintf(stderr, "tspdf merge: failed to open '%s': %s\n",
-                    inputs[i], tspdf_error_string(err));
+            if (err == TSPDF_ERR_ENCRYPTED) {
+                fprintf(stderr, "tspdf merge: '%s' is encrypted; use --password or "
+                                "--password-file (applied to every input)\n", inputs[i]);
+            } else if (err == TSPDF_ERR_BAD_PASSWORD) {
+                fprintf(stderr, "tspdf merge: wrong password for '%s' (the one "
+                                "--password is tried on every input)\n", inputs[i]);
+            } else {
+                fprintf(stderr, "tspdf merge: failed to open '%s': %s\n",
+                        inputs[i], tspdf_error_string(err));
+            }
             ret = 1;
             goto cleanup;
         }
