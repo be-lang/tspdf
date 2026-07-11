@@ -14,6 +14,7 @@
 #include "commands.h"
 #include "../include/tspdf.h"
 #include "../src/util/pdftext.h"
+#include "password_input.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,9 +37,11 @@ static void form_usage(void) {
     printf("                                      content and remove the form\n");
     printf("\n");
     printf("Options:\n");
-    printf("  --password <pass>  Password for encrypted PDFs (optional).\n");
-    printf("                     Encrypted inputs stay encrypted on output,\n");
-    printf("                     with the same passwords.\n");
+    printf("  --password <pass>       Password for encrypted PDFs (optional).\n");
+    printf("  --password-file <file>  Read it from the first line of a file\n");
+    printf("                          ('-' reads stdin) instead.\n");
+    printf("                          Encrypted inputs stay encrypted on output,\n");
+    printf("                          with the same passwords.\n");
     printf("\n");
     printf("Checkboxes and radio groups take an \"on\" state name (see the\n");
     printf("options array in `form list`), \"Off\", or true/false. Choice\n");
@@ -347,8 +350,13 @@ static TspdfReader *form_open(const char *input, const char *password) {
         ? tspdf_reader_open_file_with_password(input, password, &err)
         : tspdf_reader_open_file(input, &err);
     if (!doc) {
-        fprintf(stderr, "tspdf form: failed to open '%s': %s\n", input,
-                tspdf_error_string(err));
+        if (err == TSPDF_ERR_ENCRYPTED) {
+            fprintf(stderr, "tspdf form: '%s' is encrypted; use --password or --password-file\n",
+                    input);
+        } else {
+            fprintf(stderr, "tspdf form: failed to open '%s': %s\n", input,
+                    tspdf_error_string(err));
+        }
     }
     return doc;
 }
@@ -682,7 +690,11 @@ int cmd_form(int argc, char **argv) {
     }
     const char *input = positional[0];
     const char *output = find_flag(sub_argc, sub_argv, "-o");
-    const char *password = find_flag(sub_argc, sub_argv, "--password");
+    static char pwbuf[TSPDF_PASSWORD_MAX];
+    const char *password = tspdf_resolve_password(sub_argc, sub_argv,
+                                                  "--password", "--password-file",
+                                                  "form", "Password: ",
+                                                  false, pwbuf, sizeof(pwbuf));
 
     if (strcmp(sub, "list") == 0) return form_list(input, password);
     if (strcmp(sub, "fill") == 0) {

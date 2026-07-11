@@ -4,6 +4,7 @@
 
 #include "commands.h"
 #include "../include/tspdf.h"
+#include "password_input.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,6 +39,8 @@ static void print_crop_help(void) {
     printf("  --margin pt        uniform inward margin on all four sides\n");
     printf("If --pages is omitted, all pages are cropped. The box is clamped to\n");
     printf("the MediaBox.\n");
+    printf("Encrypted files: pass --password <pass> or --password-file <file>;\n");
+    printf("the output keeps the original encryption.\n");
 }
 
 int cmd_crop(int argc, char **argv) {
@@ -103,10 +106,22 @@ int cmd_crop(int argc, char **argv) {
         margins[0] = margins[1] = margins[2] = margins[3] = m;
     }
 
+    static char pwbuf[TSPDF_PASSWORD_MAX];
+    const char *password = tspdf_resolve_password(argc, argv,
+                                                  "--password", "--password-file",
+                                                  "crop", "Password: ",
+                                                  false, pwbuf, sizeof(pwbuf));
+
     TspdfError err = TSPDF_OK;
-    TspdfReader *doc = tspdf_reader_open_file(input, &err);
+    TspdfReader *doc = password
+        ? tspdf_reader_open_file_with_password(input, password, &err)
+        : tspdf_reader_open_file(input, &err);
     if (!doc) {
-        fprintf(stderr, "tspdf crop: failed to open '%s': %s\n", input, tspdf_error_string(err));
+        if (err == TSPDF_ERR_ENCRYPTED) {
+            fprintf(stderr, "tspdf crop: '%s' is encrypted; use --password or --password-file\n", input);
+        } else {
+            fprintf(stderr, "tspdf crop: failed to open '%s': %s\n", input, tspdf_error_string(err));
+        }
         return 1;
     }
 

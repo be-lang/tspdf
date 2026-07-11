@@ -1,9 +1,27 @@
 #include "commands.h"
 #include "../include/tspdf.h"
+#include "password_input.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+
+// Open `input`, honoring an optional password; prints the error (with the
+// standard --password hint for encrypted files) on failure.
+static TspdfReader *split_open(const char *input, const char *password) {
+    TspdfError err = TSPDF_OK;
+    TspdfReader *doc = password
+        ? tspdf_reader_open_file_with_password(input, password, &err)
+        : tspdf_reader_open_file(input, &err);
+    if (!doc) {
+        if (err == TSPDF_ERR_ENCRYPTED) {
+            fprintf(stderr, "tspdf split: '%s' is encrypted; use --password or --password-file\n", input);
+        } else {
+            fprintf(stderr, "tspdf split: failed to open '%s': %s\n", input, tspdf_error_string(err));
+        }
+    }
+    return doc;
+}
 
 // "<n>" zero-padded to `width` digits (clamped to what a size_t needs).
 static void zero_pad(char *dst, size_t dst_sz, size_t n, int width) {
@@ -113,6 +131,8 @@ int cmd_split(int argc, char **argv) {
         printf("to its own file: out.pdf becomes out-001.pdf, out-002.pdf, ...\n");
         printf("Embedded file attachments are copied into every output; --no-attachments\n");
         printf("drops them instead.\n");
+        printf("Encrypted files: pass --password <pass> or --password-file <file>;\n");
+        printf("every output keeps the original encryption.\n");
         return argc == 0 ? 1 : 0;
     }
 
@@ -140,14 +160,16 @@ int cmd_split(int argc, char **argv) {
         fprintf(stderr, "tspdf split: --burst and --pages are mutually exclusive\n");
         return 1;
     }
+    static char pwbuf[TSPDF_PASSWORD_MAX];
+    const char *password = tspdf_resolve_password(argc, argv,
+                                                  "--password", "--password-file",
+                                                  "split", "Password: ",
+                                                  false, pwbuf, sizeof(pwbuf));
+
     if (!pages_spec) {
         // Per-page split (burst) is the default when no page range is given.
-        TspdfError err = TSPDF_OK;
-        TspdfReader *doc = tspdf_reader_open_file(input, &err);
-        if (!doc) {
-            fprintf(stderr, "tspdf split: failed to open '%s': %s\n", input, tspdf_error_string(err));
-            return 1;
-        }
+        TspdfReader *doc = split_open(input, password);
+        if (!doc) return 1;
         int rc = split_burst(doc, output, no_attachments);
         tspdf_reader_destroy(doc);
         return rc;
@@ -161,9 +183,8 @@ int cmd_split(int argc, char **argv) {
     }
 
     TspdfError err = TSPDF_OK;
-    TspdfReader *doc = tspdf_reader_open_file(input, &err);
+    TspdfReader *doc = split_open(input, password);
     if (!doc) {
-        fprintf(stderr, "tspdf split: failed to open '%s': %s\n", input, tspdf_error_string(err));
         free(pages);
         return 1;
     }

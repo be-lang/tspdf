@@ -289,6 +289,83 @@ run_test "rotate specific pages" $TSPDF rotate $INPUT --pages 1 --angle 180 -o $
 run_test "rotate flag-first ordering (-o/--angle before input)" $TSPDF rotate -o $TMPDIR/rotated_ff.pdf --angle 90 $INPUT
 run_test "rotate flag-first result has 3 pages" bash -c "$TSPDF info $TMPDIR/rotated_ff.pdf | grep -qE '^Pages:[[:space:]]*3$'"
 
+# page operations on encrypted input: every command that opens a PDF takes
+# --password/--password-file, fails with a hint without one, and its output
+# keeps the original encryption (saves preserve source encryption).
+$TSPDF encrypt $INPUT -o $TMPDIR/pwop_enc.pdf --password pgsecret > /dev/null 2>&1
+printf 'pgsecret\n' > $TMPDIR/pwop_pass.txt
+
+run_test "rotate encrypted input with --password" bash -c "
+  set -e
+  \"$TSPDF\" rotate \"$TMPDIR/pwop_enc.pdf\" --angle 90 --password pgsecret -o \"$TMPDIR/pwop_rot.pdf\"
+  [ \"\$(wc -c < \"$TMPDIR/pwop_rot.pdf\")\" -gt 0 ]
+"
+run_test "rotate encrypted input with --password-file" $TSPDF rotate $TMPDIR/pwop_enc.pdf --angle 90 --password-file $TMPDIR/pwop_pass.txt -o $TMPDIR/pwop_rot2.pdf
+run_test "rotate encrypted input without password fails with hint" bash -c "
+  if \"$TSPDF\" rotate \"$TMPDIR/pwop_enc.pdf\" --angle 90 -o \"$TMPDIR/pwop_rot3.pdf\" < /dev/null > /dev/null 2> \"$TMPDIR/pwop_rot3.err\"; then
+    exit 1
+  fi
+  grep -q 'use --password or --password-file' \"$TMPDIR/pwop_rot3.err\"
+"
+run_test "rotate output stays encrypted, opens with original password" bash -c "
+  set -e
+  \"$TSPDF\" info \"$TMPDIR/pwop_rot.pdf\" | grep -q 'This PDF is encrypted'
+  \"$TSPDF\" info --password pgsecret \"$TMPDIR/pwop_rot.pdf\" | grep -qE '^Pages:[[:space:]]*3$'
+"
+
+run_test "delete encrypted input with --password" bash -c "
+  set -e
+  \"$TSPDF\" delete \"$TMPDIR/pwop_enc.pdf\" --pages 1 --password pgsecret -o \"$TMPDIR/pwop_del.pdf\"
+  \"$TSPDF\" info --password pgsecret \"$TMPDIR/pwop_del.pdf\" | grep -qE '^Pages:[[:space:]]*2$'
+"
+run_test "delete encrypted input with --password-file" $TSPDF delete $TMPDIR/pwop_enc.pdf --pages 1 --password-file $TMPDIR/pwop_pass.txt -o $TMPDIR/pwop_del2.pdf
+run_test "delete encrypted input without password fails with hint" bash -c "
+  if \"$TSPDF\" delete \"$TMPDIR/pwop_enc.pdf\" --pages 1 -o \"$TMPDIR/pwop_del3.pdf\" < /dev/null > /dev/null 2> \"$TMPDIR/pwop_del3.err\"; then
+    exit 1
+  fi
+  grep -q 'use --password or --password-file' \"$TMPDIR/pwop_del3.err\"
+"
+run_test "delete output stays encrypted" bash -c "
+  \"$TSPDF\" info \"$TMPDIR/pwop_del.pdf\" | grep -q 'This PDF is encrypted'
+"
+
+if command -v qpdf > /dev/null 2>&1; then
+  run_test "rotate/delete encrypted outputs are encrypted per qpdf" bash -c "
+    set -e
+    qpdf --is-encrypted \"$TMPDIR/pwop_rot.pdf\"
+    qpdf --is-encrypted \"$TMPDIR/pwop_del.pdf\"
+    qpdf --password=pgsecret --check \"$TMPDIR/pwop_rot.pdf\" > /dev/null
+  "
+fi
+
+# merge: the one --password is tried on every input; unencrypted inputs ignore
+# it, and an input it does not unlock is a clear error.
+run_test "merge encrypted + plain inputs with a single --password" bash -c "
+  set -e
+  \"$TSPDF\" merge \"$TMPDIR/pwop_enc.pdf\" \"$INPUT\" --password pgsecret -o \"$TMPDIR/pwop_merged.pdf\"
+  \"$TSPDF\" info \"$TMPDIR/pwop_merged.pdf\" --password pgsecret | grep -qE '^Pages:[[:space:]]*6$'
+"
+run_test "merge wrong password names the input it cannot unlock" bash -c "
+  if \"$TSPDF\" merge \"$TMPDIR/pwop_enc.pdf\" \"$INPUT\" --password nope -o \"$TMPDIR/pwop_m2.pdf\" > /dev/null 2> \"$TMPDIR/pwop_m2.err\"; then
+    exit 1
+  fi
+  grep -q 'wrong password' \"$TMPDIR/pwop_m2.err\" && grep -q 'pwop_enc.pdf' \"$TMPDIR/pwop_m2.err\"
+"
+run_test "merge encrypted input without password fails with hint" bash -c "
+  if \"$TSPDF\" merge \"$TMPDIR/pwop_enc.pdf\" \"$INPUT\" -o \"$TMPDIR/pwop_m3.pdf\" < /dev/null > /dev/null 2> \"$TMPDIR/pwop_m3.err\"; then
+    exit 1
+  fi
+  grep -q 'use --password' \"$TMPDIR/pwop_m3.err\"
+"
+
+# split: password accepted in both --pages and burst modes; parts stay encrypted
+run_test "split encrypted input with --password keeps parts encrypted" bash -c "
+  set -e
+  \"$TSPDF\" split \"$TMPDIR/pwop_enc.pdf\" --pages 1-2 --password pgsecret -o \"$TMPDIR/pwop_split.pdf\"
+  \"$TSPDF\" info \"$TMPDIR/pwop_split.pdf\" | grep -q 'This PDF is encrypted'
+  \"$TSPDF\" info --password pgsecret \"$TMPDIR/pwop_split.pdf\" | grep -qE '^Pages:[[:space:]]*2$'
+"
+
 # delete
 run_test "delete page 1" $TSPDF delete $INPUT --pages 1 -o $TMPDIR/deleted.pdf
 # flag-first ordering: -o output and --pages value must not be swallowed as input

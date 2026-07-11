@@ -1,5 +1,6 @@
 #include "commands.h"
 #include "../include/tspdf.h"
+#include "password_input.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,6 +10,8 @@ int cmd_delete(int argc, char **argv) {
     if (argc == 0 || has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
         printf("Usage: tspdf delete <input.pdf> --pages 2,4 -o <output.pdf>\n");
         printf("\nDelete specific pages from a PDF.\n");
+        printf("Encrypted files: pass --password <pass> or --password-file <file>;\n");
+        printf("the output keeps the original encryption.\n");
         return argc == 0 ? 1 : 0;
     }
 
@@ -43,10 +46,22 @@ int cmd_delete(int argc, char **argv) {
         return 1;
     }
 
+    static char pwbuf[TSPDF_PASSWORD_MAX];
+    const char *password = tspdf_resolve_password(argc, argv,
+                                                  "--password", "--password-file",
+                                                  "delete", "Password: ",
+                                                  false, pwbuf, sizeof(pwbuf));
+
     TspdfError err = TSPDF_OK;
-    TspdfReader *doc = tspdf_reader_open_file(input, &err);
+    TspdfReader *doc = password
+        ? tspdf_reader_open_file_with_password(input, password, &err)
+        : tspdf_reader_open_file(input, &err);
     if (!doc) {
-        fprintf(stderr, "tspdf delete: failed to open '%s': %s\n", input, tspdf_error_string(err));
+        if (err == TSPDF_ERR_ENCRYPTED) {
+            fprintf(stderr, "tspdf delete: '%s' is encrypted; use --password or --password-file\n", input);
+        } else {
+            fprintf(stderr, "tspdf delete: failed to open '%s': %s\n", input, tspdf_error_string(err));
+        }
         free(pages);
         return 1;
     }

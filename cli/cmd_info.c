@@ -1,6 +1,7 @@
 #include "commands.h"
 #include "../include/tspdf.h"
 #include "../src/util/pdfdate.h"
+#include "password_input.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -249,7 +250,7 @@ static int print_json(TspdfReader *doc) {
 
 int cmd_info(int argc, char **argv) {
     if (argc == 0 || has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
-        printf("Usage: tspdf info <input.pdf> [--password <pass>] [--json]\n");
+        printf("Usage: tspdf info <input.pdf> [--password <pass>] [--password-file <file>] [--json]\n");
         printf("\nPrint information about a PDF file.\n");
         printf("  --json    Machine-readable JSON output (includes metadata)\n");
         return argc == 0 ? 1 : 0;
@@ -270,7 +271,11 @@ int cmd_info(int argc, char **argv) {
         return 1;
     }
     const char *input = positional[0];
-    const char *password = find_flag(argc, argv, "--password");
+    static char pwbuf[TSPDF_PASSWORD_MAX];
+    const char *password = tspdf_resolve_password(argc, argv,
+                                                  "--password", "--password-file",
+                                                  "info", "Password: ",
+                                                  false, pwbuf, sizeof(pwbuf));
 
     TspdfError err = TSPDF_OK;
     TspdfReader *doc = password
@@ -285,7 +290,7 @@ int cmd_info(int argc, char **argv) {
             }
             printf("File:      %s\n", input);
             printf("Encrypted: yes\n");
-            printf("\nThis PDF is encrypted. Use --password <pass> to open it.\n");
+            printf("\nThis PDF is encrypted. Use --password <pass> or --password-file <file> to open it.\n");
             return 0;
         }
         fprintf(stderr, "tspdf info: failed to open '%s': %s\n", input, tspdf_error_string(err));

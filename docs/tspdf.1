@@ -212,6 +212,23 @@ Show the help message.
 .TP
 .B \-\-version
 Show version information.
+.TP
+.BI \-\-password " pass"
+Password for an encrypted input PDF. Every command that reads a PDF accepts
+it (merge, split, rotate, crop, scale, delete, reorder, metadata, info,
+watermark, stamp, nup, pagenum, compress, text, form, attach, bookmark,
+decrypt). Except for
+.BR decrypt ,
+the output keeps the original encryption.
+.B merge
+tries the one password on every input; unencrypted inputs ignore it, and an
+input it does not unlock is an error.
+.TP
+.BI \-\-password\-file " file"
+Read the password from the first line of
+.I file
+('\-' reads stdin) instead, keeping it out of the process list and shell
+history.
 .SH EXAMPLES
 .nf
 tspdf merge a.pdf b.pdf \-o combined.pdf

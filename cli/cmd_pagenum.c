@@ -1,6 +1,7 @@
 #include "commands.h"
 #include "../include/tspdf_overlay.h"
 #include "../src/util/pdftext.h"
+#include "password_input.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,6 +42,8 @@ int cmd_pagenum(int argc, char **argv) {
         printf("           top-center, top-left, top-right\n");
         printf("With --pages (e.g. 2-10), only those pages are stamped; the number\n");
         printf("still reflects the true page position (useful to skip cover pages).\n");
+        printf("Encrypted files: pass --password <pass> or --password-file <file>;\n");
+        printf("the output keeps the original encryption.\n");
         return argc == 0 ? 1 : 0;
     }
 
@@ -145,10 +148,22 @@ int cmd_pagenum(int argc, char **argv) {
         return 1;
     }
 
+    static char pwbuf[TSPDF_PASSWORD_MAX];
+    const char *password = tspdf_resolve_password(argc, argv,
+                                                  "--password", "--password-file",
+                                                  "pagenum", "Password: ",
+                                                  false, pwbuf, sizeof(pwbuf));
+
     TspdfError err = TSPDF_OK;
-    TspdfReader *doc = tspdf_reader_open_file(input, &err);
+    TspdfReader *doc = password
+        ? tspdf_reader_open_file_with_password(input, password, &err)
+        : tspdf_reader_open_file(input, &err);
     if (!doc) {
-        fprintf(stderr, "tspdf pagenum: failed to open '%s': %s\n", input, tspdf_error_string(err));
+        if (err == TSPDF_ERR_ENCRYPTED) {
+            fprintf(stderr, "tspdf pagenum: '%s' is encrypted; use --password or --password-file\n", input);
+        } else {
+            fprintf(stderr, "tspdf pagenum: failed to open '%s': %s\n", input, tspdf_error_string(err));
+        }
         free(wa_format);
         free(sel);
         return 1;

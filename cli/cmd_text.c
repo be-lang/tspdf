@@ -1,6 +1,7 @@
 #include "commands.h"
 #include "../include/tspdf.h"
 #include "../src/reader/tspr_text.h"
+#include "password_input.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,7 +12,8 @@
 // marker.
 int cmd_text(int argc, char **argv) {
     if (argc == 0 || has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
-        printf("Usage: tspdf text <input.pdf> [--layout] [--pages <range>] [--password <pass>] [-o <output.txt>]\n");
+        printf("Usage: tspdf text <input.pdf> [--layout] [--pages <range>] [--password <pass>]\n");
+        printf("                  [--password-file <file>] [-o <output.txt>]\n");
         printf("\nExtract text from a PDF (all pages to stdout by default).\n");
         printf("--layout preserves the page layout: columns and tables stay aligned.\n");
         return argc == 0 ? 1 : 0;
@@ -29,7 +31,11 @@ int cmd_text(int argc, char **argv) {
     }
     const char *input = positional[0];
     const char *output = find_flag(argc, argv, "-o");
-    const char *password = find_flag(argc, argv, "--password");
+    static char pwbuf[TSPDF_PASSWORD_MAX];
+    const char *password = tspdf_resolve_password(argc, argv,
+                                                  "--password", "--password-file",
+                                                  "text", "Password: ",
+                                                  false, pwbuf, sizeof(pwbuf));
     const char *pages_spec = find_flag(argc, argv, "--pages");
     bool layout = has_flag(argc, argv, "--layout");
 
@@ -48,7 +54,11 @@ int cmd_text(int argc, char **argv) {
         ? tspdf_reader_open_file_with_password(input, password, &err)
         : tspdf_reader_open_file(input, &err);
     if (!doc) {
-        fprintf(stderr, "tspdf text: failed to open '%s': %s\n", input, tspdf_error_string(err));
+        if (err == TSPDF_ERR_ENCRYPTED) {
+            fprintf(stderr, "tspdf text: '%s' is encrypted; use --password or --password-file\n", input);
+        } else {
+            fprintf(stderr, "tspdf text: failed to open '%s': %s\n", input, tspdf_error_string(err));
+        }
         free(pages);
         return 1;
     }
