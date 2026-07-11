@@ -33,6 +33,8 @@ tspdf split report.pdf --pages 1-5 -o extract.pdf
 tspdf encrypt doc.pdf -o locked.pdf --password secret
 tspdf decrypt locked.pdf -o unlocked.pdf --password secret
 tspdf rotate doc.pdf --angle 90 -o rotated.pdf
+tspdf delete doc.pdf --pages 2,4 -o cleaned.pdf
+tspdf reorder doc.pdf --order 3,1,2 -o reordered.pdf
 tspdf crop doc.pdf --margin 36 -o cropped.pdf
 tspdf scale doc.pdf --to a4 -o a4.pdf
 tspdf watermark doc.pdf -o draft.pdf --text "DRAFT"
@@ -43,6 +45,7 @@ tspdf pagenum doc.pdf -o numbered.pdf
 tspdf compress doc.pdf -o smaller.pdf
 tspdf compress --lossy scan.pdf -o small.pdf
 tspdf text doc.pdf -o doc.txt
+tspdf info doc.pdf
 tspdf metadata doc.pdf
 tspdf attach add doc.pdf data.csv -o with-files.pdf
 tspdf bookmark import doc.pdf --from toc.txt -o outlined.pdf
@@ -75,7 +78,7 @@ tspdf aims to open the PDFs you actually have, not just clean ones:
 
 - Cross-reference tables and streams, hybrid-reference files, object streams, and incremental updates
 - Filters: Flate (with PNG/TIFF predictors), LZW, ASCIIHex, ASCII85, RunLength, and filter chains
-- Encryption: RC4 (R2 to R4), AES-128 (R4), and AES-256 (R6, ISO 32000-2), which is what modern Acrobat, LibreOffice, and Office produce
+- Encryption: RC4 (R2 to R4), AES-128 (R4), and AES-256 (R6, ISO 32000-2), which is what modern Acrobat, LibreOffice, and Office produce. Editing an encrypted file (with `--password`) keeps the original encryption and passwords; `decrypt` removes it
 - Damaged files: recovers documents with a missing or truncated xref/trailer by scanning for objects, tolerates junk before `%PDF-` and after `%%EOF`
 
 Output is checked against `qpdf` and `mutool` in CI. If a PDF fails to open,
@@ -128,12 +131,12 @@ and conformance jobs, on every push.
 
 ## Features
 
-- **Reading**: open PDFs, extract/delete/rotate/reorder/merge pages, crop and scale/resize pages, text extraction (plain or layout-preserving), AcroForm form fill/flatten, outline (bookmark) editing, PDF stamping, N-up imposition, watermarks, annotations, page numbers, file attachments, content overlay, AES-128/256 encryption and decryption.
+- **Reading**: open PDFs, extract/delete/rotate/reorder/merge pages, crop and scale/resize pages, text extraction (plain or layout-preserving), AcroForm form fill/flatten, outline (bookmark) editing, PDF stamping, N-up imposition, watermarks, annotations, page numbers, file attachments, content overlay, lossy image recompression (downsample + JPEG/CCITT G4 re-encode), AES-128/256 encryption and decryption.
 - **Generation**: flexbox-style layout with fixed/grow/fit-content/percentage sizing, automatic page breaks with repeating headers, tables with auto-sized columns and colspan.
 - **Text**: TrueType parsing and embedding with subsetting, Unicode via CIDFont Type2 + Identity-H, wrapping, alignment, inline rich text.
 - **Graphics**: borders, shadows, opacity, clipping, transforms, vector paths, linear and radial gradients.
 - **Media**: JPEG and PNG pass-through, PNG decoding (8-bit grayscale/RGB/RGBA and palette, non-interlaced), QR codes, Markdown to PDF.
-- **From scratch**: deflate/inflate (RFC 1950/1951), AES-128/256, MD5, SHA-256/384/512, RC4.
+- **From scratch**: deflate/inflate (RFC 1950/1951), baseline JPEG encoder/decoder, CCITT G3/G4 codec, AES-128/256, MD5, SHA-256/384/512, RC4.
 
 ## Credits
 

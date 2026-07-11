@@ -6,14 +6,15 @@ See the [compatibility matrix](compatibility-matrix.md) for what is tested where
 
 ## Scope
 
-- Text extraction (`tspdf text`) reads text in content-stream order: no column re-ordering, no OCR of scanned pages, and no blank-line preservation. CID fonts without a /ToUnicode map extract as U+FFFD (a stderr warning names the affected pages). Ligature code points (U+FB00–FB06) are folded to ASCII letter sequences (ff, fi, fl, ...) for searchability, matching Unicode NFKC and poppler's Latin1 fold tables — note that default pdftotext (UTF-8 output) keeps the raw code points. Trailing spaces are trimmed from each line, as pdftotext does.
+- Text extraction (`tspdf text`) reads text in content-stream order by default: no column re-ordering, no blank-line preservation. `--layout` places text on a character grid (columns and tables stay aligned) and turns large vertical gaps into blank lines (at most 2). No OCR of scanned pages in either mode. CID fonts without a /ToUnicode map extract as U+FFFD (a stderr warning names the affected pages). Ligature code points (U+FB00–FB06) are folded to ASCII letter sequences (ff, fi, fl, ...) for searchability, matching Unicode NFKC and poppler's Latin1 fold tables — note that default pdftotext (UTF-8 output) keeps the raw code points. Trailing spaces are trimmed from each line, as pdftotext does.
 - No rendering of pages to images.
 - `form fill` and `form flatten` render values outside WinAnsi (CJK, Greek, ...) with an embedded fallback font, which needs a discoverable TrueType font on the machine: set `TSPDF_FALLBACK_FONT=/path/to/font.ttf`, or let tspdf scan the system font directories (`.ttf`/`.ttc` with glyf outlines; CFF-flavored `.otf`/`.ttc` — including many Noto CJK packages — are skipped). Without a usable font those characters display as `?` (the stored value is intact; a stderr warning names the field). One fallback font per document: a value mixing scripts that no single discovered font covers keeps the `?` rendering, and mixed Latin+CJK values render entirely in the fallback font.
 - md2pdf renders pipe tables and block-level `![alt](path)` images. Inline bold/italic/bold-italic/code only keeps its styling when the line fits unwrapped; longer lines render plain (markers stripped). `[text](url)` becomes a clickable link annotation under the same condition — on lines that wrap, the link renders as plain text without an annotation. Links inside table cells render as plain text. Images inside a paragraph fall back to their alt text. Tables longer than 28 rows are split into stacked tables with the header repeated. Inline markup inside table cells renders as plain text. A document is capped at 1024 top-level blocks (paragraphs, headings, list items, ...); content past the cap is dropped with a warning.
 - The web UI's Markdown converter (`/api/md2pdf`) supports a smaller dialect than `tspdf md2pdf`: headings, bullet lists, blockquotes, fenced code blocks, and rules. Tables, images, and inline bold/italic/code styling are CLI-only; in the web UI those markers render literally. The web endpoint deliberately embeds no images, since that would mean reading files on the server.
-- Merge and split preserve bookmarks and form fields (split keeps only what points at kept pages; named destinations are flattened to explicit ones). Structure trees and page labels are still dropped.
+- Merge and split preserve bookmarks, form fields, and page labels (split keeps only what points at kept pages; named destinations are flattened to explicit ones). Structure trees are still dropped.
 - Merging files that use the same form field name leaves the duplicate names as-is; viewers will treat them as one shared field.
-- Watermark support is text-only (no image watermark pipeline yet).
+- Metadata edits (`tspdf metadata --set/--clear`) update the Info dictionary only. An XMP metadata stream is left untouched (a notice is printed), so viewers that prefer XMP — Acrobat among them — may show the old values.
+- `compress --lossy` measures how large each image is drawn by scanning the page content streams (Form XObjects included). Images drawn only in annotation appearance streams, tiling patterns, or Type3 glyphs are not scanned: they count as never drawn and are left untouched. Only unmasked 8-bit gray/RGB (Flate or baseline DCT) and 1-bit gray (Flate or CCITT) images are eligible.
 - PNG color-key transparency (a tRNS chunk on RGB or grayscale images, color types 0/2) is not mapped to an SMask: those pixels render opaque in the generated PDF. Palette tRNS (color type 3) is fully supported.
 - Web server mode is intentionally simple and local-first; it is not a general-purpose multi-tenant service.
 
@@ -21,6 +22,7 @@ See the [compatibility matrix](compatibility-matrix.md) for what is tested where
 
 - Real-world PDF diversity is large. While core manipulation paths are tested, unusual producer-specific edge cases can still surface.
 - Xref-stream overflow guards are implemented; broader fixture coverage for all xref-stream edge variants is still evolving.
+- CCITT G3 (K>0) streams that omit EOL markers are decoded with a cadence heuristic (one 1-D line every K lines, which is what encoders like Ghostscript emit); an EOL-less stream with an irregular 1-D/2-D pattern would decode wrong.
 
 ## Performance / Resource Behavior
 

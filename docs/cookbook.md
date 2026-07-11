@@ -148,6 +148,9 @@ tspdf text report.pdf
 
 # specific pages, to a file
 tspdf text report.pdf --pages 1-3 -o report.txt
+
+# keep the page layout: columns and tables stay aligned (like pdftotext -layout)
+tspdf text report.pdf --layout -o report.txt
 ```
 
 ## Compress a PDF
@@ -188,7 +191,8 @@ tspdf form flatten filled.pdf -o final.pdf
 
 Values with characters outside WinAnsi (CJK, Greek, ...) need a fallback
 font for display. tspdf looks for one automatically in the system font
-directories (TrueType only); to pick one yourself:
+directories (TrueType only; `TSPDF_FONT_DIRS=/dir:/dir` replaces the scan
+roots); to pick one yourself:
 
 ```bash
 TSPDF_FALLBACK_FONT=/usr/share/fonts/some/font.ttf \
@@ -283,12 +287,20 @@ tspdf encrypt report.pdf --password "secret" --bits 256 -o locked-256.pdf
 tspdf decrypt locked.pdf --password "secret" -o unlocked.pdf
 ```
 
-Editing an encrypted PDF (`form fill`, `bookmark add`, `stamp`, `nup`, ...)
-with `--password` keeps the output encrypted with the same passwords. Use
-`decrypt` to remove the password. One exception: merging (via the C API —
-`tspdf merge` does not open encrypted inputs) always writes an unencrypted
-document, since several sources have no single encryption to carry over;
-re-encrypt the result if it must stay protected.
+Every command that reads a PDF takes `--password` (or `--password-file`,
+which reads the first line of a file — `-` for stdin — so the password stays
+out of the process list). The output keeps the original encryption and
+passwords; use `decrypt` to remove them:
+
+```bash
+tspdf rotate locked.pdf --password "secret" --angle 90 -o rotated.pdf   # still encrypted
+tspdf split locked.pdf --password-file pw.txt --pages 1-3 -o part.pdf
+```
+
+One exception: `tspdf merge` unlocks encrypted inputs (the one password is
+tried on every input) but always writes an unencrypted document, since
+several sources have no single encryption to carry over; re-encrypt the
+result if it must stay protected.
 
 ## Convert images to PDF
 

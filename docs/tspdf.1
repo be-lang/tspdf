@@ -15,13 +15,19 @@ PDF files, entirely on the local machine. No network access, no dependencies.
 Merge multiple PDF files into one.
 .TP
 .B split
-Split a PDF into individual pages or ranges. Embedded file attachments are
+Split a PDF into individual pages or ranges:
+.B \-\-pages
+extracts a range into one file,
+.B \-\-burst
+(the default) writes each page to its own file. Embedded file attachments are
 copied into every output;
 .B \-\-no\-attachments
 drops them instead.
 .TP
 .B rotate
-Rotate pages in a PDF.
+Rotate pages in a PDF by
+.B \-\-angle
+90, 180, or 270 degrees.
 .TP
 .B crop
 Set the CropBox of pages (clip the visible region without destroying content).
@@ -46,19 +52,37 @@ for a uniform scale, or
 to fit content into a named page size (aspect preserved, centered).
 .TP
 .B delete
-Delete pages from a PDF.
+Delete pages from a PDF
+.RB ( \-\-pages ).
 .TP
 .B reorder
-Reorder pages in a PDF.
+Reorder pages in a PDF; the
+.B \-\-order
+list (e.g. 3,1,2) must name every page exactly once.
 .TP
 .B encrypt
 Encrypt a PDF with a password.
+.B \-\-bits
+selects 128 (the default) or 256\-bit AES;
+.B \-\-owner\-password
+sets a separate owner password (defaults to the user password);
+.B \-\-permissions
+takes a comma\-separated list of ALLOWED actions (print, modify, copy,
+annotate, forms, extract, assemble, print\-hq) \(em anything not listed is
+denied, and without the flag everything is allowed.
 .TP
 .B decrypt
 Decrypt a password-protected PDF.
 .TP
 .B metadata
-View or edit PDF metadata (the Info dictionary). If the document also carries
+View or edit PDF metadata (the Info dictionary):
+.B \-\-set
+.I key=value
+edits a field,
+.B \-\-clear
+.I key
+removes one (both repeatable; keys: title, author, subject, keywords,
+creator, producer). If the document also carries
 XMP metadata, an edit leaves the XMP stream untouched and prints a notice,
 since some viewers prefer XMP over the Info dictionary. Encrypted files need
 .B \-\-password
@@ -67,7 +91,10 @@ since some viewers prefer XMP over the Info dictionary. Encrypted files need
 edited output keeps the original encryption.
 .TP
 .B info
-Print information about a PDF.
+Print information about a PDF (pages, sizes, encryption and permissions,
+outlines, form);
+.B \-\-json
+for machine\-readable output.
 .TP
 .B watermark
 Add a text or image watermark to a PDF.
@@ -77,10 +104,15 @@ draws a diagonal text stamp;
 draws a PNG/JPEG with
 .B \-\-scale
 and
-.BR \-\-position .
+.BR \-\-position ;
+.B \-\-opacity
+(0.0\-1.0, default 0.3) applies to both.
 .TP
 .B stamp
 Overlay a page of another PDF onto pages of the input (like pdftk stamp).
+.B \-\-stamp\-page
+.I N
+picks which page of the stamp file to use;
 .B \-\-under
 puts it beneath the existing content. Encrypted files are unlocked with
 .B \-\-password
@@ -110,11 +142,22 @@ Each page is scaled to fit its cell, aspect ratio preserved and centered.
 .TP
 .B pagenum
 Stamp page numbers on a PDF.
+.B \-\-format
+takes up to two %d (page number, total),
+.B \-\-position
+places the label (bottom\-center default),
+.B \-\-start
+sets the first number,
+.B \-\-font\-size
+the size in points, and
 .B \-\-pages
-limits which pages are stamped.
+limits which pages are stamped (numbering still reflects the true position).
 .TP
 .B compress
-Compress a PDF to reduce file size.
+Compress a PDF to reduce file size: strips metadata and unused objects and
+recompresses streams.
+.B \-\-keep\-metadata
+preserves the Info dictionary and XMP instead of removing them.
 .B \-\-lossy
 additionally downsamples oversized photos/scans and re\-encodes them as JPEG,
 and black\-and\-white scans as CCITT G4;
@@ -148,6 +191,9 @@ and/or repeated
 pairs;
 .B form flatten
 stamps the values into the page content and removes the form.
+.B \-\-force
+also fills readonly fields. Values outside WinAnsi (CJK, Greek, ...) are
+drawn with a fallback TrueType font when one is found (see ENVIRONMENT).
 .TP
 .B attach
 Embed files in a PDF, or list, extract, or remove embedded files
@@ -155,7 +201,9 @@ Embed files in a PDF, or list, extract, or remove embedded files
 Added files are stored with their size, modification date, an MD5 checksum,
 and a MIME type derived from the file extension
 .RB ( "\-\-mime " \fItype\fR
-overrides it).
+overrides it);
+.BI \-\-desc " text"
+stores a description with each added file.
 .TP
 .B bookmark
 Edit the outline (bookmarks) of an existing PDF
@@ -186,10 +234,21 @@ view type), actions, colors, styles, and collapsed state are preserved.
 .B img2pdf
 Convert images (JPEG/PNG) to a PDF.
 .B \-\-page\-size
-chooses a4, letter, or a page sized to each image.
+chooses a4, letter, or a page sized to each image;
+.B \-\-best\-effort
+skips inputs that fail to load and exits 0 instead of failing.
 .TP
 .B qrcode
 Generate a QR code PDF.
+.B \-\-title
+and
+.B \-\-subtitle
+label the page,
+.B \-\-no\-link
+hides the encoded text below the code, and
+.B \-\-ec\-level
+.I L|M|Q|H
+sets the error-correction level (default M).
 .TP
 .B md2pdf
 Convert Markdown to a styled PDF.
@@ -229,6 +288,25 @@ Read the password from the first line of
 .I file
 ('\-' reads stdin) instead, keeping it out of the process list and shell
 history.
+.TP
+.BI \-\-pages " range"
+Page selection, e.g. 1\-3 or 1,3,5 or 2\-4,7. Accepted by split, rotate,
+delete, crop, scale, stamp, nup, pagenum, and text.
+.SH ENVIRONMENT
+.TP
+.B TSPDF_FALLBACK_FONT
+Path to a TrueType font used to render form values outside WinAnsi (CJK,
+Greek, ...). When set, no directory scan happens: this font is used, or the
+characters render as '?'.
+.TP
+.B TSPDF_FONT_DIRS
+Colon\-separated list of directories to scan for a fallback font, replacing
+the built\-in roots (/usr/share/fonts and friends). Only TrueType fonts with
+glyf outlines are usable; CFF\-flavored OpenType is skipped.
+.TP
+.B TSPDF_NO_AESHW
+Set to 1 to force the portable AES implementation instead of the hardware
+AES instructions.
 .SH EXAMPLES
 .nf
 tspdf merge a.pdf b.pdf \-o combined.pdf
@@ -239,6 +317,7 @@ tspdf form fill form.pdf \-\-set name=Ada \-o filled.pdf
 tspdf watermark doc.pdf \-o marked.pdf \-\-image logo.png \-\-opacity 0.2
 tspdf stamp report.pdf \-\-stamp approved.pdf \-o stamped.pdf
 tspdf nup 2 slides.pdf \-o handout.pdf
+tspdf compress \-\-lossy scan.pdf \-o small.pdf
 tspdf crop doc.pdf \-\-margins 72,36,72,36 \-o cropped.pdf
 tspdf scale doc.pdf \-\-to a4 \-o a4.pdf
 tspdf serve \-\-port 3000
