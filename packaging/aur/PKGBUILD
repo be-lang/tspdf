@@ -1,6 +1,6 @@
 # Maintainer: Benjamin Lang <beni@lbau.org>
 pkgname=tspdf
-pkgver=0.3.0
+pkgver=0.4.0
 pkgrel=1
 pkgdesc="Zero-dependency PDF toolkit and CLI in pure C11"
 arch=('x86_64' 'aarch64')
@@ -11,7 +11,7 @@ depends=('glibc')
 # would strip it.
 options=('staticlibs')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('1545411ededcfb8cd517e040bdf5a2d2da135a41b19c7104c112078a3c4acfec')
+sha256sums=('9b17bc57218d5b727fa968f7e6a911e9802f46cf721d7c9933f5789826d8c5b1')
 
 build() {
     cd "$pkgname-$pkgver"

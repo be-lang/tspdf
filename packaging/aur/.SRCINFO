@@ -1,6 +1,6 @@
 pkgbase = tspdf
 	pkgdesc = Zero-dependency PDF toolkit and CLI in pure C11
-	pkgver = 0.3.0
+	pkgver = 0.4.0
 	pkgrel = 1
 	url = https://github.com/be-lang/tspdf
 	arch = x86_64
@@ -8,7 +8,7 @@ pkgbase = tspdf
 	license = MIT
 	depends = glibc
 	options = staticlibs
-	source = tspdf-0.3.0.tar.gz::https://github.com/be-lang/tspdf/archive/refs/tags/v0.3.0.tar.gz
-	sha256sums = 1545411ededcfb8cd517e040bdf5a2d2da135a41b19c7104c112078a3c4acfec
+	source = tspdf-0.4.0.tar.gz::https://github.com/be-lang/tspdf/archive/refs/tags/v0.4.0.tar.gz
+	sha256sums = 9b17bc57218d5b727fa968f7e6a911e9802f46cf721d7c9933f5789826d8c5b1
 
 pkgname = tspdf
