@@ -23,11 +23,17 @@ Reader — parse, transform, save existing PDFs (`<tspdf/reader/tspr.h>`):
 - `tspdf_reader_open_file` / `tspdf_reader_open` — parse a PDF from a file or from memory
 - `tspdf_reader_page_count` / `tspdf_reader_get_page` — page count and per-page box/rotation
 - `tspdf_reader_extract` / `tspdf_reader_delete` / `tspdf_reader_rotate` / `tspdf_reader_reorder` — page operations; each returns a new document, the source is unchanged
+- `tspdf_reader_set_cropbox` / `tspdf_reader_set_cropboxes` / `tspdf_reader_scale` / `tspdf_reader_resize_to` — crop (set the CropBox) and scale/resize pages; same new-document contract
 - `tspdf_reader_merge` — combine documents into a new, self-contained one
-- `tspdf_reader_save` / `tspdf_reader_save_to_memory` / `tspdf_reader_save_encrypted` — write out (optionally RC4/AES encrypted)
-- `tspdf_reader_page_text` — extract a page's text as UTF-8
-- `tspdf_reader_import_page_xobject` / `tspdf_page_add_xobject` — wrap another document's page as a form XObject and draw it on pages (what `tspdf stamp` uses); the import is self-contained, so the source document may be destroyed right after
-- `tspdf_reader_bookmarks` / `tspdf_reader_set_bookmarks` / `tspdf_reader_clear_bookmarks` — enumerate, replace, or drop the outline (bookmark) tree; set takes a flat `{level, title, page_index, y}` list whose levels define nesting
+- `tspdf_reader_save` / `tspdf_reader_save_to_memory` / `tspdf_reader_save_encrypted` — write out (optionally RC4/AES encrypted). A document opened with a password saves with its original encryption, so the original passwords keep working; this carries over to documents derived from it (extract, nup, ...). Exception: merge results are always unencrypted
+- `tspdf_reader_save_with_options` — `TspdfSaveOptions` controls object stripping, recompression, metadata removal, and `decrypt` (write an encrypted source unencrypted — the opt-out `tspdf decrypt` uses)
+- `tspdf_reader_page_text` / `tspdf_reader_page_text_layout` — extract a page's text as UTF-8, in content order or layout-preserving
+- `tspdf_reader_form_fields` / `tspdf_reader_form_fill` / `tspdf_reader_form_flatten` — list, set, and flatten AcroForm fields; `tspdf_reader_form_value_renderable` reports whether a value can be drawn in the generated appearance (WinAnsi, or a fallback TrueType font found via `TSPDF_FALLBACK_FONT` / `TSPDF_FONT_DIRS`)
+- `tspdf_reader_attachments` / `tspdf_reader_attachment_get` / `tspdf_reader_attachment_add` / `tspdf_reader_attachment_remove` — embedded files; `tspdf_reader_attachment_add_ex` also sets the MIME type and modification date
+- `tspdf_reader_import_page_xobject` / `tspdf_page_add_xobject` — wrap another document's page as a form XObject and draw it on pages (what `tspdf stamp` uses); each imported copy is self-contained, so after a single import the source may be destroyed right away. Repeated imports into one destination are deduplicated by source identity, so when importing more than once, keep the source alive and unmodified until the destination is saved
+- `tspdf_reader_nup` — impose N source pages per sheet. Unlike the other page operations its result is NOT self-contained: the source must outlive the returned document until that document is saved
+- `tspdf_reader_lossy_images` — downsample and re-encode drawn raster images in place (photos to baseline JPEG at a target dpi/quality, bilevel scans to CCITT G4 at a separate `mono_dpi`); what `tspdf compress --lossy` runs before saving
+- `tspdf_reader_bookmarks` / `tspdf_reader_set_bookmarks` / `tspdf_reader_clear_bookmarks` — enumerate, replace, or drop the outline (bookmark) tree; set takes a flat `{level, title, page_index, y}` list whose levels define nesting. An entry may pass an enumerated item's `node` handle as `keep` to carry that item's destination, action, color, style, and open state over verbatim (how `tspdf bookmark add` and `import --append` preserve rich outlines)
 - `tspdf_reader_pdf_version` / `tspdf_reader_encryption_info` / `tspdf_reader_has_outlines` / `tspdf_reader_has_acroform` — document facts
 - `tspdf_reader_destroy` — free a document and everything it returned
 
@@ -61,10 +67,11 @@ will not. Anything not listed above (internal headers, `tspr_internal.h`, the
 - Reader results are arena-owned. Strings, objects, and pages returned by a
   `TspdfReader` live in that reader's arena and are freed by
   `tspdf_reader_destroy`. Don't free them yourself; copy what you need to keep.
-- Extract/delete/rotate/reorder return a new document and the source is
-  unchanged. The source document must outlive the returned document unless
-  saved first, because the returned document references the source's stream
-  data. Merge copies stream data, so merged documents are self-contained.
+- Extract/delete/rotate/reorder/crop/scale/nup return a new document and the
+  source is unchanged. The source document must outlive the returned document
+  unless saved first, because the returned document references the source's
+  stream data. Merge copies stream data, so merged documents are
+  self-contained.
 - `tspdf_reader_save_to_memory` and `tspdf_writer_save_to_memory` malloc the
   output buffer; the caller frees it.
 
