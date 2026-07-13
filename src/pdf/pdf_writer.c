@@ -64,11 +64,13 @@ void tspdf_raw_write_real(TspdfRawWriter *w, double val) {
 }
 
 void tspdf_raw_write_name(TspdfRawWriter *w, const char *name) {
+    // The encoder is length-aware; strlen() bounds it for NUL-terminated strings.
     tspdf_pdf_encode_name(&w->output, (const uint8_t *)name, strlen(name));
     tspdf_buffer_append_byte(&w->output, ' ');
 }
 
 void tspdf_raw_write_string(TspdfRawWriter *w, const char *str) {
+    // The encoder is length-aware; strlen() bounds it for NUL-terminated strings.
     tspdf_pdf_encode_string(&w->output, (const uint8_t *)str, strlen(str));
     tspdf_buffer_append_byte(&w->output, ' ');
 }
