@@ -1,5 +1,6 @@
 #include "commands.h"
 #include "pipeline.h"
+#include "ops.h"
 #include "../include/tspdf.h"
 #include "../src/util/pdfdate.h"
 #include <stdio.h>
@@ -8,32 +9,6 @@
 
 static void print_field(const char *label, const char *value) {
     if (value) printf("%-16s%s\n", label, value);
-}
-
-// Apply `value` to the metadata key named by the first `key_len` bytes of
-// `key`. NULL clears the field (the writer omits cleared keys from the
-// rebuilt Info dict). Returns false for an unknown key.
-static bool apply_field(TspdfReader *doc, const char *key, size_t key_len,
-                        const char *value) {
-    static const struct {
-        const char *name;
-        void (*set)(TspdfReader *, const char *);
-    } fields[] = {
-        {"title", tspdf_reader_set_title},
-        {"author", tspdf_reader_set_author},
-        {"subject", tspdf_reader_set_subject},
-        {"keywords", tspdf_reader_set_keywords},
-        {"creator", tspdf_reader_set_creator},
-        {"producer", tspdf_reader_set_producer},
-    };
-    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
-        if (strlen(fields[i].name) == key_len &&
-            strncmp(key, fields[i].name, key_len) == 0) {
-            fields[i].set(doc, value);
-            return true;
-        }
-    }
-    return false;
 }
 
 // Dates print human-readable ("2013-10-31 14:01:50 +04:00"); a value that
@@ -88,7 +63,7 @@ static int run(TspdfCmdCtx *ctx) {
             return 1;
         }
         size_t key_len = (size_t)(eq - sets[i]);
-        if (!apply_field(doc, sets[i], key_len, eq + 1)) {
+        if (!tspdf_op_metadata_set(doc, sets[i], key_len, eq + 1)) {
             fprintf(stderr, "tspdf metadata: unknown key '%.*s'\n", (int)key_len, sets[i]);
             return 1;
         }
@@ -97,7 +72,7 @@ static int run(TspdfCmdCtx *ctx) {
     // Clearing passes NULL through the setter: the serializer sees the
     // field as overridden-with-nothing and omits it from the Info dict.
     for (int i = 0; i < nclears; i++) {
-        if (!apply_field(doc, clears[i], strlen(clears[i]), NULL)) {
+        if (!tspdf_op_metadata_set(doc, clears[i], strlen(clears[i]), NULL)) {
             fprintf(stderr, "tspdf metadata: unknown key '%s'\n", clears[i]);
             return 1;
         }
