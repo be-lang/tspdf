@@ -34,6 +34,7 @@ TSPR_SOURCES = \
 	$(SRCDIR)/reader/tspr_xref.c \
 	$(SRCDIR)/reader/tspr_pages.c \
 	$(SRCDIR)/reader/tspr_serialize.c \
+	$(SRCDIR)/reader/tspr_streamplan.c \
 	$(SRCDIR)/reader/tspr_infoplan.c \
 	$(SRCDIR)/reader/tspr_crypt.c \
 	$(SRCDIR)/reader/tspr_document.c \
