@@ -22,20 +22,7 @@
 #include "../../include/tspdf/version.h"
 
 #include "../../src/reader/tspr_text.h"
-
-static bool appendf(char *buf, size_t cap, size_t *pos, const char *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    int written = vsnprintf(buf + *pos, cap - *pos, fmt, args);
-    va_end(args);
-
-    if (written < 0 || (size_t)written >= cap - *pos) {
-        return false;
-    }
-
-    *pos += (size_t)written;
-    return true;
-}
+#include "helpers.h"
 
 static char *make_text_pdf_full(const char *resources, const char *font_body,
                                 const char *aux_dict, const char *aux_data,

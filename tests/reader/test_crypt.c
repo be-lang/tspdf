@@ -20,44 +20,7 @@
 #include "../../src/font/font_fallback.h"
 #include "../../src/crypto/md5.h"
 #include "../../include/tspdf/version.h"
-
-static bool bytes_contains(const uint8_t *haystack, size_t haystack_len, const char *needle) {
-    if (!haystack || !needle) {
-        return false;
-    }
-
-    size_t needle_len = strlen(needle);
-    if (needle_len == 0 || needle_len > haystack_len) {
-        return false;
-    }
-
-    for (size_t i = 0; i <= haystack_len - needle_len; i++) {
-        if (memcmp(haystack + i, needle, needle_len) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static size_t bytes_count(const uint8_t *haystack, size_t haystack_len, const char *needle) {
-    if (!haystack || !needle) {
-        return 0;
-    }
-
-    size_t needle_len = strlen(needle);
-    if (needle_len == 0 || needle_len > haystack_len) {
-        return 0;
-    }
-
-    size_t count = 0;
-    for (size_t i = 0; i <= haystack_len - needle_len; i++) {
-        if (memcmp(haystack + i, needle, needle_len) == 0) {
-            count++;
-            i += needle_len - 1;
-        }
-    }
-    return count;
-}
+#include "helpers.h"
 
 static const unsigned char R6_SECRET_PDF[] = {
     37,80,68,70,45,49,46,55,10,37,191,247,162,254,10,49,

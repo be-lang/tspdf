@@ -23,121 +23,7 @@
 
 #include "../../src/util/pdftext.h"
 #include "../../src/reader/tspr_text.h"
-
-static bool bytes_contains(const uint8_t *haystack, size_t haystack_len, const char *needle) {
-    if (!haystack || !needle) {
-        return false;
-    }
-
-    size_t needle_len = strlen(needle);
-    if (needle_len == 0 || needle_len > haystack_len) {
-        return false;
-    }
-
-    for (size_t i = 0; i <= haystack_len - needle_len; i++) {
-        if (memcmp(haystack + i, needle, needle_len) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static TspdfObj *test_resolve_ref(TspdfReader *doc, TspdfObj *obj) {
-    if (!doc || !obj || obj->type != TSPDF_OBJ_REF) {
-        return obj;
-    }
-
-    TspdfParser parser;
-    tspdf_parser_init(&parser, doc->data, doc->data_len, &doc->arena);
-    return tspdf_xref_resolve(&doc->xref, &parser, obj->ref.num, doc->obj_cache, doc->crypt);
-}
-
-static bool appendf(char *buf, size_t cap, size_t *pos, const char *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    int written = vsnprintf(buf + *pos, cap - *pos, fmt, args);
-    va_end(args);
-
-    if (written < 0 || (size_t)written >= cap - *pos) {
-        return false;
-    }
-
-    *pos += (size_t)written;
-    return true;
-}
-
-static TspdfObj *dt_catalog_get(TspdfReader *doc, const char *key) {
-    return test_resolve_ref(doc, tspdf_dict_get(doc->catalog, key));
-}
-
-static TspdfObj *dt_get(TspdfReader *doc, TspdfObj *dict, const char *key) {
-    return test_resolve_ref(doc, tspdf_dict_get(dict, key));
-}
-
-static bool dt_str_eq(TspdfObj *s, const char *want) {
-    return s && (s->type == TSPDF_OBJ_STRING || s->type == TSPDF_OBJ_NAME) &&
-           s->string.len == strlen(want) &&
-           memcmp(s->string.data, want, s->string.len) == 0;
-}
-
-static uint8_t *dt_writer_pdf(int npages, bool outlines, bool fields,
-                              const char *tag, const char *font_name,
-                              size_t *out_len) {
-    TspdfWriter *w = tspdf_writer_create();
-    if (!w) return NULL;
-    const char *font = tspdf_writer_add_builtin_font(w, font_name);
-    for (int i = 0; i < npages; i++) {
-        TspdfStream *page = tspdf_writer_add_page(w);
-        tspdf_stream_begin_text(page);
-        tspdf_stream_set_font(page, font, 14);
-        tspdf_stream_move_to(page, 72, 700);
-        char buf[128];
-        snprintf(buf, sizeof(buf), "%s page %d", tag, i + 1);
-        tspdf_stream_show_text(page, buf);
-        tspdf_stream_end_text(page);
-    }
-    if (outlines) {
-        char t[128];
-        snprintf(t, sizeof(t), "%s-CH1", tag);
-        int ch1 = tspdf_writer_add_bookmark(w, t, 0);
-        snprintf(t, sizeof(t), "%s-CH1-SUB", tag);
-        tspdf_writer_add_child_bookmark(w, ch1, t, npages > 1 ? 1 : 0);
-        snprintf(t, sizeof(t), "%s-CH2", tag);
-        tspdf_writer_add_bookmark(w, t, npages - 1);
-    }
-    if (fields) {
-        char n[128];
-        snprintf(n, sizeof(n), "%s_text", tag);
-        tspdf_writer_add_text_field(w, 0, n, 72, 600, 200, 20, "hello",
-                                    font_name, 12);
-        snprintf(n, sizeof(n), "%s_check", tag);
-        tspdf_writer_add_checkbox(w, npages - 1, n, 72, 560, 14, true);
-    }
-    uint8_t *data = NULL;
-    TspdfError err = tspdf_writer_save_to_memory(w, &data, out_len);
-    tspdf_writer_destroy(w);
-    if (err != TSPDF_OK) {
-        free(data);
-        return NULL;
-    }
-    return data;
-}
-
-static uint8_t *wasm_read_whole_file(const char *path, size_t *out_len) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (size < 0) { fclose(f); return NULL; }
-    uint8_t *buf = malloc((size_t)size);
-    if (!buf) { fclose(f); return NULL; }
-    size_t nread = fread(buf, 1, (size_t)size, f);
-    fclose(f);
-    if (nread != (size_t)size) { free(buf); return NULL; }
-    *out_len = nread;
-    return buf;
-}
+#include "helpers.h"
 
 static const TspdfFormFieldInfo *form_find(TspdfFormFieldInfo *fields,
                                            size_t count, const char *name) {
@@ -452,17 +338,6 @@ static size_t flat_page_font_count(TspdfReader *doc, size_t page) {
     TspdfObj *font = flat_resolve(doc, tspdf_dict_get(res, "Font"));
     if (!font || font->type != TSPDF_OBJ_DICT) return 0;
     return font->dict.count;
-}
-
-static bool bytes_contains_bin(const uint8_t *haystack, size_t haystack_len,
-                                const uint8_t *needle, size_t needle_len) {
-    if (!haystack || !needle || needle_len == 0 || needle_len > haystack_len)
-        return false;
-    for (size_t i = 0; i <= haystack_len - needle_len; i++) {
-        if (memcmp(haystack + i, needle, needle_len) == 0)
-            return true;
-    }
-    return false;
 }
 
 static TspdfReader *t2_form_fill_and_save(const char *value,

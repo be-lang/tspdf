@@ -20,6 +20,7 @@
 #include "../../src/font/font_fallback.h"
 #include "../../src/crypto/md5.h"
 #include "../../include/tspdf/version.h"
+#include "helpers.h"
 
 static const char *MINI_PDF =
     "%PDF-1.4\n"
@@ -34,20 +35,6 @@ static const char *MINI_PDF =
     "0000000115 00000 n \n"
     "trailer\n<< /TspdfSize 4 /Root 1 0 R >>\n"
     "startxref\n186\n%%EOF";
-
-static bool appendf(char *buf, size_t cap, size_t *pos, const char *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    int written = vsnprintf(buf + *pos, cap - *pos, fmt, args);
-    va_end(args);
-
-    if (written < 0 || (size_t)written >= cap - *pos) {
-        return false;
-    }
-
-    *pos += (size_t)written;
-    return true;
-}
 
 static char *make_openable_mini_pdf_with_startxref_adjust(const char *prefix,
                                                           size_t trailing_spaces,
@@ -422,20 +409,6 @@ fail:
     return NULL;
 }
 
-static void xref_entry4(uint8_t *dst, uint8_t type, size_t offset, uint8_t gen) {
-    dst[0] = type;
-    dst[1] = (uint8_t)((offset >> 8) & 0xFF);
-    dst[2] = (uint8_t)(offset & 0xFF);
-    dst[3] = gen;
-}
-
-static void xref_objstm_entry4(uint8_t *dst, uint16_t stream_obj, uint8_t index) {
-    dst[0] = 2;
-    dst[1] = (uint8_t)((stream_obj >> 8) & 0xFF);
-    dst[2] = (uint8_t)(stream_obj & 0xFF);
-    dst[3] = index;
-}
-
 static void write_be32(uint8_t *dst, uint32_t value) {
     dst[0] = (uint8_t)((value >> 24) & 0xFF);
     dst[1] = (uint8_t)((value >> 16) & 0xFF);
@@ -495,97 +468,6 @@ static char *make_recursive_compressed_xref_pdf(bool two_object_cycle, size_t *o
 fail:
     free(pdf);
     return NULL;
-}
-
-static uint8_t *ascii_hex_encode(const uint8_t *data, size_t len, size_t *out_len) {
-    if (len > (SIZE_MAX - 1) / 2) return NULL;
-
-    uint8_t *out = (uint8_t *)malloc(len * 2 + 1);
-    if (!out) return NULL;
-
-    static const char hex[] = "0123456789ABCDEF";
-    size_t pos = 0;
-    for (size_t i = 0; i < len; i++) {
-        out[pos++] = (uint8_t)hex[data[i] >> 4];
-        out[pos++] = (uint8_t)hex[data[i] & 0x0F];
-    }
-    out[pos++] = '>';
-
-    *out_len = pos;
-    return out;
-}
-
-static uint8_t *ascii85_encode(const uint8_t *data, size_t len, size_t *out_len) {
-    if (len > ((SIZE_MAX - 2) / 5) * 4) return NULL;
-
-    size_t cap = ((len + 3) / 4) * 5 + 2;
-    uint8_t *out = (uint8_t *)malloc(cap);
-    if (!out) return NULL;
-
-    size_t pos = 0;
-    size_t i = 0;
-    while (i + 4 <= len) {
-        uint32_t value = ((uint32_t)data[i] << 24) |
-                         ((uint32_t)data[i + 1] << 16) |
-                         ((uint32_t)data[i + 2] << 8) |
-                         (uint32_t)data[i + 3];
-        i += 4;
-
-        char digits[5];
-        for (int d = 4; d >= 0; d--) {
-            digits[d] = (char)((value % 85) + '!');
-            value /= 85;
-        }
-        for (int d = 0; d < 5; d++) {
-            out[pos++] = (uint8_t)digits[d];
-        }
-    }
-
-    size_t remaining = len - i;
-    if (remaining > 0) {
-        uint32_t value = 0;
-        for (size_t j = 0; j < remaining; j++) {
-            value |= (uint32_t)data[i + j] << (24 - j * 8);
-        }
-
-        char digits[5];
-        for (int d = 4; d >= 0; d--) {
-            digits[d] = (char)((value % 85) + '!');
-            value /= 85;
-        }
-        for (size_t d = 0; d < remaining + 1; d++) {
-            out[pos++] = (uint8_t)digits[d];
-        }
-    }
-
-    out[pos++] = '~';
-    out[pos++] = '>';
-
-    *out_len = pos;
-    return out;
-}
-
-static uint8_t *run_length_encode(const uint8_t *data, size_t len, size_t *out_len) {
-    if (len > SIZE_MAX - (len / 128) - 2) return NULL;
-
-    size_t cap = len + (len / 128) + 2;
-    uint8_t *out = (uint8_t *)malloc(cap);
-    if (!out) return NULL;
-
-    size_t pos = 0;
-    size_t i = 0;
-    while (i < len) {
-        size_t chunk = len - i;
-        if (chunk > 128) chunk = 128;
-        out[pos++] = (uint8_t)(chunk - 1);
-        memcpy(out + pos, data + i, chunk);
-        pos += chunk;
-        i += chunk;
-    }
-    out[pos++] = 128;
-
-    *out_len = pos;
-    return out;
 }
 
 static bool lzw_test_ensure_capacity(uint8_t **buf, size_t *cap, size_t needed) {
@@ -897,119 +779,6 @@ fail:
     free(encoded);
     free(pdf);
     return NULL;
-}
-
-static char *make_object_stream_pdf_with_options(size_t *out_len,
-                                                 const char *first_override,
-                                                 const char *n_override,
-                                                 const char *third_offset_override,
-                                                 const char *first_objnum_override,
-                                                 bool ascii_hex_filter,
-                                                 bool ascii85_filter,
-                                                 bool run_length_filter) {
-    char obj_stream[1024];
-    size_t obj_pos = 0;
-    uint8_t *comp = NULL;
-    uint8_t *encoded = NULL;
-
-    const char *obj1 = "<< /Type /Catalog /Pages 2 0 R >>";
-    const char *obj2 = "<< /Type /Pages /Kids [3 0 R] /Count 1 >>";
-    const char *obj3 = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 400] >>";
-    char third_offset_buf[32];
-    if (!third_offset_override) {
-        snprintf(third_offset_buf, sizeof(third_offset_buf), "%zu", strlen(obj1) + strlen(obj2));
-    }
-    const char *third_offset = third_offset_override ? third_offset_override : third_offset_buf;
-    const char *first_obj_num = first_objnum_override ? first_objnum_override : "1";
-
-    if (!appendf(obj_stream, sizeof(obj_stream), &obj_pos, "%s 0 2 %zu 3 %s ",
-                 first_obj_num, strlen(obj1), third_offset)) {
-        return NULL;
-    }
-
-    size_t first = obj_pos;
-    if (!appendf(obj_stream, sizeof(obj_stream), &obj_pos, "%s%s%s", obj1, obj2, obj3)) {
-        return NULL;
-    }
-
-    char *pdf = (char *)malloc(4096);
-    if (!pdf) return NULL;
-
-    size_t pos = 0;
-    if (!appendf(pdf, 4096, &pos, "%%PDF-1.5\n")) goto fail;
-
-    size_t obj4 = pos;
-    char first_buf[32];
-    if (!first_override) {
-        snprintf(first_buf, sizeof(first_buf), "%zu", first);
-    }
-    const char *first_value = first_override ? first_override : first_buf;
-
-    const char *n_value = n_override ? n_override : "3";
-    uint8_t *stream_payload = (uint8_t *)obj_stream;
-    size_t stream_payload_len = obj_pos;
-    if (ascii_hex_filter || ascii85_filter || run_length_filter) {
-        size_t comp_len = 0;
-        comp = deflate_compress((const uint8_t *)obj_stream, obj_pos, &comp_len);
-        if (!comp) goto fail;
-        encoded = run_length_filter ? run_length_encode(comp, comp_len, &stream_payload_len) :
-                  ascii85_filter ? ascii85_encode(comp, comp_len, &stream_payload_len) :
-                  ascii_hex_encode(comp, comp_len, &stream_payload_len);
-        if (!encoded) goto fail;
-        stream_payload = encoded;
-    }
-
-    if (!appendf(pdf, 4096, &pos,
-                 "4 0 obj\n"
-                 "<< /Type /ObjStm /N %s /First %s /Length %zu%s >>\n"
-                 "stream\n",
-                 n_value, first_value, stream_payload_len,
-                 ascii_hex_filter ? " /Filter [/ASCIIHexDecode /FlateDecode]" :
-                 ascii85_filter ? " /Filter [/ASCII85Decode /FlateDecode]" :
-                 run_length_filter ? " /Filter [/RunLengthDecode /FlateDecode]" : "")) goto fail;
-    if (pos + stream_payload_len + 128 > 4096) goto fail;
-    memcpy(pdf + pos, stream_payload, stream_payload_len);
-    pos += stream_payload_len;
-    if (!appendf(pdf, 4096, &pos, "\nendstream\nendobj\n")) goto fail;
-    free(encoded);
-    free(comp);
-    encoded = NULL;
-    comp = NULL;
-
-    size_t xref_obj = pos;
-    uint8_t entries[6][4];
-    xref_entry4(entries[0], 0, 0, 255);
-    xref_objstm_entry4(entries[1], 4, 0);
-    xref_objstm_entry4(entries[2], 4, 1);
-    xref_objstm_entry4(entries[3], 4, 2);
-    xref_entry4(entries[4], 1, obj4, 0);
-    xref_entry4(entries[5], 1, xref_obj, 0);
-
-    if (!appendf(pdf, 4096, &pos,
-                 "5 0 obj\n"
-                 "<< /Type /XRef /Length %zu /W [1 2 1] /Index [0 6] /Size 6 /Root 1 0 R >>\n"
-                 "stream\n",
-                 sizeof(entries))) goto fail;
-    if (pos + sizeof(entries) + 128 > 4096) goto fail;
-    memcpy(pdf + pos, entries, sizeof(entries));
-    pos += sizeof(entries);
-    if (!appendf(pdf, 4096, &pos,
-                 "\nendstream\nendobj\n"
-                 "startxref\n%zu\n%%%%EOF",
-                 xref_obj)) goto fail;
-
-    *out_len = pos;
-    return pdf;
-
-fail:
-    free(encoded);
-    free(comp);
-    free(pdf);
-    return NULL;
-}
-
-static char *make_object_stream_pdf(size_t *out_len) {
-    return make_object_stream_pdf_with_options(out_len, NULL, NULL, NULL, NULL, false, false, false);
 }
 
 static char *make_object_stream_zero_first_header_spill_pdf(size_t *out_len) {
@@ -1620,45 +1389,6 @@ static char *make_indirect_page_box_numbers_pdf(size_t *out_len) {
                  "trailer\n<< /Size 6 /Root 1 0 R >>\n"
                  "startxref\n%zu\n%%%%EOF",
                  obj1, obj2, obj3, obj4, obj5, xref)) goto fail;
-
-    *out_len = pos;
-    return pdf;
-
-fail:
-    free(pdf);
-    return NULL;
-}
-
-static char *make_missing_page_tree_type_pdf(size_t *out_len) {
-    char *pdf = (char *)malloc(2048);
-    if (!pdf) return NULL;
-
-    size_t pos = 0;
-    if (!appendf(pdf, 2048, &pos, "%%PDF-1.4\n")) goto fail;
-
-    size_t obj1 = pos;
-    if (!appendf(pdf, 2048, &pos,
-                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")) goto fail;
-
-    size_t obj2 = pos;
-    if (!appendf(pdf, 2048, &pos,
-                 "2 0 obj\n<< /Kids [3 0 R] /Count 1 /MediaBox [0 0 320 420] >>\nendobj\n")) goto fail;
-
-    size_t obj3 = pos;
-    if (!appendf(pdf, 2048, &pos,
-                 "3 0 obj\n<< /Parent 2 0 R >>\nendobj\n")) goto fail;
-
-    size_t xref = pos;
-    if (!appendf(pdf, 2048, &pos,
-                 "xref\n"
-                 "0 4\n"
-                 "0000000000 65535 f \n"
-                 "%010zu 00000 n \n"
-                 "%010zu 00000 n \n"
-                 "%010zu 00000 n \n"
-                 "trailer\n<< /Size 4 /Root 1 0 R >>\n"
-                 "startxref\n%zu\n%%%%EOF",
-                 obj1, obj2, obj3, xref)) goto fail;
 
     *out_len = pos;
     return pdf;

@@ -22,48 +22,7 @@
 #include "../../include/tspdf/version.h"
 
 #include "../../src/reader/tspr_text.h"
-
-static bool bytes_contains(const uint8_t *haystack, size_t haystack_len, const char *needle) {
-    if (!haystack || !needle) {
-        return false;
-    }
-
-    size_t needle_len = strlen(needle);
-    if (needle_len == 0 || needle_len > haystack_len) {
-        return false;
-    }
-
-    for (size_t i = 0; i <= haystack_len - needle_len; i++) {
-        if (memcmp(haystack + i, needle, needle_len) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static TspdfObj *test_resolve_ref(TspdfReader *doc, TspdfObj *obj) {
-    if (!doc || !obj || obj->type != TSPDF_OBJ_REF) {
-        return obj;
-    }
-
-    TspdfParser parser;
-    tspdf_parser_init(&parser, doc->data, doc->data_len, &doc->arena);
-    return tspdf_xref_resolve(&doc->xref, &parser, obj->ref.num, doc->obj_cache, doc->crypt);
-}
-
-static bool appendf(char *buf, size_t cap, size_t *pos, const char *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    int written = vsnprintf(buf + *pos, cap - *pos, fmt, args);
-    va_end(args);
-
-    if (written < 0 || (size_t)written >= cap - *pos) {
-        return false;
-    }
-
-    *pos += (size_t)written;
-    return true;
-}
+#include "helpers.h"
 
 static char *make_unbalanced_content_pdf(size_t *out_len) {
     char *pdf = (char *)malloc(2048);

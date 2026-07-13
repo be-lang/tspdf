@@ -20,20 +20,7 @@
 #include "../../src/font/font_fallback.h"
 #include "../../src/crypto/md5.h"
 #include "../../include/tspdf/version.h"
-
-static bool appendf(char *buf, size_t cap, size_t *pos, const char *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    int written = vsnprintf(buf + *pos, cap - *pos, fmt, args);
-    va_end(args);
-
-    if (written < 0 || (size_t)written >= cap - *pos) {
-        return false;
-    }
-
-    *pos += (size_t)written;
-    return true;
-}
+#include "helpers.h"
 
 static char *lossy_make_ctm_pdf(size_t *out_len) {
     const size_t cap = 4096;
