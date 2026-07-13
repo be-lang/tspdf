@@ -1,40 +1,16 @@
 #include "commands.h"
+#include "pipeline.h"
 #include "../include/tspdf.h"
-#include "password_input.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 
-// First 0-based page index in `pages` that is out of range for `total`.
-int cmd_reorder(int argc, char **argv) {
-    if (argc == 0 || has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
-        printf("Usage: tspdf reorder <input.pdf> --order 3,1,2 -o <output.pdf>\n");
-        printf("\nReorder pages in a PDF. Order must list all pages exactly once.\n");
-        printf("Encrypted files: pass --password <pass> or --password-file <file>;\n");
-        printf("the output keeps the original encryption.\n");
-        return argc == 0 ? 1 : 0;
-    }
+static int run(TspdfCmdCtx *ctx) {
+    TspdfReader *doc = ctx->doc;
+    TspdfError err = TSPDF_OK;
 
-    const char *positional[2];
-    int npos = collect_positional(argc, argv, positional, 2);
-    if (npos < 1) {
-        fprintf(stderr, "tspdf reorder: missing input file\n");
-        return 1;
-    }
-    if (npos > 1) {
-        fprintf(stderr, "tspdf reorder: unexpected extra argument '%s'\n", positional[1]);
-        return 1;
-    }
-    const char *input = positional[0];
-
-    const char *output = find_flag(argc, argv, "-o");
-    if (!output) {
-        fprintf(stderr, "tspdf reorder: missing -o <output.pdf>\n");
-        return 1;
-    }
-
-    const char *order_spec = find_flag(argc, argv, "--order");
+    const char *order_spec = find_flag(ctx->argc, ctx->argv, "--order");
     if (!order_spec) {
         fprintf(stderr, "tspdf reorder: missing --order <page,page,...>\n");
         return 1;
@@ -88,30 +64,9 @@ int cmd_reorder(int argc, char **argv) {
         return 1;
     }
 
-    static char pwbuf[TSPDF_PASSWORD_MAX];
-    const char *password = tspdf_resolve_password(argc, argv,
-                                                  "--password", "--password-file",
-                                                  "reorder", "Password: ",
-                                                  false, pwbuf, sizeof(pwbuf));
-
-    TspdfError err = TSPDF_OK;
-    TspdfReader *doc = password
-        ? tspdf_reader_open_file_with_password(input, password, &err)
-        : tspdf_reader_open_file(input, &err);
-    if (!doc) {
-        if (err == TSPDF_ERR_ENCRYPTED) {
-            fprintf(stderr, "tspdf reorder: '%s' is encrypted; use --password or --password-file\n", input);
-        } else {
-            fprintf(stderr, "tspdf reorder: failed to open '%s': %s\n", input, tspdf_error_string(err));
-        }
-        free(order);
-        return 1;
-    }
-
     size_t total = tspdf_reader_page_count(doc);
     if (count != total) {
         fprintf(stderr, "tspdf reorder: order has %zu entries but document has %zu pages\n", count, total);
-        tspdf_reader_destroy(doc);
         free(order);
         return 1;
     }
@@ -125,24 +80,40 @@ int cmd_reorder(int argc, char **argv) {
         } else {
             fprintf(stderr, "tspdf reorder: reorder failed: %s\n", tspdf_error_string(err));
         }
-        tspdf_reader_destroy(doc);
         free(order);
         return 1;
     }
 
-    err = tspdf_reader_save(result, output);
+    err = tspdf_reader_save(result, ctx->output);
     if (err != TSPDF_OK) {
-        fprintf(stderr, "tspdf reorder: failed to save '%s': %s\n", output, tspdf_error_string(err));
+        fprintf(stderr, "tspdf reorder: failed to save '%s': %s\n", ctx->output, tspdf_error_string(err));
         tspdf_reader_destroy(result);
-        tspdf_reader_destroy(doc);
         free(order);
         return 1;
     }
 
-    printf("Reordered %zu pages → %s\n", count, output);
+    printf("Reordered %zu pages → %s\n", count, ctx->output);
 
     tspdf_reader_destroy(result);
-    tspdf_reader_destroy(doc);
     free(order);
     return 0;
 }
+
+static const TspdfCliFlag FLAGS[] = {
+    {"-o", true}, {"--order", true},
+    {"--password", true}, {"--password-file", true},
+    {NULL, false}
+};
+
+const TspdfCmdSpec tspdf_cmd_reorder_spec = {
+    .name = "reorder",
+    .usage =
+        "Usage: tspdf reorder <input.pdf> --order 3,1,2 -o <output.pdf>\n"
+        "\nReorder pages in a PDF. Order must list all pages exactly once.\n"
+        "Encrypted files: pass --password <pass> or --password-file <file>;\n"
+        "the output keeps the original encryption.\n",
+    .flags = FLAGS,
+    .min_pos = 1, .max_pos = 1,
+    .needs = TSPDF_CMD_OPENS_INPUT | TSPDF_CMD_NEEDS_OUTPUT | TSPDF_CMD_TAKES_PASSWORD,
+    .run = run,
+};
