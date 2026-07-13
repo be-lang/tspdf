@@ -24,6 +24,7 @@ LIB_SOURCES = \
 	$(SRCDIR)/image/ccitt_codec.c \
 	$(SRCDIR)/image/png_decoder.c \
 	$(SRCDIR)/compress/deflate.c \
+	$(SRCDIR)/filters/filters.c \
 	$(SRCDIR)/qr/qr_encode.c \
 	$(SRCDIR)/tspdf_error.c
 
@@ -74,6 +75,7 @@ PUBLIC_HEADERS = \
 # Implementation-only headers (deps satisfied by tspdf.h), dependency order.
 INTERNAL_HEADERS = \
 	src/compress/deflate.h \
+	src/filters/filters.h \
 	src/crypto/md5.h \
 	src/crypto/sha256.h \
 	src/crypto/sha512.h \
