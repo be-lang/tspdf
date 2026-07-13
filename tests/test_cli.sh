@@ -470,6 +470,78 @@ else
   echo "  SKIP  encrypted-Info pdfinfo assertion (pdfinfo not found)"
 fi
 
+# metadata --set/--clear also rewrites the XMP packet (catalog /Metadata) for
+# the edited fields, since Acrobat-class viewers prefer XMP over /Info. The
+# stale-XMP notice remains only for fields the packet does not carry.
+XMP_FULL=tests/data/xmp_meta_full.pdf
+XMP_TITLE_ONLY=tests/data/xmp_meta.pdf
+XMP_FLATE=tests/data/xmp_meta_flate.pdf
+run_test "metadata --set syncs the XMP packet (no notice)" bash -c "
+  set -e
+  $TSPDF metadata $XMP_FULL --set title='Neü XMP Title' --set author='XMP Author' -o $TMPDIR/xmp_sync.pdf 2> $TMPDIR/xmp_sync.err > /dev/null
+  ! grep -q 'note:' $TMPDIR/xmp_sync.err
+  grep -aq '<rdf:li xml:lang=\"x-default\">Neü XMP Title</rdf:li>' $TMPDIR/xmp_sync.pdf
+  grep -aq '<rdf:li>XMP Author</rdf:li>' $TMPDIR/xmp_sync.pdf
+  ! grep -aq 'Old XMP title' $TMPDIR/xmp_sync.pdf
+  ! grep -aq 'Old XMP author' $TMPDIR/xmp_sync.pdf"
+run_test "XMP notice fires only for fields the packet lacks" bash -c "
+  set -e
+  $TSPDF metadata $XMP_TITLE_ONLY --set title='New T' --set keywords='k9' -o $TMPDIR/xmp_part.pdf 2> $TMPDIR/xmp_part.err > /dev/null
+  grep -q 'keywords' $TMPDIR/xmp_part.err
+  ! grep -q 'title' $TMPDIR/xmp_part.err
+  grep -aq '<rdf:li xml:lang=\"x-default\">New T</rdf:li>' $TMPDIR/xmp_part.pdf"
+run_test "XMP sync on a Flate-compressed packet" bash -c "
+  set -e
+  $TSPDF metadata $XMP_FLATE --set title='Flate XMP Title' -o $TMPDIR/xmp_flate.pdf 2> $TMPDIR/xmp_flate.err > /dev/null
+  ! grep -q 'note:' $TMPDIR/xmp_flate.err
+  grep -aq 'Flate XMP Title</rdf:li>' $TMPDIR/xmp_flate.pdf"
+if command -v uv > /dev/null 2>&1; then
+  cat > $TMPDIR/xmp_oracle.py <<'PYEOF'
+import sys
+import xml.etree.ElementTree as ET
+
+import pikepdf
+
+pdf = pikepdf.open(sys.argv[1])
+raw = bytes(pdf.Root.Metadata.read_bytes())
+ET.fromstring(raw)  # the packet must still parse as XML
+with pdf.open_metadata(update_docinfo=False) as meta:
+    assert meta["dc:title"] == "Neü XMP Title", meta["dc:title"]
+    assert list(meta["dc:creator"]) == ["XMP Author"], list(meta["dc:creator"])
+print("xmp-oracle-ok")
+PYEOF
+  run_test "XMP sync verified via pikepdf (dc:title, dc:creator, XML parses)" bash -c "
+    uv run --python 3.12 --with pikepdf python $TMPDIR/xmp_oracle.py $TMPDIR/xmp_sync.pdf | grep -q xmp-oracle-ok"
+else
+  echo "  SKIP  XMP pikepdf oracle (uv not found)"
+fi
+if command -v pdfinfo > /dev/null 2>&1; then
+  run_test "pdfinfo shows the synced title" bash -c "
+    pdfinfo $TMPDIR/xmp_sync.pdf | grep -q 'Neü XMP Title'"
+else
+  echo "  SKIP  XMP pdfinfo assertion (pdfinfo not found)"
+fi
+if command -v qpdf > /dev/null 2>&1; then
+  run_test "XMP sync when the input uses object streams" bash -c "
+    set -e
+    qpdf --object-streams=generate $XMP_FULL $TMPDIR/xmp_objstm_in.pdf
+    $TSPDF metadata $TMPDIR/xmp_objstm_in.pdf --set title='ObjStm XMP Title' -o $TMPDIR/xmp_objstm.pdf > /dev/null 2> $TMPDIR/xmp_objstm.err
+    ! grep -q 'note:' $TMPDIR/xmp_objstm.err
+    grep -aq 'ObjStm XMP Title</rdf:li>' $TMPDIR/xmp_objstm.pdf
+    qpdf --check $TMPDIR/xmp_objstm.pdf > /dev/null"
+  run_test "XMP sync inside an encrypted file (stream stays encrypted)" bash -c "
+    set -e
+    $TSPDF encrypt $XMP_FULL -o $TMPDIR/xmp_enc_in.pdf --password xmppw > /dev/null
+    $TSPDF metadata $TMPDIR/xmp_enc_in.pdf --password xmppw --set title='Enc XMP Title' -o $TMPDIR/xmp_enc.pdf > /dev/null 2> $TMPDIR/xmp_enc.err
+    ! grep -q 'note:' $TMPDIR/xmp_enc.err
+    ! grep -aq 'Enc XMP Title' $TMPDIR/xmp_enc.pdf
+    qpdf --password=xmppw --check $TMPDIR/xmp_enc.pdf > /dev/null
+    qpdf --password=xmppw --decrypt $TMPDIR/xmp_enc.pdf $TMPDIR/xmp_dec.pdf
+    grep -aq 'Enc XMP Title</rdf:li>' $TMPDIR/xmp_dec.pdf"
+else
+  echo "  SKIP  XMP objstm/encrypted sync assertions (qpdf not found)"
+fi
+
 # Object-stream re-packing: rewriting a file that used object streams must
 # re-pack them (not explode every member into a classic top-level object,
 # which roughly doubles such files); classic inputs stay classic.
@@ -3142,13 +3214,18 @@ fi
 # --- fit & finish: rich outline preservation, XMP notice, attachment
 # metadata, split --no-attachments, stamp password files ---
 
-# metadata: a one-line stderr notice when an XMP stream is present (the Info
-# edit leaves it stale), and silence when there is none.
+# metadata: a one-line stderr notice when the XMP packet lacks an edited
+# field (that field stays stale there), and silence when everything synced
+# or there is no XMP at all.
 if [ -f tests/data/xmp_meta.pdf ]; then
-  run_test "metadata --set warns about stale XMP metadata" bash -c '
+  run_test "metadata --set warns when XMP lacks the edited field" bash -c '
     set -e
-    "'"$TSPDF"'" metadata tests/data/xmp_meta.pdf --set title=NewTitle -o "'"$TMPDIR"'/xmp_out.pdf" 2> "'"$TMPDIR"'/xmp_err.txt"
-    grep -q "XMP metadata present and not updated" "'"$TMPDIR"'/xmp_err.txt"'
+    "'"$TSPDF"'" metadata tests/data/xmp_meta.pdf --set author=NewAuthor -o "'"$TMPDIR"'/xmp_out.pdf" 2> "'"$TMPDIR"'/xmp_err.txt"
+    grep -q "XMP metadata present but not updated for author" "'"$TMPDIR"'/xmp_err.txt"'
+  run_test "metadata --set stays quiet when the field synced into XMP" bash -c '
+    set -e
+    "'"$TSPDF"'" metadata tests/data/xmp_meta.pdf --set title=NewTitle -o "'"$TMPDIR"'/xmp_quiet.pdf" 2> "'"$TMPDIR"'/xmp_quiet_err.txt"
+    ! grep -q "XMP metadata" "'"$TMPDIR"'/xmp_quiet_err.txt"'
   run_test "metadata --set stays quiet without XMP metadata" bash -c '
     set -e
     "'"$TSPDF"'" metadata '"$INPUT"' --set title=NewTitle -o "'"$TMPDIR"'/noxmp_out.pdf" 2> "'"$TMPDIR"'/noxmp_err.txt"

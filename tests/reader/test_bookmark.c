@@ -726,6 +726,502 @@ TEST(test_metadata_xmp_detected) {
     free(plain);
 }
 
+// --- XMP sync (tspdf_reader_sync_xmp_metadata) ---
+
+// Assemble a full xpacket around `body` (the rdf:Description elements) with
+// `pad` spaces of xpacket padding before the trailer. Returns malloc'd bytes.
+static char *xmp_packet(const char *body, size_t pad, size_t *out_len) {
+    const char *hdr =
+        "<?xpacket begin=\"\xEF\xBB\xBF\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n"
+        "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n"
+        " <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n";
+    const char *mid = " </rdf:RDF>\n</x:xmpmeta>\n";
+    const char *end = "<?xpacket end=\"w\"?>";
+    size_t len = strlen(hdr) + strlen(body) + strlen(mid) + pad + strlen(end);
+    char *p = (char *)malloc(len + 1);
+    if (!p) return NULL;
+    size_t pos = 0;
+    memcpy(p + pos, hdr, strlen(hdr)); pos += strlen(hdr);
+    memcpy(p + pos, body, strlen(body)); pos += strlen(body);
+    memcpy(p + pos, mid, strlen(mid)); pos += strlen(mid);
+    memset(p + pos, ' ', pad); pos += pad;
+    memcpy(p + pos, end, strlen(end)); pos += strlen(end);
+    p[pos] = '\0';
+    *out_len = pos;
+    return p;
+}
+
+// A 1-page PDF whose catalog /Metadata stream holds `packet` (binary-safe),
+// optionally Flate-compressed.
+static uint8_t *xmp_make_pdf(const uint8_t *packet, size_t packet_len,
+                             bool flate, size_t *out_len) {
+    uint8_t *body = NULL;
+    size_t body_len = packet_len;
+    if (flate) {
+        body = deflate_compress(packet, packet_len, &body_len);
+        if (!body) return NULL;
+    }
+    size_t cap = 4096 + packet_len + body_len;
+    char *pdf = (char *)malloc(cap);
+    if (!pdf) { free(body); return NULL; }
+    size_t pos = 0;
+    size_t off[5] = {0};
+    if (!appendf(pdf, cap, &pos, "%%PDF-1.4\n")) goto fail;
+    off[1] = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Metadata 4 0 R >>\nendobj\n")) goto fail;
+    off[2] = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")) goto fail;
+    off[3] = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n")) goto fail;
+    off[4] = pos;
+    if (!appendf(pdf, cap, &pos,
+                 "4 0 obj\n<< /Type /Metadata /Subtype /XML%s /Length %zu >>\nstream\n",
+                 flate ? " /Filter /FlateDecode" : "",
+                 flate ? body_len : packet_len)) goto fail;
+    if (pos + (flate ? body_len : packet_len) + 64 > cap) goto fail;
+    memcpy(pdf + pos, flate ? body : packet, flate ? body_len : packet_len);
+    pos += flate ? body_len : packet_len;
+    if (!appendf(pdf, cap, &pos, "\nendstream\nendobj\n")) goto fail;
+    size_t xref = pos;
+    if (!appendf(pdf, cap, &pos, "xref\n0 5\n0000000000 65535 f \n")) goto fail;
+    for (int i = 1; i <= 4; i++) {
+        if (!appendf(pdf, cap, &pos, "%010zu 00000 n \n", off[i])) goto fail;
+    }
+    if (!appendf(pdf, cap, &pos,
+                 "trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n%zu\n%%%%EOF", xref)) goto fail;
+    free(body);
+    *out_len = pos;
+    return (uint8_t *)pdf;
+fail:
+    free(body);
+    free(pdf);
+    return NULL;
+}
+
+// Find the xpacket span (header through end of trailer) in a saved file.
+// Returns false when absent.
+static bool xmp_find_packet(const uint8_t *buf, size_t len,
+                            size_t *start, size_t *pkt_len) {
+    const char *hdr = "<?xpacket begin=";
+    const char *end = "<?xpacket end=\"w\"?>";
+    size_t hlen = strlen(hdr), elen = strlen(end);
+    size_t hpos = (size_t)-1;
+    for (size_t i = 0; i + hlen <= len; i++) {
+        if (memcmp(buf + i, hdr, hlen) == 0) { hpos = i; break; }
+    }
+    if (hpos == (size_t)-1) return false;
+    for (size_t i = len - elen + 1; i-- > hpos;) {
+        if (memcmp(buf + i, end, elen) == 0) {
+            *start = hpos;
+            *pkt_len = i + elen - hpos;
+            return true;
+        }
+    }
+    return false;
+}
+
+static const char *XMP_TITLE_BODY =
+    "  <rdf:Description rdf:about=\"\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\n"
+    "   <dc:title>\n"
+    "    <rdf:Alt>\n"
+    "     <rdf:li xml:lang=\"x-default\">Old title</rdf:li>\n"
+    "    </rdf:Alt>\n"
+    "   </dc:title>\n"
+    "  </rdf:Description>\n";
+
+// dc:title (rdf:Alt x-default li) replacement: value swapped with XML
+// escaping, the xpacket padding absorbs the length change (packet span byte
+// count is unchanged), and the Info dict gets the same value.
+TEST(test_xmp_sync_updates_dc_title) {
+    size_t pkt_len = 0;
+    char *pkt = xmp_packet(XMP_TITLE_BODY, 200, &pkt_len);
+    ASSERT(pkt != NULL);
+    size_t len = 0;
+    uint8_t *pdf = xmp_make_pdf((const uint8_t *)pkt, pkt_len, false, &len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open(pdf, len, &err);
+    ASSERT(doc != NULL);
+    tspdf_reader_set_title(doc, "Ne\xC3\xBC & <Title>");
+    ASSERT_EQ_INT((int)tspdf_reader_sync_xmp_metadata(doc), 0);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    ASSERT_EQ_INT(tspdf_reader_save_to_memory(doc, &out, &out_len), TSPDF_OK);
+    ASSERT(bytes_contains(out, out_len,
+        "<rdf:li xml:lang=\"x-default\">Ne\xC3\xBC &amp; &lt;Title&gt;</rdf:li>"));
+    ASSERT(!bytes_contains(out, out_len, "Old title"));
+
+    // Padding contract: the packet keeps its trailer and its total size.
+    size_t pstart = 0, plen = 0;
+    ASSERT(xmp_find_packet(out, out_len, &pstart, &plen));
+    ASSERT_EQ_SIZE(plen, pkt_len);
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    ASSERT_EQ_STR(tspdf_reader_get_title(re), "Ne\xC3\xBC & <Title>");
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+    free(pkt);
+}
+
+// The other property shapes: dc:creator (rdf:Seq li), dc:description
+// (rdf:Alt), a simple text element under a non-conventional prefix bound to
+// the pdf namespace, an attribute-form property on rdf:Description, and an
+// empty-element simple property.
+TEST(test_xmp_sync_all_property_forms) {
+    const char *body =
+        "  <rdf:Description rdf:about=\"\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\"\n"
+        "    xmlns:p=\"http://ns.adobe.com/pdf/1.3/\" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\"\n"
+        "    xmp:CreatorTool=\"Old Tool\">\n"
+        "   <dc:creator><rdf:Seq><rdf:li>Old Author</rdf:li></rdf:Seq></dc:creator>\n"
+        "   <dc:description><rdf:Alt><rdf:li xml:lang=\"x-default\">Old Desc</rdf:li></rdf:Alt></dc:description>\n"
+        "   <p:Producer>Old Producer</p:Producer>\n"
+        "   <p:Keywords/>\n"
+        "  </rdf:Description>\n";
+    size_t pkt_len = 0;
+    char *pkt = xmp_packet(body, 400, &pkt_len);
+    ASSERT(pkt != NULL);
+    size_t len = 0;
+    uint8_t *pdf = xmp_make_pdf((const uint8_t *)pkt, pkt_len, false, &len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open(pdf, len, &err);
+    ASSERT(doc != NULL);
+    tspdf_reader_set_author(doc, "Anne Author");
+    tspdf_reader_set_subject(doc, "New \"Desc\"");
+    tspdf_reader_set_producer(doc, "prod2");
+    tspdf_reader_set_creator(doc, "tool<2>");
+    tspdf_reader_set_keywords(doc, "k1, k2");
+    ASSERT_EQ_INT((int)tspdf_reader_sync_xmp_metadata(doc), 0);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    ASSERT_EQ_INT(tspdf_reader_save_to_memory(doc, &out, &out_len), TSPDF_OK);
+    ASSERT(bytes_contains(out, out_len, "<rdf:li>Anne Author</rdf:li>"));
+    ASSERT(bytes_contains(out, out_len,
+        "<rdf:li xml:lang=\"x-default\">New &quot;Desc&quot;</rdf:li>"));
+    ASSERT(bytes_contains(out, out_len, "<p:Producer>prod2</p:Producer>"));
+    ASSERT(bytes_contains(out, out_len, "xmp:CreatorTool=\"tool&lt;2&gt;\""));
+    ASSERT(bytes_contains(out, out_len, "<p:Keywords>k1, k2</p:Keywords>"));
+    ASSERT(!bytes_contains(out, out_len, "Old Author"));
+    ASSERT(!bytes_contains(out, out_len, "Old Desc"));
+    ASSERT(!bytes_contains(out, out_len, "Old Producer"));
+    ASSERT(!bytes_contains(out, out_len, "Old Tool"));
+    size_t pstart = 0, plen = 0;
+    ASSERT(xmp_find_packet(out, out_len, &pstart, &plen));
+    ASSERT_EQ_SIZE(plen, pkt_len);
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+    free(pkt);
+}
+
+// Fields whose property is missing from the packet (or whose value cannot be
+// XML text, e.g. control characters) are reported back so the CLI can keep
+// the stale-XMP notice for exactly those; the present fields still sync.
+TEST(test_xmp_sync_reports_unsyncable_fields) {
+    size_t pkt_len = 0;
+    char *pkt = xmp_packet(XMP_TITLE_BODY, 200, &pkt_len);
+    ASSERT(pkt != NULL);
+    size_t len = 0;
+    uint8_t *pdf = xmp_make_pdf((const uint8_t *)pkt, pkt_len, false, &len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open(pdf, len, &err);
+    ASSERT(doc != NULL);
+    tspdf_reader_set_title(doc, "Synced Title");
+    tspdf_reader_set_keywords(doc, "kw");          // no pdf:Keywords in packet
+    tspdf_reader_set_author(doc, "bad\x07value");  // control char: not XML text
+    unsigned stale = tspdf_reader_sync_xmp_metadata(doc);
+    ASSERT_EQ_INT((int)stale, (int)(TSPDF_XMP_KEYWORDS | TSPDF_XMP_AUTHOR));
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    ASSERT_EQ_INT(tspdf_reader_save_to_memory(doc, &out, &out_len), TSPDF_OK);
+    ASSERT(bytes_contains(out, out_len,
+        "<rdf:li xml:lang=\"x-default\">Synced Title</rdf:li>"));
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+    free(pkt);
+}
+
+// A Flate-compressed packet is decoded, edited, and written back
+// uncompressed (metadata streams stay scannable); the /Filter is dropped.
+TEST(test_xmp_sync_flate_packet) {
+    size_t pkt_len = 0;
+    char *pkt = xmp_packet(XMP_TITLE_BODY, 200, &pkt_len);
+    ASSERT(pkt != NULL);
+    size_t len = 0;
+    uint8_t *pdf = xmp_make_pdf((const uint8_t *)pkt, pkt_len, true, &len);
+    ASSERT(pdf != NULL);
+    ASSERT(bytes_contains(pdf, len, "FlateDecode"));
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open(pdf, len, &err);
+    ASSERT(doc != NULL);
+    tspdf_reader_set_title(doc, "Flate Title");
+    ASSERT_EQ_INT((int)tspdf_reader_sync_xmp_metadata(doc), 0);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    ASSERT_EQ_INT(tspdf_reader_save_to_memory(doc, &out, &out_len), TSPDF_OK);
+    ASSERT(bytes_contains(out, out_len,
+        "<rdf:li xml:lang=\"x-default\">Flate Title</rdf:li>"));
+    // This minimal file has no other stream, so no Flate may remain.
+    ASSERT(!bytes_contains(out, out_len, "FlateDecode"));
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+    free(pkt);
+}
+
+// When the new value exceeds the available padding the stream grows (the
+// file is rewritten anyway) but the trailer must survive at the packet end.
+TEST(test_xmp_sync_padding_grows_when_needed) {
+    size_t pkt_len = 0;
+    char *pkt = xmp_packet(XMP_TITLE_BODY, 1, &pkt_len);
+    ASSERT(pkt != NULL);
+    size_t len = 0;
+    uint8_t *pdf = xmp_make_pdf((const uint8_t *)pkt, pkt_len, false, &len);
+    ASSERT(pdf != NULL);
+
+    char big[300];
+    memset(big, 'A', sizeof(big) - 1);
+    big[sizeof(big) - 1] = '\0';
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open(pdf, len, &err);
+    ASSERT(doc != NULL);
+    tspdf_reader_set_title(doc, big);
+    ASSERT_EQ_INT((int)tspdf_reader_sync_xmp_metadata(doc), 0);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    ASSERT_EQ_INT(tspdf_reader_save_to_memory(doc, &out, &out_len), TSPDF_OK);
+    ASSERT(bytes_contains(out, out_len, big));
+    size_t pstart = 0, plen = 0;
+    ASSERT(xmp_find_packet(out, out_len, &pstart, &plen));
+    ASSERT(plen > pkt_len);
+    // The value sits inside the packet, before the trailer.
+    ASSERT(bytes_contains(out + pstart, plen, big));
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+    free(pkt);
+}
+
+// Clearing a field empties the XMP value the same way.
+TEST(test_xmp_sync_clear_empties_value) {
+    size_t pkt_len = 0;
+    char *pkt = xmp_packet(XMP_TITLE_BODY, 200, &pkt_len);
+    ASSERT(pkt != NULL);
+    size_t len = 0;
+    uint8_t *pdf = xmp_make_pdf((const uint8_t *)pkt, pkt_len, false, &len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open(pdf, len, &err);
+    ASSERT(doc != NULL);
+    tspdf_reader_set_title(doc, NULL);
+    ASSERT_EQ_INT((int)tspdf_reader_sync_xmp_metadata(doc), 0);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    ASSERT_EQ_INT(tspdf_reader_save_to_memory(doc, &out, &out_len), TSPDF_OK);
+    ASSERT(bytes_contains(out, out_len,
+        "<rdf:li xml:lang=\"x-default\"></rdf:li>"));
+    ASSERT(!bytes_contains(out, out_len, "Old title"));
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+    free(pkt);
+}
+
+// A sync that edits the packet also refreshes xmp:ModifyDate, with the same
+// timestamp the save then writes into Info /ModDate (ISO 8601 vs D: form).
+TEST(test_xmp_sync_updates_modify_date) {
+    const char *body =
+        "  <rdf:Description rdf:about=\"\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\"\n"
+        "    xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\">\n"
+        "   <dc:title><rdf:Alt><rdf:li xml:lang=\"x-default\">Old title</rdf:li></rdf:Alt></dc:title>\n"
+        "   <xmp:ModifyDate>2001-01-01T00:00:00Z</xmp:ModifyDate>\n"
+        "  </rdf:Description>\n";
+    size_t pkt_len = 0;
+    char *pkt = xmp_packet(body, 200, &pkt_len);
+    ASSERT(pkt != NULL);
+    size_t len = 0;
+    uint8_t *pdf = xmp_make_pdf((const uint8_t *)pkt, pkt_len, false, &len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open(pdf, len, &err);
+    ASSERT(doc != NULL);
+    tspdf_reader_set_title(doc, "Dated Title");
+    ASSERT_EQ_INT((int)tspdf_reader_sync_xmp_metadata(doc), 0);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    ASSERT_EQ_INT(tspdf_reader_save_to_memory(doc, &out, &out_len), TSPDF_OK);
+    ASSERT(!bytes_contains(out, out_len, "2001-01-01T00:00:00Z"));
+
+    // Read the fresh Info ModDate back and expect its ISO-8601 twin in XMP.
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    const char *mod = tspdf_reader_get_mod_date(re);
+    ASSERT(mod != NULL && strncmp(mod, "D:", 2) == 0 && strlen(mod) >= 16);
+    char iso[64];
+    snprintf(iso, sizeof(iso),
+             "<xmp:ModifyDate>%.4s-%.2s-%.2sT%.2s:%.2s:%.2sZ</xmp:ModifyDate>",
+             mod + 2, mod + 6, mod + 8, mod + 10, mod + 12, mod + 14);
+    ASSERT(bytes_contains(out, out_len, iso));
+    tspdf_reader_destroy(re);
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+    free(pkt);
+}
+
+// A dc:creator Seq with several authors cannot be mapped onto the single
+// Info string: the field is reported stale and the packet stays untouched.
+TEST(test_xmp_sync_multi_li_bails) {
+    const char *body =
+        "  <rdf:Description rdf:about=\"\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\n"
+        "   <dc:creator><rdf:Seq><rdf:li>First Author</rdf:li><rdf:li>Second Author</rdf:li></rdf:Seq></dc:creator>\n"
+        "  </rdf:Description>\n";
+    size_t pkt_len = 0;
+    char *pkt = xmp_packet(body, 100, &pkt_len);
+    ASSERT(pkt != NULL);
+    size_t len = 0;
+    uint8_t *pdf = xmp_make_pdf((const uint8_t *)pkt, pkt_len, false, &len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open(pdf, len, &err);
+    ASSERT(doc != NULL);
+    tspdf_reader_set_author(doc, "Solo Author");
+    ASSERT_EQ_INT((int)tspdf_reader_sync_xmp_metadata(doc),
+                  (int)TSPDF_XMP_AUTHOR);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    ASSERT_EQ_INT(tspdf_reader_save_to_memory(doc, &out, &out_len), TSPDF_OK);
+    // Packet untouched, byte for byte.
+    size_t pstart = 0, plen = 0;
+    ASSERT(xmp_find_packet(out, out_len, &pstart, &plen));
+    ASSERT_EQ_SIZE(plen, pkt_len);
+    ASSERT(memcmp(out + pstart, pkt, pkt_len) == 0);
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+    free(pkt);
+}
+
+// Packets we cannot edit safely (UTF-16) are left alone; every requested
+// field is reported stale.
+TEST(test_xmp_sync_utf16_packet_bails) {
+    const char ascii[] =
+        "<?xpacket begin=\"\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>"
+        "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"></x:xmpmeta>"
+        "<?xpacket end=\"w\"?>";
+    // Expand to UTF-16BE.
+    size_t alen = sizeof(ascii) - 1;
+    uint8_t *wide = (uint8_t *)malloc(alen * 2 + 2);
+    ASSERT(wide != NULL);
+    wide[0] = 0xFE; wide[1] = 0xFF;
+    for (size_t i = 0; i < alen; i++) {
+        wide[2 + 2 * i] = 0;
+        wide[3 + 2 * i] = (uint8_t)ascii[i];
+    }
+    size_t len = 0;
+    uint8_t *pdf = xmp_make_pdf(wide, alen * 2 + 2, false, &len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open(pdf, len, &err);
+    ASSERT(doc != NULL);
+    tspdf_reader_set_title(doc, "T");
+    tspdf_reader_set_author(doc, "A");
+    ASSERT_EQ_INT((int)tspdf_reader_sync_xmp_metadata(doc),
+                  (int)(TSPDF_XMP_TITLE | TSPDF_XMP_AUTHOR));
+    tspdf_reader_destroy(doc);
+    free(pdf);
+    free(wide);
+}
+
+// Without an XMP stream there is nothing stale: sync reports zero.
+TEST(test_xmp_sync_without_packet_is_zero) {
+    size_t len = 0;
+    char *plain = bm_make_three_page_pdf(&len);
+    ASSERT(plain != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)plain, len, &err);
+    ASSERT(doc != NULL);
+    tspdf_reader_set_title(doc, "T");
+    ASSERT_EQ_INT((int)tspdf_reader_sync_xmp_metadata(doc), 0);
+    tspdf_reader_destroy(doc);
+    free(plain);
+}
+
+// Encrypted documents: the packet is decrypted before editing, and the save
+// re-encrypts it (the plaintext value must not appear in the output bytes).
+TEST(test_xmp_sync_encrypted_roundtrip) {
+    size_t pkt_len = 0;
+    char *pkt = xmp_packet(XMP_TITLE_BODY, 200, &pkt_len);
+    ASSERT(pkt != NULL);
+    size_t len = 0;
+    uint8_t *pdf = xmp_make_pdf((const uint8_t *)pkt, pkt_len, false, &len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open(pdf, len, &err);
+    ASSERT(doc != NULL);
+    uint8_t *enc = NULL;
+    size_t enc_len = 0;
+    ASSERT_EQ_INT(tspdf_reader_save_to_memory_encrypted(doc, &enc, &enc_len,
+                                                        "pw", "pw", 0xFFFFFFFC, 128),
+                  TSPDF_OK);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+    free(pkt);
+
+    doc = tspdf_reader_open_with_password(enc, enc_len, "pw", &err);
+    ASSERT(doc != NULL);
+    tspdf_reader_set_title(doc, "EncTitleXYZQ");
+    ASSERT_EQ_INT((int)tspdf_reader_sync_xmp_metadata(doc), 0);
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    ASSERT_EQ_INT(tspdf_reader_save_to_memory(doc, &out, &out_len), TSPDF_OK);
+    ASSERT(!bytes_contains(out, out_len, "EncTitleXYZQ"));  // stays encrypted
+    tspdf_reader_destroy(doc);
+    free(enc);
+
+    // Decrypt-save the result: the synced value must be in the packet.
+    doc = tspdf_reader_open_with_password(out, out_len, "pw", &err);
+    ASSERT(doc != NULL);
+    TspdfSaveOptions opts = {0};
+    opts.decrypt = true;
+    opts.update_producer = true;
+    uint8_t *dec = NULL;
+    size_t dec_len = 0;
+    ASSERT_EQ_INT(tspdf_reader_save_to_memory_with_options(doc, &dec, &dec_len, &opts),
+                  TSPDF_OK);
+    ASSERT(bytes_contains(dec, dec_len,
+        "<rdf:li xml:lang=\"x-default\">EncTitleXYZQ</rdf:li>"));
+    free(dec);
+    tspdf_reader_destroy(doc);
+    free(out);
+}
+
 TEST(test_merge_copies_indirect_outline_strings) {
     TspdfError err;
     TspdfReader *doc_a = tspdf_reader_open_file("tests/data/indirect_title.pdf", &err);
@@ -909,6 +1405,17 @@ void run_bookmark_tests(void) {
     RUN(test_bookmark_add_preserves_indirect_titles);
     RUN(test_bookmark_add_preserves_rich_dests);
     RUN(test_metadata_xmp_detected);
+    RUN(test_xmp_sync_updates_dc_title);
+    RUN(test_xmp_sync_all_property_forms);
+    RUN(test_xmp_sync_reports_unsyncable_fields);
+    RUN(test_xmp_sync_flate_packet);
+    RUN(test_xmp_sync_padding_grows_when_needed);
+    RUN(test_xmp_sync_clear_empties_value);
+    RUN(test_xmp_sync_updates_modify_date);
+    RUN(test_xmp_sync_multi_li_bails);
+    RUN(test_xmp_sync_utf16_packet_bails);
+    RUN(test_xmp_sync_without_packet_is_zero);
+    RUN(test_xmp_sync_encrypted_roundtrip);
     RUN(test_merge_copies_indirect_outline_strings);
     RUN(test_serialize_never_writes_inuse_offset_zero);
     printf("\n  Task 2: pdftext pin-down (bookmark title strings):\n");

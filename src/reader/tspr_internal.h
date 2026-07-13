@@ -70,6 +70,10 @@ typedef struct {
 typedef struct {
     char *title, *author, *subject, *keywords, *creator, *producer;
     bool title_set, author_set, subject_set, keywords_set, creator_set, producer_set;
+    // "D:YYYYMMDDHHmmSS" stamped into xmp:ModifyDate by the XMP sync
+    // (tspr_xmp.c); the next save reuses it for Info /ModDate so the two
+    // stay equal. NULL when no sync edited the packet.
+    char *mod_date;
 } TspdfReaderMetadata;
 
 // True when any metadata override field is set (title/author/subject/keywords/
