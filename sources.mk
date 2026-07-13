@@ -27,8 +27,7 @@ LIB_SOURCES = \
 	$(SRCDIR)/compress/deflate.c \
 	$(SRCDIR)/filters/filters.c \
 	$(SRCDIR)/qr/qr_encode.c \
-	$(SRCDIR)/tspdf_error.c \
-	$(SRCDIR)/ops/ops.c
+	$(SRCDIR)/tspdf_error.c
 
 TSPR_SOURCES = \
 	$(SRCDIR)/reader/tspr_parser.c \
@@ -58,6 +57,13 @@ CRYPTO_SOURCES = \
 	$(SRCDIR)/crypto/sha512.c \
 	$(SRCDIR)/crypto/rc4.c \
 	$(SRCDIR)/crypto/aes.c
+
+# Shared CLI/server/wasm seam: ops that require both writer (LIB_SOURCES) and
+# reader (TSPR_SOURCES). Listed separately because the unit test runner only
+# links LIB_SOURCES and would fail on the reader references. Everything that
+# links ALL_SOURCES also links OPS_SOURCES (see Makefile).
+OPS_SOURCES = \
+	$(SRCDIR)/ops/ops.c
 
 # Public headers (umbrella closure, dependency order).
 PUBLIC_HEADERS = \
@@ -96,7 +102,8 @@ INTERNAL_HEADERS = \
 	src/reader/tspr_internal.h \
 	src/reader/tspr_doctree.h \
 	src/reader/tspr_attach.h \
-	src/reader/tspr_text.h
+	src/reader/tspr_text.h \
+	src/ops/ops.h
 
 # Umbrella headers: known but not amalgamated (they only #include the lists above).
 UMBRELLA_HEADERS = \

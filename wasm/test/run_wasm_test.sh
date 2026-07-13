@@ -15,7 +15,15 @@ printf '# tspdf wasm fixture\n\nParagraph one for the wasm gate.\n\n- item a\n- 
 ./build/tspdf md2pdf "$OUT/fixture_a.md" -o "$OUT/fixture_a.pdf"
 ./build/tspdf qrcode "https://example.com/tspdf-wasm" -o "$OUT/fixture_b.pdf" --title "wasm fixture"
 
-node wasm/test/wasm-test.js "$OUT/fixture_a.pdf" "$OUT/fixture_b.pdf" "$OUT"
+# /Rotate 90 fixture: rotate fixture_a so the wasm /Rotate watermark test has
+# a real page with /Rotate 90 to compare against the CLI's output.
+./build/tspdf rotate "$OUT/fixture_a.pdf" --angle 90 -o "$OUT/fixture_rotate90.pdf"
+
+# Generate the CLI reference watermark on the rotated fixture: this is what the
+# wasm shim must match (same content stream placement) when the bug is fixed.
+./build/tspdf watermark "$OUT/fixture_rotate90.pdf" --text "ROTATE TEST" -o "$OUT/fixture_rotate90_wm_ref.pdf"
+
+node wasm/test/wasm-test.js "$OUT/fixture_a.pdf" "$OUT/fixture_b.pdf" "$OUT/fixture_rotate90.pdf" "$OUT/fixture_rotate90_wm_ref.pdf" "$OUT"
 
 # Demo backend gate: lay the browser backend out next to the module the way
 # the demo site ships it (so its relative imports resolve) and drive it under
