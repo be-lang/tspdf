@@ -1,6 +1,8 @@
 # sources.mk — single source of truth for all library file lists.
 # Makefile does `include sources.mk`; scripts/amalgamate.sh parses this file.
 # One file per line; keep the same order as the previous Makefile source lists.
+# Note: no blank lines inside a variable block; SRCDIR ?= is for make only
+# (the amalgamate parser substitutes "src" itself).
 
 SRCDIR ?= src
 

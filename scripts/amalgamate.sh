@@ -33,6 +33,7 @@ VERSION="$VMAJ.$VMIN.$VPAT"
 parse_mk_var() {
     local var="$1"
     awk -v v="$var" '
+        BEGIN { in_var = 0 }
         # Start capturing when we see "VAR = ..." or "VAR = \"
         $0 ~ "^" v "[ \t]*=" {
             # strip "VAR = " prefix and any trailing backslash
@@ -50,6 +51,11 @@ parse_mk_var() {
             sub(/^[ \t]+/, "")
             if ($0 != "") print $0
             next
+        }
+        # Guard: blank/whitespace-only lines while in_var are an error
+        in_var && /^[ \t]*$/ {
+            print "error: blank line inside variable block in sources.mk" > "/dev/stderr"
+            exit 1
         }
         # Last continuation line (no trailing \)
         in_var {
@@ -85,7 +91,7 @@ for f in $(find src include -name '*.c' -o -name '*.h' | sort); do
 done
 if [ -n "$missing" ]; then
     echo "amalgamate.sh: unknown src/include file(s):$missing" >&2
-    echo "add them to the file lists in scripts/amalgamate.sh" >&2
+    echo "add them to the file lists in sources.mk" >&2
     exit 1
 fi
 for f in $KNOWN; do

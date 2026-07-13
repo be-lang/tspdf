@@ -330,7 +330,7 @@ fuzz: $(FUZZ_TARGETS) fuzz-corpus
 
 # Print harness names one per line (CI iterates over this instead of a hardcoded list).
 list-fuzzers:
-	@for t in $(FUZZ_TARGETS); do echo $$(basename $$t); done
+	@echo $(notdir $(FUZZ_TARGETS))
 
 $(FUZZ_BIN)/fuzz_reader: fuzz/fuzz_reader.c $(ALL_SOURCES)
 	@mkdir -p $(FUZZ_BIN)
