@@ -1221,6 +1221,220 @@ TEST(test_infoplan_enc_decrypt_edit_merges) {
     free(src_bytes);
 }
 
+// --- Stream plan matrix (tspdf_stream_plan) ---
+//
+// tspdf_stream_plan reads a stream dict only; these tests build TspdfObj values
+// on the stack (no arena) and assert the chosen action. They pin every branch
+// of the six-branch decision that used to live inline in the writer, including
+// the indirect-/DecodeParms armor-strip refusal (a past shipped-bug fix).
+
+// A name object aliasing a C string literal (never mutated by stream_plan).
+static TspdfObj sp_name(const char *s) {
+    TspdfObj o = {0};
+    o.type = TSPDF_OBJ_NAME;
+    o.string.data = (uint8_t *)s;
+    o.string.len = strlen(s);
+    return o;
+}
+
+// A stream object wrapping the given dict.
+static TspdfObj sp_stream(TspdfObj *dict) {
+    TspdfObj o = {0};
+    o.type = TSPDF_OBJ_STREAM;
+    o.stream.dict = dict;
+    return o;
+}
+
+// Build a dict from up to 4 (key, value) pairs; unused pairs pass key=NULL.
+static TspdfObj sp_dict(TspdfDictEntry *entries, size_t count) {
+    TspdfObj o = {0};
+    o.type = TSPDF_OBJ_DICT;
+    o.dict.entries = entries;
+    o.dict.count = count;
+    return o;
+}
+
+TEST(test_streamplan_recompress_off_keeps) {
+    TspdfObj flate = sp_name("FlateDecode");
+    TspdfDictEntry e[] = {{ (char *)"Filter", &flate }};
+    TspdfObj dict = sp_dict(e, 1);
+    TspdfObj stm = sp_stream(&dict);
+    // recompress=false must always KEEP, even for a FlateDecode stream.
+    TspdfStreamPlan p = tspdf_stream_plan(&stm, false, false, 100);
+    ASSERT_EQ_INT(p.action, TSPDF_STREAM_KEEP);
+}
+
+TEST(test_streamplan_xref_stream_keeps) {
+    TspdfObj flate = sp_name("FlateDecode");
+    TspdfDictEntry e[] = {{ (char *)"Filter", &flate }};
+    TspdfObj dict = sp_dict(e, 1);
+    TspdfObj stm = sp_stream(&dict);
+    // is_xref=true (an XRef stream) is never recompressed.
+    TspdfStreamPlan p = tspdf_stream_plan(&stm, true, true, 100);
+    ASSERT_EQ_INT(p.action, TSPDF_STREAM_KEEP);
+}
+
+TEST(test_streamplan_flate_redeflates) {
+    TspdfObj flate = sp_name("FlateDecode");
+    TspdfDictEntry e[] = {{ (char *)"Filter", &flate }};
+    TspdfObj dict = sp_dict(e, 1);
+    TspdfObj stm = sp_stream(&dict);
+    TspdfStreamPlan p = tspdf_stream_plan(&stm, true, false, 100);
+    ASSERT_EQ_INT(p.action, TSPDF_STREAM_REDEFLATE);
+    ASSERT(!p.use_fast_level);  // not an image
+}
+
+TEST(test_streamplan_image_flate_uses_fast_level) {
+    TspdfObj flate = sp_name("FlateDecode");
+    TspdfObj img = sp_name("Image");
+    TspdfDictEntry e[] = {
+        { (char *)"Filter", &flate },
+        { (char *)"Subtype", &img },
+    };
+    TspdfObj dict = sp_dict(e, 2);
+    TspdfObj stm = sp_stream(&dict);
+    TspdfStreamPlan p = tspdf_stream_plan(&stm, true, false, 100);
+    ASSERT_EQ_INT(p.action, TSPDF_STREAM_REDEFLATE);
+    ASSERT(p.use_fast_level);  // image XObject gets the fast level
+}
+
+TEST(test_streamplan_unfiltered_adds_flate) {
+    TspdfObj dict = sp_dict(NULL, 0);  // no /Filter at all
+    TspdfObj stm = sp_stream(&dict);
+    TspdfStreamPlan p = tspdf_stream_plan(&stm, true, false, 100);
+    ASSERT_EQ_INT(p.action, TSPDF_STREAM_ADD_FLATE);
+}
+
+TEST(test_streamplan_unfiltered_empty_keeps) {
+    TspdfObj dict = sp_dict(NULL, 0);
+    TspdfObj stm = sp_stream(&dict);
+    // Zero-length unfiltered stream is never compressed.
+    TspdfStreamPlan p = tspdf_stream_plan(&stm, true, false, 0);
+    ASSERT_EQ_INT(p.action, TSPDF_STREAM_KEEP);
+}
+
+TEST(test_streamplan_unfiltered_xmp_metadata_keeps) {
+    TspdfObj meta = sp_name("Metadata");
+    TspdfDictEntry e[] = {{ (char *)"Type", &meta }};
+    TspdfObj dict = sp_dict(e, 1);
+    TspdfObj stm = sp_stream(&dict);
+    // XMP metadata streams stay uncompressed (PDF/A-style scanning).
+    TspdfStreamPlan p = tspdf_stream_plan(&stm, true, false, 100);
+    ASSERT_EQ_INT(p.action, TSPDF_STREAM_KEEP);
+}
+
+TEST(test_streamplan_unfiltered_with_decodeparms_keeps) {
+    TspdfObj parms = sp_dict(NULL, 0);
+    TspdfDictEntry e[] = {{ (char *)"DecodeParms", &parms }};
+    TspdfObj dict = sp_dict(e, 1);
+    TspdfObj stm = sp_stream(&dict);
+    // An unfiltered stream carrying /DecodeParms is left verbatim.
+    TspdfStreamPlan p = tspdf_stream_plan(&stm, true, false, 100);
+    ASSERT_EQ_INT(p.action, TSPDF_STREAM_KEEP);
+}
+
+TEST(test_streamplan_armor_hex_strips) {
+    TspdfObj hex = sp_name("ASCIIHexDecode");
+    TspdfDictEntry e[] = {{ (char *)"Filter", &hex }};
+    TspdfObj dict = sp_dict(e, 1);
+    TspdfObj stm = sp_stream(&dict);
+    TspdfStreamPlan p = tspdf_stream_plan(&stm, true, false, 100);
+    ASSERT_EQ_INT(p.action, TSPDF_STREAM_ARMOR_STRIP);
+}
+
+TEST(test_streamplan_flate_array_strips) {
+    // Array form [/FlateDecode] normalizes to a bare Flate via armor-strip.
+    TspdfObj flate = sp_name("FlateDecode");
+    TspdfObj arr = {0};
+    arr.type = TSPDF_OBJ_ARRAY;
+    arr.array.items = &flate;
+    arr.array.count = 1;
+    TspdfDictEntry e[] = {{ (char *)"Filter", &arr }};
+    TspdfObj dict = sp_dict(e, 1);
+    TspdfObj stm = sp_stream(&dict);
+    TspdfStreamPlan p = tspdf_stream_plan(&stm, true, false, 100);
+    ASSERT_EQ_INT(p.action, TSPDF_STREAM_ARMOR_STRIP);
+}
+
+TEST(test_streamplan_armor_with_direct_decodeparms_strips) {
+    // ASCIIHex armor over Flate with a DIRECT /DecodeParms dict: the strip is
+    // allowed because the decoder can see the parameters.
+    TspdfObj hex = sp_name("ASCIIHexDecode");
+    TspdfObj flate = sp_name("FlateDecode");
+    TspdfObj filters[] = { hex, flate };
+    TspdfObj arr = {0};
+    arr.type = TSPDF_OBJ_ARRAY;
+    arr.array.items = filters;
+    arr.array.count = 2;
+    TspdfObj parms = sp_dict(NULL, 0);   // direct dict
+    TspdfDictEntry e[] = {
+        { (char *)"Filter", &arr },
+        { (char *)"DecodeParms", &parms },
+    };
+    TspdfObj dict = sp_dict(e, 2);
+    TspdfObj stm = sp_stream(&dict);
+    TspdfStreamPlan p = tspdf_stream_plan(&stm, true, false, 100);
+    ASSERT_EQ_INT(p.action, TSPDF_STREAM_ARMOR_STRIP);
+}
+
+TEST(test_streamplan_armor_indirect_decodeparms_refuses) {
+    // PIN: ASCIIHex armor with an INDIRECT /DecodeParms (a ref the decoder
+    // cannot resolve) must REFUSE the strip and keep the stream verbatim.
+    // Baking wrongly-decoded bytes into plain Flate was a shipped bug.
+    TspdfObj hex = sp_name("ASCIIHexDecode");
+    TspdfObj ref = {0};
+    ref.type = TSPDF_OBJ_REF;
+    ref.ref.num = 6;
+    ref.ref.gen = 0;
+    TspdfDictEntry e[] = {
+        { (char *)"Filter", &hex },
+        { (char *)"DecodeParms", &ref },
+    };
+    TspdfObj dict = sp_dict(e, 2);
+    TspdfObj stm = sp_stream(&dict);
+    TspdfStreamPlan p = tspdf_stream_plan(&stm, true, false, 100);
+    ASSERT_EQ_INT(p.action, TSPDF_STREAM_KEEP);
+}
+
+TEST(test_streamplan_armor_indirect_decodeparms_array_refuses) {
+    // Same refusal when the indirect ref hides inside the /DecodeParms array.
+    TspdfObj hex = sp_name("ASCIIHexDecode");
+    TspdfObj flate = sp_name("FlateDecode");
+    TspdfObj filters[] = { hex, flate };
+    TspdfObj farr = {0};
+    farr.type = TSPDF_OBJ_ARRAY;
+    farr.array.items = filters;
+    farr.array.count = 2;
+    TspdfObj ref = {0};
+    ref.type = TSPDF_OBJ_REF;
+    ref.ref.num = 9;
+    TspdfObj null_parm = {0};
+    null_parm.type = TSPDF_OBJ_NULL;
+    TspdfObj parr_items[] = { null_parm, ref };
+    TspdfObj parr = {0};
+    parr.type = TSPDF_OBJ_ARRAY;
+    parr.array.items = parr_items;
+    parr.array.count = 2;
+    TspdfDictEntry e[] = {
+        { (char *)"Filter", &farr },
+        { (char *)"DecodeParms", &parr },
+    };
+    TspdfObj dict = sp_dict(e, 2);
+    TspdfObj stm = sp_stream(&dict);
+    TspdfStreamPlan p = tspdf_stream_plan(&stm, true, false, 100);
+    ASSERT_EQ_INT(p.action, TSPDF_STREAM_KEEP);
+}
+
+TEST(test_streamplan_lossy_filter_keeps) {
+    // A DCTDecode (JPEG) stream is a lossy filter: never touched.
+    TspdfObj dct = sp_name("DCTDecode");
+    TspdfDictEntry e[] = {{ (char *)"Filter", &dct }};
+    TspdfObj dict = sp_dict(e, 1);
+    TspdfObj stm = sp_stream(&dict);
+    TspdfStreamPlan p = tspdf_stream_plan(&stm, true, false, 100);
+    ASSERT_EQ_INT(p.action, TSPDF_STREAM_KEEP);
+}
+
 void run_serialize_tests(void) {
     printf("\n  Serialization:\n");
     RUN(test_round_trip_save_reopen);
@@ -1267,4 +1481,19 @@ void run_serialize_tests(void) {
     RUN(test_infoplan_enc_edit_merges_encrypted_strings);
     RUN(test_infoplan_enc_decrypt_carries_plaintext);
     RUN(test_infoplan_enc_decrypt_edit_merges);
+    printf("\n  Stream plan matrix:\n");
+    RUN(test_streamplan_recompress_off_keeps);
+    RUN(test_streamplan_xref_stream_keeps);
+    RUN(test_streamplan_flate_redeflates);
+    RUN(test_streamplan_image_flate_uses_fast_level);
+    RUN(test_streamplan_unfiltered_adds_flate);
+    RUN(test_streamplan_unfiltered_empty_keeps);
+    RUN(test_streamplan_unfiltered_xmp_metadata_keeps);
+    RUN(test_streamplan_unfiltered_with_decodeparms_keeps);
+    RUN(test_streamplan_armor_hex_strips);
+    RUN(test_streamplan_flate_array_strips);
+    RUN(test_streamplan_armor_with_direct_decodeparms_strips);
+    RUN(test_streamplan_armor_indirect_decodeparms_refuses);
+    RUN(test_streamplan_armor_indirect_decodeparms_array_refuses);
+    RUN(test_streamplan_lossy_filter_keeps);
 }

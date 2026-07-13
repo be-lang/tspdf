@@ -183,6 +183,86 @@ void tspdf_info_emit_merged(TspdfBuffer *buf, TspdfReader *doc, TspdfParser *par
 void tspdf_info_emit_producer(TspdfBuffer *buf, TspdfReader *doc, TspdfParser *parser,
                               uint32_t info_obj_num, const RenumberMap *identity_map);
 
+// Shared stream classifiers (defined in tspr_serialize.c) used by both the
+// writer and the stream/collection planners in tspr_streamplan.c.
+//   - tspr_stream_dict_type_is: stream with /Type equal to the given name.
+//   - tspr_is_xref_machinery: an ObjStm or XRef container (dropped on rewrite).
+//   - tspr_is_xmp_metadata: a /Type /Metadata stream or dict (XMP packet).
+bool tspr_stream_dict_type_is(TspdfObj *obj, const char *type_name);
+bool tspr_is_xref_machinery(TspdfObj *obj);
+bool tspr_is_xmp_metadata(TspdfObj *obj);
+
+// --- Stream recompression plan (tspr_streamplan.c) ---
+//
+// One decision function classifies what happens to a stream on a recompressing
+// save, so write_stream_obj_with_options is a thin executor. The pure decision
+// (which strategy applies) is separated from the byte work (running deflate and
+// the never-grow size check) so it can be matrix-tested without a full save.
+//
+// History: the classification used to live inline as six intertwined branches
+// in the writer; the indirect-/DecodeParms armor-strip refusal (a shipped-bug
+// fix) is the fragile part and is pinned by the test matrix.
+
+typedef enum {
+    // Write the stream verbatim (no recompression eligible, or recompress off).
+    TSPDF_STREAM_KEEP,
+    // Inflate + re-deflate a bare /FlateDecode stream; keep the smaller of the
+    // two encodings. /Filter and any predictor /DecodeParms are preserved.
+    TSPDF_STREAM_REDEFLATE,
+    // Deflate an unfiltered stream and add /Filter /FlateDecode when smaller.
+    TSPDF_STREAM_ADD_FLATE,
+    // Decode a strippable armor chain (ASCIIHex/85/RunLength/LZW, possibly over
+    // Flate) fully and re-encode as plain Flate; drop the old /Filter and
+    // /DecodeParms (/DP). Refused when /DecodeParms is not fully direct.
+    TSPDF_STREAM_ARMOR_STRIP
+} TspdfStreamAction;
+
+typedef struct {
+    TspdfStreamAction action;
+    // Image XObjects use the fast deflate level (their predictor-coded Flate
+    // gains almost nothing from the best-effort search). Meaningful for the
+    // REDEFLATE, ADD_FLATE, and ARMOR_STRIP actions.
+    bool use_fast_level;
+} TspdfStreamPlan;
+
+// Classify a stream for a recompressing save from its dict alone (no bytes
+// read, no deflate run). `stream_len` is the source stream length; it only
+// gates the ADD_FLATE empty-stream case (len 0 is never compressed).
+// `recompress` is opts->recompress_streams; `is_xref` skips XRef streams.
+// The executor still applies the never-grow size check after running deflate.
+TspdfStreamPlan tspdf_stream_plan(TspdfObj *stream_obj, bool recompress,
+                                  bool is_xref, size_t stream_len);
+
+// --- Save-object collection (tspr_streamplan.c) ---
+//
+// The three save paths (plain-standard, encrypted, and the collection part of
+// preserve-ids) walked the same visited[] array and then filtered it into a
+// collected[] list with near-identical loops. This shared walk returns the
+// filtered list plus the renumber map, so the paths keep their own EMISSION
+// but stop duplicating the collection/decision logic.
+
+typedef struct {
+    uint32_t *collected;     // malloc'd list of source object numbers, in order
+    size_t collected_count;
+    RenumberMap map;         // old_to_new for the collected objects (from base_num)
+    bool ok;                 // false on allocation failure (nothing to free)
+} TspdfCollectResult;
+
+// Filter a visited[] mark array into the ordered object list every re-serialize
+// path emits, and build the renumber map assigning new numbers from `base_num`
+// upward in collection order. Drops xref machinery (ObjStm/XRef containers)
+// always; drops `source_root_num` when `skip_root` (the synthetic-catalog
+// paths); drops the source Info object and XMP metadata streams when
+// `strip_metadata`. Both the plain and encrypted standard paths call this.
+// On success res->ok is true and res->collected/res->map.old_to_new are
+// malloc'd (caller frees). On allocation failure res->ok is false.
+void tspdf_collect_objects(TspdfReader *doc, TspdfParser *parser,
+                           const bool *visited, size_t total_objs,
+                           uint32_t base_num, bool skip_root,
+                           uint32_t source_root_num, bool strip_metadata,
+                           uint32_t source_info_num,
+                           TspdfCollectResult *res);
+
 // --- New object list (for Phase 3 content overlay / annotations) ---
 
 typedef struct {
