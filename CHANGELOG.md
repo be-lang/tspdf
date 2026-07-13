@@ -7,6 +7,8 @@ on 0.x, the CLI is considered stable but the low-level C API may still change.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-14
+
 ### Changed
 - `metadata --set/--clear` now updates the XMP packet too, not just the Info
   dictionary, so viewers that prefer XMP (Acrobat) show the new values:

@@ -118,7 +118,11 @@ static bool walk_enter_form(TspdfWalker *w, TspdfObj *xo, uint32_t num,
         strcmp((const char *)sub->string.data, "Form") != 0)
         return false;
 
-    if (depth + 1 >= w->max_depth) return true;
+    // form_stack is sized TSPDF_WALK_MAX_DEPTH; a larger max_depth would
+    // index past it, so the array bound caps the recursion regardless.
+    int cap = w->max_depth < TSPDF_WALK_MAX_DEPTH ? w->max_depth
+                                                  : TSPDF_WALK_MAX_DEPTH;
+    if (depth + 1 >= cap) return true;
     for (int i = 0; i <= depth; i++)
         if (w->form_stack[i] == xo) return true;  // cycle
     w->form_stack[depth + 1] = xo;
