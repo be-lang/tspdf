@@ -1428,6 +1428,30 @@ assert found == need, (sorted(found), sorted(need))
     "$TSPDF" text "${TMPDIR}/serve_wm.pdf" | grep -q WMCUSTOM
   '
 
+  # Task 6: the web watermark endpoint must re-encode non-ASCII watermark text
+  # UTF-8 -> cp1252 (WinAnsiEncoding), matching the CLI. "RÉSUMÉ" carries É
+  # (U+00C9): its cp1252 byte is 0xC9, and it must appear that way in the page
+  # content stream — NOT as the raw UTF-8 bytes 0xC3 0x89. We assert the whole
+  # word "R<0xC9>SUM<0xC9>" is present after zlib-inflating the content streams.
+  run_serve_test "serve watermark re-encodes non-ASCII text to cp1252" env TMPDIR="$TMPDIR" SERVE_PORT="$SERVE_PORT" INPUT="$INPUT" bash -c '
+    curl -sf --retry 3 --retry-delay 1 --max-time 10 \
+      -F "pdf_file=@${INPUT}" \
+      -F "config={\"watermark_text\":\"RÉSUMÉ\"}" \
+      "http://localhost:${SERVE_PORT}/api/watermark-existing" -o "${TMPDIR}/serve_wm_utf8.pdf" &&
+    python3 -c "
+import sys, re, zlib
+data = open(sys.argv[1], \"rb\").read()
+cp1252 = b\"R\xc9SUM\xc9\"   # RÉSUMÉ re-encoded to WinAnsi
+found = False
+for m in re.finditer(rb\"stream\r?\n(.*?)endstream\", data, re.S):
+    s = m.group(1)
+    try: s = zlib.decompress(s)
+    except Exception: pass
+    if cp1252 in s: found = True
+assert found, \"cp1252-encoded RÉSUMÉ not found in any content stream\"
+" "${TMPDIR}/serve_wm_utf8.pdf"
+  '
+
   # server-side copy of the stamping code must also center on the visual page
   # (MediaBox origin offset), same as the CLI watermark command
   if command -v qpdf > /dev/null 2>&1 && [ -f "$TMPDIR/wm_box.pdf" ]; then
