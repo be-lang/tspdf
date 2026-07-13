@@ -192,7 +192,8 @@ jobs:
       # non-zero and fails the job.
       - name: Run harnesses over seed corpora
         run: |
-          for t in reader inflate deflate deflate_best ttf png jpeg ccitt; do
-            echo "=== fuzz_$t"
-            ./build/fuzz/fuzz_$t "fuzz/corpus/$t" -seed=1 -max_total_time=30 -print_final_stats=1
+          for name in $(make -s list-fuzzers); do
+            t=${name#fuzz_}
+            echo "=== $name"
+            ./build/fuzz/$name "fuzz/corpus/$t" -seed=1 -max_total_time=30 -print_final_stats=1
           done

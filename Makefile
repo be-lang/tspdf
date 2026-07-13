@@ -80,53 +80,10 @@ FUZZ_CFLAGS = -Wall -Wextra -std=c11 -g -O1 \
 	-fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer
 FUZZ_BIN = $(BUILDDIR)/fuzz
 
-LIB_SOURCES = \
-	$(SRCDIR)/util/buffer.c \
-	$(SRCDIR)/util/arena.c \
-	$(SRCDIR)/util/pdftext.c \
-	$(SRCDIR)/util/pdfdate.c \
-	$(SRCDIR)/pdf/pdf_writer.c \
-	$(SRCDIR)/pdf/pdf_stream.c \
-	$(SRCDIR)/pdf/pdf_base14.c \
-	$(SRCDIR)/pdf/tspdf_writer.c \
-	$(SRCDIR)/font/ttf_parser.c \
-	$(SRCDIR)/font/font_subset.c \
-	$(SRCDIR)/font/font_fallback.c \
-	$(SRCDIR)/layout/layout.c \
-	$(SRCDIR)/image/jpeg_embed.c \
-	$(SRCDIR)/image/jpeg_codec.c \
-	$(SRCDIR)/image/ccitt_codec.c \
-	$(SRCDIR)/image/png_decoder.c \
-	$(SRCDIR)/compress/deflate.c \
-	$(SRCDIR)/qr/qr_encode.c \
-	$(SRCDIR)/tspdf_error.c
-
-TSPR_SOURCES = \
-	$(SRCDIR)/reader/tspr_parser.c \
-	$(SRCDIR)/reader/tspr_xref.c \
-	$(SRCDIR)/reader/tspr_pages.c \
-	$(SRCDIR)/reader/tspr_serialize.c \
-	$(SRCDIR)/reader/tspr_crypt.c \
-	$(SRCDIR)/reader/tspr_document.c \
-	$(SRCDIR)/reader/tspr_doctree.c \
-	$(SRCDIR)/reader/tspr_attach.c \
-	$(SRCDIR)/reader/tspr_bookmark.c \
-	$(SRCDIR)/reader/tspr_metadata.c \
-	$(SRCDIR)/reader/tspr_content.c \
-	$(SRCDIR)/reader/tspr_import.c \
-	$(SRCDIR)/reader/tspr_nup.c \
-	$(SRCDIR)/reader/tspr_resources.c \
-	$(SRCDIR)/reader/tspr_annot.c \
-	$(SRCDIR)/reader/tspr_form.c \
-	$(SRCDIR)/reader/tspr_text.c \
-	$(SRCDIR)/reader/tspr_lossy.c
-
-CRYPTO_SOURCES = \
-	$(SRCDIR)/crypto/md5.c \
-	$(SRCDIR)/crypto/sha256.c \
-	$(SRCDIR)/crypto/sha512.c \
-	$(SRCDIR)/crypto/rc4.c \
-	$(SRCDIR)/crypto/aes.c
+# Single source of truth for library file lists (LIB_SOURCES, TSPR_SOURCES,
+# CRYPTO_SOURCES, PUBLIC_HEADERS, INTERNAL_HEADERS, UMBRELLA_HEADERS).
+# After Task 1, registering a new src/ file requires one edit in sources.mk only.
+include sources.mk
 
 ALL_SOURCES = $(LIB_SOURCES) $(TSPR_SOURCES) $(CRYPTO_SOURCES)
 
@@ -169,7 +126,7 @@ WEB_EMBED_INPUTS = scripts/embed_assets.sh $(WEB_EMBED_CORE) $(WEB_EMBED_TOOLS)
 
 .PHONY: all cli install install-lib uninstall clean test test-all test-cli test-reader test-crypto \
         test-asan test-asan-bin test-asan-reader test-asan-reader-bin test-external \
-        check ci fuzz fuzz-corpus print-version amalgamation \
+        check ci fuzz fuzz-corpus print-version amalgamation list-fuzzers \
         lib shared demo bench bench-reader bench-crypto minimal reader-demo generate-test-pdfs
 
 # --- Default: build the CLI ---
@@ -362,12 +319,18 @@ test-asan-reader-bin: $(BUILDDIR)/test_reader
 #   ./build/fuzz/fuzz_png    fuzz/corpus/png -max_total_time=60
 #
 # Compiler-only — the fuzzing runtime ships with clang, so zero vendored deps.
-FUZZ_TARGETS = $(FUZZ_BIN)/fuzz_reader $(FUZZ_BIN)/fuzz_inflate \
-               $(FUZZ_BIN)/fuzz_deflate $(FUZZ_BIN)/fuzz_deflate_best \
-               $(FUZZ_BIN)/fuzz_ttf $(FUZZ_BIN)/fuzz_png \
-               $(FUZZ_BIN)/fuzz_jpeg $(FUZZ_BIN)/fuzz_ccitt
+#
+# FUZZ_TARGETS is derived from the fuzz/ directory: every fuzz/fuzz_*.c becomes
+# a target. Harnesses with a specific rule below (fuzz_reader, fuzz_inflate, …)
+# link only the minimal sources they need; a new harness with no specific rule
+# falls through to the default pattern rule and links the full library.
+FUZZ_TARGETS = $(patsubst fuzz/fuzz_%.c,$(FUZZ_BIN)/fuzz_%,$(wildcard fuzz/fuzz_*.c))
 
 fuzz: $(FUZZ_TARGETS) fuzz-corpus
+
+# Print harness names one per line (CI iterates over this instead of a hardcoded list).
+list-fuzzers:
+	@for t in $(FUZZ_TARGETS); do echo $$(basename $$t); done
 
 $(FUZZ_BIN)/fuzz_reader: fuzz/fuzz_reader.c $(ALL_SOURCES)
 	@mkdir -p $(FUZZ_BIN)
@@ -401,6 +364,12 @@ $(FUZZ_BIN)/fuzz_png: fuzz/fuzz_png.c $(SRCDIR)/image/png_decoder.c \
                       $(SRCDIR)/compress/deflate.c $(SRCDIR)/util/buffer.c
 	@mkdir -p $(FUZZ_BIN)
 	$(FUZZ_CC) $(CPPFLAGS) $(FUZZ_CFLAGS) $(LDFLAGS) -o $@ $^ -lm
+
+# Default pattern rule: any new fuzz/fuzz_*.c harness with no specific rule
+# above links the full library automatically — no Makefile edit needed.
+$(FUZZ_BIN)/fuzz_%: fuzz/fuzz_%.c $(ALL_SOURCES)
+	@mkdir -p $(FUZZ_BIN)
+	$(FUZZ_CC) $(CPPFLAGS) $(FUZZ_CFLAGS) $(LDFLAGS) -o $@ $< $(LIB_SOURCES) $(TSPR_SOURCES) $(CRYPTO_SOURCES) -lm
 
 # Seed the reader corpus with the synthetic test PDFs so libFuzzer starts from
 # real, structurally-valid inputs instead of random noise. We copy the existing
