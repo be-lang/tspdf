@@ -46,6 +46,7 @@ TSPR_SOURCES = \
 	$(SRCDIR)/reader/tspr_resources.c \
 	$(SRCDIR)/reader/tspr_annot.c \
 	$(SRCDIR)/reader/tspr_form.c \
+	$(SRCDIR)/reader/tspr_content_walk.c \
 	$(SRCDIR)/reader/tspr_text.c \
 	$(SRCDIR)/reader/tspr_lossy.c
 
@@ -92,6 +93,7 @@ INTERNAL_HEADERS = \
 	src/reader/tspr_internal.h \
 	src/reader/tspr_doctree.h \
 	src/reader/tspr_attach.h \
+	src/reader/tspr_content_walk.h \
 	src/reader/tspr_text.h
 
 # Umbrella headers: known but not amalgamated (they only #include the lists above).
