@@ -5,14 +5,14 @@
 #include <string.h>
 #include <stdbool.h>
 
-static int tests_run = 0;
-static int tests_passed = 0;
-static int tests_failed = 0;
-static int tests_skipped = 0;
+extern int tests_run;
+extern int tests_passed;
+extern int tests_failed;
+extern int tests_skipped;
 
-static bool _test_failed;
-static bool _test_skipped;
-static const char *_test_skip_reason;
+extern bool _test_failed;
+extern bool _test_skipped;
+extern const char *_test_skip_reason;
 
 #define TEST(name) static void name(void)
 

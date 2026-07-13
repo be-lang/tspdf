@@ -408,17 +408,21 @@ check:
 # Alias so CI configs can call a single conventional target.
 ci: check
 
-$(BUILDDIR)/test_runner: tests/test_main.c $(LIB_SOURCES)
-	@mkdir -p $(BUILDDIR)
-	$(CC) $(CPPFLAGS) $(ALL_CFLAGS) $(LDFLAGS) -o $@ $< $(LIB_SOURCES) -lm
+UNIT_TEST_SOURCES = $(wildcard tests/unit/*.c) tests/test_framework.c
 
-$(BUILDDIR)/test_reader: tests/test_reader.c $(ALL_SOURCES)
+$(BUILDDIR)/test_runner: $(UNIT_TEST_SOURCES) $(LIB_SOURCES)
 	@mkdir -p $(BUILDDIR)
-	$(CC) $(CPPFLAGS) $(ALL_CFLAGS) $(LDFLAGS) -o $@ $< $(TSPR_SOURCES) $(LIB_SOURCES) $(CRYPTO_SOURCES) -lm
+	$(CC) $(CPPFLAGS) $(ALL_CFLAGS) $(LDFLAGS) -o $@ $(UNIT_TEST_SOURCES) $(LIB_SOURCES) -lm
 
-$(BUILDDIR)/test_crypto: tests/test_crypto.c $(CRYPTO_SOURCES)
+READER_TEST_SOURCES = $(wildcard tests/reader/*.c) tests/test_framework.c
+
+$(BUILDDIR)/test_reader: $(READER_TEST_SOURCES) $(ALL_SOURCES)
 	@mkdir -p $(BUILDDIR)
-	$(CC) $(CPPFLAGS) $(ALL_CFLAGS) $(LDFLAGS) -o $@ $< $(CRYPTO_SOURCES) -lm
+	$(CC) $(CPPFLAGS) $(ALL_CFLAGS) $(LDFLAGS) -o $@ $(READER_TEST_SOURCES) $(TSPR_SOURCES) $(LIB_SOURCES) $(CRYPTO_SOURCES) -lm
+
+$(BUILDDIR)/test_crypto: tests/test_crypto.c tests/test_framework.c $(CRYPTO_SOURCES)
+	@mkdir -p $(BUILDDIR)
+	$(CC) $(CPPFLAGS) $(ALL_CFLAGS) $(LDFLAGS) -o $@ tests/test_crypto.c tests/test_framework.c $(CRYPTO_SOURCES) -lm
 
 # --- Library (for embedding in other projects) ---
 
