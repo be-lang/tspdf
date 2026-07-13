@@ -72,6 +72,10 @@ typedef struct {
     bool title_set, author_set, subject_set, keywords_set, creator_set, producer_set;
 } TspdfReaderMetadata;
 
+// True when any metadata override field is set (title/author/subject/keywords/
+// creator/producer). Defined in tspr_infoplan.c.
+bool tspdf_metadata_has_changes(const TspdfReaderMetadata *m);
+
 // --- Xref ---
 
 typedef struct {
@@ -110,9 +114,70 @@ TspdfError tspdf_pages_load(TspdfParser *p, TspdfReaderXref *xref, TspdfObj **ca
 
 // --- Serialization ---
 
+#include "../util/buffer.h"
+
 TspdfError tspdf_serialize(TspdfReader *doc, uint8_t **out_buf, size_t *out_len);
 TspdfError tspdf_serialize_with_options(TspdfReader *doc, uint8_t **out_buf, size_t *out_len,
                                       const TspdfSaveOptions *opts);
+
+// Renumbering map: old_to_new[old_num] = new_num, 0 means not mapped. An
+// identity map (old_to_new[i] == i) is used by the preserve-object-ids path.
+typedef struct {
+    uint32_t *old_to_new;
+    size_t map_size;
+} RenumberMap;
+
+// Low-level PDF value writers (defined in tspr_serialize.c). Exposed so the
+// Info-plan module can emit Info-dict objects without duplicating them.
+void tspr_write_string_escaped(TspdfBuffer *buf, const uint8_t *data, size_t len);
+void tspr_write_hex_string(TspdfBuffer *buf, const uint8_t *data, size_t len);
+void tspr_write_name(TspdfBuffer *buf, const uint8_t *data, size_t len);
+void tspr_write_obj(TspdfBuffer *buf, TspdfObj *obj, const RenumberMap *map, TspdfReader *doc);
+
+// --- Info dict plan (tspr_infoplan.c) ---
+//
+// One module decides what happens to the trailer /Info dictionary on save and
+// emits the resulting object. Historically this was spread across the plain
+// and encrypted save paths, which drifted apart and shipped three bugs (Info
+// dropped on encrypt; a producer refresh wiping Title/Author; Info strings
+// written plaintext into encrypted files). Both save paths are now callers.
+
+typedef enum {
+    TSPDF_INFO_NONE,           // no Info object (strip_metadata, or nothing to write)
+    TSPDF_INFO_CARRY_SOURCE,   // reuse the source Info object at its own number
+    TSPDF_INFO_WRITE_MERGED,   // emit a fresh merged Info (metadata edits)
+    TSPDF_INFO_WRITE_PRODUCER  // emit a fresh Info that only stamps /Producer
+} TspdfInfoAction;
+
+typedef struct {
+    TspdfInfoAction action;
+    uint32_t source_info_num;  // source Info object number (valid unless NONE
+                               // with no source); 0 when the trailer has none
+} TspdfInfoPlan;
+
+// Decide what happens to /Info given the metadata edits, update_producer,
+// strip_metadata, and whether this save writes an encrypted file. Encrypted
+// saves never stamp Producer alone — they carry the source Info instead (its
+// strings are re-encrypted with its own key), so `encrypted` selects CARRY
+// over WRITE_PRODUCER. `parser` resolves the source Info dict.
+TspdfInfoPlan tspdf_info_plan(TspdfReader *doc, TspdfParser *parser,
+                              const TspdfSaveOptions *opts, bool encrypted);
+
+// Emit a complete merged Info object (`N 0 obj ... endobj`) at the current
+// buffer position: source fields, metadata overrides, /CreationDate, /ModDate.
+// When `crypt` is non-NULL every string value is encrypted with the Info
+// object's own key (ISO 32000 §7.6.2). Corresponds to TSPDF_INFO_WRITE_MERGED.
+void tspdf_info_emit_merged(TspdfBuffer *buf, TspdfReader *doc, TspdfParser *parser,
+                            uint32_t info_obj_num, TspdfCrypt *crypt);
+
+// Emit a fresh Info object that copies the source fields minus /Producer and
+// stamps the current tspdf Producer. Corresponds to TSPDF_INFO_WRITE_PRODUCER.
+// With `identity_map` non-NULL (the preserve-object-ids path) every source
+// value is written verbatim via tspr_write_obj; with NULL (the standard path)
+// only string-typed source fields are copied, as plain literal strings.
+// This emitter is only used for unencrypted saves.
+void tspdf_info_emit_producer(TspdfBuffer *buf, TspdfReader *doc, TspdfParser *parser,
+                              uint32_t info_obj_num, const RenumberMap *identity_map);
 
 // --- New object list (for Phase 3 content overlay / annotations) ---
 
