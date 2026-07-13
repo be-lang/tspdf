@@ -1,6 +1,5 @@
 #include "tspr_internal.h"
 #include "../util/buffer.h"
-#include "../util/pdftext.h"
 #include "../compress/deflate.h"
 #include "../crypto/md5.h"
 #include "../../include/tspdf/version.h"
@@ -41,217 +40,6 @@ static bool input_uses_objstm(const TspdfReader *doc) {
 // packed object, so every save path drops them.
 static bool is_xref_machinery(TspdfObj *obj) {
     return stream_dict_type_is(obj, "ObjStm") || stream_dict_type_is(obj, "XRef");
-}
-
-// --- Metadata helpers ---
-
-// Check if metadata has any set flags
-static bool metadata_has_changes(const TspdfReaderMetadata *m) {
-    if (!m) return false;
-    return m->title_set || m->author_set || m->subject_set ||
-           m->keywords_set || m->creator_set || m->producer_set;
-}
-
-// Resolve the source document's Info dict (trailer /Info), NULL when absent
-// or not a dict. Resolves with the document's own crypt so values from an
-// encrypted source arrive decrypted.
-static TspdfObj *source_info_dict(TspdfReader *doc, TspdfParser *parser) {
-    if (!doc->xref.trailer) return NULL;
-    TspdfObj *info_ref = tspdf_dict_get(doc->xref.trailer, "Info");
-    if (!info_ref) return NULL;
-    if (info_ref->type == TSPDF_OBJ_REF) {
-        if (info_ref->ref.num >= doc->xref.count) return NULL;
-        TspdfObj *o = tspdf_xref_resolve(&doc->xref, parser, info_ref->ref.num,
-                                         doc->obj_cache, doc->crypt);
-        return o && o->type == TSPDF_OBJ_DICT ? o : NULL;
-    }
-    return info_ref->type == TSPDF_OBJ_DICT ? info_ref : NULL;
-}
-
-// Write one Info-dict string value. In an encrypted file every string outside
-// the /Encrypt dictionary and /ID must be encrypted (ISO 32000 §7.6.2) —
-// Info strings included. Readers decrypt them unconditionally, so plaintext
-// here turns into garbage (poppler showed blank titles).
-static void write_info_string_bytes(TspdfBuffer *buf, TspdfCrypt *crypt,
-                                    uint32_t info_obj_num,
-                                    const uint8_t *data, size_t len) {
-    if (crypt) {
-        size_t enc_len = 0;
-        uint8_t *enc = tspdf_crypt_encrypt_string(crypt, info_obj_num, 0,
-                                                  data, len, &enc_len);
-        if (enc) {
-            write_hex_string(buf, enc, enc_len);
-            free(enc);
-            return;
-        }
-    }
-    write_string_escaped(buf, data, len);
-}
-
-// UTF-8 metadata override values go through the shared text-string encoder
-// (ASCII stays literal, everything else becomes BOM + UTF-16BE) and are then
-// encrypted like any other string when the save is encrypted.
-static void write_info_utf8_value(TspdfBuffer *buf, TspdfCrypt *crypt,
-                                  uint32_t info_obj_num, TspdfArena *arena,
-                                  const char *value) {
-    if (!crypt) {
-        tspdf_pdftext_write_info_string(buf, value);
-        return;
-    }
-    size_t blen = 0;
-    uint8_t *bytes = tspdf_utf8_to_pdf_text(value, &blen, arena);
-    if (!bytes) {
-        buf->error = true;
-        return;
-    }
-    write_info_string_bytes(buf, crypt, info_obj_num, bytes, blen);
-}
-
-// Build and write an Info dict object at current buffer position.
-// Merges original Info dict fields with overrides from doc->metadata.
-// When `crypt` is non-NULL the object is being written into an encrypted
-// file: every string value is encrypted with the Info object's own key.
-static void write_info_dict_obj(TspdfBuffer *buf, TspdfReader *doc, TspdfParser *parser,
-                                 uint32_t info_obj_num, TspdfCrypt *crypt) {
-    // Resolve original Info dict if present. Resolved with the document's own
-    // crypt so preserved values from an encrypted source arrive decrypted
-    // (they are re-encrypted with the new object's key on write below).
-    TspdfObj *orig_info = source_info_dict(doc, parser);
-
-    TspdfReaderMetadata *m = doc->metadata;
-
-    // Generate ModDate timestamp: D:YYYYMMDDHHmmSS
-    char mod_date[64];
-    time_t now = time(NULL);
-    struct tm *tm_info = gmtime(&now);
-    snprintf(mod_date, sizeof(mod_date), "D:%04d%02d%02d%02d%02d%02d",
-             tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,
-             tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec);
-
-    // Field names and their metadata override values (NULL = not overridden, "" ptr = set to remove)
-    static const char *field_names[] = {
-        "Title", "Author", "Subject", "Keywords", "Creator", "Producer", NULL
-    };
-
-    tspdf_buffer_printf(buf, "%u 0 obj\n<< ", info_obj_num);
-
-    // Write fields from original Info, applying overrides
-    if (orig_info && orig_info->type == TSPDF_OBJ_DICT) {
-        for (size_t i = 0; i < orig_info->dict.count; i++) {
-            const char *key = orig_info->dict.entries[i].key;
-            TspdfObj *val = orig_info->dict.entries[i].value;
-
-            // Skip ModDate — we'll add our own
-            if (strcmp(key, "ModDate") == 0) continue;
-
-            // Check if this field is overridden
-            const char *override_val = NULL;
-            bool is_overridden = false;
-            if (m) {
-                if (strcmp(key, "Title") == 0 && m->title_set) {
-                    override_val = m->title; is_overridden = true;
-                } else if (strcmp(key, "Author") == 0 && m->author_set) {
-                    override_val = m->author; is_overridden = true;
-                } else if (strcmp(key, "Subject") == 0 && m->subject_set) {
-                    override_val = m->subject; is_overridden = true;
-                } else if (strcmp(key, "Keywords") == 0 && m->keywords_set) {
-                    override_val = m->keywords; is_overridden = true;
-                } else if (strcmp(key, "Creator") == 0 && m->creator_set) {
-                    override_val = m->creator; is_overridden = true;
-                } else if (strcmp(key, "Producer") == 0 && m->producer_set) {
-                    override_val = m->producer; is_overridden = true;
-                }
-            }
-
-            if (is_overridden) {
-                // Write override value if non-NULL, otherwise skip (remove field)
-                if (override_val != NULL) {
-                    write_name(buf, (const uint8_t *)key, strlen(key));
-                    tspdf_buffer_append_byte(buf, ' ');
-                    write_info_utf8_value(buf, crypt, info_obj_num, parser->arena, override_val);
-                    tspdf_buffer_append_byte(buf, ' ');
-                }
-            } else {
-                // Keep original value (skip refs, copy simple values)
-                if (val && val->type == TSPDF_OBJ_STRING) {
-                    write_name(buf, (const uint8_t *)key, strlen(key));
-                    tspdf_buffer_append_byte(buf, ' ');
-                    write_info_string_bytes(buf, crypt, info_obj_num,
-                                            val->string.data, val->string.len);
-                    tspdf_buffer_append_byte(buf, ' ');
-                }
-                // Skip non-string values (unusual in Info dict)
-            }
-        }
-    }
-
-    // Now write new fields that weren't in the original Info dict
-    if (m) {
-        for (int fi = 0; field_names[fi] != NULL; fi++) {
-            const char *fname = field_names[fi];
-
-            // Check if this field was set in metadata
-            const char *new_val = NULL;
-            bool was_set = false;
-            if (strcmp(fname, "Title") == 0 && m->title_set) {
-                new_val = m->title; was_set = true;
-            } else if (strcmp(fname, "Author") == 0 && m->author_set) {
-                new_val = m->author; was_set = true;
-            } else if (strcmp(fname, "Subject") == 0 && m->subject_set) {
-                new_val = m->subject; was_set = true;
-            } else if (strcmp(fname, "Keywords") == 0 && m->keywords_set) {
-                new_val = m->keywords; was_set = true;
-            } else if (strcmp(fname, "Creator") == 0 && m->creator_set) {
-                new_val = m->creator; was_set = true;
-            } else if (strcmp(fname, "Producer") == 0 && m->producer_set) {
-                new_val = m->producer; was_set = true;
-            }
-
-            if (!was_set || new_val == NULL) continue;
-
-            // Only write if not already present in original (already handled above)
-            bool already_in_orig = false;
-            if (orig_info && orig_info->type == TSPDF_OBJ_DICT) {
-                for (size_t i = 0; i < orig_info->dict.count; i++) {
-                    if (strcmp(orig_info->dict.entries[i].key, fname) == 0) {
-                        already_in_orig = true;
-                        break;
-                    }
-                }
-            }
-            if (already_in_orig) continue;
-
-            write_name(buf, (const uint8_t *)fname, strlen(fname));
-            tspdf_buffer_append_byte(buf, ' ');
-            write_info_utf8_value(buf, crypt, info_obj_num, parser->arena, new_val);
-            tspdf_buffer_append_byte(buf, ' ');
-        }
-    }
-
-    // Add /CreationDate if not already present
-    bool has_creation_date = false;
-    if (orig_info && orig_info->type == TSPDF_OBJ_DICT) {
-        for (size_t i = 0; i < orig_info->dict.count; i++) {
-            if (strcmp(orig_info->dict.entries[i].key, "CreationDate") == 0) {
-                has_creation_date = true;
-                break;
-            }
-        }
-    }
-    if (!has_creation_date) {
-        write_name(buf, (const uint8_t *)"CreationDate", 12);
-        tspdf_buffer_append_byte(buf, ' ');
-        write_info_string_bytes(buf, crypt, info_obj_num,
-                                (const uint8_t *)mod_date, strlen(mod_date));
-        tspdf_buffer_append_byte(buf, ' ');
-    }
-
-    // Always add /ModDate
-    write_name(buf, (const uint8_t *)"ModDate", 7);
-    tspdf_buffer_append_byte(buf, ' ');
-    write_info_string_bytes(buf, crypt, info_obj_num,
-                            (const uint8_t *)mod_date, strlen(mod_date));
-    tspdf_buffer_append_str(buf, " >>\nendobj\n");
 }
 
 // --- Object collection: find all objects reachable from pages ---
@@ -370,11 +158,7 @@ static void collect_from_page_obj(TspdfReader *doc, TspdfObj *page_dict,
 }
 
 // --- Object writing ---
-
-typedef struct {
-    uint32_t *old_to_new;  // old_to_new[old_num] = new_num, 0 means not mapped
-    size_t map_size;
-} RenumberMap;
+// RenumberMap is defined in tspr_internal.h (shared with the Info-plan module).
 
 static void write_obj(TspdfBuffer *buf, TspdfObj *obj, const RenumberMap *map, TspdfReader *doc);
 
@@ -403,6 +187,12 @@ static void write_string_escaped(TspdfBuffer *buf, const uint8_t *data, size_t l
     tspdf_buffer_append_byte(buf, ')');
 }
 
+// Exported thin wrappers so the Info-plan module can reuse these primitives
+// without duplicating them (see tspr_internal.h).
+void tspr_write_string_escaped(TspdfBuffer *buf, const uint8_t *data, size_t len) {
+    write_string_escaped(buf, data, len);
+}
+
 static void write_name(TspdfBuffer *buf, const uint8_t *data, size_t len) {
     tspdf_buffer_append_byte(buf, '/');
     for (size_t i = 0; i < len; i++) {
@@ -416,6 +206,14 @@ static void write_name(TspdfBuffer *buf, const uint8_t *data, size_t len) {
             tspdf_buffer_append_byte(buf, c);
         }
     }
+}
+
+void tspr_write_name(TspdfBuffer *buf, const uint8_t *data, size_t len) {
+    write_name(buf, data, len);
+}
+
+void tspr_write_obj(TspdfBuffer *buf, TspdfObj *obj, const RenumberMap *map, TspdfReader *doc) {
+    write_obj(buf, obj, map, doc);
 }
 
 static void write_obj(TspdfBuffer *buf, TspdfObj *obj, const RenumberMap *map, TspdfReader *doc) {
@@ -1325,37 +1123,25 @@ TspdfError tspdf_serialize_with_options(TspdfReader *doc, uint8_t **out_buf, siz
             tspdf_buffer_append_byte(&buf, '\n');
         }
 
-        // Write producer Info dict if needed
+        // Write producer Info dict if needed. The preserve-ids path keeps
+        // original object numbers, so the emitter renders source values under
+        // an identity map (write_obj), preserving non-string fields verbatim.
         if (need_producer_info) {
             offsets[producer_info_num] = buf.len;
-            // Build a minimal or updated Info dict with /Producer
-            tspdf_buffer_printf(&buf, "%u 0 obj\n<< ", producer_info_num);
-
-            // If there was an original Info dict, copy its fields (except Producer)
-            if (orig_info_num > 0) {
-                TspdfObj *orig_info = tspdf_xref_resolve(&doc->xref, &parser, orig_info_num,
-                                                        doc->obj_cache, NULL);
-                if (orig_info && orig_info->type == TSPDF_OBJ_DICT) {
-                    // We need an identity map for write_obj since we preserve IDs
-                    RenumberMap identity_map;
-                    identity_map.map_size = total_objs;
-                    identity_map.old_to_new = (uint32_t *)calloc(total_objs, sizeof(uint32_t));
-                    if (identity_map.old_to_new) {
-                        for (size_t k = 0; k < total_objs; k++)
-                            identity_map.old_to_new[k] = (uint32_t)k;
-                        for (size_t j = 0; j < orig_info->dict.count; j++) {
-                            const char *key = orig_info->dict.entries[j].key;
-                            if (strcmp(key, "Producer") == 0) continue;
-                            write_name(&buf, (const uint8_t *)key, strlen(key));
-                            tspdf_buffer_append_byte(&buf, ' ');
-                            write_obj(&buf, orig_info->dict.entries[j].value, &identity_map, doc);
-                            tspdf_buffer_append_byte(&buf, ' ');
-                        }
-                        free(identity_map.old_to_new);
-                    }
-                }
+            RenumberMap identity_map;
+            identity_map.map_size = total_objs;
+            identity_map.old_to_new = (uint32_t *)calloc(total_objs, sizeof(uint32_t));
+            if (identity_map.old_to_new) {
+                for (size_t k = 0; k < total_objs; k++)
+                    identity_map.old_to_new[k] = (uint32_t)k;
+                tspdf_info_emit_producer(&buf, doc, &parser, producer_info_num,
+                                         &identity_map);
+                free(identity_map.old_to_new);
+            } else {
+                tspdf_buffer_printf(&buf, "%u 0 obj\n<< /Producer (tspdf "
+                                    TSPDF_VERSION_STRING ") >>\nendobj\n",
+                                    producer_info_num);
             }
-            tspdf_buffer_append_str(&buf, "/Producer (tspdf " TSPDF_VERSION_STRING ") >>\nendobj\n");
         }
 
         // Write xref / trailer
@@ -1410,21 +1196,15 @@ TspdfError tspdf_serialize_with_options(TspdfReader *doc, uint8_t **out_buf, siz
 
     // ========== STANDARD RE-SERIALIZATION PATH ==========
 
-    // When this save writes no fresh Info object (no metadata edits, no
-    // Producer stamp) the source Info dict is carried over and the trailer
-    // keeps referencing it; dropping the reference threw the document's
-    // Title/Author away. The slow-collect walk never reaches Info (it hangs
-    // off the trailer, not the page tree), so mark it reachable here.
-    bool reference_source_info = !opts->strip_metadata && !opts->update_producer &&
-                                 !metadata_has_changes(doc->metadata) &&
-                                 source_info_num > 0;
+    // One module decides what happens to /Info (carry / merge / producer /
+    // drop). When it says CARRY, the source Info dict is reused and the trailer
+    // keeps referencing it; dropping that reference used to throw the
+    // document's Title/Author away. The slow-collect walk never reaches Info
+    // (it hangs off the trailer, not the page tree), so mark it reachable here.
+    TspdfInfoPlan info_plan = tspdf_info_plan(doc, &parser, opts, false);
+    bool reference_source_info = info_plan.action == TSPDF_INFO_CARRY_SOURCE;
     if (reference_source_info) {
-        TspdfObj *cand = resolve_for_collect(doc, source_info_num, &parser);
-        if (cand && cand->type == TSPDF_OBJ_DICT) {
-            visited[source_info_num] = true;
-        } else {
-            reference_source_info = false;
-        }
+        visited[source_info_num] = true;
     }
 
     // 2. Build renumbering map
@@ -1499,10 +1279,8 @@ TspdfError tspdf_serialize_with_options(TspdfReader *doc, uint8_t **out_buf, siz
     }
 
     // Determine if we need an Info object
-    bool write_info = false;
-    if (!opts->strip_metadata) {
-        write_info = metadata_has_changes(doc->metadata) || opts->update_producer;
-    }
+    bool write_info = info_plan.action == TSPDF_INFO_WRITE_MERGED ||
+                      info_plan.action == TSPDF_INFO_WRITE_PRODUCER;
     uint32_t info_obj_num = 0;
     if (write_info) {
         info_obj_num = next_num++;
@@ -1624,32 +1402,17 @@ TspdfError tspdf_serialize_with_options(TspdfReader *doc, uint8_t **out_buf, siz
         emit_err = emit_nonstream_object(&stm_writer, new_num, &scratch);
     }
 
-    // Info dict object. Kept top-level even when packing: write_info_dict_obj
-    // emits a complete indirect object, and one small dict does not change
-    // the size math.
+    // Info dict object. Kept top-level even when packing: the emitter writes a
+    // complete indirect object, and one small dict does not change the size
+    // math. The plan chose MERGED (metadata edits) or PRODUCER (producer
+    // refresh only); the standard path passes no identity map, so the producer
+    // emitter copies only string fields as plain literals.
     if (emit_err == TSPDF_OK && write_info) {
         offsets[info_obj_num] = buf.len;
-        if (metadata_has_changes(doc->metadata)) {
-            write_info_dict_obj(&buf, doc, &parser, info_obj_num, NULL);
-        } else if (opts->update_producer) {
-            // Producer refresh must not cost the document the rest of its
-            // Info: copy the original string fields (minus /Producer) and
-            // stamp the new Producer, mirroring the preserve-ids path.
-            tspdf_buffer_printf(&buf, "%u 0 obj\n<< ", info_obj_num);
-            TspdfObj *orig_info = source_info_dict(doc, &parser);
-            if (orig_info) {
-                for (size_t j = 0; j < orig_info->dict.count; j++) {
-                    const char *key = orig_info->dict.entries[j].key;
-                    TspdfObj *val = orig_info->dict.entries[j].value;
-                    if (strcmp(key, "Producer") == 0) continue;
-                    if (!val || val->type != TSPDF_OBJ_STRING) continue;
-                    write_name(&buf, (const uint8_t *)key, strlen(key));
-                    tspdf_buffer_append_byte(&buf, ' ');
-                    write_string_escaped(&buf, val->string.data, val->string.len);
-                    tspdf_buffer_append_byte(&buf, ' ');
-                }
-            }
-            tspdf_buffer_append_str(&buf, "/Producer (tspdf " TSPDF_VERSION_STRING ") >>\nendobj\n");
+        if (info_plan.action == TSPDF_INFO_WRITE_MERGED) {
+            tspdf_info_emit_merged(&buf, doc, &parser, info_obj_num, NULL);
+        } else {
+            tspdf_info_emit_producer(&buf, doc, &parser, info_obj_num, NULL);
         }
     }
 
@@ -1746,6 +1509,10 @@ static void write_hex_string(TspdfBuffer *buf, const uint8_t *data, size_t len) 
         tspdf_buffer_printf(buf, "%02X", data[i]);
     }
     tspdf_buffer_append_byte(buf, '>');
+}
+
+void tspr_write_hex_string(TspdfBuffer *buf, const uint8_t *data, size_t len) {
+    write_hex_string(buf, data, len);
 }
 
 // Trailer /ID entries. The first is the crypt's file id — for V<5 handlers it
@@ -2059,28 +1826,20 @@ TspdfError tspdf_serialize_encrypted(TspdfReader *doc, TspdfCrypt *crypt,
         visited[doc->crypt->src_encrypt_num] = false;
     }
 
-    /* Existing Info must survive encryption. With metadata edits a merged
-     * Info object is written below (write_info); without them the source
-     * Info object is carried over — written like any other collected object,
-     * so its strings are encrypted with its own key — and the trailer keeps
-     * referencing it. The slow-collect walk never reaches Info (it hangs off
-     * the trailer, not the page tree), so mark it reachable here. */
-    bool write_info = metadata_has_changes(doc->metadata);
+    /* Existing Info must survive encryption. The plan chooses: WRITE_MERGED
+     * (metadata edits, or a direct trailer Info dict rebuilt as an indirect
+     * object) or CARRY_SOURCE (the source Info object is written like any other
+     * collected object — its strings encrypted with its own key — and the
+     * trailer keeps referencing it). Encrypted saves never stamp Producer
+     * alone, so `encrypted=true` selects CARRY over PRODUCER. The slow-collect
+     * walk never reaches Info (it hangs off the trailer, not the page tree),
+     * so mark a carried object reachable here. */
+    TspdfInfoPlan info_plan = tspdf_info_plan(doc, &parser, NULL, true);
+    bool write_info = info_plan.action == TSPDF_INFO_WRITE_MERGED;
     uint32_t source_info_num = 0;
-    if (!write_info && doc->xref.trailer) {
-        TspdfObj *info_ref = tspdf_dict_get(doc->xref.trailer, "Info");
-        if (info_ref && info_ref->type == TSPDF_OBJ_REF &&
-            info_ref->ref.num < total_objs) {
-            TspdfObj *cand = resolve_for_collect(doc, info_ref->ref.num, &parser);
-            if (cand && cand->type == TSPDF_OBJ_DICT) {
-                source_info_num = info_ref->ref.num;
-                visited[source_info_num] = true;
-            }
-        } else if (info_ref && info_ref->type == TSPDF_OBJ_DICT) {
-            /* Direct (non-indirect) trailer Info dict: rebuild it as a fresh
-             * indirect object via the merge writer. */
-            write_info = true;
-        }
+    if (info_plan.action == TSPDF_INFO_CARRY_SOURCE) {
+        source_info_num = info_plan.source_info_num;
+        visited[source_info_num] = true;
     }
 
     /* 2. Build renumbering map */
@@ -2350,7 +2109,7 @@ TspdfError tspdf_serialize_encrypted(TspdfReader *doc, TspdfCrypt *crypt,
      * values must be encrypted with this object's key like any other string. */
     if (write_info) {
         offsets[info_obj_num] = buf.len;
-        write_info_dict_obj(&buf, doc, &parser, info_obj_num, crypt);
+        tspdf_info_emit_merged(&buf, doc, &parser, info_obj_num, crypt);
     }
 
     /* Flush the last (partial) object stream */
