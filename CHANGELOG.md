@@ -8,6 +8,12 @@ on 0.x, the CLI is considered stable but the low-level C API may still change.
 ## [Unreleased]
 
 ### Fixed
+- Writer now escapes PDF names and string control bytes per spec (ISO 32000
+  §7.3.4/§7.3.5). Previously `tspdf_raw_write_name` emitted names verbatim
+  (bytes needing `#HH` encoding were written raw), and `tspdf_raw_write_string`
+  omitted the `\n \r \t \b \f` named escapes and the `\NNN` octal fallback for
+  other control bytes. Both functions now delegate to the new canonical encoder
+  in `src/pdf/primitives.c`, shared with the reader serializer.
 - Every command that reads a PDF now takes `--password`/`--password-file`:
   `rotate`, `delete`, `reorder`, `split`, `merge`, `crop`, `scale`, `pagenum`,
   `watermark`, and `compress` gained both (they could not open encrypted files

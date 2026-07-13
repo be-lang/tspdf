@@ -1,4 +1,5 @@
 #include "pdf_writer.h"
+#include "primitives.h"
 #include "../compress/deflate.h"
 #include <string.h>
 #include <stdlib.h>
@@ -63,21 +64,13 @@ void tspdf_raw_write_real(TspdfRawWriter *w, double val) {
 }
 
 void tspdf_raw_write_name(TspdfRawWriter *w, const char *name) {
-    tspdf_buffer_printf(&w->output, "/%s ", name);
+    tspdf_pdf_encode_name(&w->output, (const uint8_t *)name, strlen(name));
+    tspdf_buffer_append_byte(&w->output, ' ');
 }
 
 void tspdf_raw_write_string(TspdfRawWriter *w, const char *str) {
-    tspdf_buffer_append_byte(&w->output, '(');
-    // Escape special characters
-    for (const char *p = str; *p; p++) {
-        switch (*p) {
-            case '(':  tspdf_buffer_append_str(&w->output, "\\("); break;
-            case ')':  tspdf_buffer_append_str(&w->output, "\\)"); break;
-            case '\\': tspdf_buffer_append_str(&w->output, "\\\\"); break;
-            default:   tspdf_buffer_append_byte(&w->output, (uint8_t)*p); break;
-        }
-    }
-    tspdf_buffer_append_str(&w->output, ") ");
+    tspdf_pdf_encode_string(&w->output, (const uint8_t *)str, strlen(str));
+    tspdf_buffer_append_byte(&w->output, ' ');
 }
 
 void tspdf_raw_write_string_hex(TspdfRawWriter *w, const uint8_t *data, size_t len) {

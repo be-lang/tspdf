@@ -1,4 +1,5 @@
 #include "tspr_internal.h"
+#include "../pdf/primitives.h"
 #include "../util/buffer.h"
 #include "../compress/deflate.h"
 #include "../crypto/md5.h"
@@ -162,54 +163,24 @@ static void collect_from_page_obj(TspdfReader *doc, TspdfObj *page_dict,
 
 static void write_obj(TspdfBuffer *buf, TspdfObj *obj, const RenumberMap *map, TspdfReader *doc);
 
+// Delegate to the canonical primitive encoder in src/pdf/primitives.c.
+// This static alias preserves all internal call sites unchanged.
 static void write_string_escaped(TspdfBuffer *buf, const uint8_t *data, size_t len) {
-    tspdf_buffer_append_byte(buf, '(');
-    for (size_t i = 0; i < len; i++) {
-        uint8_t c = data[i];
-        switch (c) {
-            case '(':  tspdf_buffer_append_str(buf, "\\("); break;
-            case ')':  tspdf_buffer_append_str(buf, "\\)"); break;
-            case '\\': tspdf_buffer_append_str(buf, "\\\\"); break;
-            case '\n': tspdf_buffer_append_str(buf, "\\n"); break;
-            case '\r': tspdf_buffer_append_str(buf, "\\r"); break;
-            case '\t': tspdf_buffer_append_str(buf, "\\t"); break;
-            case '\b': tspdf_buffer_append_str(buf, "\\b"); break;
-            case '\f': tspdf_buffer_append_str(buf, "\\f"); break;
-            default:
-                if (c < 32 || c > 126) {
-                    tspdf_buffer_printf(buf, "\\%03o", c);
-                } else {
-                    tspdf_buffer_append_byte(buf, c);
-                }
-                break;
-        }
-    }
-    tspdf_buffer_append_byte(buf, ')');
+    tspdf_pdf_encode_string(buf, data, len);
 }
 
-// Exported thin wrappers so the Info-plan module can reuse these primitives
-// without duplicating them (see tspr_internal.h).
+// Exported thin wrapper so tspr_infoplan.c can call the canonical encoder
+// without duplicating it (see tspr_internal.h).
 void tspr_write_string_escaped(TspdfBuffer *buf, const uint8_t *data, size_t len) {
-    write_string_escaped(buf, data, len);
+    tspdf_pdf_encode_string(buf, data, len);
 }
 
 static void write_name(TspdfBuffer *buf, const uint8_t *data, size_t len) {
-    tspdf_buffer_append_byte(buf, '/');
-    for (size_t i = 0; i < len; i++) {
-        uint8_t c = data[i];
-        // Escape non-regular characters per PDF spec
-        if (c < 33 || c > 126 || c == '#' || c == '/' || c == '(' || c == ')' ||
-            c == '<' || c == '>' || c == '[' || c == ']' || c == '{' || c == '}' ||
-            c == '%') {
-            tspdf_buffer_printf(buf, "#%02X", c);
-        } else {
-            tspdf_buffer_append_byte(buf, c);
-        }
-    }
+    tspdf_pdf_encode_name(buf, data, len);
 }
 
 void tspr_write_name(TspdfBuffer *buf, const uint8_t *data, size_t len) {
-    write_name(buf, data, len);
+    tspdf_pdf_encode_name(buf, data, len);
 }
 
 void tspr_write_obj(TspdfBuffer *buf, TspdfObj *obj, const RenumberMap *map, TspdfReader *doc) {
