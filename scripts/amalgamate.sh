@@ -70,9 +70,13 @@ parse_mk_var() {
 # Derive the lists from sources.mk (single source of truth).
 PUBLIC_HEADERS=$(parse_mk_var PUBLIC_HEADERS)
 INTERNAL_HEADERS=$(parse_mk_var INTERNAL_HEADERS)
-# ALL_SOURCES in the amalgamation = LIB_SOURCES + TSPR_SOURCES + CRYPTO_SOURCES
+# ALL_SOURCES in the amalgamation = LIB_SOURCES + OPS_SOURCES + TSPR_SOURCES + CRYPTO_SOURCES
+# ops.c comes after TSPR_SOURCES because it calls reader functions at runtime
+# (it only needs the declarations at compile time via tspdf.h, but dependency
+# ordering is clearest this way and avoids forward-reference surprises).
 SOURCES="$(parse_mk_var LIB_SOURCES)
 $(parse_mk_var TSPR_SOURCES)
+$(parse_mk_var OPS_SOURCES)
 $(parse_mk_var CRYPTO_SOURCES)"
 
 # A new file under src/ or include/ that this script does not know about must

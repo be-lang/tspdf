@@ -16,21 +16,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include <math.h>
 
 #include "../src/reader/tspr.h"
-#include "../src/reader/tspr_overlay.h"
 #include "../include/tspdf/version.h"
+#include "../src/ops/ops.h"
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #define WASM_EXPORT EMSCRIPTEN_KEEPALIVE
 #else
 #define WASM_EXPORT
-#endif
-
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
 #endif
 
 #define WASM_MAX_DOCS 64
@@ -136,12 +131,13 @@ WASM_EXPORT uint8_t *tspdf_wasm_save(int h, uint32_t *out_len) {
 
 // Save with the encryption removed. A plain save preserves a password-opened
 // document's encryption, so the unlock tool needs this explicit opt-out
-// (mirroring `tspdf decrypt` and the server's unlock endpoint).
+// (mirroring `tspdf decrypt` and the server's unlock endpoint). Thin adapter
+// over tsops_unlock_save_options so the three callers (CLI, server, wasm)
+// share one implementation.
 WASM_EXPORT uint8_t *tspdf_wasm_save_decrypted(int h, uint32_t *out_len) {
     TspdfReader *doc = wasm_get(h);
     if (!doc) return NULL;
-    TspdfSaveOptions opts = tspdf_save_options_default();
-    opts.decrypt = true;
+    TspdfSaveOptions opts = tsops_unlock_save_options();
     uint8_t *out = NULL;
     size_t len = 0;
     TspdfError err = tspdf_reader_save_to_memory_with_options(doc, &out, &len, &opts);
@@ -260,8 +256,13 @@ WASM_EXPORT uint8_t *tspdf_wasm_encrypt(int h, const char *user_pass,
     return out;
 }
 
-// Diagonal text watermark on every page (same drawing as the server's
-// watermark endpoint). Mutates the handle's document, then saves it.
+// Diagonal text watermark on every page (same drawing as the CLI's `tspdf
+// watermark` and the server's watermark endpoint). Thin adapter over
+// tsops_watermark_text — which correctly compensates page /Rotate so the
+// watermark reads upright on rotated pages. Previously this function had its
+// own copy of the drawing loop that ignored /Rotate; now all three callers
+// share a single implementation and the bug is fixed.
+// Mutates the handle's document, then saves it.
 WASM_EXPORT uint8_t *tspdf_wasm_watermark_text(int h, const char *text,
                                                double font_size, double opacity,
                                                uint32_t *out_len) {
@@ -271,49 +272,13 @@ WASM_EXPORT uint8_t *tspdf_wasm_watermark_text(int h, const char *text,
     if (font_size <= 0.0) font_size = 48.0;
     if (opacity <= 0.0 || opacity > 1.0) opacity = 0.3;
 
-    size_t page_count = tspdf_reader_page_count(doc);
-    double angle_rad = 45.0 * M_PI / 180.0;
-    double cos_a = cos(angle_rad);
-    double sin_a = sin(angle_rad);
-
-    for (size_t i = 0; i < page_count; i++) {
-        TspdfReaderPage *page = tspdf_reader_get_page(doc, i);
-        if (!page) continue;
-
-        double w = page->media_box[2] - page->media_box[0];
-        double hgt = page->media_box[3] - page->media_box[1];
-        double cx = w / 2.0;
-        double cy = hgt / 2.0;
-
-        TspdfWriter *writer = tspdf_writer_create();
-        if (!writer) continue;
-
-        const char *font_name = tspdf_writer_add_builtin_font(writer, "Helvetica");
-        if (!font_name) { tspdf_writer_destroy(writer); continue; }
-
-        const char *gs_name = tspdf_writer_add_opacity(writer, opacity, opacity);
-
-        TspdfStream *stream = tspdf_page_begin_content(doc, i);
-        if (!stream) { tspdf_writer_destroy(writer); continue; }
-
-        tspdf_stream_save(stream);
-        if (gs_name) tspdf_stream_set_opacity(stream, gs_name);
-
-        TspdfColor gray = tspdf_color_rgb(0.7, 0.7, 0.7);
-        tspdf_stream_set_fill_color(stream, gray);
-        tspdf_stream_concat_matrix(stream, cos_a, sin_a, -sin_a, cos_a, cx, cy);
-
-        double text_width = (double)strlen(text) * font_size * 0.5;
-        tspdf_stream_begin_text(stream);
-        tspdf_stream_set_font(stream, font_name, font_size);
-        tspdf_stream_text_position(stream, -text_width / 2.0, -font_size / 3.0);
-        tspdf_stream_show_text(stream, text);
-        tspdf_stream_end_text(stream);
-        tspdf_stream_restore(stream);
-
-        TspdfError err = tspdf_page_end_content(doc, i, stream, writer);
-        tspdf_writer_destroy(writer);
-        if (err != TSPDF_OK) { wasm_set_error_code(err); return NULL; }
+    TsopsWatermarkText params = {
+        .text = text, .opacity = opacity, .font_size = font_size,
+    };
+    TspdfError err = tsops_watermark_text(doc, &params, NULL);
+    if (err != TSPDF_OK) {
+        wasm_set_error_code(err);
+        return NULL;
     }
 
     return wasm_save_doc(doc, out_len);

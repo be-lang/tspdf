@@ -1,6 +1,6 @@
 #include "commands.h"
 #include "pipeline.h"
-#include "ops.h"
+#include "../src/ops/ops.h"
 #include "../include/tspdf.h"
 #include <stdio.h>
 #include <string.h>
@@ -8,7 +8,7 @@
 static int run(TspdfCmdCtx *ctx) {
     // Saves preserve a source document's encryption by default; decrypt is
     // the one command whose whole point is the opt-out.
-    TspdfSaveOptions opts = tspdf_op_unlock_save_options();
+    TspdfSaveOptions opts = tsops_unlock_save_options();
     TspdfError err = tspdf_reader_save_with_options(ctx->doc, ctx->output, &opts);
     if (err != TSPDF_OK) {
         fprintf(stderr, "tspdf decrypt: failed to save '%s': %s\n", ctx->output, tspdf_error_string(err));

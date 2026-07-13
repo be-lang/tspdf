@@ -1,6 +1,6 @@
 #include "commands.h"
 #include "pipeline.h"
-#include "ops.h"
+#include "../src/ops/ops.h"
 #include "../include/tspdf.h"
 #include "../src/util/pdfdate.h"
 #include <stdio.h>
@@ -63,7 +63,7 @@ static int run(TspdfCmdCtx *ctx) {
             return 1;
         }
         size_t key_len = (size_t)(eq - sets[i]);
-        if (!tspdf_op_metadata_set(doc, sets[i], key_len, eq + 1)) {
+        if (!tsops_metadata_set(doc, sets[i], key_len, eq + 1)) {
             fprintf(stderr, "tspdf metadata: unknown key '%.*s'\n", (int)key_len, sets[i]);
             return 1;
         }
@@ -72,7 +72,7 @@ static int run(TspdfCmdCtx *ctx) {
     // Clearing passes NULL through the setter: the serializer sees the
     // field as overridden-with-nothing and omits it from the Info dict.
     for (int i = 0; i < nclears; i++) {
-        if (!tspdf_op_metadata_set(doc, clears[i], strlen(clears[i]), NULL)) {
+        if (!tsops_metadata_set(doc, clears[i], strlen(clears[i]), NULL)) {
             fprintf(stderr, "tspdf metadata: unknown key '%s'\n", clears[i]);
             return 1;
         }

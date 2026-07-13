@@ -85,13 +85,12 @@ FUZZ_BIN = $(BUILDDIR)/fuzz
 # After Task 1, registering a new src/ file requires one edit in sources.mk only.
 include sources.mk
 
-ALL_SOURCES = $(LIB_SOURCES) $(TSPR_SOURCES) $(CRYPTO_SOURCES)
+ALL_SOURCES = $(LIB_SOURCES) $(OPS_SOURCES) $(TSPR_SOURCES) $(CRYPTO_SOURCES)
 
 CLI_SOURCES = \
 	cli/main.c \
 	cli/commands.c \
 	cli/pipeline.c \
-	cli/ops.c \
 	cli/cmd_merge.c \
 	cli/cmd_split.c \
 	cli/cmd_rotate.c \
@@ -336,7 +335,7 @@ list-fuzzers:
 
 $(FUZZ_BIN)/fuzz_reader: fuzz/fuzz_reader.c $(ALL_SOURCES)
 	@mkdir -p $(FUZZ_BIN)
-	$(FUZZ_CC) $(CPPFLAGS) $(FUZZ_CFLAGS) $(LDFLAGS) -o $@ $< $(LIB_SOURCES) $(TSPR_SOURCES) $(CRYPTO_SOURCES) -lm
+	$(FUZZ_CC) $(CPPFLAGS) $(FUZZ_CFLAGS) $(LDFLAGS) -o $@ $< $(LIB_SOURCES) $(OPS_SOURCES) $(TSPR_SOURCES) $(CRYPTO_SOURCES) -lm
 
 $(FUZZ_BIN)/fuzz_inflate: fuzz/fuzz_inflate.c $(SRCDIR)/compress/deflate.c $(SRCDIR)/util/buffer.c
 	@mkdir -p $(FUZZ_BIN)
@@ -371,7 +370,7 @@ $(FUZZ_BIN)/fuzz_png: fuzz/fuzz_png.c $(SRCDIR)/image/png_decoder.c \
 # above links the full library automatically — no Makefile edit needed.
 $(FUZZ_BIN)/fuzz_%: fuzz/fuzz_%.c $(ALL_SOURCES)
 	@mkdir -p $(FUZZ_BIN)
-	$(FUZZ_CC) $(CPPFLAGS) $(FUZZ_CFLAGS) $(LDFLAGS) -o $@ $< $(LIB_SOURCES) $(TSPR_SOURCES) $(CRYPTO_SOURCES) -lm
+	$(FUZZ_CC) $(CPPFLAGS) $(FUZZ_CFLAGS) $(LDFLAGS) -o $@ $< $(LIB_SOURCES) $(OPS_SOURCES) $(TSPR_SOURCES) $(CRYPTO_SOURCES) -lm
 
 # Seed the reader corpus with the synthetic test PDFs so libFuzzer starts from
 # real, structurally-valid inputs instead of random noise. We copy the existing
@@ -424,7 +423,7 @@ READER_TEST_SOURCES = $(wildcard tests/reader/*.c) tests/test_framework.c
 
 $(BUILDDIR)/test_reader: $(READER_TEST_SOURCES) $(ALL_SOURCES)
 	@mkdir -p $(BUILDDIR)
-	$(CC) $(CPPFLAGS) $(ALL_CFLAGS) $(LDFLAGS) -o $@ $(READER_TEST_SOURCES) $(TSPR_SOURCES) $(LIB_SOURCES) $(CRYPTO_SOURCES) -lm
+	$(CC) $(CPPFLAGS) $(ALL_CFLAGS) $(LDFLAGS) -o $@ $(READER_TEST_SOURCES) $(TSPR_SOURCES) $(LIB_SOURCES) $(OPS_SOURCES) $(CRYPTO_SOURCES) -lm
 
 $(BUILDDIR)/test_crypto: tests/test_crypto.c tests/test_framework.c $(CRYPTO_SOURCES)
 	@mkdir -p $(BUILDDIR)

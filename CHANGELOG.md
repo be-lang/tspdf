@@ -58,6 +58,9 @@ on 0.x, the CLI is considered stable but the low-level C API may still change.
   `Top 3 Correlated Emotion Representations` block), and the blank-line
   gap below a merged row is measured from its lowest baseline so the
   merge cannot open a spurious gap.
+- Web demo / wasm watermark now honors page rotation: on pages with a
+  `/Rotate` entry the watermark text is pre-rotated so it reads upright
+  as the viewer displays the page, matching the behavior of `tspdf watermark`.
 
 ## [0.4.0] - 2026-07-11
 

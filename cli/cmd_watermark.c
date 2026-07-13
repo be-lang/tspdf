@@ -1,6 +1,6 @@
 #include "commands.h"
 #include "pipeline.h"
-#include "ops.h"
+#include "../src/ops/ops.h"
 #include "../include/tspdf_overlay.h"
 #include "../src/util/pdftext.h"
 #include <stdio.h>
@@ -247,11 +247,11 @@ static int watermark_text(const char *input, const char *output, const char *tex
 
     // The op re-encodes the UTF-8 text to cp1252 (WinAnsi) for Helvetica and
     // stamps every page; we translate its TspdfError into the CLI's messages.
-    TspdfOpWatermarkText params = {
+    TsopsWatermarkText params = {
         .text = text, .opacity = opacity, .font_size = 48.0,
     };
-    TspdfOpWatermarkTextDetail detail = {0};
-    TspdfError err = tspdf_op_watermark_text(doc, &params, &detail);
+    TsopsWatermarkTextDetail detail = {0};
+    TspdfError err = tsops_watermark_text(doc, &params, &detail);
     if (err != TSPDF_OK) {
         if (err == TSPDF_ERR_UNSUPPORTED) {
             char ch[5];
