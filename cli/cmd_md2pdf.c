@@ -1,4 +1,5 @@
 #include "commands.h"
+#include "pipeline.h"
 #include "../include/tspdf.h"
 #include "../src/util/pdftext.h"
 #include <stdio.h>
@@ -1104,3 +1105,18 @@ int cmd_md2pdf(int argc, char **argv) {
     printf("Markdown (%d page%s) -> %s\n", num_pages, num_pages == 1 ? "" : "s", output);
     return 0;
 }
+
+
+/* md2pdf reads a Markdown (not PDF) input — it stays a RAW_ARGS command. */
+static int run_md2pdf_raw(TspdfCmdCtx *ctx) { return cmd_md2pdf(ctx->argc, ctx->argv); }
+static const TspdfCliFlag MD2PDF_FLAGS[] = {
+    {"-o", true},
+    {NULL, false}
+};
+const TspdfCmdSpec tspdf_cmd_md2pdf_spec = {
+    .name = "md2pdf",
+    .flags = MD2PDF_FLAGS,
+    .min_pos = 0, .max_pos = -1,
+    .needs = TSPDF_CMD_RAW_ARGS,
+    .run = run_md2pdf_raw,
+};

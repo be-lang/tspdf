@@ -32,30 +32,20 @@ size_t first_out_of_range(const size_t *pages, size_t count, size_t total);
 struct TspdfStream;
 void tspdf_cli_emit_rotate_compensation(struct TspdfStream *s, int rot, double cx, double cy);
 
-// Command entry points (argc/argv shifted past the subcommand name)
+// Command entry points for the nonstandard commands that keep a raw argc/argv
+// body (their spec sets TSPDF_CMD_RAW_ARGS and delegates here). The standard
+// commands no longer expose a cmd_* symbol — their body is the spec's run()
+// callback, dispatched through cli/pipeline.c.
 int cmd_merge(int argc, char **argv);
-int cmd_split(int argc, char **argv);
-int cmd_rotate(int argc, char **argv);
-int cmd_delete(int argc, char **argv);
-int cmd_reorder(int argc, char **argv);
-int cmd_encrypt(int argc, char **argv);
-int cmd_decrypt(int argc, char **argv);
-int cmd_metadata(int argc, char **argv);
 int cmd_info(int argc, char **argv);
-int cmd_watermark(int argc, char **argv);
-int cmd_compress(int argc, char **argv);
 int cmd_img2pdf(int argc, char **argv);
 int cmd_qrcode(int argc, char **argv);
 int cmd_md2pdf(int argc, char **argv);
 int cmd_serve(int argc, char **argv);
-int cmd_text(int argc, char **argv);
-int cmd_pagenum(int argc, char **argv);
 int cmd_form(int argc, char **argv);
 int cmd_attach(int argc, char **argv);
 int cmd_bookmark(int argc, char **argv);
 int cmd_stamp(int argc, char **argv);
 int cmd_nup(int argc, char **argv);
-int cmd_crop(int argc, char **argv);
-int cmd_scale(int argc, char **argv);
 
 #endif

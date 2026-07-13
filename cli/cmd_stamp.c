@@ -4,6 +4,7 @@
 // centered), compensating a page-level /Rotate so the stamp reads upright.
 
 #include "commands.h"
+#include "pipeline.h"
 #include "password_input.h"
 #include "../include/tspdf_overlay.h"
 #include <stdio.h>
@@ -256,3 +257,25 @@ int cmd_stamp(int argc, char **argv) {
     free(mask);
     return 0;
 }
+
+
+/* stamp overlays a second PDF onto the input (two-PDF) — it stays a RAW_ARGS command. */
+static int run_stamp_raw(TspdfCmdCtx *ctx) { return cmd_stamp(ctx->argc, ctx->argv); }
+static const TspdfCliFlag STAMP_FLAGS[] = {
+    {"-o", true},
+    {"--stamp", true},
+    {"--stamp-page", true},
+    {"--pages", true},
+    {"--stamp-password", true},
+    {"--stamp-password-file", true},
+    {"--password", true},
+    {"--password-file", true},
+    {NULL, false}
+};
+const TspdfCmdSpec tspdf_cmd_stamp_spec = {
+    .name = "stamp",
+    .flags = STAMP_FLAGS,
+    .min_pos = 0, .max_pos = -1,
+    .needs = TSPDF_CMD_RAW_ARGS,
+    .run = run_stamp_raw,
+};

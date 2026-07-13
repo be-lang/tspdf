@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "commands.h"
+#include "pipeline.h"
 #include "assets.h"
 #include "../include/tspdf.h"
 #include "../include/tspdf_overlay.h"
@@ -2422,3 +2423,18 @@ int cmd_serve(int argc, char **argv)
 
     return start_server(port);
 }
+
+/* serve is nonstandard: it runs with no arguments and owns its own help, so it
+ * stays a RAW_ARGS command (the pipeline only derives its value flags). */
+static int run_serve_raw(TspdfCmdCtx *ctx) { return cmd_serve(ctx->argc, ctx->argv); }
+static const TspdfCliFlag SERVE_FLAGS[] = {
+    {"--port", true}, {"--bind", true},
+    {NULL, false}
+};
+const TspdfCmdSpec tspdf_cmd_serve_spec = {
+    .name = "serve",
+    .flags = SERVE_FLAGS,
+    .min_pos = 0, .max_pos = -1,
+    .needs = TSPDF_CMD_RAW_ARGS,
+    .run = run_serve_raw,
+};

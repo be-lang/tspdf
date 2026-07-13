@@ -90,6 +90,7 @@ ALL_SOURCES = $(LIB_SOURCES) $(TSPR_SOURCES) $(CRYPTO_SOURCES)
 CLI_SOURCES = \
 	cli/main.c \
 	cli/commands.c \
+	cli/pipeline.c \
 	cli/cmd_merge.c \
 	cli/cmd_split.c \
 	cli/cmd_rotate.c \
