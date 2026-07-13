@@ -259,7 +259,7 @@ void tspdf_form_fallback_free(struct TspdfReader *doc);
 
 // Internal seam: generate the content-stream bytes for a text-field appearance
 // (/Tx BMC ... EMC). Pure function — no document access. Exposed for testing.
-// w, h: widget bounding box dimensions. res_font: resource name for the font.
+// h: widget bounding box height. res_font: resource name for the font.
 // size: Tf point size. line: cp1252-safe value text (or ignored when
 // fallback_tj is non-NULL). fallback_tj: Identity-H hex string, or NULL.
 // Returns malloc'd NUL-terminated bytes; NULL on alloc failure.

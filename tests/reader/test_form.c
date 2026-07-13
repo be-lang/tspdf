@@ -1606,7 +1606,7 @@ TEST(test_seam_gen_text_ap_content_fallback_hex) {
     // The hex string appears verbatim, followed by Tj.
     ASSERT(str_has(ap, "<0041 0042> Tj"));
     // No literal-string syntax since we are in the fallback branch.
-    ASSERT(!str_has(ap, "(") || !str_has(ap, "(\\x00"));
+    ASSERT(!str_has(ap, "("));
     // Resource name is the fallback name.
     char expected_tf[64];
     snprintf(expected_tf, sizeof(expected_tf), "/%s ", TSPR_FORM_FALLBACK_RES_NAME);
