@@ -256,6 +256,22 @@ struct TspdfReader {
 // Free doc->form_fallback (safe when NULL). Defined in tspr_form.c.
 void tspdf_form_fallback_free(struct TspdfReader *doc);
 
+// Resource name used in appearance streams and /DR for the embedded fallback
+// font (CIDFontType2 / Identity-H). Defined here so tests can reference it
+// without duplicating the literal.
+#define TSPR_FORM_FALLBACK_RES_NAME "TspdfFb"
+
+// Internal seam: generate the content-stream bytes for a text-field appearance
+// (/Tx BMC ... EMC). Pure function — no document access. Exposed for testing.
+// h: widget bounding box height. res_font: resource name for the font.
+// size: Tf point size. line: cp1252-safe value text (or ignored when
+// fallback_tj is non-NULL). fallback_tj: Identity-H hex string, or NULL.
+// Returns malloc'd NUL-terminated bytes; NULL on alloc failure.
+char *tspr_form_gen_text_ap_content(double h,
+                                    const char *res_font, double size,
+                                    const char *line,
+                                    const char *fallback_tj);
+
 // --- Crypt ---
 
 TspdfError tspdf_crypt_init(TspdfCrypt *crypt, TspdfObj *encrypt_dict,
