@@ -66,7 +66,6 @@ static int run(TspdfCmdCtx *ctx) {
         if (err != TSPDF_OK) {
             fprintf(stderr, "tspdf compress: lossy image pass failed: %s\n",
                     tspdf_error_string(err));
-            tspdf_reader_destroy(doc);
             return 1;
         }
     }

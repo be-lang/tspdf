@@ -37,7 +37,7 @@ jobs:
       - uses: actions/checkout@v4
 
       # Install Liberation fonts and link them to the path the TTF tests probe
-      # (tests/test_main.c hardcodes /usr/share/fonts/liberation/...). Without
+      # (tests/unit/ hardcodes /usr/share/fonts/liberation/...). Without
       # this the font-dependent tests `return` early and report a silent PASS.
       - name: Install Liberation fonts (Linux)
         if: runner.os == 'Linux'

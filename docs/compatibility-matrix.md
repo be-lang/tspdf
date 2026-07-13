@@ -14,20 +14,20 @@ This matrix reflects what the project currently validates in CI and local regres
 
 | Area | Status | Coverage Source |
 |---|---|---|
-| Merge / Split / Rotate / Reorder / Delete | Stable | `tests/test_reader.c`, `tests/test_cli.sh` |
-| Encrypt / Decrypt (AES-128/256) | Stable | `tests/test_reader.c`, `tests/test_crypto.c`, `tests/test_cli.sh` |
-| Metadata view/edit | Stable | `tests/test_reader.c`, `tests/test_cli.sh` |
+| Merge / Split / Rotate / Reorder / Delete | Stable | `tests/reader/`, `tests/test_cli.sh` |
+| Encrypt / Decrypt (AES-128/256) | Stable | `tests/reader/`, `tests/test_crypto.c`, `tests/test_cli.sh` |
+| Metadata view/edit | Stable | `tests/reader/`, `tests/test_cli.sh` |
 | Watermark (text/image) | Stable | `tests/test_cli.sh` |
-| Stamp / N-up / Crop / Scale | Stable | `tests/test_reader.c`, `tests/test_cli.sh` |
-| Forms (list/fill/flatten) | Stable | `tests/test_reader.c`, `tests/test_cli.sh` |
-| Attachments / Bookmarks | Stable | `tests/test_reader.c`, `tests/test_cli.sh` |
-| Text extraction | Stable | `tests/test_reader.c`, `tests/test_cli.sh` |
-| Compress (incl. `--lossy` image recompression) | Stable | `tests/test_main.c`, `tests/test_reader.c`, `tests/test_cli.sh` |
+| Stamp / N-up / Crop / Scale | Stable | `tests/reader/`, `tests/test_cli.sh` |
+| Forms (list/fill/flatten) | Stable | `tests/reader/`, `tests/test_cli.sh` |
+| Attachments / Bookmarks | Stable | `tests/reader/`, `tests/test_cli.sh` |
+| Text extraction | Stable | `tests/reader/`, `tests/test_cli.sh` |
+| Compress (incl. `--lossy` image recompression) | Stable | `tests/unit/`, `tests/reader/`, `tests/test_cli.sh` |
 | Images to PDF (img2pdf) / page numbers | Stable | `tests/test_cli.sh` |
 | Markdown to PDF | Stable | `tests/test_cli.sh` |
-| QR code to PDF | Stable | `tests/test_main.c`, `tests/test_cli.sh` |
-| PNG decode | Hardened | `tests/test_main.c` |
-| Deflate/inflate | Hardened | `tests/test_main.c` |
+| QR code to PDF | Stable | `tests/unit/`, `tests/test_cli.sh` |
+| PNG decode | Hardened | `tests/unit/` |
+| Deflate/inflate | Hardened | `tests/unit/` |
 | Embedded web server | Hardened | `tests/test_cli.sh` raw HTTP regressions |
 
 ## Reliability Signals

@@ -384,7 +384,12 @@ fuzz-corpus:
 		cp -f tests/data/one_page.pdf fuzz/corpus/reader/; fi
 	@if [ -f tests/data/three_pages.pdf ]; then \
 		cp -f tests/data/three_pages.pdf fuzz/corpus/reader/; fi
-	@mkdir -p fuzz/corpus/jpeg fuzz/corpus/ccitt fuzz/corpus/deflate fuzz/corpus/deflate_best
+	@mkdir -p fuzz/corpus/jpeg fuzz/corpus/ccitt fuzz/corpus/deflate fuzz/corpus/deflate_best fuzz/corpus/filters
+	@printf '\x00Hello World' > fuzz/corpus/filters/seed_asciihex
+	@printf '\x02~Hello~World~' > fuzz/corpus/filters/seed_ascii85
+	@printf '\x04\x78\x9c\x4b\xcb\xcf\x07\x00\x02\x82\x01\x45' > fuzz/corpus/filters/seed_flate
+	@printf '\x06HELLO' > fuzz/corpus/filters/seed_lzw
+	@printf '\x08\xff\xd8\xff\xe0\x00\x10JFIF' > fuzz/corpus/filters/seed_dct
 	@cp -f tests/data/jpg_*.jpg fuzz/corpus/jpeg/ 2>/dev/null || true
 	@cp -f tests/data/ccitt_*.g3 tests/data/ccitt_*.g4 tests/data/ccitt_*.bin fuzz/corpus/ccitt/ 2>/dev/null || true
 	@cp -f README.md fuzz/corpus/deflate/seed_text 2>/dev/null || true

@@ -46,7 +46,6 @@ static int run(TspdfCmdCtx *ctx) {
         out = fopen(output, "wb");
         if (!out) {
             fprintf(stderr, "tspdf text: failed to open '%s' for writing\n", output);
-            tspdf_reader_destroy(doc);
             free(pages);
             return 1;
         }
