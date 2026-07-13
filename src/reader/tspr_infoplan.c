@@ -90,13 +90,18 @@ void tspdf_info_emit_merged(TspdfBuffer *buf, TspdfReader *doc, TspdfParser *par
 
     TspdfReaderMetadata *m = doc->metadata;
 
-    // Generate ModDate timestamp: D:YYYYMMDDHHmmSS
+    // ModDate timestamp: D:YYYYMMDDHHmmSS. When the XMP sync stamped one into
+    // xmp:ModifyDate, reuse it so Info and XMP agree; otherwise generate.
     char mod_date[64];
-    time_t now = time(NULL);
-    struct tm *tm_info = gmtime(&now);
-    snprintf(mod_date, sizeof(mod_date), "D:%04d%02d%02d%02d%02d%02d",
-             tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,
-             tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec);
+    if (m && m->mod_date) {
+        snprintf(mod_date, sizeof(mod_date), "%s", m->mod_date);
+    } else {
+        time_t now = time(NULL);
+        struct tm *tm_info = gmtime(&now);
+        snprintf(mod_date, sizeof(mod_date), "D:%04d%02d%02d%02d%02d%02d",
+                 tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,
+                 tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec);
+    }
 
     // Field names and their metadata override values (NULL = not overridden, "" ptr = set to remove)
     static const char *field_names[] = {

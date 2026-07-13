@@ -28,6 +28,7 @@
 //    (accepted limitation).
 
 #include "tspr_internal.h"
+#include "tspr_content_walk.h"
 #include "../image/jpeg_codec.h"
 #include "../image/ccitt_codec.h"
 #include <math.h>
@@ -239,23 +240,11 @@ bool tspdf_lossy_worth_replacing(size_t old_stored, size_t new_stored) {
 }
 
 // --- Content-stream walker (CTM tracking to each image Do) ---
-
-typedef struct {
-    double a, b, c, d, e, f;
-} LossyMat;
-
-static const LossyMat LOSSY_IDENTITY = {1, 0, 0, 1, 0, 0};
-
-static LossyMat lossy_mat_mul(LossyMat m, LossyMat n) {
-    LossyMat r;
-    r.a = m.a * n.a + m.b * n.c;
-    r.b = m.a * n.b + m.b * n.d;
-    r.c = m.c * n.a + m.d * n.c;
-    r.d = m.c * n.b + m.d * n.d;
-    r.e = m.e * n.a + m.f * n.c + n.e;
-    r.f = m.e * n.b + m.f * n.d + n.f;
-    return r;
-}
+//
+// The shared walker (tspr_content_walk.c) owns tokenization, the q/Q + cm CTM
+// stack, Form recursion, and inline-image skipping. This client only needs the
+// image-Do callback: measure the placement, or mark the image unmeasurable
+// when the CTM was lost (q/Q nesting outgrew the save stack).
 
 // Per-object usage accumulator, indexed by object number.
 typedef struct {
@@ -264,10 +253,6 @@ typedef struct {
     bool lost;  // drawn while the CTM was untracked: never downsample
 } LossyUse;
 
-#define LOSSY_MAX_DEPTH 8       // Form XObject recursion cap
-#define LOSSY_OP_STACK 8        // operands kept for cm/Do
-#define LOSSY_GS_STACK 64       // initial q/Q save-stack capacity (heap-grown)
-#define LOSSY_GS_MAX 4096       // growth cap; deeper nesting loses CTM tracking
 #define LOSSY_CONTENT_MAX (64u << 20)
 
 typedef struct {
@@ -275,7 +260,6 @@ typedef struct {
     TspdfParser rp;             // object resolution (doc arena)
     TspdfArena scratch;         // transient operand parsing
     LossyUse *use;              // indexed by obj num, doc->xref.count entries
-    const TspdfObj *form_stack[LOSSY_MAX_DEPTH];
 } LossyCtx;
 
 static TspdfObj *lossy_resolve(LossyCtx *ctx, TspdfObj *o) {
@@ -339,212 +323,60 @@ static uint8_t *lossy_load_stream(LossyCtx *ctx, TspdfObj *s, uint32_t obj_num,
     return decoded;
 }
 
-static bool lossy_is_ws(uint8_t c) {
-    return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' || c == 0;
+// Walker load_stream/free callbacks.
+static uint8_t *lossy_walk_load(void *client, TspdfObj *s, uint32_t obj_num,
+                                size_t *out_len) {
+    return lossy_load_stream((LossyCtx *)client, s, obj_num, out_len);
 }
 
-static bool lossy_is_delim(uint8_t c) {
-    return c == '(' || c == ')' || c == '<' || c == '>' || c == '[' ||
-           c == ']' || c == '{' || c == '}' || c == '/' || c == '%';
+static void lossy_walk_free(void *client, uint8_t *bytes) {
+    (void)client;
+    free(bytes);
 }
 
-// Skip BI ... ID <binary> EI so raw inline-image bytes cannot derail the
-// tokenizer (same approach as the text extractor).
-static void lossy_skip_inline_image(TspdfParser *p) {
-    while (p->pos + 1 < p->len) {
-        if (p->data[p->pos] == 'I' && p->data[p->pos + 1] == 'D' &&
-            (p->pos + 2 >= p->len || lossy_is_ws(p->data[p->pos + 2]))) {
-            p->pos += 2;
-            break;
-        }
-        p->pos++;
-    }
-    if (p->pos < p->len && lossy_is_ws(p->data[p->pos])) p->pos++;
-    while (p->pos + 1 < p->len) {
-        if (p->data[p->pos] == 'E' && p->data[p->pos + 1] == 'I' &&
-            p->pos > 0 && lossy_is_ws(p->data[p->pos - 1]) &&
-            (p->pos + 2 >= p->len || lossy_is_ws(p->data[p->pos + 2]) ||
-             lossy_is_delim(p->data[p->pos + 2]))) {
-            p->pos += 2;
-            return;
-        }
-        p->pos++;
-    }
-    p->pos = p->len;
-}
-
-static void lossy_interpret(LossyCtx *ctx, const uint8_t *data, size_t len,
-                            LossyMat ctm, TspdfObj *resources, int depth,
-                            bool ctm_lost);
-
-static void lossy_do_xobject(LossyCtx *ctx, LossyMat ctm, TspdfObj *resources,
-                             const TspdfObj *name, int depth, bool ctm_lost) {
-    if (!resources || !name || name->type != TSPDF_OBJ_NAME) return;
-    TspdfObj *xobjs = lossy_resolve(ctx, tspdf_dict_get(resources, "XObject"));
-    if (!xobjs || xobjs->type != TSPDF_OBJ_DICT) return;
-    TspdfObj *ref = tspdf_dict_get(xobjs, (const char *)name->string.data);
-    uint32_t num = ref && ref->type == TSPDF_OBJ_REF ? ref->ref.num : 0;
-    TspdfObj *xo = lossy_resolve(ctx, ref);
-    if (!xo || xo->type != TSPDF_OBJ_STREAM) return;
+// Image Do callback: measure the placement, or mark it unmeasurable when the
+// CTM was lost. The walker enters Form XObjects itself, so this only fires for
+// Image (and unknown-subtype) XObjects.
+static void lossy_walk_image(void *client, TspdfObj *xo, uint32_t obj_num,
+                             TspdfWalkMat ctm, bool ctm_lost) {
+    LossyCtx *ctx = (LossyCtx *)client;
     TspdfObj *sub = lossy_resolve(ctx, tspdf_dict_get(xo->stream.dict, "Subtype"));
-    if (!sub || sub->type != TSPDF_OBJ_NAME) return;
-
-    if (strcmp((const char *)sub->string.data, "Image") == 0) {
-        if (num == 0 || num >= ctx->doc->xref.count) return;
-        LossyUse *u = &ctx->use[num];
-        if (ctm_lost) {
-            // The CTM is untrustworthy (q nesting outgrew the save stack):
-            // this placement is unmeasurable, so the image must never be
-            // downsampled, no matter what other placements measured.
-            u->lost = true;
-            return;
-        }
-        // The image fills the unit square under the CTM; the rendered size
-        // in points is the length of the transformed basis vectors.
-        double w = hypot(ctm.a, ctm.b);
-        double h = hypot(ctm.c, ctm.d);
-        if (w > u->w_pt) u->w_pt = w;
-        if (h > u->h_pt) u->h_pt = h;
-        u->drawn = true;
+    if (!sub || sub->type != TSPDF_OBJ_NAME ||
+        strcmp((const char *)sub->string.data, "Image") != 0)
+        return;
+    if (obj_num == 0 || obj_num >= ctx->doc->xref.count) return;
+    LossyUse *u = &ctx->use[obj_num];
+    if (ctm_lost) {
+        // The CTM is untrustworthy (q nesting outgrew the save stack): this
+        // placement is unmeasurable, so the image must never be downsampled,
+        // no matter what other placements measured.
+        u->lost = true;
         return;
     }
-
-    if (strcmp((const char *)sub->string.data, "Form") != 0) return;
-    if (depth + 1 >= LOSSY_MAX_DEPTH) return;
-    for (int i = 0; i <= depth; i++)
-        if (ctx->form_stack[i] == xo) return;  // cycle
-    ctx->form_stack[depth + 1] = xo;
-
-    size_t blen = 0;
-    uint8_t *bytes = lossy_load_stream(ctx, xo, num, &blen);
-    if (bytes) {
-        LossyMat sub_ctm = ctm;
-        TspdfObj *mtx = lossy_resolve(ctx, tspdf_dict_get(xo->stream.dict, "Matrix"));
-        if (mtx && mtx->type == TSPDF_OBJ_ARRAY && mtx->array.count >= 6) {
-            LossyMat m;
-            m.a = lossy_obj_num(lossy_resolve(ctx, &mtx->array.items[0]));
-            m.b = lossy_obj_num(lossy_resolve(ctx, &mtx->array.items[1]));
-            m.c = lossy_obj_num(lossy_resolve(ctx, &mtx->array.items[2]));
-            m.d = lossy_obj_num(lossy_resolve(ctx, &mtx->array.items[3]));
-            m.e = lossy_obj_num(lossy_resolve(ctx, &mtx->array.items[4]));
-            m.f = lossy_obj_num(lossy_resolve(ctx, &mtx->array.items[5]));
-            sub_ctm = lossy_mat_mul(m, ctm);
-        }
-        TspdfObj *sub_res = lossy_resolve(ctx, tspdf_dict_get(xo->stream.dict, "Resources"));
-        if (!sub_res || sub_res->type != TSPDF_OBJ_DICT) sub_res = resources;
-        lossy_interpret(ctx, bytes, blen, sub_ctm, sub_res, depth + 1, ctm_lost);
-        free(bytes);
-    }
-    ctx->form_stack[depth + 1] = NULL;
+    // The image fills the unit square under the CTM; the rendered size in
+    // points is the length of the transformed basis vectors.
+    double w = hypot(ctm.a, ctm.b);
+    double h = hypot(ctm.c, ctm.d);
+    if (w > u->w_pt) u->w_pt = w;
+    if (h > u->h_pt) u->h_pt = h;
+    u->drawn = true;
 }
 
-static void lossy_interpret(LossyCtx *ctx, const uint8_t *data, size_t len,
-                            LossyMat ctm, TspdfObj *resources, int depth,
-                            bool ctm_lost) {
-    TspdfParser p;
-    tspdf_parser_init(&p, data, len, &ctx->scratch);
-    TspdfObj *stk[LOSSY_OP_STACK];
-    int ns = 0;
-    // q/Q save stack: starts on the C stack, grows on the heap up to
-    // LOSSY_GS_MAX. If nesting goes deeper still (or the realloc fails),
-    // ctm_lost is set for the rest of this content stream: an unmatched Q
-    // would otherwise restore an ancestor CTM too early and make a large
-    // image look tiny, so from then on every image Do is marked
-    // unmeasurable and skipped instead.
-    LossyMat gs_fixed[LOSSY_GS_STACK];
-    LossyMat *gstack = gs_fixed;
-    LossyMat *gs_heap = NULL;
-    size_t gs_cap = LOSSY_GS_STACK;
-    size_t ngs = 0;
-
-    while (1) {
-        tspdf_skip_whitespace(&p);
-        if (p.pos >= p.len) break;
-        uint8_t c = p.data[p.pos];
-
-        if (c == '(' || c == '<' || c == '[' || c == '/' || c == '+' ||
-            c == '-' || c == '.' || (c >= '0' && c <= '9')) {
-            p.error = TSPDF_OK;
-            size_t before = p.pos;
-            TspdfObj *o = tspdf_parse_obj(&p);
-            if (!o) {
-                p.error = TSPDF_OK;
-                p.pos = before + 1;
-                ns = 0;
-                continue;
-            }
-            if (ns == LOSSY_OP_STACK) {
-                memmove(stk, stk + 1, sizeof(stk[0]) * (LOSSY_OP_STACK - 1));
-                ns--;
-            }
-            stk[ns++] = o;
-            continue;
-        }
-        if (lossy_is_delim(c)) {  // stray delimiter: resync
-            p.pos++;
-            continue;
-        }
-
-        char op[8];
-        size_t ol = 0;
-        bool overlong = false;
-        while (p.pos < p.len && !lossy_is_ws(p.data[p.pos]) &&
-               !lossy_is_delim(p.data[p.pos]) && p.data[p.pos] > ' ') {
-            if (ol + 1 < sizeof(op)) op[ol++] = (char)p.data[p.pos];
-            else overlong = true;
-            p.pos++;
-        }
-        op[ol] = '\0';
-        if (ol == 0) {
-            p.pos++;
-            continue;
-        }
-        if (overlong) {
-            ns = 0;
-            continue;
-        }
-        if (strcmp(op, "true") == 0 || strcmp(op, "false") == 0 ||
-            strcmp(op, "null") == 0) {
-            continue;  // operands, not operators
-        }
-
-        if (strcmp(op, "q") == 0) {
-            if (!ctm_lost && ngs == gs_cap) {
-                LossyMat *nh = NULL;
-                size_t ncap = gs_cap * 2;
-                if (ncap <= LOSSY_GS_MAX)
-                    nh = (LossyMat *)realloc(gs_heap, ncap * sizeof(LossyMat));
-                if (nh) {
-                    if (!gs_heap) memcpy(nh, gs_fixed, sizeof(gs_fixed));
-                    gs_heap = nh;
-                    gstack = nh;
-                    gs_cap = ncap;
-                } else {
-                    ctm_lost = true;  // too deep / OOM: stop trusting the CTM
-                }
-            }
-            if (!ctm_lost) gstack[ngs++] = ctm;
-        } else if (strcmp(op, "Q") == 0) {
-            if (!ctm_lost && ngs > 0) ctm = gstack[--ngs];
-        } else if (strcmp(op, "cm") == 0 && ns >= 6) {
-            LossyMat m;
-            m.a = lossy_obj_num(stk[ns - 6]);
-            m.b = lossy_obj_num(stk[ns - 5]);
-            m.c = lossy_obj_num(stk[ns - 4]);
-            m.d = lossy_obj_num(stk[ns - 3]);
-            m.e = lossy_obj_num(stk[ns - 2]);
-            m.f = lossy_obj_num(stk[ns - 1]);
-            ctm = lossy_mat_mul(m, ctm);
-        } else if (strcmp(op, "Do") == 0 && ns >= 1) {
-            lossy_do_xobject(ctx, ctm, resources, stk[ns - 1], depth, ctm_lost);
-        } else if (strcmp(op, "BI") == 0) {
-            lossy_skip_inline_image(&p);
-        }
-        // every other operator: irrelevant to image placement
-        ns = 0;
-    }
-    free(gs_heap);
+// Build a walker configured for placement measurement (CTM only, no gstate
+// blob, no per-operator callback).
+static void lossy_walker_init(LossyCtx *ctx, TspdfWalker *w) {
+    memset(w, 0, sizeof(*w));
+    w->doc = ctx->doc;
+    w->rp = &ctx->rp;
+    w->scratch = &ctx->scratch;
+    w->client = ctx;
+    w->max_depth = TSPDF_WALK_MAX_DEPTH;
+    w->gstate_size = 0;
+    w->load_stream = lossy_walk_load;
+    w->load_stream_free = lossy_walk_free;
+    w->image_do = lossy_walk_image;
 }
+
 
 // Page /Resources with Pages-tree inheritance via the /Parent chain.
 static TspdfObj *lossy_page_resources(LossyCtx *ctx, TspdfObj *page_dict) {
@@ -625,6 +457,8 @@ TspdfError tspdf_lossy_scan_placements(TspdfReader *doc,
         return TSPDF_ERR_ALLOC;
     }
 
+    TspdfWalker walker;
+    lossy_walker_init(&ctx, &walker);
     for (size_t i = 0; i < doc->pages.count; i++) {
         TspdfObj *page = doc->pages.pages[i].page_dict;
         if (!page || page->type != TSPDF_OBJ_DICT) continue;
@@ -632,7 +466,8 @@ TspdfError tspdf_lossy_scan_placements(TspdfReader *doc,
         size_t clen = 0;
         uint8_t *content = lossy_page_content(&ctx, page, &clen);
         if (content) {
-            lossy_interpret(&ctx, content, clen, LOSSY_IDENTITY, res, 0, false);
+            tspdf_walk_run(&walker, content, clen, TSPDF_WALK_IDENTITY, res, 0,
+                           false, NULL);
             free(content);
         }
         tspdf_arena_reset(&ctx.scratch);

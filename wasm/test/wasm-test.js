@@ -2,15 +2,34 @@
 // native-CLI-generated fixture PDFs and writes the outputs for the qpdf
 // conformance gate in run_wasm_test.sh.
 //
-// Usage: node wasm/test/wasm-test.js <fixture_a.pdf> <fixture_b.pdf> <outdir>
+// Usage: node wasm/test/wasm-test.js <fixture_a.pdf> <fixture_b.pdf> <rotate90.pdf> <rotate90_wm_ref.pdf> <outdir>
 
 import { readFile, writeFile } from 'node:fs/promises';
 import { strict as assert } from 'node:assert';
 import createTspdf from '../dist/tspdf.js';
 import { makeTspdf } from '../tspdf-api.js';
 
-const [fixtureA, fixtureB, outDir] = process.argv.slice(2);
-assert.ok(fixtureA && fixtureB && outDir, 'usage: wasm-test.js a.pdf b.pdf outdir');
+const [fixtureA, fixtureB, fixtureRotate90, fixtureRotate90WmRef, outDir] = process.argv.slice(2);
+assert.ok(fixtureA && fixtureB && fixtureRotate90 && fixtureRotate90WmRef && outDir,
+  'usage: wasm-test.js a.pdf b.pdf rotate90.pdf rotate90_wm_ref.pdf outdir');
+
+// Extract the first `cm` matrix [a,b,c,d,e,f] from a PDF's content streams.
+// Content streams may be compressed; we search raw bytes for uncompressed
+// content blocks prepended by the shim (which are NOT deflate-compressed).
+// Returns [a, b, c, d, e, f] or null.
+function extractFirstCmMatrix(pdfBytes) {
+  // The watermark content stream is appended as a new uncompressed stream.
+  // Find 'cm' in the raw bytes (ASCII text). We scan for the ASCII sequence
+  // matching: <number> <number> <number> <number> <number> <number> cm
+  const text = new TextDecoder('latin1').decode(pdfBytes);
+  // Match 6 floating-point/integer numbers before 'cm' with whitespace
+  const re = /([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+cm/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    return [m[1], m[2], m[3], m[4], m[5], m[6]].map(Number);
+  }
+  return null;
+}
 
 const Module = await createTspdf();
 const t = makeTspdf(Module);
@@ -31,6 +50,8 @@ console.log(`tspdf wasm ${t.version()} under node ${process.version}`);
 
 const bytesA = new Uint8Array(await readFile(fixtureA));
 const bytesB = new Uint8Array(await readFile(fixtureB));
+const bytesRotate90 = new Uint8Array(await readFile(fixtureRotate90));
+const bytesRotate90WmRef = new Uint8Array(await readFile(fixtureRotate90WmRef));
 
 // open + page_count
 const ha = t.open(bytesA);
@@ -131,6 +152,49 @@ const hplain = t.open(decrypted); // no password: must be unencrypted
 assert.equal(t.pageCount(hplain), pagesA + pagesB, 'unlocked page count');
 t.close(hplain);
 await writeOut('out_decrypted.pdf', decrypted);
+
+// /Rotate 90 watermark: TDD gate for the "wasm watermark ignores page /Rotate"
+// bug. The CLI reference (bytesRotate90WmRef) was produced by
+//   tspdf rotate fixture_a --angle 90 | tspdf watermark --text "ROTATE TEST"
+// which uses tsops_watermark_text and therefore compensates /Rotate 90 with
+// angle = 45 + 90 = 135 degrees (cos(135) ≈ -0.7071).
+//
+// The buggy shim always used 45 degrees (cos(45) ≈ +0.7071). After the fix the
+// shim delegates to tsops_watermark_text and produces the same matrix.
+//
+// Assertion: the first `cm` matrix in the wasm-watermarked /Rotate 90 output
+// has a negative first element (cos(135°) < 0). The CLI reference must also
+// have a negative first element (confirms the fixture is good). If the shim
+// still uses 45° the first element will be positive and the assertion fails.
+{
+  const hr90 = t.open(bytesRotate90);
+  const wasm_wm90 = t.watermark(hr90, 'ROTATE TEST', { opacity: 0.3 });
+  t.close(hr90);
+  assertPdf(wasm_wm90, 'watermark_rotate90');
+  await writeOut('out_watermarked_rotate90.pdf', wasm_wm90);
+
+  // Extract the cm matrix from the wasm output and from the CLI reference.
+  const wasmMatrix = extractFirstCmMatrix(wasm_wm90);
+  const refMatrix  = extractFirstCmMatrix(bytesRotate90WmRef);
+  assert.ok(wasmMatrix !== null, 'watermark_rotate90: no cm matrix found in wasm output');
+  assert.ok(refMatrix  !== null, 'watermark_rotate90: no cm matrix found in CLI reference');
+
+  // The CLI reference must use a negative cosine (135°), confirming the fixture.
+  assert.ok(refMatrix[0] < 0,
+    `watermark_rotate90: CLI reference cm[0]=${refMatrix[0]} should be negative (135 deg)`);
+
+  // The wasm shim must now also use a negative cosine (bug fix: honors /Rotate).
+  assert.ok(wasmMatrix[0] < 0,
+    `watermark_rotate90: wasm cm[0]=${wasmMatrix[0]} should be negative (135 deg); ` +
+    'shim is not compensating /Rotate — bug not fixed');
+
+  // The matrices must match within floating-point tolerance.
+  for (let i = 0; i < 4; i++) {
+    assert.ok(Math.abs(wasmMatrix[i] - refMatrix[i]) < 1e-4,
+      `watermark_rotate90: cm[${i}] wasm=${wasmMatrix[i]} ref=${refMatrix[i]} differ`);
+  }
+  console.log(`  watermark_rotate90: cm=[${wasmMatrix.map(v=>v.toFixed(4)).join(',')}] matches CLI`);
+}
 
 // error surface: invalid handle and invalid page index give real messages
 assert.throws(() => t.pageCount(999), /handle/, 'bad handle error');

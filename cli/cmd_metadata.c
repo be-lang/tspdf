@@ -1,6 +1,6 @@
 #include "commands.h"
 #include "pipeline.h"
-#include "ops.h"
+#include "../src/ops/ops.h"
 #include "../include/tspdf.h"
 #include "../src/util/pdfdate.h"
 #include <stdio.h>
@@ -63,7 +63,7 @@ static int run(TspdfCmdCtx *ctx) {
             return 1;
         }
         size_t key_len = (size_t)(eq - sets[i]);
-        if (!tspdf_op_metadata_set(doc, sets[i], key_len, eq + 1)) {
+        if (!tsops_metadata_set(doc, sets[i], key_len, eq + 1)) {
             fprintf(stderr, "tspdf metadata: unknown key '%.*s'\n", (int)key_len, sets[i]);
             return 1;
         }
@@ -72,17 +72,31 @@ static int run(TspdfCmdCtx *ctx) {
     // Clearing passes NULL through the setter: the serializer sees the
     // field as overridden-with-nothing and omits it from the Info dict.
     for (int i = 0; i < nclears; i++) {
-        if (!tspdf_op_metadata_set(doc, clears[i], strlen(clears[i]), NULL)) {
+        if (!tsops_metadata_set(doc, clears[i], strlen(clears[i]), NULL)) {
             fprintf(stderr, "tspdf metadata: unknown key '%s'\n", clears[i]);
             return 1;
         }
     }
 
-    // The Info-dict edit leaves any XMP metadata stream untouched, and some
-    // viewers (Acrobat) prefer XMP over /Info. Say so once on stderr.
-    if (tspdf_reader_has_xmp_metadata(doc)) {
-        fprintf(stderr, "note: XMP metadata present and not updated; viewers "
-                        "preferring XMP may show old values\n");
+    // Apply the edits to the XMP packet too — some viewers (Acrobat) prefer
+    // XMP over /Info. Fields the packet cannot take (property absent, or a
+    // packet we cannot edit safely) stay stale there; say so once on stderr.
+    unsigned stale = tspdf_reader_sync_xmp_metadata(doc);
+    if (stale) {
+        static const struct { unsigned bit; const char *name; } xmp_fields[] = {
+            {TSPDF_XMP_TITLE, "title"},       {TSPDF_XMP_AUTHOR, "author"},
+            {TSPDF_XMP_SUBJECT, "subject"},   {TSPDF_XMP_KEYWORDS, "keywords"},
+            {TSPDF_XMP_CREATOR, "creator"},   {TSPDF_XMP_PRODUCER, "producer"},
+        };
+        fprintf(stderr, "note: XMP metadata present but not updated for");
+        const char *sep = " ";
+        for (size_t i = 0; i < sizeof(xmp_fields) / sizeof(xmp_fields[0]); i++) {
+            if (stale & xmp_fields[i].bit) {
+                fprintf(stderr, "%s%s", sep, xmp_fields[i].name);
+                sep = ", ";
+            }
+        }
+        fprintf(stderr, "; viewers preferring XMP may show old values\n");
     }
 
     err = tspdf_reader_save(doc, output);

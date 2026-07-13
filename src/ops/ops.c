@@ -1,7 +1,7 @@
 #include "ops.h"
 
-#include "../include/tspdf_overlay.h"
-#include "../src/util/pdftext.h"
+#include "../../include/tspdf_overlay.h"
+#include "../util/pdftext.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -12,9 +12,9 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-TspdfError tspdf_op_watermark_text(TspdfReader *doc,
-                                   const TspdfOpWatermarkText *params,
-                                   TspdfOpWatermarkTextDetail *detail)
+TspdfError tsops_watermark_text(TspdfReader *doc,
+                                const TsopsWatermarkText *params,
+                                TsopsWatermarkTextDetail *detail)
 {
     const char *text = params->text;
     double opacity = params->opacity;
@@ -113,8 +113,8 @@ TspdfError tspdf_op_watermark_text(TspdfReader *doc,
     return TSPDF_OK;
 }
 
-bool tspdf_op_metadata_set(TspdfReader *doc, const char *key, size_t key_len,
-                           const char *value)
+bool tsops_metadata_set(TspdfReader *doc, const char *key, size_t key_len,
+                        const char *value)
 {
     static const struct {
         const char *name;
@@ -137,7 +137,7 @@ bool tspdf_op_metadata_set(TspdfReader *doc, const char *key, size_t key_len,
     return false;
 }
 
-TspdfSaveOptions tspdf_op_unlock_save_options(void)
+TspdfSaveOptions tsops_unlock_save_options(void)
 {
     TspdfSaveOptions opts = tspdf_save_options_default();
     opts.decrypt = true;

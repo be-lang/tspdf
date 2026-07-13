@@ -11,6 +11,7 @@ LIB_SOURCES = \
 	$(SRCDIR)/util/arena.c \
 	$(SRCDIR)/util/pdftext.c \
 	$(SRCDIR)/util/pdfdate.c \
+	$(SRCDIR)/pdf/primitives.c \
 	$(SRCDIR)/pdf/pdf_writer.c \
 	$(SRCDIR)/pdf/pdf_stream.c \
 	$(SRCDIR)/pdf/pdf_base14.c \
@@ -33,6 +34,7 @@ TSPR_SOURCES = \
 	$(SRCDIR)/reader/tspr_xref.c \
 	$(SRCDIR)/reader/tspr_pages.c \
 	$(SRCDIR)/reader/tspr_serialize.c \
+	$(SRCDIR)/reader/tspr_streamplan.c \
 	$(SRCDIR)/reader/tspr_infoplan.c \
 	$(SRCDIR)/reader/tspr_crypt.c \
 	$(SRCDIR)/reader/tspr_document.c \
@@ -40,12 +42,14 @@ TSPR_SOURCES = \
 	$(SRCDIR)/reader/tspr_attach.c \
 	$(SRCDIR)/reader/tspr_bookmark.c \
 	$(SRCDIR)/reader/tspr_metadata.c \
+	$(SRCDIR)/reader/tspr_xmp.c \
 	$(SRCDIR)/reader/tspr_content.c \
 	$(SRCDIR)/reader/tspr_import.c \
 	$(SRCDIR)/reader/tspr_nup.c \
 	$(SRCDIR)/reader/tspr_resources.c \
 	$(SRCDIR)/reader/tspr_annot.c \
 	$(SRCDIR)/reader/tspr_form.c \
+	$(SRCDIR)/reader/tspr_content_walk.c \
 	$(SRCDIR)/reader/tspr_text.c \
 	$(SRCDIR)/reader/tspr_lossy.c
 
@@ -55,6 +59,13 @@ CRYPTO_SOURCES = \
 	$(SRCDIR)/crypto/sha512.c \
 	$(SRCDIR)/crypto/rc4.c \
 	$(SRCDIR)/crypto/aes.c
+
+# Shared CLI/server/wasm seam: ops that require both writer (LIB_SOURCES) and
+# reader (TSPR_SOURCES). Listed separately because the unit test runner only
+# links LIB_SOURCES and would fail on the reader references. Everything that
+# links ALL_SOURCES also links OPS_SOURCES (see Makefile).
+OPS_SOURCES = \
+	$(SRCDIR)/ops/ops.c
 
 # Public headers (umbrella closure, dependency order).
 PUBLIC_HEADERS = \
@@ -75,6 +86,7 @@ PUBLIC_HEADERS = \
 
 # Implementation-only headers (deps satisfied by tspdf.h), dependency order.
 INTERNAL_HEADERS = \
+	src/pdf/primitives.h \
 	src/compress/deflate.h \
 	src/filters/filters.h \
 	src/crypto/md5.h \
@@ -92,7 +104,9 @@ INTERNAL_HEADERS = \
 	src/reader/tspr_internal.h \
 	src/reader/tspr_doctree.h \
 	src/reader/tspr_attach.h \
-	src/reader/tspr_text.h
+	src/reader/tspr_content_walk.h \
+	src/reader/tspr_text.h \
+	src/ops/ops.h
 
 # Umbrella headers: known but not amalgamated (they only #include the lists above).
 UMBRELLA_HEADERS = \

@@ -1,4 +1,5 @@
 #include "tspr_internal.h"
+#include "../pdf/primitives.h"
 #include "../util/buffer.h"
 #include "../compress/deflate.h"
 #include "../crypto/md5.h"
@@ -38,8 +39,9 @@ static bool input_uses_objstm(const TspdfReader *doc) {
 // re-derives both (members are written individually or re-packed, and a fresh
 // xref is emitted). Copying the source containers would duplicate every
 // packed object, so every save path drops them.
-static bool is_xref_machinery(TspdfObj *obj) {
-    return stream_dict_type_is(obj, "ObjStm") || stream_dict_type_is(obj, "XRef");
+bool tspr_is_xref_machinery(TspdfObj *obj) {
+    return tspr_stream_dict_type_is(obj, "ObjStm") ||
+           tspr_stream_dict_type_is(obj, "XRef");
 }
 
 // --- Object collection: find all objects reachable from pages ---
@@ -162,54 +164,24 @@ static void collect_from_page_obj(TspdfReader *doc, TspdfObj *page_dict,
 
 static void write_obj(TspdfBuffer *buf, TspdfObj *obj, const RenumberMap *map, TspdfReader *doc);
 
+// Delegate to the canonical primitive encoder in src/pdf/primitives.c.
+// This static alias preserves all internal call sites unchanged.
 static void write_string_escaped(TspdfBuffer *buf, const uint8_t *data, size_t len) {
-    tspdf_buffer_append_byte(buf, '(');
-    for (size_t i = 0; i < len; i++) {
-        uint8_t c = data[i];
-        switch (c) {
-            case '(':  tspdf_buffer_append_str(buf, "\\("); break;
-            case ')':  tspdf_buffer_append_str(buf, "\\)"); break;
-            case '\\': tspdf_buffer_append_str(buf, "\\\\"); break;
-            case '\n': tspdf_buffer_append_str(buf, "\\n"); break;
-            case '\r': tspdf_buffer_append_str(buf, "\\r"); break;
-            case '\t': tspdf_buffer_append_str(buf, "\\t"); break;
-            case '\b': tspdf_buffer_append_str(buf, "\\b"); break;
-            case '\f': tspdf_buffer_append_str(buf, "\\f"); break;
-            default:
-                if (c < 32 || c > 126) {
-                    tspdf_buffer_printf(buf, "\\%03o", c);
-                } else {
-                    tspdf_buffer_append_byte(buf, c);
-                }
-                break;
-        }
-    }
-    tspdf_buffer_append_byte(buf, ')');
+    tspdf_pdf_encode_string(buf, data, len);
 }
 
-// Exported thin wrappers so the Info-plan module can reuse these primitives
-// without duplicating them (see tspr_internal.h).
+// Exported thin wrapper so tspr_infoplan.c can call the canonical encoder
+// without duplicating it (see tspr_internal.h).
 void tspr_write_string_escaped(TspdfBuffer *buf, const uint8_t *data, size_t len) {
-    write_string_escaped(buf, data, len);
+    tspdf_pdf_encode_string(buf, data, len);
 }
 
 static void write_name(TspdfBuffer *buf, const uint8_t *data, size_t len) {
-    tspdf_buffer_append_byte(buf, '/');
-    for (size_t i = 0; i < len; i++) {
-        uint8_t c = data[i];
-        // Escape non-regular characters per PDF spec
-        if (c < 33 || c > 126 || c == '#' || c == '/' || c == '(' || c == ')' ||
-            c == '<' || c == '>' || c == '[' || c == ']' || c == '{' || c == '}' ||
-            c == '%') {
-            tspdf_buffer_printf(buf, "#%02X", c);
-        } else {
-            tspdf_buffer_append_byte(buf, c);
-        }
-    }
+    tspdf_pdf_encode_name(buf, data, len);
 }
 
 void tspr_write_name(TspdfBuffer *buf, const uint8_t *data, size_t len) {
-    write_name(buf, data, len);
+    tspdf_pdf_encode_name(buf, data, len);
 }
 
 void tspr_write_obj(TspdfBuffer *buf, TspdfObj *obj, const RenumberMap *map, TspdfReader *doc) {
@@ -387,7 +359,7 @@ typedef struct {
     uint8_t *owned;
 } StreamBytes;
 
-static bool stream_dict_type_is(TspdfObj *obj, const char *type_name) {
+bool tspr_stream_dict_type_is(TspdfObj *obj, const char *type_name) {
     if (!obj || obj->type != TSPDF_OBJ_STREAM || !type_name) {
         return false;
     }
@@ -396,74 +368,9 @@ static bool stream_dict_type_is(TspdfObj *obj, const char *type_name) {
            strcmp((const char *)type_val->string.data, type_name) == 0;
 }
 
-// Image XObjects get the fast deflate level during recompression: their
-// Flate payloads (PNG-style, usually predictor-coded) gain almost nothing
-// from the slow best-effort search, and scan-heavy files would otherwise
-// dominate `tspdf compress` wall time for no size benefit.
-static bool stream_is_image(TspdfObj *dict) {
-    TspdfObj *st = tspdf_dict_get(dict, "Subtype");
-    return st && st->type == TSPDF_OBJ_NAME &&
-           strcmp((const char *)st->string.data, "Image") == 0;
-}
-
-// True when the /Filter chain consists only of lossless byte filters our
-// decoder can round-trip AND rewriting it as a bare /FlateDecode can win:
-// either it contains a non-Flate "armor" stage (ASCIIHex/ASCII85/RunLength/
-// LZW — those cost 25%+, hex doubles) or it is an array form like
-// [/FlateDecode] (common in generator output; re-encoding normalizes it and
-// applies the best-effort level). A bare FlateDecode NAME (with or without
-// predictor params) is handled by the cheaper re-flate branch instead — the
-// predictor usually helps compression, so full-decode-and-replace would
-// only burn time to then keep the original.
-static bool filter_chain_is_strippable(TspdfObj *filter) {
-    if (!filter) return false;
-    size_t count = filter->type == TSPDF_OBJ_ARRAY ? filter->array.count : 1;
-    if (filter->type != TSPDF_OBJ_NAME && filter->type != TSPDF_OBJ_ARRAY) return false;
-    bool has_armor = false;
-    for (size_t i = 0; i < count; i++) {
-        TspdfObj *name = filter->type == TSPDF_OBJ_NAME ? filter : &filter->array.items[i];
-        if (!name || name->type != TSPDF_OBJ_NAME) return false;
-        const char *f = (const char *)name->string.data;
-        if (strcmp(f, "FlateDecode") == 0 || strcmp(f, "Fl") == 0) {
-            continue;
-        }
-        if (strcmp(f, "ASCIIHexDecode") == 0 || strcmp(f, "AHx") == 0 ||
-            strcmp(f, "ASCII85Decode") == 0 || strcmp(f, "A85") == 0 ||
-            strcmp(f, "RunLengthDecode") == 0 || strcmp(f, "RL") == 0 ||
-            strcmp(f, "LZWDecode") == 0 || strcmp(f, "LZW") == 0) {
-            has_armor = true;
-            continue;
-        }
-        return false;  // lossy or unknown filter: leave the stream verbatim
-    }
-    return has_armor || filter->type == TSPDF_OBJ_ARRAY;
-}
-
-// True when the stream's /DecodeParms (or /DP) is absent or fully direct —
-// null, a dict, or an array of dicts/nulls. tspdf_stream_decode looks the
-// parameters up per filter but does NOT resolve indirect references: a
-// "/DecodeParms 6 0 R" (or a ref inside the array form) silently yields no
-// parameters, so a predictor or LZW /EarlyChange 0 would be skipped and the
-// "decoded" bytes would be wrong. The armor-strip path bakes those bytes
-// into the output as plain Flate, so it must refuse any parms it cannot see.
-static bool decode_parms_fully_direct(TspdfObj *dict) {
-    TspdfObj *parms = tspdf_dict_get(dict, "DecodeParms");
-    if (!parms) {
-        parms = tspdf_dict_get(dict, "DP");
-    }
-    if (!parms || parms->type == TSPDF_OBJ_NULL || parms->type == TSPDF_OBJ_DICT) {
-        return true;
-    }
-    if (parms->type == TSPDF_OBJ_ARRAY) {
-        for (size_t i = 0; i < parms->array.count; i++) {
-            TspdfObj *entry = &parms->array.items[i];
-            if (entry->type != TSPDF_OBJ_DICT && entry->type != TSPDF_OBJ_NULL) {
-                return false;
-            }
-        }
-        return true;
-    }
-    return false;  // indirect reference or unexpected type
+// Thin static alias so existing call sites in this file stay unchanged.
+static bool stream_dict_type_is(TspdfObj *obj, const char *type_name) {
+    return tspr_stream_dict_type_is(obj, type_name);
 }
 
 static uint16_t source_object_gen(TspdfReader *doc, uint32_t obj_num) {
@@ -552,28 +459,31 @@ static TspdfError write_stream_obj_with_options(TspdfBuffer *buf, TspdfObj *obj,
     const uint8_t *stream_data = stream.data;
     size_t stream_len = stream.len;
 
-    // Recompression. Every branch keeps whichever encoding is smaller, so a
-    // stream never grows: an already-well-compressed stream stays verbatim.
-    // The size-focused best-effort deflate level is used throughout —
+    // Recompression. The strategy is chosen by tspdf_stream_plan from the dict
+    // alone (which handles the XRef skip, the filter classification, the XMP
+    // and external-file guards, and the indirect-/DecodeParms armor refusal);
+    // this executor runs the deflate for the chosen strategy and keeps whichever
+    // encoding is smaller, so a stream never grows. The size-focused best-effort
+    // deflate level is used throughout except for image XObjects (fast level);
     // `tspdf compress` is the only recompress_streams caller.
     uint8_t *recompressed = NULL;
     size_t recomp_len = 0;
     bool add_flate_filter = false;    // append /Filter /FlateDecode
     bool replace_filter = false;      // drop original /Filter + /DecodeParms too
-    if (opts->recompress_streams && !stream_dict_type_is(obj, "XRef")) {
-        TspdfObj *filter = tspdf_dict_get(dict, "Filter");
-        bool is_image = stream_is_image(dict);
-        if (filter && filter->type == TSPDF_OBJ_NAME &&
-            strcmp((char *)filter->string.data, "FlateDecode") == 0) {
-            // Flate stream (predictor params, if any, are preserved since
-            // the re-encoded bytes are the same predicted bytes): inflate +
-            // re-deflate and keep the smaller encoding. This recovers
-            // streams stored at a low compression level (or as raw stored
-            // blocks) regardless of their size.
+    TspdfStreamPlan plan = tspdf_stream_plan(
+        obj, opts->recompress_streams, stream_dict_type_is(obj, "XRef"), stream_len);
+    switch (plan.action) {
+        case TSPDF_STREAM_KEEP:
+            break;
+        case TSPDF_STREAM_REDEFLATE: {
+            // Flate stream (predictor params, if any, are preserved since the
+            // re-encoded bytes are the same predicted bytes): inflate +
+            // re-deflate and keep the smaller encoding. Recovers streams
+            // stored at a low compression level (or as raw stored blocks).
             size_t dec_len = 0;
             uint8_t *decompressed = deflate_decompress(stream_data, stream_len, &dec_len);
             if (decompressed) {
-                recompressed = is_image
+                recompressed = plan.use_fast_level
                     ? deflate_compress(decompressed, dec_len, &recomp_len)
                     : deflate_compress_best(decompressed, dec_len, &recomp_len);
                 free(decompressed);
@@ -585,15 +495,11 @@ static TspdfError write_stream_obj_with_options(TspdfBuffer *buf, TspdfObj *obj,
                     recompressed = NULL;
                 }
             }
-        } else if (!filter && stream_len > 0 &&
-                   !tspdf_dict_get(dict, "FFilter") &&
-                   !tspdf_dict_get(dict, "DecodeParms") &&
-                   !tspdf_dict_get(dict, "DP") &&
-                   !is_xmp_metadata(obj)) {
+            break;
+        }
+        case TSPDF_STREAM_ADD_FLATE:
             // Stream stored with no filter at all: deflate it and add the
-            // /Filter entry if that shrinks it. XMP metadata streams stay
-            // uncompressed (PDF/A-style scanning), as does anything with
-            // external-file or decode-parameter entries.
+            // /Filter entry if that shrinks it.
             recompressed = deflate_compress_best(stream_data, stream_len, &recomp_len);
             if (recompressed && recomp_len < stream_len) {
                 stream_data = recompressed;
@@ -603,21 +509,17 @@ static TspdfError write_stream_obj_with_options(TspdfBuffer *buf, TspdfObj *obj,
                 free(recompressed);
                 recompressed = NULL;
             }
-        } else if (filter_chain_is_strippable(filter) &&
-                   !tspdf_dict_get(dict, "FFilter") &&
-                   decode_parms_fully_direct(dict)) {
-            // ASCII/RunLength/LZW armor (possibly stacked on Flate): decode
-            // the chain fully and re-encode as plain Flate when that is
-            // smaller, replacing the whole /Filter (+/DecodeParms) — hex
-            // doubles the bytes, ASCII85 adds 25%. Lossy/unknown filters
-            // never reach here (see filter_chain_is_strippable), a failed
-            // decode keeps the stream verbatim, and an indirect /DecodeParms
-            // (which the decoder cannot resolve) refuses the strip entirely.
+            break;
+        case TSPDF_STREAM_ARMOR_STRIP: {
+            // ASCII/RunLength/LZW armor (possibly stacked on Flate): decode the
+            // chain fully and re-encode as plain Flate when smaller, replacing
+            // the whole /Filter (+/DecodeParms). A failed decode keeps the
+            // stream verbatim.
             uint8_t *decoded = NULL;
             size_t dec_len = 0;
             if (tspdf_stream_decode(dict, stream_data, stream_len,
                                     &decoded, &dec_len) == TSPDF_OK) {
-                recompressed = is_image
+                recompressed = plan.use_fast_level
                     ? deflate_compress(decoded, dec_len, &recomp_len)
                     : deflate_compress_best(decoded, dec_len, &recomp_len);
                 free(decoded);
@@ -631,6 +533,7 @@ static TspdfError write_stream_obj_with_options(TspdfBuffer *buf, TspdfObj *obj,
                     recompressed = NULL;
                 }
             }
+            break;
         }
     }
 
@@ -679,7 +582,7 @@ static TspdfError write_stream_obj_with_options(TspdfBuffer *buf, TspdfObj *obj,
 }
 
 // --- Helper: check if object is XMP metadata ---
-static bool is_xmp_metadata(TspdfObj *obj) {
+bool tspr_is_xmp_metadata(TspdfObj *obj) {
     if (!obj) return false;
     TspdfObj *dict = NULL;
     if (obj->type == TSPDF_OBJ_STREAM) {
@@ -691,6 +594,10 @@ static bool is_xmp_metadata(TspdfObj *obj) {
     TspdfObj *type_val = tspdf_dict_get(dict, "Type");
     return (type_val && type_val->type == TSPDF_OBJ_NAME &&
             strcmp((const char *)type_val->string.data, "Metadata") == 0);
+}
+
+static bool is_xmp_metadata(TspdfObj *obj) {
+    return tspr_is_xmp_metadata(obj);
 }
 
 // --- Object stream (ObjStm) packing ---
@@ -1207,76 +1114,24 @@ TspdfError tspdf_serialize_with_options(TspdfReader *doc, uint8_t **out_buf, siz
         visited[source_info_num] = true;
     }
 
-    // 2. Build renumbering map
-    RenumberMap map;
-    map.map_size = total_objs;
-    map.old_to_new = (uint32_t *)calloc(map.map_size, sizeof(uint32_t));
-    if (!map.old_to_new) {
+    // 2. Collect the emit list and build the renumbering map. New obj 1 =
+    // Catalog (synthetic), obj 2 = Pages (synthetic), so collected objects are
+    // numbered from 3. The shared walk drops xref machinery, the source root
+    // (emitted as obj 1 here), and — under strip_metadata — the source Info
+    // and XMP streams.
+    TspdfCollectResult collect = {0};
+    tspdf_collect_objects(doc, &parser, visited, total_objs, /*base_num=*/3,
+                          /*skip_root=*/true, source_root_num,
+                          opts->strip_metadata, source_info_num, &collect);
+    if (!collect.ok) {
         free(visited);
         return TSPDF_ERR_ALLOC;
     }
+    RenumberMap map = collect.map;
+    uint32_t *collected = collect.collected;
+    size_t collected_count = collect.collected_count;
 
-    uint32_t *collected = NULL;
-    size_t collected_count = 0;
-    {
-        for (size_t i = 1; i < total_objs; i++) {
-            if (!visited[i]) continue;
-            if (!use_preserve && source_root_num > 0 &&
-                (uint32_t)i == source_root_num) {
-                continue;
-            }
-            // Source ObjStm/XRef containers are dropped: the fast-collect
-            // path marks every in-use entry, which includes them, and copying
-            // them would duplicate every object they hold (the members are
-            // written individually below).
-            if (is_xref_machinery(resolve_for_collect(doc, (uint32_t)i, &parser))) {
-                continue;
-            }
-            if (opts->strip_metadata) {
-                if (source_info_num > 0 && (uint32_t)i == source_info_num) {
-                    continue;
-                }
-                TspdfObj *obj = resolve_for_collect(doc, (uint32_t)i, &parser);
-                if (is_xmp_metadata(obj)) {
-                    continue;
-                }
-            }
-            collected_count++;
-        }
-        collected = (uint32_t *)malloc(sizeof(uint32_t) * (collected_count > 0 ? collected_count : 1));
-        if (!collected) {
-            free(map.old_to_new);
-            free(visited);
-            return TSPDF_ERR_ALLOC;
-        }
-        size_t ci = 0;
-        for (size_t i = 1; i < total_objs; i++) {
-            if (!visited[i]) continue;
-            if (!use_preserve && source_root_num > 0 &&
-                (uint32_t)i == source_root_num) {
-                continue;
-            }
-            if (is_xref_machinery(resolve_for_collect(doc, (uint32_t)i, &parser))) {
-                continue;
-            }
-            if (opts->strip_metadata) {
-                if (source_info_num > 0 && (uint32_t)i == source_info_num) {
-                    continue;
-                }
-                TspdfObj *obj = resolve_for_collect(doc, (uint32_t)i, &parser);
-                if (is_xmp_metadata(obj)) {
-                    continue;
-                }
-            }
-            collected[ci++] = (uint32_t)i;
-        }
-    }
-
-    // New obj 1 = Catalog (synthetic), new obj 2 = Pages (synthetic)
-    uint32_t next_num = 3;
-    for (size_t i = 0; i < collected_count; i++) {
-        map.old_to_new[collected[i]] = next_num++;
-    }
+    uint32_t next_num = 3 + (uint32_t)collected_count;
 
     // Determine if we need an Info object
     bool write_info = info_plan.action == TSPDF_INFO_WRITE_MERGED ||
@@ -1842,45 +1697,26 @@ TspdfError tspdf_serialize_encrypted(TspdfReader *doc, TspdfCrypt *crypt,
         visited[source_info_num] = true;
     }
 
-    /* 2. Build renumbering map */
-    RenumberMap map;
-    map.map_size = total_objs;
-    map.old_to_new = (uint32_t *)calloc(map.map_size, sizeof(uint32_t));
-    if (!map.old_to_new) {
+    /* 2. Collect the emit list and build the renumbering map. Same shared walk
+     * as the plain path, but encrypted saves never strip metadata and DO carry
+     * the catalog through collection (it is re-emitted as obj 1 but not
+     * dropped here — historical behavior preserved), so skip_root is false and
+     * strip_metadata is false. New obj 1 = Catalog, obj 2 = Pages, collected
+     * objects from 3, then the /Encrypt dict. */
+    TspdfCollectResult collect = {0};
+    tspdf_collect_objects(doc, &parser, visited, total_objs, /*base_num=*/3,
+                          /*skip_root=*/false, /*source_root_num=*/0,
+                          /*strip_metadata=*/false, /*source_info_num=*/0,
+                          &collect);
+    if (!collect.ok) {
         free(visited);
         return TSPDF_ERR_ALLOC;
     }
+    RenumberMap map = collect.map;
+    uint32_t *collected = collect.collected;
+    size_t collected_count = collect.collected_count;
 
-    uint32_t *collected = NULL;
-    size_t collected_count = 0;
-    {
-        // Skip source ObjStm/XRef containers here for the same reason as the
-        // plain path: the fast-collect loop above marks them in-use, but
-        // their members are written individually (or re-packed) below.
-        for (size_t i = 1; i < total_objs; i++) {
-            if (!visited[i]) continue;
-            if (is_xref_machinery(resolve_for_collect(doc, (uint32_t)i, &parser))) continue;
-            collected_count++;
-        }
-        collected = (uint32_t *)malloc(sizeof(uint32_t) * (collected_count > 0 ? collected_count : 1));
-        if (!collected) {
-            free(map.old_to_new);
-            free(visited);
-            return TSPDF_ERR_ALLOC;
-        }
-        size_t ci = 0;
-        for (size_t i = 1; i < total_objs; i++) {
-            if (!visited[i]) continue;
-            if (is_xref_machinery(resolve_for_collect(doc, (uint32_t)i, &parser))) continue;
-            collected[ci++] = (uint32_t)i;
-        }
-    }
-
-    /* New obj 1 = Catalog, obj 2 = Pages, then collected objects, then encrypt dict */
-    uint32_t next_num = 3;
-    for (size_t i = 0; i < collected_count; i++) {
-        map.old_to_new[collected[i]] = next_num++;
-    }
+    uint32_t next_num = 3 + (uint32_t)collected_count;
 
     uint32_t encrypt_obj_num = next_num++; /* The /Encrypt dict object */
 

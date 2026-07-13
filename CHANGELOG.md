@@ -7,7 +7,28 @@ on 0.x, the CLI is considered stable but the low-level C API may still change.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-14
+
+### Changed
+- `metadata --set/--clear` now updates the XMP packet too, not just the Info
+  dictionary, so viewers that prefer XMP (Acrobat) show the new values:
+  title, author, subject, keywords, creator, and producer map to dc:title,
+  dc:creator, dc:description, pdf:Keywords, xmp:CreatorTool, and
+  pdf:Producer, and xmp:ModifyDate is refreshed with the same timestamp the
+  save writes into Info /ModDate. Editing is conservative — a property
+  already in the packet gets its value replaced (XML-escaped, keeping the
+  xpacket padding contract); nothing is injected. The stale-XMP notice now
+  fires only for edited fields whose property the packet does not carry, or
+  for packets that cannot be edited safely (UTF-16, multi-author
+  dc:creator).
+
 ### Fixed
+- Writer now escapes PDF names and string control bytes per spec (ISO 32000
+  §7.3.4/§7.3.5). Previously `tspdf_raw_write_name` emitted names verbatim
+  (bytes needing `#HH` encoding were written raw), and `tspdf_raw_write_string`
+  omitted the `\n \r \t \b \f` named escapes and the `\NNN` octal fallback for
+  other control bytes. Both functions now delegate to the new canonical encoder
+  in `src/pdf/primitives.c`, shared with the reader serializer.
 - Every command that reads a PDF now takes `--password`/`--password-file`:
   `rotate`, `delete`, `reorder`, `split`, `merge`, `crop`, `scale`, `pagenum`,
   `watermark`, and `compress` gained both (they could not open encrypted files
@@ -39,6 +60,9 @@ on 0.x, the CLI is considered stable but the low-level C API may still change.
   `Top 3 Correlated Emotion Representations` block), and the blank-line
   gap below a merged row is measured from its lowest baseline so the
   merge cannot open a spurious gap.
+- Web demo / wasm watermark now honors page rotation: on pages with a
+  `/Rotate` entry the watermark text is pre-rotated so it reads upright
+  as the viewer displays the page, matching the behavior of `tspdf watermark`.
 
 ## [0.4.0] - 2026-07-11
 

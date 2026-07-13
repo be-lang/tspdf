@@ -452,6 +452,7 @@ void tspdf_reader_destroy(TspdfReader *doc) {
         free(doc->metadata->keywords);
         free(doc->metadata->creator);
         free(doc->metadata->producer);
+        free(doc->metadata->mod_date);
         free(doc->metadata);
     }
     free(doc->new_objs.objs);
