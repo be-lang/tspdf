@@ -1,40 +1,15 @@
 #include "commands.h"
+#include "pipeline.h"
 #include "../include/tspdf.h"
-#include "password_input.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-// First 0-based page index in `pages` that is out of range for `total`.
-int cmd_rotate(int argc, char **argv) {
-    if (argc == 0 || has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
-        printf("Usage: tspdf rotate <input.pdf> [--pages 1,3] --angle 90 -o <output.pdf>\n");
-        printf("\nRotate pages in a PDF. Angle must be 90, 180, or 270.\n");
-        printf("If --pages is omitted, all pages are rotated.\n");
-        printf("Encrypted files: pass --password <pass> or --password-file <file>;\n");
-        printf("the output keeps the original encryption.\n");
-        return argc == 0 ? 1 : 0;
-    }
+static int run(TspdfCmdCtx *ctx) {
+    TspdfReader *doc = ctx->doc;
+    TspdfError err = TSPDF_OK;
 
-    const char *positional[2];
-    int npos = collect_positional(argc, argv, positional, 2);
-    if (npos < 1) {
-        fprintf(stderr, "tspdf rotate: missing input file\n");
-        return 1;
-    }
-    if (npos > 1) {
-        fprintf(stderr, "tspdf rotate: unexpected extra argument '%s'\n", positional[1]);
-        return 1;
-    }
-    const char *input = positional[0];
-
-    const char *output = find_flag(argc, argv, "-o");
-    if (!output) {
-        fprintf(stderr, "tspdf rotate: missing -o <output.pdf>\n");
-        return 1;
-    }
-
-    const char *angle_str = find_flag(argc, argv, "--angle");
+    const char *angle_str = find_flag(ctx->argc, ctx->argv, "--angle");
     if (!angle_str) {
         fprintf(stderr, "tspdf rotate: missing --angle <90|180|270>\n");
         return 1;
@@ -45,34 +20,14 @@ int cmd_rotate(int argc, char **argv) {
         return 1;
     }
 
-    static char pwbuf[TSPDF_PASSWORD_MAX];
-    const char *password = tspdf_resolve_password(argc, argv,
-                                                  "--password", "--password-file",
-                                                  "rotate", "Password: ",
-                                                  false, pwbuf, sizeof(pwbuf));
-
-    TspdfError err = TSPDF_OK;
-    TspdfReader *doc = password
-        ? tspdf_reader_open_file_with_password(input, password, &err)
-        : tspdf_reader_open_file(input, &err);
-    if (!doc) {
-        if (err == TSPDF_ERR_ENCRYPTED) {
-            fprintf(stderr, "tspdf rotate: '%s' is encrypted; use --password or --password-file\n", input);
-        } else {
-            fprintf(stderr, "tspdf rotate: failed to open '%s': %s\n", input, tspdf_error_string(err));
-        }
-        return 1;
-    }
-
     size_t page_count = 0;
     size_t *pages = NULL;
 
-    const char *pages_spec = find_flag(argc, argv, "--pages");
+    const char *pages_spec = find_flag(ctx->argc, ctx->argv, "--pages");
     if (pages_spec) {
         pages = parse_page_range(pages_spec, &page_count);
         if (!pages) {
             fprintf(stderr, "tspdf rotate: invalid page range '%s'\n", pages_spec);
-            tspdf_reader_destroy(doc);
             return 1;
         }
     } else {
@@ -81,7 +36,6 @@ int cmd_rotate(int argc, char **argv) {
         pages = malloc(total * sizeof(size_t));
         if (!pages) {
             fprintf(stderr, "tspdf rotate: out of memory\n");
-            tspdf_reader_destroy(doc);
             return 1;
         }
         for (size_t i = 0; i < total; i++) pages[i] = i;
@@ -98,24 +52,41 @@ int cmd_rotate(int argc, char **argv) {
         } else {
             fprintf(stderr, "tspdf rotate: rotate failed: %s\n", tspdf_error_string(err));
         }
-        tspdf_reader_destroy(doc);
         free(pages);
         return 1;
     }
 
-    err = tspdf_reader_save(result, output);
+    err = tspdf_reader_save(result, ctx->output);
     if (err != TSPDF_OK) {
-        fprintf(stderr, "tspdf rotate: failed to save '%s': %s\n", output, tspdf_error_string(err));
+        fprintf(stderr, "tspdf rotate: failed to save '%s': %s\n", ctx->output, tspdf_error_string(err));
         tspdf_reader_destroy(result);
-        tspdf_reader_destroy(doc);
         free(pages);
         return 1;
     }
 
-    printf("Rotated %zu page(s) by %d° → %s\n", page_count, angle, output);
+    printf("Rotated %zu page(s) by %d° → %s\n", page_count, angle, ctx->output);
 
     tspdf_reader_destroy(result);
-    tspdf_reader_destroy(doc);
     free(pages);
     return 0;
 }
+
+static const TspdfCliFlag FLAGS[] = {
+    {"-o", true}, {"--pages", true}, {"--angle", true},
+    {"--password", true}, {"--password-file", true},
+    {NULL, false}
+};
+
+const TspdfCmdSpec tspdf_cmd_rotate_spec = {
+    .name = "rotate",
+    .usage =
+        "Usage: tspdf rotate <input.pdf> [--pages 1,3] --angle 90 -o <output.pdf>\n"
+        "\nRotate pages in a PDF. Angle must be 90, 180, or 270.\n"
+        "If --pages is omitted, all pages are rotated.\n"
+        "Encrypted files: pass --password <pass> or --password-file <file>;\n"
+        "the output keeps the original encryption.\n",
+    .flags = FLAGS,
+    .min_pos = 1, .max_pos = 1,
+    .needs = TSPDF_CMD_OPENS_INPUT | TSPDF_CMD_NEEDS_OUTPUT | TSPDF_CMD_TAKES_PASSWORD,
+    .run = run,
+};

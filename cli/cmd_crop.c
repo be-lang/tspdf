@@ -3,8 +3,8 @@
 // each page's MediaBox origin) or inward margins.
 
 #include "commands.h"
+#include "pipeline.h"
 #include "../include/tspdf.h"
-#include "password_input.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,49 +27,13 @@ static bool parse_csv_doubles(const char *s, double *out, int n) {
     return *s == '\0';
 }
 
-static void print_crop_help(void) {
-    printf("Usage: tspdf crop <input.pdf> -o <output.pdf>\n");
-    printf("             (--box x0,y0,x1,y1 | --margins t,r,b,l | --margin pt)\n");
-    printf("             [--pages <range>]\n");
-    printf("\nSet the CropBox of pages (the visible region). Content is kept,\n");
-    printf("only the view is clipped. Choose ONE of:\n");
-    printf("  --box x0,y0,x1,y1  explicit box in points, relative to the page's\n");
-    printf("                     MediaBox origin (x1>x0, y1>y0)\n");
-    printf("  --margins t,r,b,l  crop inward from the MediaBox by these margins\n");
-    printf("  --margin pt        uniform inward margin on all four sides\n");
-    printf("If --pages is omitted, all pages are cropped. The box is clamped to\n");
-    printf("the MediaBox.\n");
-    printf("Encrypted files: pass --password <pass> or --password-file <file>;\n");
-    printf("the output keeps the original encryption.\n");
-}
+static int run(TspdfCmdCtx *ctx) {
+    TspdfReader *doc = ctx->doc;
+    TspdfError err = TSPDF_OK;
 
-int cmd_crop(int argc, char **argv) {
-    if (argc == 0 || has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
-        print_crop_help();
-        return argc == 0 ? 1 : 0;
-    }
-
-    const char *positional[2];
-    int npos = collect_positional(argc, argv, positional, 2);
-    if (npos < 1) {
-        fprintf(stderr, "tspdf crop: missing input file\n");
-        return 1;
-    }
-    if (npos > 1) {
-        fprintf(stderr, "tspdf crop: unexpected extra argument '%s'\n", positional[1]);
-        return 1;
-    }
-    const char *input = positional[0];
-
-    const char *output = find_flag(argc, argv, "-o");
-    if (!output) {
-        fprintf(stderr, "tspdf crop: missing -o <output.pdf>\n");
-        return 1;
-    }
-
-    const char *box_str = find_flag(argc, argv, "--box");
-    const char *margins_str = find_flag(argc, argv, "--margins");
-    const char *margin_str = find_flag(argc, argv, "--margin");
+    const char *box_str = find_flag(ctx->argc, ctx->argv, "--box");
+    const char *margins_str = find_flag(ctx->argc, ctx->argv, "--margins");
+    const char *margin_str = find_flag(ctx->argc, ctx->argv, "--margin");
 
     int modes = (box_str != NULL) + (margins_str != NULL) + (margin_str != NULL);
     if (modes == 0) {
@@ -106,34 +70,14 @@ int cmd_crop(int argc, char **argv) {
         margins[0] = margins[1] = margins[2] = margins[3] = m;
     }
 
-    static char pwbuf[TSPDF_PASSWORD_MAX];
-    const char *password = tspdf_resolve_password(argc, argv,
-                                                  "--password", "--password-file",
-                                                  "crop", "Password: ",
-                                                  false, pwbuf, sizeof(pwbuf));
-
-    TspdfError err = TSPDF_OK;
-    TspdfReader *doc = password
-        ? tspdf_reader_open_file_with_password(input, password, &err)
-        : tspdf_reader_open_file(input, &err);
-    if (!doc) {
-        if (err == TSPDF_ERR_ENCRYPTED) {
-            fprintf(stderr, "tspdf crop: '%s' is encrypted; use --password or --password-file\n", input);
-        } else {
-            fprintf(stderr, "tspdf crop: failed to open '%s': %s\n", input, tspdf_error_string(err));
-        }
-        return 1;
-    }
-
     size_t total = tspdf_reader_page_count(doc);
     size_t page_count = 0;
     size_t *pages = NULL;
-    const char *pages_spec = find_flag(argc, argv, "--pages");
+    const char *pages_spec = find_flag(ctx->argc, ctx->argv, "--pages");
     if (pages_spec) {
         pages = parse_page_range(pages_spec, &page_count);
         if (!pages) {
             fprintf(stderr, "tspdf crop: invalid page range '%s'\n", pages_spec);
-            tspdf_reader_destroy(doc);
             return 1;
         }
         size_t bad = first_out_of_range(pages, page_count, total);
@@ -141,14 +85,12 @@ int cmd_crop(int argc, char **argv) {
             fprintf(stderr, "tspdf crop: page %zu is out of range (document has %zu page%s)\n",
                     bad + 1, total, total == 1 ? "" : "s");
             free(pages);
-            tspdf_reader_destroy(doc);
             return 1;
         }
     } else {
         pages = malloc((total ? total : 1) * sizeof(size_t));
         if (!pages) {
             fprintf(stderr, "tspdf crop: out of memory\n");
-            tspdf_reader_destroy(doc);
             return 1;
         }
         for (size_t i = 0; i < total; i++) pages[i] = i;
@@ -160,7 +102,6 @@ int cmd_crop(int argc, char **argv) {
     if (!boxes) {
         fprintf(stderr, "tspdf crop: out of memory\n");
         free(pages);
-        tspdf_reader_destroy(doc);
         return 1;
     }
     for (size_t i = 0; i < page_count; i++) {
@@ -183,7 +124,6 @@ int cmd_crop(int argc, char **argv) {
             fprintf(stderr, "tspdf crop: crop collapses page %zu to an empty box\n", pages[i] + 1);
             free(boxes);
             free(pages);
-            tspdf_reader_destroy(doc);
             return 1;
         }
     }
@@ -193,23 +133,48 @@ int cmd_crop(int argc, char **argv) {
     if (!result) {
         fprintf(stderr, "tspdf crop: crop failed: %s\n", tspdf_error_string(err));
         free(pages);
-        tspdf_reader_destroy(doc);
         return 1;
     }
 
-    err = tspdf_reader_save(result, output);
+    err = tspdf_reader_save(result, ctx->output);
     if (err != TSPDF_OK) {
-        fprintf(stderr, "tspdf crop: failed to save '%s': %s\n", output, tspdf_error_string(err));
+        fprintf(stderr, "tspdf crop: failed to save '%s': %s\n", ctx->output, tspdf_error_string(err));
         tspdf_reader_destroy(result);
-        tspdf_reader_destroy(doc);
         free(pages);
         return 1;
     }
 
-    printf("Cropped %zu page(s) → %s\n", page_count, output);
+    printf("Cropped %zu page(s) → %s\n", page_count, ctx->output);
 
     tspdf_reader_destroy(result);
-    tspdf_reader_destroy(doc);
     free(pages);
     return 0;
 }
+
+static const TspdfCliFlag FLAGS[] = {
+    {"-o", true}, {"--box", true}, {"--margins", true}, {"--margin", true},
+    {"--pages", true}, {"--password", true}, {"--password-file", true},
+    {NULL, false}
+};
+
+const TspdfCmdSpec tspdf_cmd_crop_spec = {
+    .name = "crop",
+    .usage =
+        "Usage: tspdf crop <input.pdf> -o <output.pdf>\n"
+        "             (--box x0,y0,x1,y1 | --margins t,r,b,l | --margin pt)\n"
+        "             [--pages <range>]\n"
+        "\nSet the CropBox of pages (the visible region). Content is kept,\n"
+        "only the view is clipped. Choose ONE of:\n"
+        "  --box x0,y0,x1,y1  explicit box in points, relative to the page's\n"
+        "                     MediaBox origin (x1>x0, y1>y0)\n"
+        "  --margins t,r,b,l  crop inward from the MediaBox by these margins\n"
+        "  --margin pt        uniform inward margin on all four sides\n"
+        "If --pages is omitted, all pages are cropped. The box is clamped to\n"
+        "the MediaBox.\n"
+        "Encrypted files: pass --password <pass> or --password-file <file>;\n"
+        "the output keeps the original encryption.\n",
+    .flags = FLAGS,
+    .min_pos = 1, .max_pos = 1,
+    .needs = TSPDF_CMD_OPENS_INPUT | TSPDF_CMD_NEEDS_OUTPUT | TSPDF_CMD_TAKES_PASSWORD,
+    .run = run,
+};

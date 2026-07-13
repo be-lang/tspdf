@@ -1,27 +1,10 @@
 #include "commands.h"
+#include "pipeline.h"
 #include "../include/tspdf.h"
-#include "password_input.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-
-// Open `input`, honoring an optional password; prints the error (with the
-// standard --password hint for encrypted files) on failure.
-static TspdfReader *split_open(const char *input, const char *password) {
-    TspdfError err = TSPDF_OK;
-    TspdfReader *doc = password
-        ? tspdf_reader_open_file_with_password(input, password, &err)
-        : tspdf_reader_open_file(input, &err);
-    if (!doc) {
-        if (err == TSPDF_ERR_ENCRYPTED) {
-            fprintf(stderr, "tspdf split: '%s' is encrypted; use --password or --password-file\n", input);
-        } else {
-            fprintf(stderr, "tspdf split: failed to open '%s': %s\n", input, tspdf_error_string(err));
-        }
-    }
-    return doc;
-}
 
 // "<n>" zero-padded to `width` digits (clamped to what a size_t needs).
 static void zero_pad(char *dst, size_t dst_sz, size_t n, int width) {
@@ -122,37 +105,12 @@ static int split_burst(TspdfReader *doc, const char *output, bool no_attachments
 }
 
 // First 0-based page index in `pages` that is out of range for `total`.
-int cmd_split(int argc, char **argv) {
-    if (argc == 0 || has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
-        printf("Usage: tspdf split <input.pdf> [--pages 1-3,5 | --burst] [--no-attachments] -o <output.pdf>\n");
-        printf("\nExtract specific pages from a PDF, or split it into one file per page.\n");
-        printf("With --pages, the selected pages are written to the output file.\n");
-        printf("With --burst (the default when --pages is absent), each page is written\n");
-        printf("to its own file: out.pdf becomes out-001.pdf, out-002.pdf, ...\n");
-        printf("Embedded file attachments are copied into every output; --no-attachments\n");
-        printf("drops them instead.\n");
-        printf("Encrypted files: pass --password <pass> or --password-file <file>;\n");
-        printf("every output keeps the original encryption.\n");
-        return argc == 0 ? 1 : 0;
-    }
-
-    const char *positional[2];
-    int npos = collect_positional(argc, argv, positional, 2);
-    if (npos < 1) {
-        fprintf(stderr, "tspdf split: missing input file\n");
-        return 1;
-    }
-    if (npos > 1) {
-        fprintf(stderr, "tspdf split: unexpected extra argument '%s'\n", positional[1]);
-        return 1;
-    }
-    const char *input = positional[0];
-
-    const char *output = find_flag(argc, argv, "-o");
-    if (!output) {
-        fprintf(stderr, "tspdf split: missing -o <output.pdf>\n");
-        return 1;
-    }
+static int run(TspdfCmdCtx *ctx) {
+    int argc = ctx->argc;
+    char **argv = ctx->argv;
+    const char *output = ctx->output;
+    TspdfReader *doc = ctx->doc;
+    TspdfError err = TSPDF_OK;
 
     const char *pages_spec = find_flag(argc, argv, "--pages");
     bool no_attachments = has_flag(argc, argv, "--no-attachments");
@@ -160,32 +118,16 @@ int cmd_split(int argc, char **argv) {
         fprintf(stderr, "tspdf split: --burst and --pages are mutually exclusive\n");
         return 1;
     }
-    static char pwbuf[TSPDF_PASSWORD_MAX];
-    const char *password = tspdf_resolve_password(argc, argv,
-                                                  "--password", "--password-file",
-                                                  "split", "Password: ",
-                                                  false, pwbuf, sizeof(pwbuf));
 
     if (!pages_spec) {
         // Per-page split (burst) is the default when no page range is given.
-        TspdfReader *doc = split_open(input, password);
-        if (!doc) return 1;
-        int rc = split_burst(doc, output, no_attachments);
-        tspdf_reader_destroy(doc);
-        return rc;
+        return split_burst(doc, output, no_attachments);
     }
 
     size_t page_count;
     size_t *pages = parse_page_range(pages_spec, &page_count);
     if (!pages) {
         fprintf(stderr, "tspdf split: invalid page range '%s'\n", pages_spec);
-        return 1;
-    }
-
-    TspdfError err = TSPDF_OK;
-    TspdfReader *doc = split_open(input, password);
-    if (!doc) {
-        free(pages);
         return 1;
     }
 
@@ -199,7 +141,6 @@ int cmd_split(int argc, char **argv) {
         } else {
             fprintf(stderr, "tspdf split: extract failed: %s\n", tspdf_error_string(err));
         }
-        tspdf_reader_destroy(doc);
         free(pages);
         return 1;
     }
@@ -210,7 +151,6 @@ int cmd_split(int argc, char **argv) {
             fprintf(stderr, "tspdf split: dropping attachments failed: %s\n",
                     tspdf_error_string(err));
             tspdf_reader_destroy(result);
-            tspdf_reader_destroy(doc);
             free(pages);
             return 1;
         }
@@ -224,7 +164,6 @@ int cmd_split(int argc, char **argv) {
     if (err != TSPDF_OK) {
         fprintf(stderr, "tspdf split: failed to save '%s': %s\n", output, tspdf_error_string(err));
         tspdf_reader_destroy(result);
-        tspdf_reader_destroy(doc);
         free(pages);
         return 1;
     }
@@ -232,7 +171,30 @@ int cmd_split(int argc, char **argv) {
     printf("Extracted %zu page(s) → %s\n", page_count, output);
 
     tspdf_reader_destroy(result);
-    tspdf_reader_destroy(doc);
     free(pages);
     return 0;
 }
+
+static const TspdfCliFlag FLAGS[] = {
+    {"-o", true}, {"--pages", true},
+    {"--password", true}, {"--password-file", true},
+    {NULL, false}
+};
+
+const TspdfCmdSpec tspdf_cmd_split_spec = {
+    .name = "split",
+    .usage =
+        "Usage: tspdf split <input.pdf> [--pages 1-3,5 | --burst] [--no-attachments] -o <output.pdf>\n"
+        "\nExtract specific pages from a PDF, or split it into one file per page.\n"
+        "With --pages, the selected pages are written to the output file.\n"
+        "With --burst (the default when --pages is absent), each page is written\n"
+        "to its own file: out.pdf becomes out-001.pdf, out-002.pdf, ...\n"
+        "Embedded file attachments are copied into every output; --no-attachments\n"
+        "drops them instead.\n"
+        "Encrypted files: pass --password <pass> or --password-file <file>;\n"
+        "every output keeps the original encryption.\n",
+    .flags = FLAGS,
+    .min_pos = 1, .max_pos = 1,
+    .needs = TSPDF_CMD_OPENS_INPUT | TSPDF_CMD_NEEDS_OUTPUT | TSPDF_CMD_TAKES_PASSWORD,
+    .run = run,
+};

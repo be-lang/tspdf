@@ -1,7 +1,7 @@
 #include "commands.h"
+#include "pipeline.h"
 #include "../include/tspdf_overlay.h"
 #include "../src/util/pdftext.h"
-#include "password_input.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,39 +31,12 @@ static int validate_format(const char *fmt, int *d_count) {
     return 0;
 }
 
-int cmd_pagenum(int argc, char **argv) {
-    if (argc == 0 || has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
-        printf("Usage: tspdf pagenum <input.pdf> -o <output.pdf> [--format \"%%d / %%d\"]\n");
-        printf("                     [--position <pos>] [--start N] [--font-size N]\n");
-        printf("                     [--pages <range>]\n");
-        printf("\nStamp a page number on every page.\n");
-        printf("The format may contain up to two %%d: the page number and the total.\n");
-        printf("Positions: bottom-center (default), bottom-left, bottom-right,\n");
-        printf("           top-center, top-left, top-right\n");
-        printf("With --pages (e.g. 2-10), only those pages are stamped; the number\n");
-        printf("still reflects the true page position (useful to skip cover pages).\n");
-        printf("Encrypted files: pass --password <pass> or --password-file <file>;\n");
-        printf("the output keeps the original encryption.\n");
-        return argc == 0 ? 1 : 0;
-    }
-
-    const char *positional[2];
-    int npos = collect_positional(argc, argv, positional, 2);
-    if (npos < 1) {
-        fprintf(stderr, "tspdf pagenum: missing input file\n");
-        return 1;
-    }
-    if (npos > 1) {
-        fprintf(stderr, "tspdf pagenum: unexpected extra argument '%s'\n", positional[1]);
-        return 1;
-    }
-    const char *input = positional[0];
-
-    const char *output = find_flag(argc, argv, "-o");
-    if (!output) {
-        fprintf(stderr, "tspdf pagenum: missing -o <output.pdf>\n");
-        return 1;
-    }
+static int run(TspdfCmdCtx *ctx) {
+    int argc = ctx->argc;
+    char **argv = ctx->argv;
+    const char *output = ctx->output;
+    TspdfReader *doc = ctx->doc;
+    TspdfError err = TSPDF_OK;
 
     const char *format = find_flag(argc, argv, "--format");
     if (!format) format = "%d";
@@ -148,27 +121,6 @@ int cmd_pagenum(int argc, char **argv) {
         return 1;
     }
 
-    static char pwbuf[TSPDF_PASSWORD_MAX];
-    const char *password = tspdf_resolve_password(argc, argv,
-                                                  "--password", "--password-file",
-                                                  "pagenum", "Password: ",
-                                                  false, pwbuf, sizeof(pwbuf));
-
-    TspdfError err = TSPDF_OK;
-    TspdfReader *doc = password
-        ? tspdf_reader_open_file_with_password(input, password, &err)
-        : tspdf_reader_open_file(input, &err);
-    if (!doc) {
-        if (err == TSPDF_ERR_ENCRYPTED) {
-            fprintf(stderr, "tspdf pagenum: '%s' is encrypted; use --password or --password-file\n", input);
-        } else {
-            fprintf(stderr, "tspdf pagenum: failed to open '%s': %s\n", input, tspdf_error_string(err));
-        }
-        free(wa_format);
-        free(sel);
-        return 1;
-    }
-
     size_t page_count = tspdf_reader_page_count(doc);
     long total = start + (long)page_count - 1;
     double margin = 30.0;
@@ -182,7 +134,6 @@ int cmd_pagenum(int argc, char **argv) {
             if (sel[k] >= page_count) {
                 fprintf(stderr, "tspdf pagenum: page %zu is out of range (document has %zu page%s)\n",
                         sel[k] + 1, page_count, page_count == 1 ? "" : "s");
-                tspdf_reader_destroy(doc);
                 free(wa_format);
                 free(sel);
                 return 1;
@@ -191,7 +142,6 @@ int cmd_pagenum(int argc, char **argv) {
         stamp = calloc(page_count, sizeof(bool));
         if (!stamp) {
             fprintf(stderr, "tspdf pagenum: out of memory\n");
-            tspdf_reader_destroy(doc);
             free(wa_format);
             free(sel);
             return 1;
@@ -262,7 +212,6 @@ int cmd_pagenum(int argc, char **argv) {
         if (err != TSPDF_OK) {
             fprintf(stderr, "tspdf pagenum: overlay failed on page %zu: %s\n",
                     i + 1, tspdf_error_string(err));
-            tspdf_reader_destroy(doc);
             free(wa_format);
             free(sel);
             free(stamp);
@@ -274,7 +223,6 @@ int cmd_pagenum(int argc, char **argv) {
     err = tspdf_reader_save(doc, output);
     if (err != TSPDF_OK) {
         fprintf(stderr, "tspdf pagenum: failed to save '%s': %s\n", output, tspdf_error_string(err));
-        tspdf_reader_destroy(doc);
         free(wa_format);
         free(sel);
         free(stamp);
@@ -283,9 +231,36 @@ int cmd_pagenum(int argc, char **argv) {
 
     printf("Numbered %zu of %zu page(s) → %s\n", stamped, page_count, output);
 
-    tspdf_reader_destroy(doc);
     free(wa_format);
     free(sel);
     free(stamp);
     return 0;
 }
+
+
+static const TspdfCliFlag FLAGS[] = {
+    {"-o", true}, {"--format", true}, {"--position", true},
+    {"--start", true}, {"--font-size", true}, {"--pages", true},
+    {"--password", true}, {"--password-file", true},
+    {NULL, false}
+};
+
+const TspdfCmdSpec tspdf_cmd_pagenum_spec = {
+    .name = "pagenum",
+    .usage =
+        "Usage: tspdf pagenum <input.pdf> -o <output.pdf> [--format \"%d / %d\"]\n"
+        "                     [--position <pos>] [--start N] [--font-size N]\n"
+        "                     [--pages <range>]\n"
+        "\nStamp a page number on every page.\n"
+        "The format may contain up to two %d: the page number and the total.\n"
+        "Positions: bottom-center (default), bottom-left, bottom-right,\n"
+        "           top-center, top-left, top-right\n"
+        "With --pages (e.g. 2-10), only those pages are stamped; the number\n"
+        "still reflects the true page position (useful to skip cover pages).\n"
+        "Encrypted files: pass --password <pass> or --password-file <file>;\n"
+        "the output keeps the original encryption.\n",
+    .flags = FLAGS,
+    .min_pos = 1, .max_pos = 1,
+    .needs = TSPDF_CMD_OPENS_INPUT | TSPDF_CMD_NEEDS_OUTPUT | TSPDF_CMD_TAKES_PASSWORD,
+    .run = run,
+};

@@ -1,4 +1,5 @@
 #include "commands.h"
+#include "pipeline.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -108,74 +109,16 @@ int find_flags(int argc, char **argv, const char *flag, const char **out, int ou
     return count;
 }
 
-// Flags that consume the following argv token as their value. The token after
-// any of these must NOT be treated as a positional input (e.g. the `-o` output
-// path or the `--pages` range). Kept in sync with the flags parsed by the
-// cmd_*.c handlers and the web server option set.
-static const char *const VALUE_FLAGS[] = {
-    "-o",
-    "--pages",
-    "--order",
-    "--angle",
-    "--password",
-    "--password-file",
-    "--owner-password",
-    "--owner-password-file",
-    "--bits",
-    "--permissions",
-    "--text",
-    "--image",
-    "--scale",
-    "--stamp",
-    "--stamp-page",
-    "--stamp-password",
-    "--stamp-password-file",
-    "--mime",
-    "--opacity",
-    "--set",
-    "--data",
-    "--clear",
-    "--title",
-    "--subtitle",
-    "--ec-level",
-    "--port",
-    "--format",
-    "--position",
-    "--start",
-    "--font-size",
-    "--page-size",
-    "--gap",
-    "--bind",
-    "--desc",
-    "--name",
-    "--from",
-    "--page",
-    "--level",
-    "--box",
-    "--margins",
-    "--margin",
-    "--to",
-    "--factor",
-    "--image-dpi",
-    "--image-quality",
-    "--mono-dpi",
-};
-
-static bool is_value_flag(const char *arg) {
-    if (!arg) return false;
-    for (size_t i = 0; i < sizeof(VALUE_FLAGS) / sizeof(VALUE_FLAGS[0]); i++) {
-        if (strcmp(arg, VALUE_FLAGS[i]) == 0) return true;
-    }
-    return false;
-}
-
 int collect_positional(int argc, char **argv, const char **out, int out_max) {
     int count = 0;
     for (int i = 0; i < argc; i++) {
         // Skip the value that belongs to a value-taking flag (e.g. `-o out.pdf`),
-        // otherwise it gets mistaken for a positional input.
+        // otherwise it gets mistaken for a positional input. The set of
+        // value-taking flags is derived from every command spec (see
+        // pipeline.c) — a flag a command declares with takes_value=true can no
+        // longer be forgotten here.
         if (argv[i][0] == '-') {
-            if (is_value_flag(argv[i])) i++;  // also skip the following value token
+            if (tspdf_cli_is_value_flag(argv[i])) i++;  // skip its value token too
             continue;
         }
         if (count < out_max) out[count] = argv[i];

@@ -1,7 +1,7 @@
 #include "commands.h"
+#include "pipeline.h"
 #include "../include/tspdf_overlay.h"
 #include "../src/util/pdftext.h"
-#include "password_input.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,17 +20,6 @@ typedef enum {
     WM_POS_BOTTOM_LEFT,
     WM_POS_BOTTOM_RIGHT,
 } WatermarkPosition;
-
-static void print_watermark_help(void) {
-    printf("Usage: tspdf watermark <input.pdf> -o <output.pdf> --text \"DRAFT\" [--opacity 0.3]\n");
-    printf("       tspdf watermark <input.pdf> -o <output.pdf> --image <logo.png|jpg>\n");
-    printf("                       [--opacity 0.3] [--scale 0.5] [--position <pos>]\n");
-    printf("\nAdd a watermark to all pages: diagonal text, or an image (PNG/JPEG).\n");
-    printf("Positions: center (default), tile, top-left, top-right,\n");
-    printf("           bottom-left, bottom-right\n");
-    printf("Encrypted files: pass --password <pass> or --password-file <file>;\n");
-    printf("the output keeps the original encryption.\n");
-}
 
 // Open `input`, honoring an optional password; prints the error (with the
 // standard --password hint for encrypted files) on failure.
@@ -373,29 +362,12 @@ static int watermark_text(const char *input, const char *output, const char *tex
     return 0;
 }
 
-int cmd_watermark(int argc, char **argv) {
-    if (argc == 0 || has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
-        print_watermark_help();
-        return argc == 0 ? 1 : 0;
-    }
-
-    const char *positional[2];
-    int npos = collect_positional(argc, argv, positional, 2);
-    if (npos < 1) {
-        fprintf(stderr, "tspdf watermark: missing input file\n");
-        return 1;
-    }
-    if (npos > 1) {
-        fprintf(stderr, "tspdf watermark: unexpected extra argument '%s'\n", positional[1]);
-        return 1;
-    }
-    const char *input = positional[0];
-
-    const char *output = find_flag(argc, argv, "-o");
-    if (!output) {
-        fprintf(stderr, "tspdf watermark: missing -o <output.pdf>\n");
-        return 1;
-    }
+static int run(TspdfCmdCtx *ctx) {
+    int argc = ctx->argc;
+    char **argv = ctx->argv;
+    const char *input = ctx->input;
+    const char *output = ctx->output;
+    const char *password = ctx->password;
 
     const char *text = find_flag(argc, argv, "--text");
     const char *image = find_flag(argc, argv, "--image");
@@ -417,12 +389,6 @@ int cmd_watermark(int argc, char **argv) {
             return 1;
         }
     }
-
-    static char pwbuf[TSPDF_PASSWORD_MAX];
-    const char *password = tspdf_resolve_password(argc, argv,
-                                                  "--password", "--password-file",
-                                                  "watermark", "Password: ",
-                                                  false, pwbuf, sizeof(pwbuf));
 
     if (text) {
         return watermark_text(input, output, text, opacity, password);
@@ -455,3 +421,31 @@ int cmd_watermark(int argc, char **argv) {
 
     return watermark_image(input, output, image, opacity, scale, pos, password);
 }
+
+
+static const TspdfCliFlag FLAGS[] = {
+    {"-o", true}, {"--text", true}, {"--image", true}, {"--opacity", true},
+    {"--scale", true}, {"--position", true},
+    {"--password", true}, {"--password-file", true},
+    {NULL, false}
+};
+
+// The watermark helpers open the input themselves (they also need the two-PDF
+// overlay path), so this spec resolves the password but does not set
+// OPENS_INPUT — run() hands ctx->input/output/password to the helpers.
+const TspdfCmdSpec tspdf_cmd_watermark_spec = {
+    .name = "watermark",
+    .usage =
+        "Usage: tspdf watermark <input.pdf> -o <output.pdf> --text \"DRAFT\" [--opacity 0.3]\n"
+        "       tspdf watermark <input.pdf> -o <output.pdf> --image <logo.png|jpg>\n"
+        "                       [--opacity 0.3] [--scale 0.5] [--position <pos>]\n"
+        "\nAdd a watermark to all pages: diagonal text, or an image (PNG/JPEG).\n"
+        "Positions: center (default), tile, top-left, top-right,\n"
+        "           bottom-left, bottom-right\n"
+        "Encrypted files: pass --password <pass> or --password-file <file>;\n"
+        "the output keeps the original encryption.\n",
+    .flags = FLAGS,
+    .min_pos = 1, .max_pos = 1,
+    .needs = TSPDF_CMD_NEEDS_OUTPUT | TSPDF_CMD_TAKES_PASSWORD,
+    .run = run,
+};

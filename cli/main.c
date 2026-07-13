@@ -1,4 +1,5 @@
 #include "commands.h"
+#include "pipeline.h"
 #include "../include/tspdf/version.h"
 
 #include <stdio.h>
@@ -42,49 +43,15 @@ static void print_usage(void) {
     printf("Run 'tspdf help <command>' for command-specific help.\n");
 }
 
-static const struct {
-    const char *name;
-    int (*fn)(int argc, char **argv);
-} commands[] = {
-    { "merge",     cmd_merge },
-    { "split",     cmd_split },
-    { "rotate",    cmd_rotate },
-    { "delete",    cmd_delete },
-    { "reorder",   cmd_reorder },
-    { "encrypt",   cmd_encrypt },
-    { "decrypt",   cmd_decrypt },
-    { "metadata",  cmd_metadata },
-    { "info",      cmd_info },
-    { "watermark", cmd_watermark },
-    { "compress",  cmd_compress },
-    { "img2pdf",   cmd_img2pdf },
-    { "qrcode",    cmd_qrcode },
-    { "md2pdf",    cmd_md2pdf },
-    { "serve",     cmd_serve },
-    { "text",      cmd_text },
-    { "pagenum",   cmd_pagenum },
-    { "form",      cmd_form },
-    { "attach",    cmd_attach },
-    { "bookmark",  cmd_bookmark },
-    { "stamp",     cmd_stamp },
-    { "nup",       cmd_nup },
-    { "crop",      cmd_crop },
-    { "scale",     cmd_scale },
-};
-
-/* Run a subcommand; returns -1 for an unknown command name. */
+/* Run a subcommand through the spec pipeline; -1 for an unknown command. */
 static int run_command(const char *cmd, int argc, char **argv) {
-    for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++)
-        if (strcmp(cmd, commands[i].name) == 0)
-            return commands[i].fn(argc, argv);
-    return -1;
+    return tspdf_cli_run(cmd, argc, argv);
 }
 
 static void print_command_help(const char *cmd) {
-    /* Delegate to the command's own --help so the text has a single
-     * source of truth (the cmd_*.c usage next to the flag parsing). */
-    char *help_argv[] = { (char *)"--help" };
-    if (run_command(cmd, 1, help_argv) < 0)
+    /* Delegate to the command's own usage text (registered in its spec) so the
+     * help has a single source of truth next to the flag parsing. */
+    if (!tspdf_cli_print_help(cmd))
         print_usage(); /* unknown command — fall back to general help */
 }
 
