@@ -546,6 +546,86 @@ TEST(test_text_form_xobject_self_cycle_guarded) {
     free(pdf);
 }
 
+TEST(test_text_walker_inline_image_skipped) {
+    // BI ... ID <binary> EI: the shared walker must skip the raw image bytes
+    // (which contain operator-looking garbage) without derailing the tokenizer,
+    // so text before and after the inline image is still extracted in order.
+    size_t len = 0;
+    char *pdf = make_text_pdf(TEXT_HELV_FONT,
+        "BT /F1 12 Tf 72 700 Td (Before) Tj ET\n"
+        "q BI /W 2 /H 2 /BPC 8 /CS /G ID (Tj) BT ET junk data EI Q\n"
+        "BT /F1 12 Tf 72 680 Td (After) Tj ET", &len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    const char *text = tspdf_reader_page_text(doc, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT_EQ_STR(text, "Before\nAfter\n");
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_text_walker_form_matrix_composed) {
+    // A Form /Matrix scales/translates its content; the walker composes it onto
+    // the caller CTM so the form's text lands where the placement puts it. The
+    // form draws at its own local origin (0,0) but the /Matrix lifts it to y in
+    // device space between the two page lines, keeping content order.
+    size_t len = 0;
+    char *pdf = make_text_pdf_full(
+        "<< /Font << /F1 4 0 R >> /XObject << /Fx 5 0 R >> >>",
+        TEXT_HELV_FONT,
+        "/Type /XObject /Subtype /Form /BBox [0 0 200 200] "
+        "/Matrix [1 0 0 1 0 650] "
+        "/Resources << /Font << /F1 4 0 R >> >>",
+        "BT /F1 12 Tf 0 0 Td (Middle) Tj ET",
+        "BT /F1 12 Tf 72 700 Td (Top) Tj ET "
+        "/Fx Do "
+        "BT /F1 12 Tf 72 600 Td (Bottom) Tj ET", &len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    const char *text = tspdf_reader_page_text(doc, 0, &err);
+    ASSERT(text != NULL);
+    // Content order: Top (700), Middle (form at y=650), Bottom (600).
+    ASSERT_EQ_STR(text, "Top\nMiddle\nBottom\n");
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+TEST(test_text_walker_deep_qq_no_crash) {
+    // Deeply nested q/Q (past the walker's fixed save-stack, forcing heap
+    // growth) must extract text correctly and not crash or leak. Text keeps
+    // drawing even if the CTM save stack is exhausted.
+    enum { CAP = 200000 };
+    char *content = (char *)malloc(CAP);
+    ASSERT(content != NULL);
+    size_t p = 0;
+    p += (size_t)snprintf(content + p, CAP - p,
+                          "BT /F1 12 Tf 72 700 Td (Deep) Tj ET ");
+    for (int i = 0; i < 5000; i++)
+        p += (size_t)snprintf(content + p, CAP - p, "q 1 0 0 1 1 0 cm ");
+    p += (size_t)snprintf(content + p, CAP - p,
+                          "BT /F1 12 Tf 72 680 Td (Inner) Tj ET ");
+    for (int i = 0; i < 5000; i++)
+        p += (size_t)snprintf(content + p, CAP - p, "Q ");
+    ASSERT(p < CAP);
+    size_t len = 0;
+    char *pdf = make_text_pdf(TEXT_HELV_FONT, content, &len);
+    free(content);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    const char *text = tspdf_reader_page_text(doc, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT(strstr(text, "Deep") != NULL);
+    ASSERT(strstr(text, "Inner") != NULL);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
 TEST(test_text_identity_h_ttf_tounicode) {
     // The writer's own TTF path (CIDFontType2 + Identity-H + ToUnicode) must
     // round-trip UTF-8 text through 2-byte glyph codes.
@@ -945,6 +1025,9 @@ void run_text_tests(void) {
     RUN(test_text_differences_encoding);
     RUN(test_text_form_xobject_recursion);
     RUN(test_text_form_xobject_self_cycle_guarded);
+    RUN(test_text_walker_inline_image_skipped);
+    RUN(test_text_walker_form_matrix_composed);
+    RUN(test_text_walker_deep_qq_no_crash);
     RUN(test_text_identity_h_ttf_tounicode);
     RUN(test_text_cid_no_tounicode_replacement);
     RUN(test_text_encrypted_pdf);

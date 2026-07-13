@@ -17,6 +17,7 @@
 
 #include "tspr_internal.h"
 #include "tspr_text.h"
+#include "tspr_content_walk.h"
 #include "../util/pdftext.h"
 #include "../util/buffer.h"
 #include "../pdf/pdf_base14.h"
@@ -25,8 +26,6 @@
 #include <math.h>
 
 #define TEXT_MAX_DEPTH 8     // Form XObject recursion cap
-#define TEXT_OP_STACK 16     // operand stack (operators take at most 6)
-#define TEXT_GS_STACK 32     // q/Q nesting kept
 #define TOU_MAX_UNITS 8      // UTF-16 units per ToUnicode target (ligatures)
 // Total concatenated /Contents bytes per page. The per-stream decode cap
 // alone lets a small file with many compressed streams demand N x 128 MB;
@@ -307,7 +306,6 @@ typedef struct {
     bool layout;             // collect fragments instead of emitting inline
     TextFrag *frags;         // scratch-arena, doubling
     size_t nfrags, frag_cap;
-    const TspdfObj *form_stack[TEXT_MAX_DEPTH]; // cycle guard, indexed by depth
 } TextCtx;
 
 typedef struct {
@@ -317,6 +315,40 @@ typedef struct {
     TextFont *font;
     double size, tc, tw, tl;
 } TextGS;
+
+// The walker owns the CTM and current /Resources and saves/restores them on
+// q/Q; the text-specific graphics state (text matrices, font, spacing) lives
+// in this client blob, which the walker saves/restores alongside. A full
+// TextGS is reconstituted per operator from the walker's ctm/resources plus
+// the blob (tx_gs_load) and the mutated text fields written back (tx_gs_store).
+typedef struct {
+    TxMat tm, tlm;
+    TextFont *font;
+    double size, tc, tw, tl;
+} TextGSBlob;
+
+static void tx_gs_load(TextGS *gs, const TextGSBlob *b, TxMat ctm,
+                       TspdfObj *resources) {
+    gs->ctm = ctm;
+    gs->resources = resources;
+    gs->tm = b->tm;
+    gs->tlm = b->tlm;
+    gs->font = b->font;
+    gs->size = b->size;
+    gs->tc = b->tc;
+    gs->tw = b->tw;
+    gs->tl = b->tl;
+}
+
+static void tx_gs_store(TextGSBlob *b, const TextGS *gs) {
+    b->tm = gs->tm;
+    b->tlm = gs->tlm;
+    b->font = gs->font;
+    b->size = gs->size;
+    b->tc = gs->tc;
+    b->tw = gs->tw;
+    b->tl = gs->tl;
+}
 
 static TspdfObj *tx_resolve(TextCtx *ctx, TspdfObj *o) {
     if (!o || o->type != TSPDF_OBJ_REF) return o;
@@ -1090,77 +1122,7 @@ static void tx_show_string(TextCtx *ctx, TextGS *gs, const TspdfObj *str) {
     }
 }
 
-// --- Interpreter ---
-
-static void tx_interpret(TextCtx *ctx, const uint8_t *data, size_t len,
-                         TextGS *gs, int depth);
-
-static void tx_do_xobject(TextCtx *ctx, const TextGS *gs,
-                          const TspdfObj *name, int depth) {
-    if (depth + 1 >= TEXT_MAX_DEPTH) return;
-    if (!gs->resources || !name || name->type != TSPDF_OBJ_NAME) return;
-    TspdfObj *xobjs = tx_resolve(ctx, tspdf_dict_get(gs->resources, "XObject"));
-    if (!xobjs || xobjs->type != TSPDF_OBJ_DICT) return;
-    TspdfObj *ref = tspdf_dict_get(xobjs, (const char *)name->string.data);
-    uint32_t num = ref && ref->type == TSPDF_OBJ_REF ? ref->ref.num : 0;
-    TspdfObj *xo = tx_resolve(ctx, ref);
-    if (!xo || xo->type != TSPDF_OBJ_STREAM) return;
-    TspdfObj *sub = tx_resolve(ctx, tspdf_dict_get(xo->stream.dict, "Subtype"));
-    if (!sub || sub->type != TSPDF_OBJ_NAME ||
-        strcmp((const char *)sub->string.data, "Form") != 0)
-        return;
-    for (int i = 0; i <= depth; i++)
-        if (ctx->form_stack[i] == xo) return; // cycle
-    ctx->form_stack[depth + 1] = xo;
-
-    size_t blen = 0;
-    uint8_t *bytes = tx_load_stream(ctx, xo, num, &blen);
-    if (!bytes) return;
-
-    TextGS sub_gs = *gs;
-    sub_gs.tm = sub_gs.tlm = TX_IDENTITY;
-    TspdfObj *mtx = tx_resolve(ctx, tspdf_dict_get(xo->stream.dict, "Matrix"));
-    if (mtx && mtx->type == TSPDF_OBJ_ARRAY && mtx->array.count >= 6) {
-        TxMat m;
-        m.a = tx_obj_num(tx_resolve(ctx, &mtx->array.items[0]));
-        m.b = tx_obj_num(tx_resolve(ctx, &mtx->array.items[1]));
-        m.c = tx_obj_num(tx_resolve(ctx, &mtx->array.items[2]));
-        m.d = tx_obj_num(tx_resolve(ctx, &mtx->array.items[3]));
-        m.e = tx_obj_num(tx_resolve(ctx, &mtx->array.items[4]));
-        m.f = tx_obj_num(tx_resolve(ctx, &mtx->array.items[5]));
-        sub_gs.ctm = tx_mul(m, sub_gs.ctm);
-    }
-    TspdfObj *res = tx_resolve(ctx, tspdf_dict_get(xo->stream.dict, "Resources"));
-    if (res && res->type == TSPDF_OBJ_DICT) sub_gs.resources = res;
-
-    tx_interpret(ctx, bytes, blen, &sub_gs, depth + 1);
-    free(bytes);
-    ctx->form_stack[depth + 1] = NULL;
-}
-
-// Skip BI ... ID <binary> EI: the raw image bytes would derail the tokenizer.
-static void tx_skip_inline_image(TspdfParser *p) {
-    while (p->pos + 1 < p->len) {
-        if (p->data[p->pos] == 'I' && p->data[p->pos + 1] == 'D' &&
-            (p->pos + 2 >= p->len || tx_is_ws(p->data[p->pos + 2]))) {
-            p->pos += 2;
-            break;
-        }
-        p->pos++;
-    }
-    if (p->pos < p->len && tx_is_ws(p->data[p->pos])) p->pos++;
-    while (p->pos + 1 < p->len) {
-        if (p->data[p->pos] == 'E' && p->data[p->pos + 1] == 'I' &&
-            p->pos > 0 && tx_is_ws(p->data[p->pos - 1]) &&
-            (p->pos + 2 >= p->len || tx_is_ws(p->data[p->pos + 2]) ||
-             tx_is_delim(p->data[p->pos + 2]))) {
-            p->pos += 2;
-            return;
-        }
-        p->pos++;
-    }
-    p->pos = p->len;
-}
+// --- Interpreter (driven by the shared content-stream walker) ---
 
 static TspdfObj *stk_at(TspdfObj **stk, int ns, int from_top) {
     int i = ns - 1 - from_top;
@@ -1176,153 +1138,127 @@ static void tx_op_td(TextGS *gs, double tx, double ty) {
     gs->tm = gs->tlm;
 }
 
-static void tx_interpret(TextCtx *ctx, const uint8_t *data, size_t len,
-                         TextGS *gs, int depth) {
-    TspdfParser p;
-    tspdf_parser_init(&p, data, len, &ctx->scratch);
-    TspdfObj *stk[TEXT_OP_STACK];
-    int ns = 0;
-    TextGS gstack[TEXT_GS_STACK];
-    int ngs = 0;
+// Walker load_stream/free callbacks.
+static uint8_t *tx_walk_load(void *client, TspdfObj *s, uint32_t obj_num,
+                             size_t *out_len) {
+    return tx_load_stream((TextCtx *)client, s, obj_num, out_len);
+}
 
-    while (1) {
-        tspdf_skip_whitespace(&p);
-        if (p.pos >= p.len) break;
-        uint8_t c = p.data[p.pos];
+static void tx_walk_free(void *client, uint8_t *bytes) {
+    (void)client;
+    free(bytes);
+}
 
-        if (c == '(' || c == '<' || c == '[' || c == '/' || c == '+' ||
-            c == '-' || c == '.' || (c >= '0' && c <= '9')) {
-            p.error = TSPDF_OK;
-            size_t before = p.pos;
-            TspdfObj *o = tspdf_parse_obj(&p);
-            if (!o) {
-                // Malformed operand: resync one byte further, drop the stack.
-                p.error = TSPDF_OK;
-                p.pos = before + 1;
-                ns = 0;
-                continue;
-            }
-            if (ns == TEXT_OP_STACK) {
-                memmove(stk, stk + 1, sizeof(stk[0]) * (TEXT_OP_STACK - 1));
-                ns--;
-            }
-            stk[ns++] = o;
-            continue;
-        }
-        if (tx_is_delim(c)) { // stray ) > ] } { — resync
-            p.pos++;
-            continue;
-        }
+// A Form XObject was entered: reset the text matrices for its sub-stream, like
+// a fresh BT would (the walker gives us a private blob copy to mutate).
+static void tx_walk_form_enter(void *client, void *gstate, TspdfObj *form) {
+    (void)client;
+    (void)form;
+    TextGSBlob *b = (TextGSBlob *)gstate;
+    b->tm = b->tlm = TX_IDENTITY;
+}
 
-        char op[8];
-        size_t ol = 0;
-        bool overlong = false;
-        while (p.pos < p.len && !tx_is_ws(p.data[p.pos]) && !tx_is_delim(p.data[p.pos]) &&
-               p.data[p.pos] > ' ') {
-            if (ol + 1 < sizeof(op)) op[ol++] = (char)p.data[p.pos];
-            else overlong = true;
-            p.pos++;
-        }
-        op[ol] = '\0';
-        if (ol == 0) { p.pos++; continue; }
-        if (overlong) { ns = 0; continue; }
+// Operator callback: the walker already handled q/Q/cm/Do/BI/true/false/null,
+// so this sees only the text operators. Reconstitute a full TextGS from the
+// walker's ctm/resources plus the client blob, run the operator, and store the
+// mutated text state back into the blob.
+static void tx_walk_op(void *client, const char *op, TspdfObj **stk, int ns,
+                       TspdfWalkMat wctm, TspdfObj *resources, void *gstate) {
+    TextCtx *ctx = (TextCtx *)client;
+    TextGSBlob *b = (TextGSBlob *)gstate;
+    TxMat ctm = {wctm.a, wctm.b, wctm.c, wctm.d, wctm.e, wctm.f};
+    TextGS gs;
+    tx_gs_load(&gs, b, ctm, resources);
 
-        // "true"/"false"/"null" are operands, not operators.
-        if (strcmp(op, "true") == 0 || strcmp(op, "false") == 0 ||
-            strcmp(op, "null") == 0) {
-            continue; // no text operator consumes them; keep stack as-is
-        }
-
-        if (strcmp(op, "BT") == 0) {
-            gs->tm = gs->tlm = TX_IDENTITY;
-        } else if (strcmp(op, "ET") == 0) {
-            // nothing
-        } else if (strcmp(op, "Tf") == 0) {
-            gs->size = stk_num(stk, ns, 0);
-            gs->font = tx_get_font(ctx, gs->resources, stk_at(stk, ns, 1));
-        } else if (strcmp(op, "Td") == 0) {
-            tx_op_td(gs, stk_num(stk, ns, 1), stk_num(stk, ns, 0));
-        } else if (strcmp(op, "TD") == 0) {
-            gs->tl = -stk_num(stk, ns, 0);
-            tx_op_td(gs, stk_num(stk, ns, 1), stk_num(stk, ns, 0));
-        } else if (strcmp(op, "Tm") == 0) {
-            TxMat m;
-            m.a = stk_num(stk, ns, 5);
-            m.b = stk_num(stk, ns, 4);
-            m.c = stk_num(stk, ns, 3);
-            m.d = stk_num(stk, ns, 2);
-            m.e = stk_num(stk, ns, 1);
-            m.f = stk_num(stk, ns, 0);
-            gs->tm = gs->tlm = m;
-        } else if (strcmp(op, "T*") == 0) {
-            tx_op_td(gs, 0, -gs->tl);
-        } else if (strcmp(op, "TL") == 0) {
-            gs->tl = stk_num(stk, ns, 0);
-        } else if (strcmp(op, "Tc") == 0) {
-            gs->tc = stk_num(stk, ns, 0);
-        } else if (strcmp(op, "Tw") == 0) {
-            gs->tw = stk_num(stk, ns, 0);
-        } else if (strcmp(op, "Tz") == 0 || strcmp(op, "Ts") == 0 ||
-                   strcmp(op, "Tr") == 0) {
-            // horizontal scale / rise / render mode: explicitly ignored
-        } else if (strcmp(op, "Tj") == 0) {
-            tx_pre_run(ctx, gs);
-            tx_show_string(ctx, gs, stk_at(stk, ns, 0));
-            tx_post_run(ctx, gs);
-        } else if (strcmp(op, "TJ") == 0) {
-            TspdfObj *arr = stk_at(stk, ns, 0);
-            if (arr && arr->type == TSPDF_OBJ_ARRAY) {
-                tx_pre_run(ctx, gs);
-                double thr = gs->font && gs->font->space_w > 0
-                                 ? gs->font->space_w * 0.5 : 120.0;
-                if (thr > 200.0) thr = 200.0; // same 0.20 em cap as tx_pre_run
-                for (size_t i = 0; i < arr->array.count; i++) {
-                    TspdfObj *el = &arr->array.items[i];
-                    if (el->type == TSPDF_OBJ_STRING) {
-                        tx_show_string(ctx, gs, el);
-                    } else if (el->type == TSPDF_OBJ_INT ||
-                               el->type == TSPDF_OBJ_REAL) {
-                        double v = tx_obj_num(el);
-                        if (!ctx->layout && -v > thr) tx_space(ctx);
-                        gs->tm = tx_mul(tx_translate(-v / 1000.0 * gs->size, 0),
-                                        gs->tm);
-                    }
+    if (strcmp(op, "BT") == 0) {
+        gs.tm = gs.tlm = TX_IDENTITY;
+    } else if (strcmp(op, "ET") == 0) {
+        // nothing
+    } else if (strcmp(op, "Tf") == 0) {
+        gs.size = stk_num(stk, ns, 0);
+        gs.font = tx_get_font(ctx, gs.resources, stk_at(stk, ns, 1));
+    } else if (strcmp(op, "Td") == 0) {
+        tx_op_td(&gs, stk_num(stk, ns, 1), stk_num(stk, ns, 0));
+    } else if (strcmp(op, "TD") == 0) {
+        gs.tl = -stk_num(stk, ns, 0);
+        tx_op_td(&gs, stk_num(stk, ns, 1), stk_num(stk, ns, 0));
+    } else if (strcmp(op, "Tm") == 0) {
+        TxMat m;
+        m.a = stk_num(stk, ns, 5);
+        m.b = stk_num(stk, ns, 4);
+        m.c = stk_num(stk, ns, 3);
+        m.d = stk_num(stk, ns, 2);
+        m.e = stk_num(stk, ns, 1);
+        m.f = stk_num(stk, ns, 0);
+        gs.tm = gs.tlm = m;
+    } else if (strcmp(op, "T*") == 0) {
+        tx_op_td(&gs, 0, -gs.tl);
+    } else if (strcmp(op, "TL") == 0) {
+        gs.tl = stk_num(stk, ns, 0);
+    } else if (strcmp(op, "Tc") == 0) {
+        gs.tc = stk_num(stk, ns, 0);
+    } else if (strcmp(op, "Tw") == 0) {
+        gs.tw = stk_num(stk, ns, 0);
+    } else if (strcmp(op, "Tz") == 0 || strcmp(op, "Ts") == 0 ||
+               strcmp(op, "Tr") == 0) {
+        // horizontal scale / rise / render mode: explicitly ignored
+    } else if (strcmp(op, "Tj") == 0) {
+        tx_pre_run(ctx, &gs);
+        tx_show_string(ctx, &gs, stk_at(stk, ns, 0));
+        tx_post_run(ctx, &gs);
+    } else if (strcmp(op, "TJ") == 0) {
+        TspdfObj *arr = stk_at(stk, ns, 0);
+        if (arr && arr->type == TSPDF_OBJ_ARRAY) {
+            tx_pre_run(ctx, &gs);
+            double thr = gs.font && gs.font->space_w > 0
+                             ? gs.font->space_w * 0.5 : 120.0;
+            if (thr > 200.0) thr = 200.0; // same 0.20 em cap as tx_pre_run
+            for (size_t i = 0; i < arr->array.count; i++) {
+                TspdfObj *el = &arr->array.items[i];
+                if (el->type == TSPDF_OBJ_STRING) {
+                    tx_show_string(ctx, &gs, el);
+                } else if (el->type == TSPDF_OBJ_INT ||
+                           el->type == TSPDF_OBJ_REAL) {
+                    double v = tx_obj_num(el);
+                    if (!ctx->layout && -v > thr) tx_space(ctx);
+                    gs.tm = tx_mul(tx_translate(-v / 1000.0 * gs.size, 0),
+                                   gs.tm);
                 }
-                tx_post_run(ctx, gs);
             }
-        } else if (strcmp(op, "'") == 0) {
-            tx_op_td(gs, 0, -gs->tl);
-            tx_pre_run(ctx, gs);
-            tx_show_string(ctx, gs, stk_at(stk, ns, 0));
-            tx_post_run(ctx, gs);
-        } else if (strcmp(op, "\"") == 0) {
-            gs->tw = stk_num(stk, ns, 2);
-            gs->tc = stk_num(stk, ns, 1);
-            tx_op_td(gs, 0, -gs->tl);
-            tx_pre_run(ctx, gs);
-            tx_show_string(ctx, gs, stk_at(stk, ns, 0));
-            tx_post_run(ctx, gs);
-        } else if (strcmp(op, "q") == 0) {
-            if (ngs < TEXT_GS_STACK) gstack[ngs++] = *gs;
-        } else if (strcmp(op, "Q") == 0) {
-            if (ngs > 0) *gs = gstack[--ngs];
-        } else if (strcmp(op, "cm") == 0) {
-            TxMat m;
-            m.a = stk_num(stk, ns, 5);
-            m.b = stk_num(stk, ns, 4);
-            m.c = stk_num(stk, ns, 3);
-            m.d = stk_num(stk, ns, 2);
-            m.e = stk_num(stk, ns, 1);
-            m.f = stk_num(stk, ns, 0);
-            gs->ctm = tx_mul(m, gs->ctm);
-        } else if (strcmp(op, "Do") == 0) {
-            tx_do_xobject(ctx, gs, stk_at(stk, ns, 0), depth);
-        } else if (strcmp(op, "BI") == 0) {
-            tx_skip_inline_image(&p);
+            tx_post_run(ctx, &gs);
         }
-        // every other operator: skipped
-        ns = 0;
+    } else if (strcmp(op, "'") == 0) {
+        tx_op_td(&gs, 0, -gs.tl);
+        tx_pre_run(ctx, &gs);
+        tx_show_string(ctx, &gs, stk_at(stk, ns, 0));
+        tx_post_run(ctx, &gs);
+    } else if (strcmp(op, "\"") == 0) {
+        gs.tw = stk_num(stk, ns, 2);
+        gs.tc = stk_num(stk, ns, 1);
+        tx_op_td(&gs, 0, -gs.tl);
+        tx_pre_run(ctx, &gs);
+        tx_show_string(ctx, &gs, stk_at(stk, ns, 0));
+        tx_post_run(ctx, &gs);
     }
+    // every other operator: skipped
+
+    tx_gs_store(b, &gs);
+}
+
+// Configure a walker for text extraction: full text graphics-state blob, an
+// operator callback, no image callback (text ignores images).
+static void tx_walker_init(TextCtx *ctx, TspdfWalker *w) {
+    memset(w, 0, sizeof(*w));
+    w->doc = ctx->doc;
+    w->rp = &ctx->rp;
+    w->scratch = &ctx->scratch;
+    w->client = ctx;
+    w->max_depth = TEXT_MAX_DEPTH;
+    w->gstate_size = sizeof(TextGSBlob);
+    w->load_stream = tx_walk_load;
+    w->load_stream_free = tx_walk_free;
+    w->op = tx_walk_op;
+    w->form_enter = tx_walk_form_enter;
 }
 
 // --- Layout assembly (fragments -> character grid) ---
@@ -1566,16 +1502,19 @@ static const char *tx_page_text(TspdfReader *doc, size_t page_index, bool layout
     ctx.out = tspdf_buffer_create(4096);
 
     TspdfReaderPage *page = &doc->pages.pages[page_index];
-    TextGS gs;
-    memset(&gs, 0, sizeof(gs));
-    gs.ctm = TX_IDENTITY;
-    gs.tm = gs.tlm = TX_IDENTITY;
-    gs.resources = tx_page_resources(&ctx, page->page_dict);
+    TspdfObj *resources = tx_page_resources(&ctx, page->page_dict);
+    TextGSBlob blob;
+    memset(&blob, 0, sizeof(blob));
+    blob.tm = blob.tlm = TX_IDENTITY;
 
     TspdfBuffer content = tspdf_buffer_create(4096);
     tx_load_page_content(&ctx, page->page_dict, &content);
-    if (content.len > 0 && !content.error)
-        tx_interpret(&ctx, content.data, content.len, &gs, 0);
+    if (content.len > 0 && !content.error) {
+        TspdfWalker walker;
+        tx_walker_init(&ctx, &walker);
+        tspdf_walk_run(&walker, content.data, content.len, TSPDF_WALK_IDENTITY,
+                       resources, 0, false, &blob);
+    }
     tspdf_buffer_destroy(&content);
 
     if (layout) {
