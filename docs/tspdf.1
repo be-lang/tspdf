@@ -83,8 +83,11 @@ edits a field,
 .I key
 removes one (both repeatable; keys: title, author, subject, keywords,
 creator, producer). If the document also carries
-XMP metadata, an edit leaves the XMP stream untouched and prints a notice,
-since some viewers prefer XMP over the Info dictionary. Encrypted files need
+XMP metadata, an edit updates the matching XMP properties too (dc:title,
+dc:creator, dc:description, pdf:Keywords, xmp:CreatorTool, pdf:Producer),
+since some viewers prefer XMP over the Info dictionary. A field whose XMP
+property is missing from the packet is left alone there and a notice names
+it. Encrypted files need
 .B \-\-password
 (or
 .BR \-\-password\-file );

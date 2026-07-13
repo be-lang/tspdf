@@ -197,9 +197,29 @@ const char *tspdf_reader_get_creation_date(const TspdfReader *doc);
 const char *tspdf_reader_get_mod_date(const TspdfReader *doc);
 
 // True when the document carries an XMP metadata stream (catalog /Metadata).
-// The Info-dict setters below do not update XMP, so callers can use this to
-// warn that viewers preferring XMP may show stale values after an edit.
 bool tspdf_reader_has_xmp_metadata(TspdfReader *doc);
+
+// Field bits reported by tspdf_reader_sync_xmp_metadata.
+#define TSPDF_XMP_TITLE    (1u << 0)
+#define TSPDF_XMP_AUTHOR   (1u << 1)
+#define TSPDF_XMP_SUBJECT  (1u << 2)
+#define TSPDF_XMP_KEYWORDS (1u << 3)
+#define TSPDF_XMP_CREATOR  (1u << 4)
+#define TSPDF_XMP_PRODUCER (1u << 5)
+
+// Apply the pending Info-dict edits (made with the setters below) to the XMP
+// packet in the catalog /Metadata stream, so viewers that prefer XMP see the
+// new values. Call after the last setter, before saving. Conservative textual
+// editing: a property already in the packet gets its value replaced (element
+// or attribute form, XML-escaped; clearing a field empties the value); a
+// property that is absent, structured beyond a single value (e.g. a
+// multi-author dc:creator), or in a packet this cannot edit safely (UTF-16,
+// undecodable) is left alone. Whenever the packet is edited, xmp:ModifyDate
+// is refreshed too and the following save stamps the matching timestamp into
+// Info /ModDate. Returns a bitmask of TSPDF_XMP_* bits for the edited fields
+// that could NOT be applied — the caller may warn that XMP stays stale for
+// those — or 0 when everything applied or there is no XMP stream at all.
+unsigned tspdf_reader_sync_xmp_metadata(TspdfReader *doc);
 
 // Metadata setters (pass NULL to remove a field)
 void tspdf_reader_set_title(TspdfReader *doc, const char *value);

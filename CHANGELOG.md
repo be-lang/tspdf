@@ -7,6 +7,19 @@ on 0.x, the CLI is considered stable but the low-level C API may still change.
 
 ## [Unreleased]
 
+### Changed
+- `metadata --set/--clear` now updates the XMP packet too, not just the Info
+  dictionary, so viewers that prefer XMP (Acrobat) show the new values:
+  title, author, subject, keywords, creator, and producer map to dc:title,
+  dc:creator, dc:description, pdf:Keywords, xmp:CreatorTool, and
+  pdf:Producer, and xmp:ModifyDate is refreshed with the same timestamp the
+  save writes into Info /ModDate. Editing is conservative — a property
+  already in the packet gets its value replaced (XML-escaped, keeping the
+  xpacket padding contract); nothing is injected. The stale-XMP notice now
+  fires only for edited fields whose property the packet does not carry, or
+  for packets that cannot be edited safely (UTF-16, multi-author
+  dc:creator).
+
 ### Fixed
 - Every command that reads a PDF now takes `--password`/`--password-file`:
   `rotate`, `delete`, `reorder`, `split`, `merge`, `crop`, `scale`, `pagenum`,

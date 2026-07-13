@@ -216,8 +216,10 @@ tspdf metadata report.pdf \
 ```
 
 This edits the Info dictionary. If the document also carries XMP metadata,
-the XMP stream is left as-is and tspdf prints a notice, because some viewers
-(Acrobat among them) show the XMP values instead.
+the matching XMP properties are updated as well, because some viewers
+(Acrobat among them) show the XMP values instead. Fields whose property is
+missing from the XMP packet are left alone there (tspdf never invents XMP
+structure) and a notice names them.
 
 ## Edit bookmarks (outline)
 
