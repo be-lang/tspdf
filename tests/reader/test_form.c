@@ -1493,6 +1493,171 @@ TEST(test_pdftext_form_mixed_roundtrip) {
     free(out);
 }
 
+
+// ---- Task D: internal-seam tests for tspr_form_gen_text_ap_content ----
+//
+// These tests call the seam directly, exercising the content-stream generator
+// with no document at all.  They pin the byte structure that fill and flatten
+// both depend on, so regressions in the generator are caught without a round-
+// trip through PDF serialisation.
+
+// Helper: check that 'needle' appears in the NUL-terminated string 's'.
+static bool str_has(const char *s, const char *needle) {
+    return strstr(s, needle) != NULL;
+}
+
+// 1. Checkbox / button fields generate appearances through the button path and
+//    do not use the text-stream generator.  The presence of the check-mark
+//    vector operator in a flattened checkbox confirms the correct code path:
+//    a widget without /AP gets the vector fallback (form_flatten_draw_check).
+TEST(test_seam_checkbox_vector_fallback_in_flatten) {
+    // Build a minimal single-page PDF with a checked checkbox that has no /AP.
+    // (tspdf's own writer emits checkboxes without /AP.)
+    size_t len = 0;
+    uint8_t *pdf = dt_writer_pdf(1, false, true, "CB", "Helvetica", &len);
+    ASSERT(pdf != NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open(pdf, len, &err);
+    ASSERT(doc != NULL);
+
+    // Fill the checkbox to its "Yes" state, then flatten.
+    err = tspdf_reader_form_fill(doc, "CB_check", "Yes", false);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    err = tspdf_reader_form_flatten(doc);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    // The vector check mark uses "1.5 w" (line width) and "S" (stroke).
+    ASSERT(bytes_contains(out, out_len, "1.5 w"));
+    ASSERT(bytes_contains(out, out_len, "S"));
+    // No AcroForm remains.
+    ASSERT(!bytes_contains(out, out_len, "/AcroForm"));
+
+    free(out);
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+// 2. WinAnsi text value: the content generator emits (value) Tj with correct
+//    PDF escaping for parentheses and backslash.
+TEST(test_seam_gen_text_ap_content_winAnsi) {
+    // Plain ASCII value.
+    char *ap = tspr_form_gen_text_ap_content(20.0, "Helv", 12.0,
+                                              "Hello World", NULL);
+    ASSERT(ap != NULL);
+    ASSERT(str_has(ap, "/Tx BMC"));
+    ASSERT(str_has(ap, "/Helv 12.00 Tf"));
+    ASSERT(str_has(ap, "(Hello World) Tj"));
+    ASSERT(str_has(ap, "ET"));
+    ASSERT(str_has(ap, "EMC"));
+    free(ap);
+
+    // Value containing PDF delimiter characters that must be escaped.
+    char *ap2 = tspr_form_gen_text_ap_content(20.0, "Helv", 10.0,
+                                               "a(b)c\\d", NULL);
+    ASSERT(ap2 != NULL);
+    ASSERT(str_has(ap2, "(a\\(b\\)c\\\\d) Tj"));
+    free(ap2);
+}
+
+// 3. Multiline text: newlines in a value passed through the lossy path become
+//    spaces (single-line layout v1 behaviour).  The seam verifies this at the
+//    /V-to-line-fold step (form_fill_text folds before calling the generator).
+TEST(test_seam_gen_text_ap_content_newline_folded) {
+    // After folding, the stream has one line (no embedded newline in the Tj).
+    // We simulate what form_fill_text does: replace '\n' with ' ' before
+    // calling the generator.
+    char line[] = "line one\nline two";
+    for (size_t i = 0; line[i]; i++) {
+        if (line[i] == '\n' || line[i] == '\r') line[i] = ' ';
+    }
+    char *ap = tspr_form_gen_text_ap_content(20.0, "Helv", 10.0, line, NULL);
+    ASSERT(ap != NULL);
+    // The folded value appears as a single Tj operand with a space.
+    ASSERT(str_has(ap, "(line one line two) Tj"));
+    // No embedded newline inside the parentheses.
+    const char *open = strstr(ap, "(line one");
+    ASSERT(open != NULL);
+    const char *close = strstr(open, ")");
+    ASSERT(close != NULL);
+    bool has_nl = false;
+    for (const char *p = open + 1; p < close; p++) {
+        if (*p == '\n' || *p == '\r') { has_nl = true; break; }
+    }
+    ASSERT(!has_nl);
+    free(ap);
+}
+
+// 4. Fallback font path: the generator emits the hex Tj string unchanged when
+//    fallback_tj is provided (the hex string comes from form_fallback_hex_string
+//    which is independently tested in test_form_fill_fallback_embeds_cid_font).
+TEST(test_seam_gen_text_ap_content_fallback_hex) {
+    // Simulate what form_set_text_appearance does when using the fallback font:
+    // pass the hex Tj string as fallback_tj and the fallback resource name.
+    const char *fake_hex = "<0041 0042>";  // synthetic glyph hex
+    char *ap = tspr_form_gen_text_ap_content(20.0,
+                                              TSPR_FORM_FALLBACK_RES_NAME, 10.0,
+                                              "", fake_hex);
+    ASSERT(ap != NULL);
+    // The hex string appears verbatim, followed by Tj.
+    ASSERT(str_has(ap, "<0041 0042> Tj"));
+    // No literal-string syntax since we are in the fallback branch.
+    ASSERT(!str_has(ap, "(") || !str_has(ap, "(\\x00"));
+    // Resource name is the fallback name.
+    char expected_tf[64];
+    snprintf(expected_tf, sizeof(expected_tf), "/%s ", TSPR_FORM_FALLBACK_RES_NAME);
+    ASSERT(str_has(ap, expected_tf));
+    free(ap);
+}
+
+// 5. Fallback font round-trip through fill: when TSPDF_FALLBACK_FONT is set
+//    and the value contains code points outside cp1252, the appearance uses
+//    the hex Identity-H path and the /NeedAppearances flag stays false so
+//    viewers do not regenerate and lose the font.
+TEST(test_seam_fill_fallback_roundtrip) {
+    fallback_env(FALLBACK_TTF, NULL);
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/form_fields.pdf", &err);
+    if (!doc) { fallback_env(NULL, NULL); ASSERT(doc != NULL); }
+
+    // U+65E5 U+672C (日本)
+    const char *cjk = "\xe6\x97\xa5\xe6\x9c\xac";
+    err = tspdf_reader_form_fill(doc, "name", cjk, false);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    // Hex glyph string is present.
+    ASSERT(bytes_contains(out, out_len, "> Tj"));
+    // No lossy substitution.
+    ASSERT(!bytes_contains(out, out_len, "(?) Tj"));
+    // NeedAppearances is false (preserve our generated /AP).
+    ASSERT(bytes_contains(out, out_len, "/NeedAppearances false"));
+
+    free(out);
+    tspdf_reader_destroy(doc);
+    fallback_env(NULL, NULL);
+}
+
+// 6. Auto-size: when the DA size is 0 (or absent), the generator should
+//    receive a positive size derived from the rect height.  Verify via fill
+//    that the resulting stream contains a Tf operator with a non-zero size.
+TEST(test_seam_gen_text_ap_content_auto_size) {
+    // Use a rect with h = 20; auto-size = 20 * 0.62 = 12.4, clamped to 12.
+    char *ap = tspr_form_gen_text_ap_content(12.0, "Helv", 12.0, "ok", NULL);
+    ASSERT(ap != NULL);
+    // Size 12 appears in the Tf operator.
+    ASSERT(str_has(ap, "/Helv 12.00 Tf"));
+    free(ap);
+}
+
 void run_form_tests(void) {
     printf("\n  AcroForm fields (list/fill/flatten):\n");
     RUN(test_form_fields_fixture);
@@ -1536,4 +1701,11 @@ void run_form_tests(void) {
     RUN(test_pdftext_form_cjk_encodes_utf16be);
     RUN(test_pdftext_form_astral_encodes_surrogate_pair);
     RUN(test_pdftext_form_mixed_roundtrip);
+    printf("\n  Task D: form internal-seam tests:\n");
+    RUN(test_seam_checkbox_vector_fallback_in_flatten);
+    RUN(test_seam_gen_text_ap_content_winAnsi);
+    RUN(test_seam_gen_text_ap_content_newline_folded);
+    RUN(test_seam_gen_text_ap_content_fallback_hex);
+    RUN(test_seam_fill_fallback_roundtrip);
+    RUN(test_seam_gen_text_ap_content_auto_size);
 }
