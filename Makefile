@@ -91,7 +91,6 @@ CLI_SOURCES = \
 	cli/main.c \
 	cli/commands.c \
 	cli/pipeline.c \
-	cli/ops.c \
 	cli/cmd_merge.c \
 	cli/cmd_split.c \
 	cli/cmd_rotate.c \

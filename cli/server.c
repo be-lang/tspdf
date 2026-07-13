@@ -1,7 +1,7 @@
 #define _GNU_SOURCE
 #include "commands.h"
 #include "pipeline.h"
-#include "ops.h"
+#include "../src/ops/ops.h"
 #include "assets.h"
 #include "../include/tspdf.h"
 #include "../include/tspdf_overlay.h"
@@ -1402,7 +1402,7 @@ static void api_unlock(int fd, MultipartForm *form)
     if (!doc) { send_error(fd, 400, "Failed to open PDF (wrong password?)"); return; }
 
     // Saves preserve encryption by default; unlocking is the explicit opt-out.
-    TspdfSaveOptions opts = tspdf_op_unlock_save_options();
+    TspdfSaveOptions opts = tsops_unlock_save_options();
     uint8_t *out = NULL;
     size_t out_len = 0;
     err = tspdf_reader_save_to_memory_with_options(doc, &out, &out_len, &opts);
@@ -1545,7 +1545,7 @@ static void api_metadata(int fd, MultipartForm *form)
         char val[512];
         for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
             if (json_get_string(config_buf, keys[k], val, sizeof(val)) == 0)
-                tspdf_op_metadata_set(doc, keys[k], strlen(keys[k]), val);
+                tsops_metadata_set(doc, keys[k], strlen(keys[k]), val);
         }
         // Keep any XMP packet in step with the Info edits (best effort;
         // fields the packet does not carry simply stay as they were).
@@ -1599,10 +1599,10 @@ static void api_watermark(int fd, MultipartForm *form)
     /* Same placement/rotation math and cp1252 re-encoding as the CLI: the web
      * endpoint now shares cmd_watermark.c's operation, so non-ASCII watermark
      * text (é, €, ...) renders correctly instead of leaking raw UTF-8 bytes. */
-    TspdfOpWatermarkText params = {
+    TsopsWatermarkText params = {
         .text = text, .opacity = opacity, .font_size = cfg_font_size,
     };
-    err = tspdf_op_watermark_text(doc, &params, NULL);
+    err = tsops_watermark_text(doc, &params, NULL);
     if (err != TSPDF_OK) {
         tspdf_reader_destroy(doc);
         if (err == TSPDF_ERR_UNSUPPORTED || err == TSPDF_ERR_ENCODING)

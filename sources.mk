@@ -27,7 +27,8 @@ LIB_SOURCES = \
 	$(SRCDIR)/compress/deflate.c \
 	$(SRCDIR)/filters/filters.c \
 	$(SRCDIR)/qr/qr_encode.c \
-	$(SRCDIR)/tspdf_error.c
+	$(SRCDIR)/tspdf_error.c \
+	$(SRCDIR)/ops/ops.c
 
 TSPR_SOURCES = \
 	$(SRCDIR)/reader/tspr_parser.c \
