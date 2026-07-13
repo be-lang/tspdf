@@ -15694,6 +15694,318 @@ TEST(test_lossy_mono_imagemask_and_nondefault_decode_excluded) {
     tspdf_arena_destroy(&enc_arena);
 }
 
+/* -----------------------------------------------------------------------
+ * Task 2: pdftext pin-down tests
+ *
+ * These tests record the exact bytes that form_make_text_string() and
+ * bm_title_obj() produce today so that the refactor (replacing both with
+ * tspdf_utf8_to_pdf_text()) cannot silently change the encoding.
+ *
+ * Byte encoding reference (ISO 32000 §7.9.2.2):
+ *   pure ASCII  -> raw bytes, no BOM
+ *   non-ASCII UTF-8 -> BOM FE FF + UTF-16BE code units (surrogate pairs for
+ *                     astral code points)
+ *
+ * write_string_escaped() octal-escapes bytes outside 32..126, so the BOM
+ * bytes 0xFE 0xFF appear in the PDF file as the ASCII text \376\377.
+ * Code units 0xD83D/0xDE00 (U+1F600 surrogate pair) appear as \330= and
+ * \336\000 respectively.  The helpers below search the raw PDF bytes for
+ * these ASCII-printable representations, which avoids embedded-NUL issues
+ * in C string literals.
+ * ----------------------------------------------------------------------- */
+
+/* Search for `needle` (needle_len bytes) inside `haystack` (haystack_len
+ * bytes).  Used for patterns that contain 0x00 bytes after octal-escape
+ * expansion which would truncate a strlen()-based search. */
+static bool bytes_contains_bin(const uint8_t *haystack, size_t haystack_len,
+                                const uint8_t *needle, size_t needle_len) {
+    if (!haystack || !needle || needle_len == 0 || needle_len > haystack_len)
+        return false;
+    for (size_t i = 0; i <= haystack_len - needle_len; i++) {
+        if (memcmp(haystack + i, needle, needle_len) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* ---- form pin-down helpers ---- */
+
+/* Fill field "name" in form_fields.pdf with `value`, save to memory.
+ * Returns a re-opened reader (caller destroys); raw PDF bytes in *out
+ * (caller frees) with byte count in *out_len. Returns NULL on any failure. */
+static TspdfReader *t2_form_fill_and_save(const char *value,
+                                          uint8_t **out, size_t *out_len) {
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/form_fields.pdf", &err);
+    if (!doc) return NULL;
+    err = tspdf_reader_form_fill(doc, "name", value, false);
+    if (err != TSPDF_OK) { tspdf_reader_destroy(doc); return NULL; }
+
+    *out = NULL; *out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, out, out_len);
+    tspdf_reader_destroy(doc);
+    if (err != TSPDF_OK) { free(*out); return NULL; }
+
+    TspdfReader *re = tspdf_reader_open(*out, *out_len, &err);
+    if (!re) { free(*out); return NULL; }
+    return re;
+}
+
+/* ---- bookmark pin-down helpers ---- */
+
+static TspdfReader *t2_bookmark_set_and_save(const char *title,
+                                             uint8_t **out, size_t *out_len) {
+    size_t pdf_len = 0;
+    char *pdf = bm_make_three_page_pdf(&pdf_len);
+    if (!pdf) return NULL;
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, pdf_len, &err);
+    free(pdf);
+    if (!doc) return NULL;
+
+    TspdfBookmarkEntry entry = {title, 1, 0, 0, false, NULL};
+    err = tspdf_reader_set_bookmarks(doc, &entry, 1);
+    if (err != TSPDF_OK) { tspdf_reader_destroy(doc); return NULL; }
+
+    *out = NULL; *out_len = 0;
+    err = tspdf_reader_save_to_memory(doc, out, out_len);
+    tspdf_reader_destroy(doc);
+    if (err != TSPDF_OK) { free(*out); return NULL; }
+
+    TspdfReader *re = tspdf_reader_open(*out, *out_len, &err);
+    if (!re) { free(*out); return NULL; }
+    return re;
+}
+
+/* ======== form fill pin-down tests ======== */
+
+/* ASCII "Hello": stored raw, no BOM. */
+TEST(test_pdftext_form_ascii_stays_raw) {
+    uint8_t *out = NULL; size_t out_len = 0;
+    TspdfReader *re = t2_form_fill_and_save("Hello", &out, &out_len);
+    ASSERT(re != NULL);
+
+    ASSERT(bytes_contains(out, out_len, "(Hello)"));
+    ASSERT(!bytes_contains(out, out_len, "\\376\\377"));
+
+    TspdfFormFieldInfo *fields = NULL; size_t count = 0;
+    TspdfError err = tspdf_reader_form_fields(re, &fields, &count);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    const TspdfFormFieldInfo *f = form_find(fields, count, "name");
+    ASSERT(f != NULL);
+    ASSERT(f->value && strcmp(f->value, "Hello") == 0);
+
+    tspdf_reader_destroy(re);
+    free(out);
+}
+
+/* Latin-1 plus: e-acute U+00E9 (UTF-8 \xC3\xA9).
+ * Encoded as BOM FE FF + U+00E9 (bytes 00 E9).
+ * In PDF literal string: \376\377\000\351 */
+TEST(test_pdftext_form_latin1_plus_encodes_utf16be) {
+    const char *value = "\xC3\xA9";  /* e-acute */
+    uint8_t *out = NULL; size_t out_len = 0;
+    TspdfReader *re = t2_form_fill_and_save(value, &out, &out_len);
+    ASSERT(re != NULL);
+
+    ASSERT(bytes_contains(out, out_len, "\\376\\377"));
+    /* U+00E9 as UTF-16BE: 00 E9; 0x00->\000, 0xE9->\\351 in octal. */
+    ASSERT(bytes_contains(out, out_len, "\\000\\351"));
+
+    TspdfFormFieldInfo *fields = NULL; size_t count = 0;
+    TspdfError err = tspdf_reader_form_fields(re, &fields, &count);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    const TspdfFormFieldInfo *f = form_find(fields, count, "name");
+    ASSERT(f != NULL);
+    ASSERT(f->value && strcmp(f->value, value) == 0);
+
+    tspdf_reader_destroy(re);
+    free(out);
+}
+
+/* CJK: U+6F22 (UTF-8 \xE6\xBC\xA2).
+ * Encoded as BOM FE FF + U+6F22 (bytes 6F 22).
+ * 0x6F='o' and 0x22='"' are printable so not octal-escaped.
+ * In PDF literal string: \376\377o" */
+TEST(test_pdftext_form_cjk_encodes_utf16be) {
+    const char *value = "\xE6\xBC\xA2";  /* U+6F22 */
+    uint8_t *out = NULL; size_t out_len = 0;
+    TspdfReader *re = t2_form_fill_and_save(value, &out, &out_len);
+    ASSERT(re != NULL);
+
+    ASSERT(bytes_contains(out, out_len, "\\376\\377"));
+    /* Bytes 6F 22 are printable 'o' and '"' -- check full BOM+code-unit. */
+    ASSERT(bytes_contains(out, out_len, "\\376\\377o\""));
+
+    TspdfFormFieldInfo *fields = NULL; size_t count = 0;
+    TspdfError err = tspdf_reader_form_fields(re, &fields, &count);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    const TspdfFormFieldInfo *f = form_find(fields, count, "name");
+    ASSERT(f != NULL);
+    ASSERT(f->value && strcmp(f->value, value) == 0);
+
+    tspdf_reader_destroy(re);
+    free(out);
+}
+
+/* Astral: U+1F600 (UTF-8 \xF0\x9F\x98\x80).
+ * Surrogate pair: hi=D83D, lo=DE00.
+ * Bytes: FE FF D8 3D DE 00
+ * In PDF literal: \376\377\330=\336\000
+ * 0xD8->\330, 0x3D='=', 0xDE->\336, 0x00->\000 */
+TEST(test_pdftext_form_astral_encodes_surrogate_pair) {
+    const char *value = "\xF0\x9F\x98\x80";  /* U+1F600 */
+    uint8_t *out = NULL; size_t out_len = 0;
+    TspdfReader *re = t2_form_fill_and_save(value, &out, &out_len);
+    ASSERT(re != NULL);
+
+    ASSERT(bytes_contains(out, out_len, "\\376\\377"));
+    /* High surrogate D83D: D8->\\330, 3D->'=' */
+    ASSERT(bytes_contains(out, out_len, "\\376\\377\\330="));
+    /* Full pattern including low surrogate NUL byte -- use binary search. */
+    const uint8_t bom_surr[] = {
+        '\\','3','7','6','\\','3','7','7',  /* \376\377 (BOM)           */
+        '\\','3','3','0','=',               /* \330=    (D8 3D)         */
+        '\\','3','3','6','\\','0','0','0'   /* \336\000 (DE 00)         */
+    };
+    ASSERT(bytes_contains_bin(out, out_len, bom_surr, sizeof(bom_surr)));
+
+    TspdfFormFieldInfo *fields = NULL; size_t count = 0;
+    TspdfError err = tspdf_reader_form_fields(re, &fields, &count);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    const TspdfFormFieldInfo *f = form_find(fields, count, "name");
+    ASSERT(f != NULL);
+    ASSERT(f->value && strcmp(f->value, value) == 0);
+
+    tspdf_reader_destroy(re);
+    free(out);
+}
+
+/* Mixed "Ae-acuteU+6F22U+1F600": non-ASCII triggers BOM+UTF-16BE; roundtrip. */
+TEST(test_pdftext_form_mixed_roundtrip) {
+    const char *value = "A\xC3\xA9\xE6\xBC\xA2\xF0\x9F\x98\x80";
+    uint8_t *out = NULL; size_t out_len = 0;
+    TspdfReader *re = t2_form_fill_and_save(value, &out, &out_len);
+    ASSERT(re != NULL);
+
+    ASSERT(bytes_contains(out, out_len, "\\376\\377"));
+
+    TspdfFormFieldInfo *fields = NULL; size_t count = 0;
+    TspdfError err = tspdf_reader_form_fields(re, &fields, &count);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    const TspdfFormFieldInfo *f = form_find(fields, count, "name");
+    ASSERT(f != NULL);
+    ASSERT(f->value && strcmp(f->value, value) == 0);
+
+    tspdf_reader_destroy(re);
+    free(out);
+}
+
+/* ======== bookmark title pin-down tests ======== */
+
+/* ASCII "Hello": no BOM. */
+TEST(test_pdftext_bookmark_ascii_stays_raw) {
+    uint8_t *out = NULL; size_t out_len = 0;
+    TspdfReader *re = t2_bookmark_set_and_save("Hello", &out, &out_len);
+    ASSERT(re != NULL);
+
+    ASSERT(!bytes_contains(out, out_len, "\\376\\377"));
+
+    TspdfBookmarkInfo *bm = NULL; size_t n = 0;
+    TspdfError err = tspdf_reader_bookmarks(re, &bm, &n);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_SIZE(n, 1);
+    ASSERT_EQ_STR(bm[0].title, "Hello");
+
+    tspdf_reader_destroy(re);
+    free(out);
+}
+
+/* e-acute U+00E9: BOM + code unit 00 E9. */
+TEST(test_pdftext_bookmark_latin1_plus_encodes_utf16be) {
+    const char *title = "\xC3\xA9";
+    uint8_t *out = NULL; size_t out_len = 0;
+    TspdfReader *re = t2_bookmark_set_and_save(title, &out, &out_len);
+    ASSERT(re != NULL);
+
+    ASSERT(bytes_contains(out, out_len, "\\376\\377"));
+    ASSERT(bytes_contains(out, out_len, "\\000\\351"));
+
+    TspdfBookmarkInfo *bm = NULL; size_t n = 0;
+    TspdfError err = tspdf_reader_bookmarks(re, &bm, &n);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_SIZE(n, 1);
+    ASSERT_EQ_STR(bm[0].title, title);
+
+    tspdf_reader_destroy(re);
+    free(out);
+}
+
+/* U+6F22: BOM + printable bytes 6F 22. */
+TEST(test_pdftext_bookmark_cjk_encodes_utf16be) {
+    const char *title = "\xE6\xBC\xA2";
+    uint8_t *out = NULL; size_t out_len = 0;
+    TspdfReader *re = t2_bookmark_set_and_save(title, &out, &out_len);
+    ASSERT(re != NULL);
+
+    ASSERT(bytes_contains(out, out_len, "\\376\\377"));
+    ASSERT(bytes_contains(out, out_len, "\\376\\377o\""));
+
+    TspdfBookmarkInfo *bm = NULL; size_t n = 0;
+    TspdfError err = tspdf_reader_bookmarks(re, &bm, &n);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_SIZE(n, 1);
+    ASSERT_EQ_STR(bm[0].title, title);
+
+    tspdf_reader_destroy(re);
+    free(out);
+}
+
+/* U+1F600: BOM + surrogate pair D83D/DE00. */
+TEST(test_pdftext_bookmark_astral_encodes_surrogate_pair) {
+    const char *title = "\xF0\x9F\x98\x80";
+    uint8_t *out = NULL; size_t out_len = 0;
+    TspdfReader *re = t2_bookmark_set_and_save(title, &out, &out_len);
+    ASSERT(re != NULL);
+
+    ASSERT(bytes_contains(out, out_len, "\\376\\377"));
+    ASSERT(bytes_contains(out, out_len, "\\376\\377\\330="));
+    const uint8_t bom_surr[] = {
+        '\\','3','7','6','\\','3','7','7',
+        '\\','3','3','0','=',
+        '\\','3','3','6','\\','0','0','0'
+    };
+    ASSERT(bytes_contains_bin(out, out_len, bom_surr, sizeof(bom_surr)));
+
+    TspdfBookmarkInfo *bm = NULL; size_t n = 0;
+    TspdfError err = tspdf_reader_bookmarks(re, &bm, &n);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_SIZE(n, 1);
+    ASSERT_EQ_STR(bm[0].title, title);
+
+    tspdf_reader_destroy(re);
+    free(out);
+}
+
+/* Mixed "Ae-acuteU+6F22U+1F600": non-ASCII triggers BOM+UTF-16BE; roundtrip. */
+TEST(test_pdftext_bookmark_mixed_roundtrip) {
+    const char *title = "A\xC3\xA9\xE6\xBC\xA2\xF0\x9F\x98\x80";
+    uint8_t *out = NULL; size_t out_len = 0;
+    TspdfReader *re = t2_bookmark_set_and_save(title, &out, &out_len);
+    ASSERT(re != NULL);
+
+    ASSERT(bytes_contains(out, out_len, "\\376\\377"));
+
+    TspdfBookmarkInfo *bm = NULL; size_t n = 0;
+    TspdfError err = tspdf_reader_bookmarks(re, &bm, &n);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT_EQ_SIZE(n, 1);
+    ASSERT_EQ_STR(bm[0].title, title);
+
+    tspdf_reader_destroy(re);
+    free(out);
+}
+
 int main(void) {
     printf("tspr reader tests:\n");
 
@@ -16128,6 +16440,21 @@ int main(void) {
     RUN(test_lossy_mono_ccitt_passthrough_below_target);
     RUN(test_lossy_mono_noise_keeps_original);
     RUN(test_lossy_mono_imagemask_and_nondefault_decode_excluded);
+
+    /* Task 2: pdftext pin-down */
+    printf("\n  Task 2: pdftext pin-down (form text strings):\n");
+    RUN(test_pdftext_form_ascii_stays_raw);
+    RUN(test_pdftext_form_latin1_plus_encodes_utf16be);
+    RUN(test_pdftext_form_cjk_encodes_utf16be);
+    RUN(test_pdftext_form_astral_encodes_surrogate_pair);
+    RUN(test_pdftext_form_mixed_roundtrip);
+
+    printf("\n  Task 2: pdftext pin-down (bookmark title strings):\n");
+    RUN(test_pdftext_bookmark_ascii_stays_raw);
+    RUN(test_pdftext_bookmark_latin1_plus_encodes_utf16be);
+    RUN(test_pdftext_bookmark_cjk_encodes_utf16be);
+    RUN(test_pdftext_bookmark_astral_encodes_surrogate_pair);
+    RUN(test_pdftext_bookmark_mixed_roundtrip);
 
     printf("\n%d tests, %d passed, %d failed\n",
            tests_run, tests_passed, tests_failed);

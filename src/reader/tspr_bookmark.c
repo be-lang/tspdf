@@ -383,45 +383,15 @@ static TspdfObj *bm_obj_name(TspdfArena *a, const char *name) {
 // Build a /Title string object. ASCII titles become a plain string (the
 // serializer escapes it); non-ASCII UTF-8 becomes UTF-16BE with a BOM so other
 // readers do not misread the bytes.
+// Delegates to tspdf_utf8_to_pdf_text() which owns all of this logic.
 static TspdfObj *bm_title_obj(TspdfArena *a, const char *title) {
     TspdfObj *o = bm_obj_new(a, TSPDF_OBJ_STRING);
     if (!o) return NULL;
-    if (tspdf_str_is_ascii(title)) {
-        size_t len = strlen(title);
-        o->string.data = (uint8_t *)tspdf_arena_alloc(a, len ? len : 1);
-        if (!o->string.data) return NULL;
-        if (len) memcpy(o->string.data, title, len);
-        o->string.len = len;
-        return o;
-    }
-    // UTF-8 -> UTF-16BE with BOM (FE FF), matching the Info-string path.
-    size_t out_cap = strlen(title) * 2 + 2;
-    uint8_t *buf = (uint8_t *)tspdf_arena_alloc(a, out_cap ? out_cap : 2);
-    if (!buf) return NULL;
-    size_t n = 0;
-    buf[n++] = 0xFE;
-    buf[n++] = 0xFF;
-    const char *p = title;
-    while (*p) {
-        uint32_t cp = 0;
-        size_t used = tspdf_utf8_decode(p, &cp);
-        if (used == 0) { p++; continue; }
-        p += used;
-        if (cp <= 0xFFFF) {
-            buf[n++] = (uint8_t)(cp >> 8);
-            buf[n++] = (uint8_t)(cp & 0xFF);
-        } else {
-            cp -= 0x10000;
-            uint16_t hi = (uint16_t)(0xD800 + (cp >> 10));
-            uint16_t lo = (uint16_t)(0xDC00 + (cp & 0x3FF));
-            buf[n++] = (uint8_t)(hi >> 8);
-            buf[n++] = (uint8_t)(hi & 0xFF);
-            buf[n++] = (uint8_t)(lo >> 8);
-            buf[n++] = (uint8_t)(lo & 0xFF);
-        }
-    }
-    o->string.data = buf;
-    o->string.len = n;
+    size_t len = 0;
+    uint8_t *data = tspdf_utf8_to_pdf_text(title, &len, a);
+    if (!data) return NULL;
+    o->string.data = data;
+    o->string.len = len;
     return o;
 }
 
