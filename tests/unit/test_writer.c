@@ -19,6 +19,7 @@
 #include "../../src/tspdf_error.h"
 #include "../../src/qr/qr_encode.h"
 #include "../../src/util/pdfdate.h"
+#include "../../src/pdf/primitives.h"
 
 // ============================================================
 // Base14 font tests
@@ -1127,6 +1128,221 @@ TEST(test_pdf_date_garbage_rejected) {
     ASSERT(!tspdf_format_pdf_date(NULL, out, sizeof(out)));
 }
 
+// ============================================================
+// PDF primitives unit tests (src/pdf/primitives.c)
+// ============================================================
+
+// Helper: render tspdf_pdf_encode_string to a NUL-terminated C string.
+// Caller must free() the result.
+static char *prim_encode_string(const char *input) {
+    TspdfBuffer buf = tspdf_buffer_create(64);
+    tspdf_pdf_encode_string(&buf, (const uint8_t *)input, strlen(input));
+    // Append NUL for strcmp
+    tspdf_buffer_append_byte(&buf, '\0');
+    char *out = malloc(buf.len);
+    if (out) memcpy(out, buf.data, buf.len);
+    tspdf_buffer_destroy(&buf);
+    return out;
+}
+
+// Helper: render tspdf_pdf_encode_name to a NUL-terminated C string.
+static char *prim_encode_name(const char *input) {
+    TspdfBuffer buf = tspdf_buffer_create(64);
+    tspdf_pdf_encode_name(&buf, (const uint8_t *)input, strlen(input));
+    tspdf_buffer_append_byte(&buf, '\0');
+    char *out = malloc(buf.len);
+    if (out) memcpy(out, buf.data, buf.len);
+    tspdf_buffer_destroy(&buf);
+    return out;
+}
+
+// Plain ASCII round-trips unchanged.
+TEST(test_primitives_string_plain_ascii) {
+    char *got = prim_encode_string("Hello world");
+    ASSERT(strcmp(got, "(Hello world)") == 0);
+    free(got);
+}
+
+// ( ) \\ must be escaped.
+TEST(test_primitives_string_delimiters) {
+    char *got = prim_encode_string("(paren) \\back\\");
+    ASSERT(strcmp(got, "(\\(paren\\) \\\\back\\\\)") == 0);
+    free(got);
+}
+
+// Named escapes for the five whitespace control chars.
+TEST(test_primitives_string_named_escapes) {
+    char *got = prim_encode_string("\n\r\t\b\f");
+    ASSERT(strcmp(got, "(\\n\\r\\t\\b\\f)") == 0);
+    free(got);
+}
+
+// Bytes < 32 (other than the named ones) become \NNN octal.
+TEST(test_primitives_string_control_byte) {
+    // \x01 -> \001
+    char *got = prim_encode_string("\x01");
+    ASSERT(strcmp(got, "(\\001)") == 0);
+    free(got);
+}
+
+// Bytes > 126 (DEL and high bytes) become \NNN octal.
+TEST(test_primitives_string_high_byte) {
+    // \x80 -> \200
+    const uint8_t data[] = { 0x80 };
+    TspdfBuffer buf = tspdf_buffer_create(16);
+    tspdf_pdf_encode_string(&buf, data, 1);
+    tspdf_buffer_append_byte(&buf, '\0');
+    ASSERT(strcmp((char *)buf.data, "(\\200)") == 0);
+    tspdf_buffer_destroy(&buf);
+}
+
+// Plain ASCII name round-trips unchanged.
+TEST(test_primitives_name_plain) {
+    char *got = prim_encode_name("FlateDecode");
+    ASSERT(strcmp(got, "/FlateDecode") == 0);
+    free(got);
+}
+
+// # encodes as #23, / as #2F, % as #25, space as #20.
+TEST(test_primitives_name_specials) {
+    char *got = prim_encode_name("/#% ()");
+    // / -> #2F, # -> #23, % -> #25, space -> #20, ( -> #28, ) -> #29
+    ASSERT(strcmp(got, "/#2F#23#25#20#28#29") == 0);
+    free(got);
+}
+
+// Bytes < 33 (e.g., space 0x20, control 0x01) must be escaped.
+TEST(test_primitives_name_low_byte) {
+    char *got = prim_encode_name(" ");  // 0x20 = space
+    ASSERT(strcmp(got, "/#20") == 0);
+    free(got);
+}
+
+// Byte > 126 (DEL 0x7F) must be escaped.
+TEST(test_primitives_name_del_byte) {
+    const uint8_t data[] = { 0x7F };
+    TspdfBuffer buf = tspdf_buffer_create(16);
+    tspdf_pdf_encode_name(&buf, data, 1);
+    tspdf_buffer_append_byte(&buf, '\0');
+    ASSERT(strcmp((char *)buf.data, "/#7F") == 0);
+    tspdf_buffer_destroy(&buf);
+}
+
+// Empty string -> "()"
+TEST(test_primitives_string_empty) {
+    char *got = prim_encode_string("");
+    ASSERT(strcmp(got, "()") == 0);
+    free(got);
+}
+
+// Empty name -> "/"
+TEST(test_primitives_name_empty) {
+    char *got = prim_encode_name("");
+    ASSERT(strcmp(got, "/") == 0);
+    free(got);
+}
+
+// ============================================================
+// TDD: writer string and name escaping (spec fix)
+// ============================================================
+//
+// These tests pin the SPEC-CORRECT behavior after the fix.
+// The writer must now use the canonical primitives.
+
+// Writer string: control byte \x01 must be octal-escaped in /Title.
+TEST(test_writer_string_escapes_control_byte) {
+    TspdfWriter *doc = tspdf_writer_create();
+    tspdf_writer_add_page(doc);
+    // Title containing a control byte 0x01
+    tspdf_writer_set_title(doc, "A\x01Z");
+
+    uint8_t *pdf = NULL;
+    size_t len = 0;
+    ASSERT_EQ_INT(tspdf_writer_save_to_memory(doc, &pdf, &len), TSPDF_OK);
+    tspdf_writer_destroy(doc);
+
+    // Spec-correct: \001 (three-digit octal) must appear, not the raw byte
+    ASSERT(bytes_contain(pdf, len, "/Title (A\\001Z)"));
+    // Raw control byte must NOT appear in the title string
+    // (Check we have no literal 0x01 between /Title ( and ))
+    // Simple approach: verify the escaped form is present
+    free(pdf);
+}
+
+// Writer string: parens and backslash must be escaped in /Title.
+TEST(test_writer_string_escapes_parens_and_backslash) {
+    TspdfWriter *doc = tspdf_writer_create();
+    tspdf_writer_add_page(doc);
+    tspdf_writer_set_title(doc, "(paren) \\back\\");
+
+    uint8_t *pdf = NULL;
+    size_t len = 0;
+    ASSERT_EQ_INT(tspdf_writer_save_to_memory(doc, &pdf, &len), TSPDF_OK);
+    tspdf_writer_destroy(doc);
+
+    // Spec-correct escaping (parens and backslash already worked in old code,
+    // but we verify after refactor that they still work)
+    ASSERT(bytes_contain(pdf, len, "/Title (\\(paren\\) \\\\back\\\\)"));
+    free(pdf);
+}
+
+// Writer string: \n \r \t must be escaped as named escapes.
+TEST(test_writer_string_escapes_whitespace_controls) {
+    TspdfWriter *doc = tspdf_writer_create();
+    tspdf_writer_add_page(doc);
+    tspdf_writer_set_title(doc, "A\nB\rC\tD");
+
+    uint8_t *pdf = NULL;
+    size_t len = 0;
+    ASSERT_EQ_INT(tspdf_writer_save_to_memory(doc, &pdf, &len), TSPDF_OK);
+    tspdf_writer_destroy(doc);
+
+    // Spec-correct: named escapes
+    ASSERT(bytes_contain(pdf, len, "/Title (A\\nB\\rC\\tD)"));
+    free(pdf);
+}
+
+// Writer name: special characters in a font/field name must be #HH-escaped.
+// Use form field /T (field name stored as PDF string) and /FT (name).
+// The real name escaping test: write a name via tspdf_raw_write_name
+// and check it appears escaped in the output.
+TEST(test_writer_name_escapes_special_chars) {
+    // We test the primitives directly here since the high-level writer
+    // doesn't expose a way to set a PDF name containing special chars.
+    // Verify that a name "/#% ()" is correctly encoded.
+    TspdfBuffer buf = tspdf_buffer_create(64);
+    tspdf_pdf_encode_name(&buf, (const uint8_t *)"/#% ()", 6);
+    tspdf_buffer_append_byte(&buf, '\0');
+    // / -> #2F, # -> #23, % -> #25, space -> #20, ( -> #28, ) -> #29
+    ASSERT(strcmp((char *)buf.data, "/#2F#23#25#20#28#29") == 0);
+    tspdf_buffer_destroy(&buf);
+}
+
+// Integration: writer-generated PDF with special-char title passes qpdf --check.
+// (This test generates a file; the qpdf check happens in the gate script,
+//  but we verify the file is written correctly here.)
+TEST(test_writer_special_chars_pdf_valid) {
+    TspdfWriter *doc = tspdf_writer_create();
+    tspdf_writer_add_page(doc);
+    // Title with parens, backslash, control byte, named escapes
+    tspdf_writer_set_title(doc, "(test)\\\x01\n");
+
+    const char *path = "/tmp/tspdf_test_special_chars.pdf";
+    TspdfError err = tspdf_writer_save(doc, path);
+    ASSERT(err == TSPDF_OK);
+    tspdf_writer_destroy(doc);
+
+    // Verify the file exists and is non-empty
+    FILE *f = fopen(path, "rb");
+    ASSERT(f != NULL);
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fclose(f);
+    ASSERT(size > 100);
+
+    remove(path);
+}
+
 void run_writer_tests(void) {
     printf("\n  Base14 Fonts:\n");
     RUN(test_base14_get);
@@ -1212,4 +1428,24 @@ void run_writer_tests(void) {
     RUN(test_pdf_date_partial_fields_default);
     RUN(test_pdf_date_odd_zones);
     RUN(test_pdf_date_garbage_rejected);
+
+    printf("\n  PDF primitives (encoding correctness):\n");
+    RUN(test_primitives_string_plain_ascii);
+    RUN(test_primitives_string_delimiters);
+    RUN(test_primitives_string_named_escapes);
+    RUN(test_primitives_string_control_byte);
+    RUN(test_primitives_string_high_byte);
+    RUN(test_primitives_name_plain);
+    RUN(test_primitives_name_specials);
+    RUN(test_primitives_name_low_byte);
+    RUN(test_primitives_name_del_byte);
+    RUN(test_primitives_string_empty);
+    RUN(test_primitives_name_empty);
+
+    printf("\n  Writer escaping (spec fix, TDD):\n");
+    RUN(test_writer_string_escapes_control_byte);
+    RUN(test_writer_string_escapes_parens_and_backslash);
+    RUN(test_writer_string_escapes_whitespace_controls);
+    RUN(test_writer_name_escapes_special_chars);
+    RUN(test_writer_special_chars_pdf_valid);
 }

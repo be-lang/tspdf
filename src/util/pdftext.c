@@ -3,6 +3,7 @@
 // every binary (LIB_SOURCES), so both the writer and the reader can use them.
 
 #include "pdftext.h"
+#include "../pdf/primitives.h"
 #include <string.h>
 
 size_t tspdf_utf8_decode(const char *s, uint32_t *out_cp) {
@@ -163,30 +164,11 @@ bool tspdf_str_is_ascii(const char *s) {
     return true;
 }
 
-// Escaped literal string, mirroring the serializer's escaping rules.
+// Escaped literal string using the canonical PDF encoder.
+// Input is ASCII-only C string (guarded by tspdf_str_is_ascii above),
+// so strlen() is safe for length.
 static void pdftext_write_literal(TspdfBuffer *buf, const char *value) {
-    tspdf_buffer_append_byte(buf, '(');
-    for (const uint8_t *p = (const uint8_t *)value; *p; p++) {
-        uint8_t c = *p;
-        switch (c) {
-            case '(':  tspdf_buffer_append_str(buf, "\\("); break;
-            case ')':  tspdf_buffer_append_str(buf, "\\)"); break;
-            case '\\': tspdf_buffer_append_str(buf, "\\\\"); break;
-            case '\n': tspdf_buffer_append_str(buf, "\\n"); break;
-            case '\r': tspdf_buffer_append_str(buf, "\\r"); break;
-            case '\t': tspdf_buffer_append_str(buf, "\\t"); break;
-            case '\b': tspdf_buffer_append_str(buf, "\\b"); break;
-            case '\f': tspdf_buffer_append_str(buf, "\\f"); break;
-            default:
-                if (c < 32 || c > 126) {
-                    tspdf_buffer_printf(buf, "\\%03o", c);
-                } else {
-                    tspdf_buffer_append_byte(buf, c);
-                }
-                break;
-        }
-    }
-    tspdf_buffer_append_byte(buf, ')');
+    tspdf_pdf_encode_string(buf, (const uint8_t *)value, strlen(value));
 }
 
 void tspdf_pdftext_write_info_string(TspdfBuffer *buf, const char *value) {

@@ -11,6 +11,7 @@ LIB_SOURCES = \
 	$(SRCDIR)/util/arena.c \
 	$(SRCDIR)/util/pdftext.c \
 	$(SRCDIR)/util/pdfdate.c \
+	$(SRCDIR)/pdf/primitives.c \
 	$(SRCDIR)/pdf/pdf_writer.c \
 	$(SRCDIR)/pdf/pdf_stream.c \
 	$(SRCDIR)/pdf/pdf_base14.c \
@@ -76,6 +77,7 @@ PUBLIC_HEADERS = \
 
 # Implementation-only headers (deps satisfied by tspdf.h), dependency order.
 INTERNAL_HEADERS = \
+	src/pdf/primitives.h \
 	src/compress/deflate.h \
 	src/filters/filters.h \
 	src/crypto/md5.h \
