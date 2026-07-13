@@ -1,4 +1,5 @@
 #include "commands.h"
+#include "pipeline.h"
 #include "password_input.h"
 #include "../include/tspdf.h"
 #include <stdio.h>
@@ -57,47 +58,12 @@ static bool parse_permissions(const char *spec, uint32_t *out) {
     return true;
 }
 
-int cmd_encrypt(int argc, char **argv) {
-    if (argc == 0 || has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
-        printf("Usage: tspdf encrypt <input.pdf> -o <output.pdf> [--password <pass>]\n");
-        printf("                     [--password-file <path>] [--owner-password <pass>]\n");
-        printf("                     [--owner-password-file <path>] [--bits 128|256]\n");
-        printf("                     [--permissions <list>]\n");
-        printf("\nEncrypt a PDF with a password.\n");
-        printf("The password can be passed with --password, read from the first line of a\n");
-        printf("file with --password-file ('-' reads stdin), or typed at a hidden prompt\n");
-        printf("when neither is given. The owner password defaults to the user password.\n");
-        printf("\n--permissions takes a comma-separated list of ALLOWED actions; anything\n");
-        printf("not listed is denied. Without the flag everything is allowed. Actions:\n");
-        printf("  print, modify, copy, annotate, forms, extract, assemble, print-hq\n");
-        printf("Requesting print-hq also enables print (high-res print needs print).\n");
-        return argc == 0 ? 1 : 0;
-    }
-
-    const char *positional[2];
-    int npos = collect_positional(argc, argv, positional, 2);
-    if (npos < 1) {
-        fprintf(stderr, "tspdf encrypt: missing input file\n");
-        return 1;
-    }
-    if (npos > 1) {
-        fprintf(stderr, "tspdf encrypt: unexpected extra argument '%s'\n", positional[1]);
-        return 1;
-    }
-    const char *input = positional[0];
-
-    const char *output = find_flag(argc, argv, "-o");
-    if (!output) {
-        fprintf(stderr, "tspdf encrypt: missing -o <output.pdf>\n");
-        return 1;
-    }
-
-    char pass_buf[TSPDF_PASSWORD_MAX];
-    const char *password = tspdf_resolve_password(argc, argv,
-                                                  "--password", "--password-file",
-                                                  "encrypt", "Password: ",
-                                                  true, pass_buf, sizeof(pass_buf));
-    if (!password) return 1;
+static int run(TspdfCmdCtx *ctx) {
+    int argc = ctx->argc;
+    char **argv = ctx->argv;
+    const char *input = ctx->input;
+    const char *output = ctx->output;
+    const char *password = ctx->password;  // resolved & required by the pipeline
 
     // Owner password is optional: no prompt, default to the user password.
     char owner_buf[TSPDF_PASSWORD_MAX];
@@ -149,3 +115,34 @@ int cmd_encrypt(int argc, char **argv) {
     tspdf_reader_destroy(doc);
     return 0;
 }
+
+
+static const TspdfCliFlag FLAGS[] = {
+    {"-o", true}, {"--password", true}, {"--password-file", true},
+    {"--owner-password", true}, {"--owner-password-file", true},
+    {"--bits", true}, {"--permissions", true},
+    {NULL, false}
+};
+
+// encrypt opens the *plaintext* input itself (no password on open), so it does
+// not set OPENS_INPUT; the pipeline still resolves & requires the user password.
+const TspdfCmdSpec tspdf_cmd_encrypt_spec = {
+    .name = "encrypt",
+    .usage =
+        "Usage: tspdf encrypt <input.pdf> -o <output.pdf> [--password <pass>]\n"
+        "                     [--password-file <path>] [--owner-password <pass>]\n"
+        "                     [--owner-password-file <path>] [--bits 128|256]\n"
+        "                     [--permissions <list>]\n"
+        "\nEncrypt a PDF with a password.\n"
+        "The password can be passed with --password, read from the first line of a\n"
+        "file with --password-file ('-' reads stdin), or typed at a hidden prompt\n"
+        "when neither is given. The owner password defaults to the user password.\n"
+        "\n--permissions takes a comma-separated list of ALLOWED actions; anything\n"
+        "not listed is denied. Without the flag everything is allowed. Actions:\n"
+        "  print, modify, copy, annotate, forms, extract, assemble, print-hq\n"
+        "Requesting print-hq also enables print (high-res print needs print).\n",
+    .flags = FLAGS,
+    .min_pos = 1, .max_pos = 1,
+    .needs = TSPDF_CMD_NEEDS_OUTPUT | TSPDF_CMD_TAKES_PASSWORD | TSPDF_CMD_PASSWORD_REQUIRED,
+    .run = run,
+};

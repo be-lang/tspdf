@@ -10,6 +10,7 @@
 // can be edited and fed straight back with `bookmark import`.
 
 #include "commands.h"
+#include "pipeline.h"
 #include "password_input.h"
 #include "../include/tspdf.h"
 #include <stdio.h>
@@ -523,3 +524,24 @@ int cmd_bookmark(int argc, char **argv) {
     bookmark_usage();
     return 1;
 }
+
+
+/* bookmark dispatches on a subcommand (list/add/import/clear) — it stays a RAW_ARGS command. */
+static int run_bookmark_raw(TspdfCmdCtx *ctx) { return cmd_bookmark(ctx->argc, ctx->argv); }
+static const TspdfCliFlag BOOKMARK_FLAGS[] = {
+    {"-o", true},
+    {"--title", true},
+    {"--page", true},
+    {"--level", true},
+    {"--from", true},
+    {"--password", true},
+    {"--password-file", true},
+    {NULL, false}
+};
+const TspdfCmdSpec tspdf_cmd_bookmark_spec = {
+    .name = "bookmark",
+    .flags = BOOKMARK_FLAGS,
+    .min_pos = 0, .max_pos = -1,
+    .needs = TSPDF_CMD_RAW_ARGS,
+    .run = run_bookmark_raw,
+};

@@ -5,6 +5,7 @@
 // scaled to fit with the aspect ratio preserved.
 
 #include "commands.h"
+#include "pipeline.h"
 #include "../include/tspdf_overlay.h"
 #include "password_input.h"
 #include <stdio.h>
@@ -163,3 +164,23 @@ int cmd_nup(int argc, char **argv) {
     free(sel);
     return 0;
 }
+
+
+/* nup takes two positionals (<N> <input.pdf>) with a custom usage message — RAW_ARGS. */
+static int run_nup_raw(TspdfCmdCtx *ctx) { return cmd_nup(ctx->argc, ctx->argv); }
+static const TspdfCliFlag NUP_FLAGS[] = {
+    {"-o", true},
+    {"--page-size", true},
+    {"--gap", true},
+    {"--pages", true},
+    {"--password", true},
+    {"--password-file", true},
+    {NULL, false}
+};
+const TspdfCmdSpec tspdf_cmd_nup_spec = {
+    .name = "nup",
+    .flags = NUP_FLAGS,
+    .min_pos = 0, .max_pos = -1,
+    .needs = TSPDF_CMD_RAW_ARGS,
+    .run = run_nup_raw,
+};

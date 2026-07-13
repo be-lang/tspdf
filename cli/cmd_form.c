@@ -12,6 +12,7 @@
 #define _POSIX_C_SOURCE 200809L  // strdup, strndup
 
 #include "commands.h"
+#include "pipeline.h"
 #include "../include/tspdf.h"
 #include "../src/util/pdftext.h"
 #include "password_input.h"
@@ -706,3 +707,22 @@ int cmd_form(int argc, char **argv) {
             "(expected list, fill, or flatten)\n", sub);
     return 1;
 }
+
+
+/* form dispatches on a subcommand (list/fill/flatten) — it stays a RAW_ARGS command. */
+static int run_form_raw(TspdfCmdCtx *ctx) { return cmd_form(ctx->argc, ctx->argv); }
+static const TspdfCliFlag FORM_FLAGS[] = {
+    {"-o", true},
+    {"--data", true},
+    {"--set", true},
+    {"--password", true},
+    {"--password-file", true},
+    {NULL, false}
+};
+const TspdfCmdSpec tspdf_cmd_form_spec = {
+    .name = "form",
+    .flags = FORM_FLAGS,
+    .min_pos = 0, .max_pos = -1,
+    .needs = TSPDF_CMD_RAW_ARGS,
+    .run = run_form_raw,
+};

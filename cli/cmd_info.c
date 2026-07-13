@@ -1,4 +1,5 @@
 #include "commands.h"
+#include "pipeline.h"
 #include "../include/tspdf.h"
 #include "../src/util/pdfdate.h"
 #include "password_input.h"
@@ -354,3 +355,21 @@ int cmd_info(int argc, char **argv) {
     tspdf_reader_destroy(doc);
     return 0;
 }
+
+
+/* info opens the input itself: its --json path returns a special JSON object
+ * for the encrypted/error cases (not the standard stderr messages), so it stays
+ * a RAW_ARGS command owning its own positional/open handling. */
+static int run_info_raw(TspdfCmdCtx *ctx) { return cmd_info(ctx->argc, ctx->argv); }
+static const TspdfCliFlag INFO_FLAGS[] = {
+    {"--password", true},
+    {"--password-file", true},
+    {NULL, false}
+};
+const TspdfCmdSpec tspdf_cmd_info_spec = {
+    .name = "info",
+    .flags = INFO_FLAGS,
+    .min_pos = 0, .max_pos = -1,
+    .needs = TSPDF_CMD_RAW_ARGS,
+    .run = run_info_raw,
+};

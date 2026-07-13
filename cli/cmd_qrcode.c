@@ -1,4 +1,5 @@
 #include "commands.h"
+#include "pipeline.h"
 #include "../include/tspdf.h"
 #include "../src/qr/qr_encode.h"
 #include <stdio.h>
@@ -152,3 +153,21 @@ int cmd_qrcode(int argc, char **argv) {
     printf("QR code -> %s\n", output);
     return 0;
 }
+
+
+/* qrcode's positional is arbitrary data (no input PDF) — it stays a RAW_ARGS command. */
+static int run_qrcode_raw(TspdfCmdCtx *ctx) { return cmd_qrcode(ctx->argc, ctx->argv); }
+static const TspdfCliFlag QRCODE_FLAGS[] = {
+    {"-o", true},
+    {"--title", true},
+    {"--subtitle", true},
+    {"--ec-level", true},
+    {NULL, false}
+};
+const TspdfCmdSpec tspdf_cmd_qrcode_spec = {
+    .name = "qrcode",
+    .flags = QRCODE_FLAGS,
+    .min_pos = 0, .max_pos = -1,
+    .needs = TSPDF_CMD_RAW_ARGS,
+    .run = run_qrcode_raw,
+};

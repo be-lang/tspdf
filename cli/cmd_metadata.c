@@ -1,39 +1,14 @@
 #include "commands.h"
+#include "pipeline.h"
+#include "ops.h"
 #include "../include/tspdf.h"
 #include "../src/util/pdfdate.h"
-#include "password_input.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 static void print_field(const char *label, const char *value) {
     if (value) printf("%-16s%s\n", label, value);
-}
-
-// Apply `value` to the metadata key named by the first `key_len` bytes of
-// `key`. NULL clears the field (the writer omits cleared keys from the
-// rebuilt Info dict). Returns false for an unknown key.
-static bool apply_field(TspdfReader *doc, const char *key, size_t key_len,
-                        const char *value) {
-    static const struct {
-        const char *name;
-        void (*set)(TspdfReader *, const char *);
-    } fields[] = {
-        {"title", tspdf_reader_set_title},
-        {"author", tspdf_reader_set_author},
-        {"subject", tspdf_reader_set_subject},
-        {"keywords", tspdf_reader_set_keywords},
-        {"creator", tspdf_reader_set_creator},
-        {"producer", tspdf_reader_set_producer},
-    };
-    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
-        if (strlen(fields[i].name) == key_len &&
-            strncmp(key, fields[i].name, key_len) == 0) {
-            fields[i].set(doc, value);
-            return true;
-        }
-    }
-    return false;
 }
 
 // Dates print human-readable ("2013-10-31 14:01:50 +04:00"); a value that
@@ -47,56 +22,19 @@ static void print_date_field(const char *label, const char *value) {
         printf("%-16s%s\n", label, value);
 }
 
-int cmd_metadata(int argc, char **argv) {
-    if (argc == 0 || has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
-        printf("Usage: tspdf metadata <input.pdf>                                     # view\n");
-        printf("       tspdf metadata <input.pdf> --set title=\"X\" --set author=\"Y\" -o out.pdf  # edit\n");
-        printf("       tspdf metadata <input.pdf> --clear title -o out.pdf            # remove a field\n");
-        printf("\nView or edit PDF metadata. --set and --clear are repeatable.\n");
-        printf("Supported keys: title, author, subject, keywords, creator, producer\n");
-        printf("Encrypted files: pass --password <pass> or --password-file <file>;\n");
-        printf("edited output keeps the original encryption.\n");
-        return argc == 0 ? 1 : 0;
-    }
-
-    const char *positional[2];
-    int npos = collect_positional(argc, argv, positional, 2);
-    if (npos < 1) {
-        fprintf(stderr, "tspdf metadata: missing input file\n");
-        return 1;
-    }
-    if (npos > 1) {
-        fprintf(stderr, "tspdf metadata: unexpected extra argument '%s'\n", positional[1]);
-        return 1;
-    }
-    const char *input = positional[0];
+static int run(TspdfCmdCtx *ctx) {
+    int argc = ctx->argc;
+    char **argv = ctx->argv;
+    const char *input = ctx->input;
+    const char *output = ctx->output;
+    TspdfReader *doc = ctx->doc;
+    TspdfError err = TSPDF_OK;
 
     // Collect --set and --clear values
     const char *sets[32];
     int nsets = find_flags(argc, argv, "--set", sets, 32);
     const char *clears[32];
     int nclears = find_flags(argc, argv, "--clear", clears, 32);
-
-    const char *output = find_flag(argc, argv, "-o");
-
-    static char pwbuf[TSPDF_PASSWORD_MAX];
-    const char *password = tspdf_resolve_password(argc, argv,
-                                                  "--password", "--password-file",
-                                                  "metadata", "Password: ",
-                                                  false, pwbuf, sizeof(pwbuf));
-
-    TspdfError err = TSPDF_OK;
-    TspdfReader *doc = password
-        ? tspdf_reader_open_file_with_password(input, password, &err)
-        : tspdf_reader_open_file(input, &err);
-    if (!doc) {
-        if (err == TSPDF_ERR_ENCRYPTED) {
-            fprintf(stderr, "tspdf metadata: '%s' is encrypted; use --password or --password-file\n", input);
-        } else {
-            fprintf(stderr, "tspdf metadata: failed to open '%s': %s\n", input, tspdf_error_string(err));
-        }
-        return 1;
-    }
 
     if (nsets == 0 && nclears == 0) {
         // View mode
@@ -109,14 +47,12 @@ int cmd_metadata(int argc, char **argv) {
         print_field("Producer:", tspdf_reader_get_producer(doc));
         print_date_field("Created:", tspdf_reader_get_creation_date(doc));
         print_date_field("Modified:", tspdf_reader_get_mod_date(doc));
-        tspdf_reader_destroy(doc);
         return 0;
     }
 
     // Edit mode
     if (!output) {
         fprintf(stderr, "tspdf metadata: --set/--clear requires -o <output.pdf>\n");
-        tspdf_reader_destroy(doc);
         return 1;
     }
 
@@ -124,13 +60,11 @@ int cmd_metadata(int argc, char **argv) {
         const char *eq = strchr(sets[i], '=');
         if (!eq) {
             fprintf(stderr, "tspdf metadata: invalid --set format '%s' (expected key=value)\n", sets[i]);
-            tspdf_reader_destroy(doc);
             return 1;
         }
         size_t key_len = (size_t)(eq - sets[i]);
-        if (!apply_field(doc, sets[i], key_len, eq + 1)) {
+        if (!tspdf_op_metadata_set(doc, sets[i], key_len, eq + 1)) {
             fprintf(stderr, "tspdf metadata: unknown key '%.*s'\n", (int)key_len, sets[i]);
-            tspdf_reader_destroy(doc);
             return 1;
         }
     }
@@ -138,9 +72,8 @@ int cmd_metadata(int argc, char **argv) {
     // Clearing passes NULL through the setter: the serializer sees the
     // field as overridden-with-nothing and omits it from the Info dict.
     for (int i = 0; i < nclears; i++) {
-        if (!apply_field(doc, clears[i], strlen(clears[i]), NULL)) {
+        if (!tspdf_op_metadata_set(doc, clears[i], strlen(clears[i]), NULL)) {
             fprintf(stderr, "tspdf metadata: unknown key '%s'\n", clears[i]);
-            tspdf_reader_destroy(doc);
             return 1;
         }
     }
@@ -155,12 +88,32 @@ int cmd_metadata(int argc, char **argv) {
     err = tspdf_reader_save(doc, output);
     if (err != TSPDF_OK) {
         fprintf(stderr, "tspdf metadata: failed to save '%s': %s\n", output, tspdf_error_string(err));
-        tspdf_reader_destroy(doc);
         return 1;
     }
 
     printf("Updated %d field(s) → %s\n", nsets + nclears, output);
 
-    tspdf_reader_destroy(doc);
     return 0;
 }
+
+static const TspdfCliFlag FLAGS[] = {
+    {"-o", true}, {"--set", true}, {"--clear", true},
+    {"--password", true}, {"--password-file", true},
+    {NULL, false}
+};
+
+const TspdfCmdSpec tspdf_cmd_metadata_spec = {
+    .name = "metadata",
+    .usage =
+        "Usage: tspdf metadata <input.pdf>                                     # view\n"
+        "       tspdf metadata <input.pdf> --set title=\"X\" --set author=\"Y\" -o out.pdf  # edit\n"
+        "       tspdf metadata <input.pdf> --clear title -o out.pdf            # remove a field\n"
+        "\nView or edit PDF metadata. --set and --clear are repeatable.\n"
+        "Supported keys: title, author, subject, keywords, creator, producer\n"
+        "Encrypted files: pass --password <pass> or --password-file <file>;\n"
+        "edited output keeps the original encryption.\n",
+    .flags = FLAGS,
+    .min_pos = 1, .max_pos = 1,
+    .needs = TSPDF_CMD_OPENS_INPUT | TSPDF_CMD_TAKES_PASSWORD,
+    .run = run,
+};

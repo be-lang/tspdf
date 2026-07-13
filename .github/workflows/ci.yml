@@ -37,7 +37,7 @@ jobs:
       - uses: actions/checkout@v4
 
       # Install Liberation fonts and link them to the path the TTF tests probe
-      # (tests/test_main.c hardcodes /usr/share/fonts/liberation/...). Without
+      # (tests/unit/ hardcodes /usr/share/fonts/liberation/...). Without
       # this the font-dependent tests `return` early and report a silent PASS.
       - name: Install Liberation fonts (Linux)
         if: runner.os == 'Linux'
@@ -192,7 +192,8 @@ jobs:
       # non-zero and fails the job.
       - name: Run harnesses over seed corpora
         run: |
-          for t in reader inflate deflate deflate_best ttf png jpeg ccitt; do
-            echo "=== fuzz_$t"
-            ./build/fuzz/fuzz_$t "fuzz/corpus/$t" -seed=1 -max_total_time=30 -print_final_stats=1
+          for name in $(make -s list-fuzzers); do
+            t=${name#fuzz_}
+            echo "=== $name"
+            ./build/fuzz/$name "fuzz/corpus/$t" -seed=1 -max_total_time=30 -print_final_stats=1
           done

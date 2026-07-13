@@ -1,7 +1,8 @@
 #include "commands.h"
+#include "pipeline.h"
+#include "ops.h"
 #include "../include/tspdf_overlay.h"
 #include "../src/util/pdftext.h"
-#include "password_input.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,17 +21,6 @@ typedef enum {
     WM_POS_BOTTOM_LEFT,
     WM_POS_BOTTOM_RIGHT,
 } WatermarkPosition;
-
-static void print_watermark_help(void) {
-    printf("Usage: tspdf watermark <input.pdf> -o <output.pdf> --text \"DRAFT\" [--opacity 0.3]\n");
-    printf("       tspdf watermark <input.pdf> -o <output.pdf> --image <logo.png|jpg>\n");
-    printf("                       [--opacity 0.3] [--scale 0.5] [--position <pos>]\n");
-    printf("\nAdd a watermark to all pages: diagonal text, or an image (PNG/JPEG).\n");
-    printf("Positions: center (default), tile, top-left, top-right,\n");
-    printf("           bottom-left, bottom-right\n");
-    printf("Encrypted files: pass --password <pass> or --password-file <file>;\n");
-    printf("the output keeps the original encryption.\n");
-}
 
 // Open `input`, honoring an optional password; prints the error (with the
 // standard --password hint for encrypted files) on failure.
@@ -252,150 +242,53 @@ static int watermark_image(const char *input, const char *output, const char *im
 
 static int watermark_text(const char *input, const char *output, const char *text,
                           double opacity, const char *password) {
-    // The watermark is drawn with the built-in Helvetica font, which uses
-    // WinAnsiEncoding (cp1252): re-encode the UTF-8 input up front so the
-    // content stream carries cp1252 bytes instead of raw UTF-8 mojibake.
-    char *wa_text = malloc(strlen(text) + 1);
-    if (!wa_text) {
-        fprintf(stderr, "tspdf watermark: out of memory\n");
-        return 1;
-    }
-    uint32_t bad_cp = 0;
-    int conv = tspdf_utf8_to_cp1252(text, wa_text, &bad_cp);
-    if (conv != TSPDF_PDFTEXT_OK) {
-        if (conv == TSPDF_PDFTEXT_UNMAPPED) {
+    TspdfReader *doc = watermark_open(input, password);
+    if (!doc) return 1;
+
+    // The op re-encodes the UTF-8 text to cp1252 (WinAnsi) for Helvetica and
+    // stamps every page; we translate its TspdfError into the CLI's messages.
+    TspdfOpWatermarkText params = {
+        .text = text, .opacity = opacity, .font_size = 48.0,
+    };
+    TspdfOpWatermarkTextDetail detail = {0};
+    TspdfError err = tspdf_op_watermark_text(doc, &params, &detail);
+    if (err != TSPDF_OK) {
+        if (err == TSPDF_ERR_UNSUPPORTED) {
             char ch[5];
-            ch[tspdf_utf8_encode(bad_cp, ch)] = '\0';
+            ch[tspdf_utf8_encode(detail.bad_codepoint, ch)] = '\0';
             fprintf(stderr, "tspdf watermark: character '%s' (U+%04X) cannot be shown with the "
                             "built-in fonts (WinAnsi/cp1252); use Latin-script text\n",
-                    ch, (unsigned)bad_cp);
-        } else {
+                    ch, (unsigned)detail.bad_codepoint);
+        } else if (err == TSPDF_ERR_ENCODING) {
             fprintf(stderr, "tspdf watermark: --text is not valid UTF-8\n");
+        } else if (err == TSPDF_ERR_ALLOC) {
+            fprintf(stderr, "tspdf watermark: out of memory\n");
+        } else {
+            fprintf(stderr, "tspdf watermark: overlay failed: %s\n", tspdf_error_string(err));
         }
-        free(wa_text);
-        return 1;
-    }
-
-    TspdfError err = TSPDF_OK;
-    TspdfReader *doc = watermark_open(input, password);
-    if (!doc) {
-        free(wa_text);
+        tspdf_reader_destroy(doc);
         return 1;
     }
 
     size_t page_count = tspdf_reader_page_count(doc);
-    double font_size = 48.0;
-
-    for (size_t i = 0; i < page_count; i++) {
-        TspdfReaderPage *page = tspdf_reader_get_page(doc, i);
-        if (!page) continue;
-
-        // Center of the VISIBLE page: the MediaBox origin is not always
-        // (0,0), so the center is ((x0+x1)/2, (y0+y1)/2), not (w/2, h/2).
-        double cx = (page->media_box[0] + page->media_box[2]) / 2.0;
-        double cy = (page->media_box[1] + page->media_box[3]) / 2.0;
-
-        // Compensate a page-level /Rotate: the viewer turns the page
-        // clockwise by that many degrees, so pre-rotate the stamp the other
-        // way (45 + rotate CCW) to keep the diagonal upright as viewed.
-        // Rotation is about the page center, so the stamp stays centered.
-        int rot = ((page->rotate % 360) + 360) % 360;
-        double angle_rad = (45.0 + (double)rot) * M_PI / 180.0;
-        double cos_a = cos(angle_rad);
-        double sin_a = sin(angle_rad);
-
-        TspdfWriter *writer = tspdf_writer_create();
-        if (!writer) continue;
-
-        const char *font_name = tspdf_writer_add_builtin_font(writer, "Helvetica");
-        if (!font_name) {
-            tspdf_writer_destroy(writer);
-            continue;
-        }
-
-        // Add opacity state
-        const char *gs_name = tspdf_writer_add_opacity(writer, opacity, opacity);
-
-        TspdfStream *stream = tspdf_page_begin_content(doc, i);
-        if (!stream) {
-            tspdf_writer_destroy(writer);
-            continue;
-        }
-
-        tspdf_stream_save(stream);
-
-        // Set opacity if we got a graphics state
-        if (gs_name) {
-            tspdf_stream_set_opacity(stream, gs_name);
-        }
-
-        // Set gray color for watermark
-        TspdfColor gray = tspdf_color_rgb(0.7, 0.7, 0.7);
-        tspdf_stream_set_fill_color(stream, gray);
-
-        // Transform: translate to center, then rotate 45 degrees
-        tspdf_stream_concat_matrix(stream, cos_a, sin_a, -sin_a, cos_a, cx, cy);
-
-        // Estimate text width to center it (rough: ~0.5 * font_size per char for Helvetica)
-        double text_width = (double)strlen(wa_text) * font_size * 0.5;
-
-        tspdf_stream_begin_text(stream);
-        tspdf_stream_set_font(stream, font_name, font_size);
-        tspdf_stream_text_position(stream, -text_width / 2.0, -font_size / 3.0);
-        tspdf_stream_show_text(stream, wa_text);
-        tspdf_stream_end_text(stream);
-
-        tspdf_stream_restore(stream);
-
-        err = tspdf_page_end_content(doc, i, stream, writer);
-        tspdf_writer_destroy(writer);
-        if (err != TSPDF_OK) {
-            fprintf(stderr, "tspdf watermark: overlay failed on page %zu: %s\n",
-                    i + 1, tspdf_error_string(err));
-            tspdf_reader_destroy(doc);
-            free(wa_text);
-            return 1;
-        }
-    }
-
     err = tspdf_reader_save(doc, output);
     if (err != TSPDF_OK) {
         fprintf(stderr, "tspdf watermark: failed to save '%s': %s\n", output, tspdf_error_string(err));
         tspdf_reader_destroy(doc);
-        free(wa_text);
         return 1;
     }
 
     printf("Watermarked %zu page(s) → %s\n", page_count, output);
-
     tspdf_reader_destroy(doc);
-    free(wa_text);
     return 0;
 }
 
-int cmd_watermark(int argc, char **argv) {
-    if (argc == 0 || has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
-        print_watermark_help();
-        return argc == 0 ? 1 : 0;
-    }
-
-    const char *positional[2];
-    int npos = collect_positional(argc, argv, positional, 2);
-    if (npos < 1) {
-        fprintf(stderr, "tspdf watermark: missing input file\n");
-        return 1;
-    }
-    if (npos > 1) {
-        fprintf(stderr, "tspdf watermark: unexpected extra argument '%s'\n", positional[1]);
-        return 1;
-    }
-    const char *input = positional[0];
-
-    const char *output = find_flag(argc, argv, "-o");
-    if (!output) {
-        fprintf(stderr, "tspdf watermark: missing -o <output.pdf>\n");
-        return 1;
-    }
+static int run(TspdfCmdCtx *ctx) {
+    int argc = ctx->argc;
+    char **argv = ctx->argv;
+    const char *input = ctx->input;
+    const char *output = ctx->output;
+    const char *password = ctx->password;
 
     const char *text = find_flag(argc, argv, "--text");
     const char *image = find_flag(argc, argv, "--image");
@@ -417,12 +310,6 @@ int cmd_watermark(int argc, char **argv) {
             return 1;
         }
     }
-
-    static char pwbuf[TSPDF_PASSWORD_MAX];
-    const char *password = tspdf_resolve_password(argc, argv,
-                                                  "--password", "--password-file",
-                                                  "watermark", "Password: ",
-                                                  false, pwbuf, sizeof(pwbuf));
 
     if (text) {
         return watermark_text(input, output, text, opacity, password);
@@ -455,3 +342,31 @@ int cmd_watermark(int argc, char **argv) {
 
     return watermark_image(input, output, image, opacity, scale, pos, password);
 }
+
+
+static const TspdfCliFlag FLAGS[] = {
+    {"-o", true}, {"--text", true}, {"--image", true}, {"--opacity", true},
+    {"--scale", true}, {"--position", true},
+    {"--password", true}, {"--password-file", true},
+    {NULL, false}
+};
+
+// The watermark helpers open the input themselves (they also need the two-PDF
+// overlay path), so this spec resolves the password but does not set
+// OPENS_INPUT — run() hands ctx->input/output/password to the helpers.
+const TspdfCmdSpec tspdf_cmd_watermark_spec = {
+    .name = "watermark",
+    .usage =
+        "Usage: tspdf watermark <input.pdf> -o <output.pdf> --text \"DRAFT\" [--opacity 0.3]\n"
+        "       tspdf watermark <input.pdf> -o <output.pdf> --image <logo.png|jpg>\n"
+        "                       [--opacity 0.3] [--scale 0.5] [--position <pos>]\n"
+        "\nAdd a watermark to all pages: diagonal text, or an image (PNG/JPEG).\n"
+        "Positions: center (default), tile, top-left, top-right,\n"
+        "           bottom-left, bottom-right\n"
+        "Encrypted files: pass --password <pass> or --password-file <file>;\n"
+        "the output keeps the original encryption.\n",
+    .flags = FLAGS,
+    .min_pos = 1, .max_pos = 1,
+    .needs = TSPDF_CMD_NEEDS_OUTPUT | TSPDF_CMD_TAKES_PASSWORD,
+    .run = run,
+};

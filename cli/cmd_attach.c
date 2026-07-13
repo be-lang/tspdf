@@ -6,6 +6,7 @@
 // rejected, so writes always land inside the target directory.
 
 #include "commands.h"
+#include "pipeline.h"
 #include "password_input.h"
 #include "../include/tspdf.h"
 #include <stdio.h>
@@ -421,3 +422,23 @@ int cmd_attach(int argc, char **argv) {
     attach_usage();
     return 1;
 }
+
+
+/* attach dispatches on a subcommand (add/list/extract/remove) — it stays a RAW_ARGS command. */
+static int run_attach_raw(TspdfCmdCtx *ctx) { return cmd_attach(ctx->argc, ctx->argv); }
+static const TspdfCliFlag ATTACH_FLAGS[] = {
+    {"-o", true},
+    {"--desc", true},
+    {"--mime", true},
+    {"--name", true},
+    {"--password", true},
+    {"--password-file", true},
+    {NULL, false}
+};
+const TspdfCmdSpec tspdf_cmd_attach_spec = {
+    .name = "attach",
+    .flags = ATTACH_FLAGS,
+    .min_pos = 0, .max_pos = -1,
+    .needs = TSPDF_CMD_RAW_ARGS,
+    .run = run_attach_raw,
+};

@@ -1,4 +1,5 @@
 #include "commands.h"
+#include "pipeline.h"
 #include "../include/tspdf.h"
 #include "password_input.h"
 #include <stdio.h>
@@ -102,3 +103,20 @@ cleanup:
     free(inputs);
     return ret;
 }
+
+
+/* merge takes a variable number of input PDFs (multi-input) — it stays a RAW_ARGS command. */
+static int run_merge_raw(TspdfCmdCtx *ctx) { return cmd_merge(ctx->argc, ctx->argv); }
+static const TspdfCliFlag MERGE_FLAGS[] = {
+    {"-o", true},
+    {"--password", true},
+    {"--password-file", true},
+    {NULL, false}
+};
+const TspdfCmdSpec tspdf_cmd_merge_spec = {
+    .name = "merge",
+    .flags = MERGE_FLAGS,
+    .min_pos = 0, .max_pos = -1,
+    .needs = TSPDF_CMD_RAW_ARGS,
+    .run = run_merge_raw,
+};

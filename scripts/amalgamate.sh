@@ -26,100 +26,61 @@ VMIN=$(sed -n 's/^#define TSPDF_VERSION_MINOR *//p' include/tspdf/version.h)
 VPAT=$(sed -n 's/^#define TSPDF_VERSION_PATCH *//p' include/tspdf/version.h)
 VERSION="$VMAJ.$VMIN.$VPAT"
 
-# Public headers (the include/tspdf.h umbrella closure), dependency order.
-PUBLIC_HEADERS="
-include/tspdf/version.h
-src/tspdf_error.h
-src/util/buffer.h
-src/util/arena.h
-src/font/ttf_parser.h
-src/font/font_subset.h
-src/image/jpeg_embed.h
-src/pdf/pdf_writer.h
-src/pdf/pdf_base14.h
-src/pdf/pdf_stream.h
-src/pdf/tspdf_writer.h
-src/reader/tspr.h
-src/reader/tspr_overlay.h
-src/layout/layout.h
-"
+# Parse sources.mk to derive the file lists — single source of truth.
+# awk extracts each multi-line Make variable (VAR = \ ... lines) as a
+# whitespace-separated list of values (stripping backslash continuations,
+# $(SRCDIR) substitution, and blank/comment lines).
+parse_mk_var() {
+    local var="$1"
+    awk -v v="$var" '
+        BEGIN { in_var = 0 }
+        # Start capturing when we see "VAR = ..." or "VAR = \"
+        $0 ~ "^" v "[ \t]*=" {
+            # strip "VAR = " prefix and any trailing backslash
+            sub("^" v "[ \t]*=[ \t]*", "")
+            sub(/[ \t]*\\[ \t]*$/, "")
+            gsub(/\$\(SRCDIR\)/, "src")
+            if ($0 != "") print $0
+            in_var = 1
+            next
+        }
+        # Continue capturing continuation lines (end with \)
+        in_var && /\\[ \t]*$/ {
+            sub(/[ \t]*\\[ \t]*$/, "")
+            gsub(/\$\(SRCDIR\)/, "src")
+            sub(/^[ \t]+/, "")
+            if ($0 != "") print $0
+            next
+        }
+        # Guard: blank/whitespace-only lines while in_var are an error
+        in_var && /^[ \t]*$/ {
+            print "error: blank line inside variable block in sources.mk" > "/dev/stderr"
+            exit 1
+        }
+        # Last continuation line (no trailing \)
+        in_var {
+            sub(/^[ \t]+/, "")
+            gsub(/\$\(SRCDIR\)/, "src")
+            if ($0 != "" && $0 !~ /^#/) print $0
+            in_var = 0
+        }
+    ' sources.mk
+}
 
-# Implementation-only headers, dependency order (deps satisfied by tspdf.h).
-INTERNAL_HEADERS="
-src/compress/deflate.h
-src/crypto/md5.h
-src/crypto/sha256.h
-src/crypto/sha512.h
-src/crypto/rc4.h
-src/crypto/aes.h
-src/image/png_decoder.h
-src/image/jpeg_codec.h
-src/image/ccitt_codec.h
-src/qr/qr_encode.h
-src/util/pdftext.h
-src/util/pdfdate.h
-src/font/font_fallback.h
-src/reader/tspr_internal.h
-src/reader/tspr_doctree.h
-src/reader/tspr_attach.h
-src/reader/tspr_text.h
-"
-
-# Library sources, same order as ALL_SOURCES in the Makefile.
-SOURCES="
-src/util/buffer.c
-src/util/arena.c
-src/util/pdftext.c
-src/util/pdfdate.c
-src/pdf/pdf_writer.c
-src/pdf/pdf_stream.c
-src/pdf/pdf_base14.c
-src/pdf/tspdf_writer.c
-src/font/ttf_parser.c
-src/font/font_subset.c
-src/font/font_fallback.c
-src/layout/layout.c
-src/image/jpeg_embed.c
-src/image/jpeg_codec.c
-src/image/ccitt_codec.c
-src/image/png_decoder.c
-src/compress/deflate.c
-src/qr/qr_encode.c
-src/tspdf_error.c
-src/reader/tspr_parser.c
-src/reader/tspr_xref.c
-src/reader/tspr_pages.c
-src/reader/tspr_serialize.c
-src/reader/tspr_crypt.c
-src/reader/tspr_document.c
-src/reader/tspr_doctree.c
-src/reader/tspr_attach.c
-src/reader/tspr_bookmark.c
-src/reader/tspr_metadata.c
-src/reader/tspr_content.c
-src/reader/tspr_import.c
-src/reader/tspr_nup.c
-src/reader/tspr_resources.c
-src/reader/tspr_annot.c
-src/reader/tspr_form.c
-src/reader/tspr_text.c
-src/reader/tspr_lossy.c
-src/crypto/md5.c
-src/crypto/sha256.c
-src/crypto/sha512.c
-src/crypto/rc4.c
-src/crypto/aes.c
-"
+# Derive the lists from sources.mk (single source of truth).
+PUBLIC_HEADERS=$(parse_mk_var PUBLIC_HEADERS)
+INTERNAL_HEADERS=$(parse_mk_var INTERNAL_HEADERS)
+# ALL_SOURCES in the amalgamation = LIB_SOURCES + TSPR_SOURCES + CRYPTO_SOURCES
+SOURCES="$(parse_mk_var LIB_SOURCES)
+$(parse_mk_var TSPR_SOURCES)
+$(parse_mk_var CRYPTO_SOURCES)"
 
 # A new file under src/ or include/ that this script does not know about must
 # fail loudly, not ship a silently incomplete amalgamation. The umbrella
 # headers are known-but-not-amalgamated: they only #include the closures
 # listed above (this file replaces them), so they are exempt from the scan
 # without being emitted.
-UMBRELLA_HEADERS="
-include/tspdf.h
-include/tspdf_overlay.h
-"
+UMBRELLA_HEADERS=$(parse_mk_var UMBRELLA_HEADERS)
 KNOWN="$PUBLIC_HEADERS $INTERNAL_HEADERS $SOURCES"
 missing=""
 for f in $(find src include -name '*.c' -o -name '*.h' | sort); do
@@ -130,7 +91,7 @@ for f in $(find src include -name '*.c' -o -name '*.h' | sort); do
 done
 if [ -n "$missing" ]; then
     echo "amalgamate.sh: unknown src/include file(s):$missing" >&2
-    echo "add them to the file lists in scripts/amalgamate.sh" >&2
+    echo "add them to the file lists in sources.mk" >&2
     exit 1
 fi
 for f in $KNOWN; do

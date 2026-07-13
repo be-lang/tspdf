@@ -1,4 +1,5 @@
 #include "commands.h"
+#include "pipeline.h"
 #include "../include/tspdf.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -160,3 +161,19 @@ int cmd_img2pdf(int argc, char **argv) {
 
     return 0;
 }
+
+
+/* img2pdf takes a variable number of image inputs — it stays a RAW_ARGS command. */
+static int run_img2pdf_raw(TspdfCmdCtx *ctx) { return cmd_img2pdf(ctx->argc, ctx->argv); }
+static const TspdfCliFlag IMG2PDF_FLAGS[] = {
+    {"-o", true},
+    {"--page-size", true},
+    {NULL, false}
+};
+const TspdfCmdSpec tspdf_cmd_img2pdf_spec = {
+    .name = "img2pdf",
+    .flags = IMG2PDF_FLAGS,
+    .min_pos = 0, .max_pos = -1,
+    .needs = TSPDF_CMD_RAW_ARGS,
+    .run = run_img2pdf_raw,
+};

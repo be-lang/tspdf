@@ -608,52 +608,15 @@ static void form_dict_remove(TspdfObj *dict, const char *key) {
 // PDF text string object for a UTF-8 value: ASCII stays raw, anything else
 // becomes a BOM-prefixed UTF-16BE string (ISO 32000 §7.9.2.2), matching the
 // Info-dictionary convention. Invalid UTF-8 is stored raw.
+// Delegates to tspdf_utf8_to_pdf_text() which owns all of this logic.
 static TspdfObj *form_make_text_string(TspdfArena *a, const char *utf8) {
     TspdfObj *o = form_obj_new(a, TSPDF_OBJ_STRING);
     if (!o) return NULL;
-    size_t len = strlen(utf8);
-    if (tspdf_str_is_ascii(utf8)) {
-        o->string.data = (uint8_t *)tspdf_arena_alloc(a, len + 1);
-        if (!o->string.data) return NULL;
-        memcpy(o->string.data, utf8, len + 1);
-        o->string.len = len;
-        return o;
-    }
-    // Worst case: every UTF-8 byte becomes a surrogate pair unit.
-    uint8_t *buf = (uint8_t *)tspdf_arena_alloc(a, 2 + len * 4 + 1);
-    if (!buf) return NULL;
-    size_t pos = 0;
-    buf[pos++] = 0xFE;
-    buf[pos++] = 0xFF;
-    const char *p = utf8;
-    while (*p) {
-        uint32_t cp = 0;
-        size_t consumed = tspdf_utf8_decode(p, &cp);
-        if (consumed == 0) {
-            // Not valid UTF-8 after all: store the raw bytes unchanged.
-            uint8_t *raw = (uint8_t *)tspdf_arena_alloc(a, len + 1);
-            if (!raw) return NULL;
-            memcpy(raw, utf8, len + 1);
-            o->string.data = raw;
-            o->string.len = len;
-            return o;
-        }
-        p += consumed;
-        if (cp > 0xFFFF) {
-            uint32_t v = cp - 0x10000;
-            uint32_t hi = 0xD800 + (v >> 10);
-            uint32_t lo = 0xDC00 + (v & 0x3FF);
-            buf[pos++] = (uint8_t)(hi >> 8);
-            buf[pos++] = (uint8_t)hi;
-            buf[pos++] = (uint8_t)(lo >> 8);
-            buf[pos++] = (uint8_t)lo;
-        } else {
-            buf[pos++] = (uint8_t)(cp >> 8);
-            buf[pos++] = (uint8_t)cp;
-        }
-    }
-    o->string.data = buf;
-    o->string.len = pos;
+    size_t len = 0;
+    uint8_t *data = tspdf_utf8_to_pdf_text(utf8, &len, a);
+    if (!data) return NULL;
+    o->string.data = data;
+    o->string.len = len;
     return o;
 }
 

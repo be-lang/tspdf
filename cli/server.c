@@ -1,5 +1,7 @@
 #define _GNU_SOURCE
 #include "commands.h"
+#include "pipeline.h"
+#include "ops.h"
 #include "assets.h"
 #include "../include/tspdf.h"
 #include "../include/tspdf_overlay.h"
@@ -1400,8 +1402,7 @@ static void api_unlock(int fd, MultipartForm *form)
     if (!doc) { send_error(fd, 400, "Failed to open PDF (wrong password?)"); return; }
 
     // Saves preserve encryption by default; unlocking is the explicit opt-out.
-    TspdfSaveOptions opts = tspdf_save_options_default();
-    opts.decrypt = true;
+    TspdfSaveOptions opts = tspdf_op_unlock_save_options();
     uint8_t *out = NULL;
     size_t out_len = 0;
     err = tspdf_reader_save_to_memory_with_options(doc, &out, &out_len, &opts);
@@ -1536,19 +1537,16 @@ static void api_metadata(int fd, MultipartForm *form)
         memcpy(config_buf, cfg->data, clen);
         config_buf[clen] = '\0';
 
+        // Each config key maps to an Info field; the shared op is the single
+        // field-setter loop (same one the CLI's --set drives).
+        static const char *const keys[] = {
+            "title", "author", "subject", "keywords", "creator", "producer",
+        };
         char val[512];
-        if (json_get_string(config_buf, "title", val, sizeof(val)) == 0)
-            tspdf_reader_set_title(doc, val);
-        if (json_get_string(config_buf, "author", val, sizeof(val)) == 0)
-            tspdf_reader_set_author(doc, val);
-        if (json_get_string(config_buf, "subject", val, sizeof(val)) == 0)
-            tspdf_reader_set_subject(doc, val);
-        if (json_get_string(config_buf, "keywords", val, sizeof(val)) == 0)
-            tspdf_reader_set_keywords(doc, val);
-        if (json_get_string(config_buf, "creator", val, sizeof(val)) == 0)
-            tspdf_reader_set_creator(doc, val);
-        if (json_get_string(config_buf, "producer", val, sizeof(val)) == 0)
-            tspdf_reader_set_producer(doc, val);
+        for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
+            if (json_get_string(config_buf, keys[k], val, sizeof(val)) == 0)
+                tspdf_op_metadata_set(doc, keys[k], strlen(keys[k]), val);
+        }
     }
 
     uint8_t *out = NULL;
@@ -1595,58 +1593,20 @@ static void api_watermark(int fd, MultipartForm *form)
         (const uint8_t *)file->data, file->data_len, &err);
     if (!doc) { send_error(fd, 400, "Failed to open PDF"); return; }
 
-    size_t page_count = tspdf_reader_page_count(doc);
-    double font_size = cfg_font_size;
-
-    for (size_t i = 0; i < page_count; i++) {
-        TspdfReaderPage *page = tspdf_reader_get_page(doc, i);
-        if (!page) continue;
-
-        /* Center of the VISIBLE page: the MediaBox origin is not always
-         * (0,0), so the center is ((x0+x1)/2, (y0+y1)/2), not (w/2, h/2).
-         * A page-level /Rotate is compensated by pre-rotating the stamp the
-         * other way (45 + rotate CCW) so the diagonal reads upright as
-         * viewed. Same math as cmd_watermark.c. */
-        double cx = (page->media_box[0] + page->media_box[2]) / 2.0;
-        double cy = (page->media_box[1] + page->media_box[3]) / 2.0;
-        int rot = ((page->rotate % 360) + 360) % 360;
-        double angle_rad = (45.0 + (double)rot) * M_PI / 180.0;
-        double cos_a = cos(angle_rad);
-        double sin_a = sin(angle_rad);
-
-        TspdfWriter *writer = tspdf_writer_create();
-        if (!writer) continue;
-
-        const char *font_name = tspdf_writer_add_builtin_font(writer, "Helvetica");
-        if (!font_name) { tspdf_writer_destroy(writer); continue; }
-
-        const char *gs_name = tspdf_writer_add_opacity(writer, opacity, opacity);
-
-        TspdfStream *stream = tspdf_page_begin_content(doc, i);
-        if (!stream) { tspdf_writer_destroy(writer); continue; }
-
-        tspdf_stream_save(stream);
-        if (gs_name) tspdf_stream_set_opacity(stream, gs_name);
-
-        TspdfColor gray = tspdf_color_rgb(0.7, 0.7, 0.7);
-        tspdf_stream_set_fill_color(stream, gray);
-        tspdf_stream_concat_matrix(stream, cos_a, sin_a, -sin_a, cos_a, cx, cy);
-
-        double text_width = (double)strlen(text) * font_size * 0.5;
-        tspdf_stream_begin_text(stream);
-        tspdf_stream_set_font(stream, font_name, font_size);
-        tspdf_stream_text_position(stream, -text_width / 2.0, -font_size / 3.0);
-        tspdf_stream_show_text(stream, text);
-        tspdf_stream_end_text(stream);
-        tspdf_stream_restore(stream);
-
-        err = tspdf_page_end_content(doc, i, stream, writer);
-        tspdf_writer_destroy(writer);
-        if (err != TSPDF_OK) {
-            tspdf_reader_destroy(doc);
+    /* Same placement/rotation math and cp1252 re-encoding as the CLI: the web
+     * endpoint now shares cmd_watermark.c's operation, so non-ASCII watermark
+     * text (é, €, ...) renders correctly instead of leaking raw UTF-8 bytes. */
+    TspdfOpWatermarkText params = {
+        .text = text, .opacity = opacity, .font_size = cfg_font_size,
+    };
+    err = tspdf_op_watermark_text(doc, &params, NULL);
+    if (err != TSPDF_OK) {
+        tspdf_reader_destroy(doc);
+        if (err == TSPDF_ERR_UNSUPPORTED || err == TSPDF_ERR_ENCODING)
+            send_error(fd, 400, "Watermark text cannot be shown with the built-in fonts");
+        else
             send_error(fd, 500, "Watermark overlay failed");
-            return;
-        }
+        return;
     }
 
     uint8_t *out = NULL;
@@ -2422,3 +2382,18 @@ int cmd_serve(int argc, char **argv)
 
     return start_server(port);
 }
+
+/* serve is nonstandard: it runs with no arguments and owns its own help, so it
+ * stays a RAW_ARGS command (the pipeline only derives its value flags). */
+static int run_serve_raw(TspdfCmdCtx *ctx) { return cmd_serve(ctx->argc, ctx->argv); }
+static const TspdfCliFlag SERVE_FLAGS[] = {
+    {"--port", true}, {"--bind", true},
+    {NULL, false}
+};
+const TspdfCmdSpec tspdf_cmd_serve_spec = {
+    .name = "serve",
+    .flags = SERVE_FLAGS,
+    .min_pos = 0, .max_pos = -1,
+    .needs = TSPDF_CMD_RAW_ARGS,
+    .run = run_serve_raw,
+};

@@ -1,6 +1,6 @@
 #include "commands.h"
+#include "pipeline.h"
 #include "../include/tspdf.h"
-#include "password_input.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,41 +16,12 @@ static bool parse_int_flag(const char *s, int *out) {
     return true;
 }
 
-int cmd_compress(int argc, char **argv) {
-    if (argc == 0 || has_flag(argc, argv, "--help") || has_flag(argc, argv, "-h")) {
-        printf("Usage: tspdf compress <input.pdf> -o <output.pdf> [--keep-metadata]\n");
-        printf("                      [--lossy] [--image-dpi N] [--image-quality N] [--mono-dpi N]\n");
-        printf("\nStrip metadata and unused objects, recompress streams to reduce file size.\n");
-        printf("Uncompressed streams shrink a lot; already well-compressed files only a little.\n");
-        printf("By default removes all metadata (Info dict, XMP). Use --keep-metadata to preserve it.\n");
-        printf("\n--lossy additionally downsamples oversized photos/scans and re-encodes them\n");
-        printf("as JPEG, and black-and-white scans as CCITT G4. --image-dpi sets the target\n");
-        printf("resolution for photos (default 150); --image-quality sets the JPEG quality\n");
-        printf("1-100 (default 75); --mono-dpi sets the target for black-and-white images\n");
-        printf("(default 300 - text needs more dpi than photos to stay legible).\n");
-        printf("Without --lossy no image is altered.\n");
-        printf("\nEncrypted files: pass --password <pass> or --password-file <file>;\n");
-        printf("the output keeps the original encryption.\n");
-        return argc == 0 ? 1 : 0;
-    }
-
-    const char *positional[2];
-    int npos = collect_positional(argc, argv, positional, 2);
-    if (npos < 1) {
-        fprintf(stderr, "tspdf compress: missing input file\n");
-        return 1;
-    }
-    if (npos > 1) {
-        fprintf(stderr, "tspdf compress: unexpected extra argument '%s'\n", positional[1]);
-        return 1;
-    }
-    const char *input = positional[0];
-
-    const char *output = find_flag(argc, argv, "-o");
-    if (!output) {
-        fprintf(stderr, "tspdf compress: missing -o <output.pdf>\n");
-        return 1;
-    }
+static int run(TspdfCmdCtx *ctx) {
+    int argc = ctx->argc;
+    char **argv = ctx->argv;
+    const char *input = ctx->input;
+    const char *output = ctx->output;
+    TspdfReader *doc = ctx->doc;
 
     bool keep_metadata = has_flag(argc, argv, "--keep-metadata");
     bool lossy = has_flag(argc, argv, "--lossy");
@@ -87,25 +58,7 @@ int cmd_compress(int argc, char **argv) {
         return 1;
     }
 
-    static char pwbuf[TSPDF_PASSWORD_MAX];
-    const char *password = tspdf_resolve_password(argc, argv,
-                                                  "--password", "--password-file",
-                                                  "compress", "Password: ",
-                                                  false, pwbuf, sizeof(pwbuf));
-
     TspdfError err = TSPDF_OK;
-    TspdfReader *doc = password
-        ? tspdf_reader_open_file_with_password(input, password, &err)
-        : tspdf_reader_open_file(input, &err);
-    if (!doc) {
-        if (err == TSPDF_ERR_ENCRYPTED) {
-            fprintf(stderr, "tspdf compress: '%s' is encrypted; use --password or --password-file\n", input);
-        } else {
-            fprintf(stderr, "tspdf compress: failed to open '%s': %s\n", input, tspdf_error_string(err));
-        }
-        return 1;
-    }
-
     TspdfLossyStats lossy_stats = {0};
     if (lossy) {
         err = tspdf_reader_lossy_images(doc, image_dpi, image_quality, mono_dpi,
@@ -113,7 +66,6 @@ int cmd_compress(int argc, char **argv) {
         if (err != TSPDF_OK) {
             fprintf(stderr, "tspdf compress: lossy image pass failed: %s\n",
                     tspdf_error_string(err));
-            tspdf_reader_destroy(doc);
             return 1;
         }
     }
@@ -126,7 +78,6 @@ int cmd_compress(int argc, char **argv) {
     err = tspdf_reader_save_with_options(doc, output, &opts);
     if (err != TSPDF_OK) {
         fprintf(stderr, "tspdf compress: failed to save '%s': %s\n", output, tspdf_error_string(err));
-        tspdf_reader_destroy(doc);
         return 1;
     }
 
@@ -153,6 +104,33 @@ int cmd_compress(int argc, char **argv) {
         printf("Compressed → %s\n", output);
     }
 
-    tspdf_reader_destroy(doc);
     return 0;
 }
+
+static const TspdfCliFlag FLAGS[] = {
+    {"-o", true}, {"--image-dpi", true}, {"--image-quality", true},
+    {"--mono-dpi", true}, {"--password", true}, {"--password-file", true},
+    {NULL, false}
+};
+
+const TspdfCmdSpec tspdf_cmd_compress_spec = {
+    .name = "compress",
+    .usage =
+        "Usage: tspdf compress <input.pdf> -o <output.pdf> [--keep-metadata]\n"
+        "                      [--lossy] [--image-dpi N] [--image-quality N] [--mono-dpi N]\n"
+        "\nStrip metadata and unused objects, recompress streams to reduce file size.\n"
+        "Uncompressed streams shrink a lot; already well-compressed files only a little.\n"
+        "By default removes all metadata (Info dict, XMP). Use --keep-metadata to preserve it.\n"
+        "\n--lossy additionally downsamples oversized photos/scans and re-encodes them\n"
+        "as JPEG, and black-and-white scans as CCITT G4. --image-dpi sets the target\n"
+        "resolution for photos (default 150); --image-quality sets the JPEG quality\n"
+        "1-100 (default 75); --mono-dpi sets the target for black-and-white images\n"
+        "(default 300 - text needs more dpi than photos to stay legible).\n"
+        "Without --lossy no image is altered.\n"
+        "\nEncrypted files: pass --password <pass> or --password-file <file>;\n"
+        "the output keeps the original encryption.\n",
+    .flags = FLAGS,
+    .min_pos = 1, .max_pos = 1,
+    .needs = TSPDF_CMD_OPENS_INPUT | TSPDF_CMD_NEEDS_OUTPUT | TSPDF_CMD_TAKES_PASSWORD,
+    .run = run,
+};
