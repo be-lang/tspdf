@@ -15694,6 +15694,270 @@ TEST(test_lossy_mono_imagemask_and_nondefault_decode_excluded) {
     tspdf_arena_destroy(&enc_arena);
 }
 
+/* ==================================================================
+ * Task 3: info plan matrix
+ *
+ * The Info-dict decision (carry the source Info, write a merged Info, or
+ * drop it) is exercised end-to-end across the matrix the brief specifies:
+ *   {no edits, edits, strip} x {update_producer on/off}
+ *     x {plain input, encrypted input} x {decrypt on/off}
+ * asserting Title/Author survival, Producer value, and (for encrypted
+ * output) that Info strings are never plaintext in the file bytes.
+ * ================================================================== */
+
+/* Build a plain document whose SOURCE Info dict already carries Title and
+ * Author (so the {no edits} carry path has something to preserve). Returns a
+ * reopened reader over the saved bytes; *bytes_out must be freed by the
+ * caller AFTER the returned reader is destroyed (the reader borrows them). */
+static TspdfReader *infoplan_make_plain_source(uint8_t **bytes_out, size_t *len_out) {
+    TspdfError err;
+    TspdfReader *base = tspdf_reader_open_file("tests/data/one_page.pdf", &err);
+    if (!base) return NULL;
+    tspdf_reader_set_title(base, "Src Title");
+    tspdf_reader_set_author(base, "Src Author");
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    /* update_producer off so the source Producer is a known non-tspdf value
+     * we can distinguish from a later stamp; one_page.pdf ships (tspl). */
+    TspdfSaveOptions o = tspdf_save_options_default();
+    o.update_producer = false;
+    err = tspdf_reader_save_to_memory_with_options(base, &buf, &len, &o);
+    tspdf_reader_destroy(base);
+    if (err != TSPDF_OK) { free(buf); return NULL; }
+    TspdfReader *src = tspdf_reader_open(buf, len, &err);
+    if (!src) { free(buf); return NULL; }
+    *bytes_out = buf;
+    *len_out = len;
+    return src;
+}
+
+/* Build an encrypted source document (Title/Author in Info), reopened with
+ * its password. Same borrow contract as the plain builder. */
+static TspdfReader *infoplan_make_encrypted_source(uint8_t **bytes_out, size_t *len_out) {
+    TspdfError err;
+    TspdfReader *base = tspdf_reader_open_file("tests/data/one_page.pdf", &err);
+    if (!base) return NULL;
+    tspdf_reader_set_title(base, "Src Title");
+    tspdf_reader_set_author(base, "Src Author");
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    err = tspdf_reader_save_to_memory_encrypted(base, &buf, &len,
+                                                "pw", "opw", 0xFFFFFFFC, 128);
+    tspdf_reader_destroy(base);
+    if (err != TSPDF_OK) { free(buf); return NULL; }
+    TspdfReader *src = tspdf_reader_open_with_password(buf, len, "pw", &err);
+    if (!src) { free(buf); return NULL; }
+    *bytes_out = buf;
+    *len_out = len;
+    return src;
+}
+
+/* --- Plain input, plain output --- */
+
+/* No edits, update_producer off: source Title/Author carried over intact. */
+TEST(test_infoplan_plain_noedit_noproducer_carries) {
+    uint8_t *src_bytes = NULL; size_t src_len = 0;
+    TspdfReader *src = infoplan_make_plain_source(&src_bytes, &src_len);
+    ASSERT(src != NULL);
+    ASSERT_EQ_STR(tspdf_reader_get_title(src), "Src Title");
+
+    TspdfSaveOptions o = tspdf_save_options_default();
+    o.update_producer = false;
+    uint8_t *out = NULL; size_t out_len = 0;
+    TspdfError err = tspdf_reader_save_to_memory_with_options(src, &out, &out_len, &o);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    TspdfReader *doc = tspdf_reader_open(out, out_len, &err);
+    ASSERT(doc != NULL);
+    ASSERT_EQ_STR(tspdf_reader_get_title(doc), "Src Title");
+    ASSERT_EQ_STR(tspdf_reader_get_author(doc), "Src Author");
+    ASSERT_EQ_STR(tspdf_reader_get_producer(doc), "tspl");
+
+    tspdf_reader_destroy(doc);
+    free(out);
+    tspdf_reader_destroy(src);
+    free(src_bytes);
+}
+
+/* No edits, update_producer on: Title/Author survive AND Producer stamped.
+ * This is the regression for the "producer rewrite wiped Title/Author" bug. */
+TEST(test_infoplan_plain_noedit_producer_stamps_keeps_fields) {
+    uint8_t *src_bytes = NULL; size_t src_len = 0;
+    TspdfReader *src = infoplan_make_plain_source(&src_bytes, &src_len);
+    ASSERT(src != NULL);
+
+    TspdfSaveOptions o = tspdf_save_options_default();
+    o.update_producer = true;
+    uint8_t *out = NULL; size_t out_len = 0;
+    TspdfError err = tspdf_reader_save_to_memory_with_options(src, &out, &out_len, &o);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    TspdfReader *doc = tspdf_reader_open(out, out_len, &err);
+    ASSERT(doc != NULL);
+    ASSERT_EQ_STR(tspdf_reader_get_title(doc), "Src Title");
+    ASSERT_EQ_STR(tspdf_reader_get_author(doc), "Src Author");
+    ASSERT_EQ_STR(tspdf_reader_get_producer(doc), "tspdf " TSPDF_VERSION_STRING);
+
+    tspdf_reader_destroy(doc);
+    free(out);
+    tspdf_reader_destroy(src);
+    free(src_bytes);
+}
+
+/* Edits, update_producer on: edited Title wins, untouched Author carried. */
+TEST(test_infoplan_plain_edit_producer_merges) {
+    uint8_t *src_bytes = NULL; size_t src_len = 0;
+    TspdfReader *src = infoplan_make_plain_source(&src_bytes, &src_len);
+    ASSERT(src != NULL);
+    tspdf_reader_set_title(src, "New Title");
+
+    TspdfSaveOptions o = tspdf_save_options_default();
+    o.update_producer = true;
+    uint8_t *out = NULL; size_t out_len = 0;
+    TspdfError err = tspdf_reader_save_to_memory_with_options(src, &out, &out_len, &o);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    TspdfReader *doc = tspdf_reader_open(out, out_len, &err);
+    ASSERT(doc != NULL);
+    ASSERT_EQ_STR(tspdf_reader_get_title(doc), "New Title");
+    ASSERT_EQ_STR(tspdf_reader_get_author(doc), "Src Author");
+
+    tspdf_reader_destroy(doc);
+    free(out);
+    tspdf_reader_destroy(src);
+    free(src_bytes);
+}
+
+/* strip_metadata: Info dropped entirely regardless of edits/producer. */
+TEST(test_infoplan_plain_strip_drops_info) {
+    uint8_t *src_bytes = NULL; size_t src_len = 0;
+    TspdfReader *src = infoplan_make_plain_source(&src_bytes, &src_len);
+    ASSERT(src != NULL);
+    tspdf_reader_set_title(src, "New Title");
+
+    TspdfSaveOptions o = tspdf_save_options_default();
+    o.strip_metadata = true;
+    o.update_producer = true;
+    uint8_t *out = NULL; size_t out_len = 0;
+    TspdfError err = tspdf_reader_save_to_memory_with_options(src, &out, &out_len, &o);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(!bytes_contains(out, out_len, "/Info "));
+
+    TspdfReader *doc = tspdf_reader_open(out, out_len, &err);
+    ASSERT(doc != NULL);
+    ASSERT(tspdf_reader_get_title(doc) == NULL);
+    ASSERT(tspdf_reader_get_author(doc) == NULL);
+
+    tspdf_reader_destroy(doc);
+    free(out);
+    tspdf_reader_destroy(src);
+    free(src_bytes);
+}
+
+/* --- Encrypted input --- */
+
+/* Encrypted in, encrypted out, no edits: Info carried, strings encrypted
+ * (title text must NOT appear raw), decodes on reopen. This is the
+ * regression for both "Info dropped on encrypt" and "Info strings written
+ * plaintext into encrypted files". */
+TEST(test_infoplan_enc_noedit_carries_encrypted_strings) {
+    uint8_t *src_bytes = NULL; size_t src_len = 0;
+    TspdfReader *src = infoplan_make_encrypted_source(&src_bytes, &src_len);
+    ASSERT(src != NULL);
+    ASSERT_EQ_STR(tspdf_reader_get_title(src), "Src Title");
+
+    /* Re-save (stays encrypted: opened with password, no decrypt). */
+    TspdfSaveOptions o = tspdf_save_options_default();
+    uint8_t *out = NULL; size_t out_len = 0;
+    TspdfError err = tspdf_reader_save_to_memory_with_options(src, &out, &out_len, &o);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    /* Title text must not appear in plaintext in the encrypted file. */
+    ASSERT(!bytes_contains(out, out_len, "Src Title"));
+
+    TspdfReader *doc = tspdf_reader_open_with_password(out, out_len, "pw", &err);
+    ASSERT(doc != NULL);
+    ASSERT_EQ_STR(tspdf_reader_get_title(doc), "Src Title");
+    ASSERT_EQ_STR(tspdf_reader_get_author(doc), "Src Author");
+
+    tspdf_reader_destroy(doc);
+    free(out);
+    tspdf_reader_destroy(src);
+    free(src_bytes);
+}
+
+/* Encrypted in, encrypted out, WITH edits: merged Info, strings encrypted,
+ * new Title decodes and untouched Author survives. */
+TEST(test_infoplan_enc_edit_merges_encrypted_strings) {
+    uint8_t *src_bytes = NULL; size_t src_len = 0;
+    TspdfReader *src = infoplan_make_encrypted_source(&src_bytes, &src_len);
+    ASSERT(src != NULL);
+    tspdf_reader_set_title(src, "Secret Title");
+
+    uint8_t *out = NULL; size_t out_len = 0;
+    TspdfError err = tspdf_reader_save_to_memory_encrypted(src, &out, &out_len,
+                                                           "pw2", "opw2", 0xFFFFFFFC, 256);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(!bytes_contains(out, out_len, "Secret Title"));
+
+    TspdfReader *doc = tspdf_reader_open_with_password(out, out_len, "pw2", &err);
+    ASSERT(doc != NULL);
+    ASSERT_EQ_STR(tspdf_reader_get_title(doc), "Secret Title");
+    ASSERT_EQ_STR(tspdf_reader_get_author(doc), "Src Author");
+
+    tspdf_reader_destroy(doc);
+    free(out);
+    tspdf_reader_destroy(src);
+    free(src_bytes);
+}
+
+/* Encrypted in, decrypt on (unlock), no edits: Info survives into the plain
+ * output and strings are now readable plaintext. */
+TEST(test_infoplan_enc_decrypt_carries_plaintext) {
+    uint8_t *src_bytes = NULL; size_t src_len = 0;
+    TspdfReader *src = infoplan_make_encrypted_source(&src_bytes, &src_len);
+    ASSERT(src != NULL);
+
+    TspdfSaveOptions o = tspdf_save_options_default();
+    o.decrypt = true;
+    uint8_t *out = NULL; size_t out_len = 0;
+    TspdfError err = tspdf_reader_save_to_memory_with_options(src, &out, &out_len, &o);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    TspdfReader *doc = tspdf_reader_open(out, out_len, &err);
+    ASSERT(doc != NULL);
+    ASSERT_EQ_STR(tspdf_reader_get_title(doc), "Src Title");
+    ASSERT_EQ_STR(tspdf_reader_get_author(doc), "Src Author");
+
+    tspdf_reader_destroy(doc);
+    free(out);
+    tspdf_reader_destroy(src);
+    free(src_bytes);
+}
+
+/* Encrypted in, decrypt on, WITH edits: merged Info in plain output. */
+TEST(test_infoplan_enc_decrypt_edit_merges) {
+    uint8_t *src_bytes = NULL; size_t src_len = 0;
+    TspdfReader *src = infoplan_make_encrypted_source(&src_bytes, &src_len);
+    ASSERT(src != NULL);
+    tspdf_reader_set_author(src, "New Author");
+
+    TspdfSaveOptions o = tspdf_save_options_default();
+    o.decrypt = true;
+    uint8_t *out = NULL; size_t out_len = 0;
+    TspdfError err = tspdf_reader_save_to_memory_with_options(src, &out, &out_len, &o);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    TspdfReader *doc = tspdf_reader_open(out, out_len, &err);
+    ASSERT(doc != NULL);
+    ASSERT_EQ_STR(tspdf_reader_get_title(doc), "Src Title");
+    ASSERT_EQ_STR(tspdf_reader_get_author(doc), "New Author");
+
+    tspdf_reader_destroy(doc);
+    free(out);
+    tspdf_reader_destroy(src);
+    free(src_bytes);
+}
+
 int main(void) {
     printf("tspr reader tests:\n");
 
@@ -16128,6 +16392,17 @@ int main(void) {
     RUN(test_lossy_mono_ccitt_passthrough_below_target);
     RUN(test_lossy_mono_noise_keeps_original);
     RUN(test_lossy_mono_imagemask_and_nondefault_decode_excluded);
+
+    /* Task 3: info plan matrix */
+    printf("\n  Info plan matrix:\n");
+    RUN(test_infoplan_plain_noedit_noproducer_carries);
+    RUN(test_infoplan_plain_noedit_producer_stamps_keeps_fields);
+    RUN(test_infoplan_plain_edit_producer_merges);
+    RUN(test_infoplan_plain_strip_drops_info);
+    RUN(test_infoplan_enc_noedit_carries_encrypted_strings);
+    RUN(test_infoplan_enc_edit_merges_encrypted_strings);
+    RUN(test_infoplan_enc_decrypt_carries_plaintext);
+    RUN(test_infoplan_enc_decrypt_edit_merges);
 
     printf("\n%d tests, %d passed, %d failed\n",
            tests_run, tests_passed, tests_failed);
