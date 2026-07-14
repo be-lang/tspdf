@@ -380,13 +380,7 @@ static void lossy_walker_init(LossyCtx *ctx, TspdfWalker *w) {
 
 // Page /Resources with Pages-tree inheritance via the /Parent chain.
 static TspdfObj *lossy_page_resources(LossyCtx *ctx, TspdfObj *page_dict) {
-    TspdfObj *cur = page_dict;
-    for (size_t depth = 0; cur && cur->type == TSPDF_OBJ_DICT && depth < 64; depth++) {
-        TspdfObj *res = lossy_resolve(ctx, tspdf_dict_get(cur, "Resources"));
-        if (res && res->type == TSPDF_OBJ_DICT) return res;
-        cur = lossy_resolve(ctx, tspdf_dict_get(cur, "Parent"));
-    }
-    return NULL;
+    return tspdf_page_inherited_resources(ctx->doc, &ctx->rp, page_dict);
 }
 
 // Concatenate a page's /Contents streams ('\n' between).

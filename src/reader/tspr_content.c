@@ -9,6 +9,7 @@
 
 static bool dict_set(TspdfObj *dict, TspdfArena *arena, const char *key, TspdfObj *value);
 static TspdfObj *resolve_maybe_ref(TspdfReader *doc, TspdfObj *obj);
+static TspdfObj *get_or_create_page_resources(TspdfReader *doc, TspdfObj *page_dict);
 
 static TspdfObj *make_name_obj(TspdfArena *a, const char *str) {
     TspdfObj *obj = tspdf_arena_alloc_zero(a, sizeof(TspdfObj));
@@ -185,7 +186,14 @@ static TspdfObj *shallow_copy_dict(TspdfArena *a, const TspdfObj *src) {
 static TspdfError inline_resources_for_merge(TspdfReader *doc, TspdfObj *page_dict) {
     TspdfArena *arena = &doc->arena;
     TspdfObj *res = tspdf_dict_get(page_dict, "Resources");
-    if (!res) return TSPDF_OK; // absent: the merge creates a fresh dict
+    if (!res) {
+        // Absent: seed a direct, page-private /Resources from what the page
+        // inherits so the merge extends the inherited fonts rather than
+        // shadowing them with a fresh empty dict. get_or_create_page_resources
+        // re-owns the sub-dicts, so the REF-only copy below need not touch them.
+        res = get_or_create_page_resources(doc, page_dict);
+        if (!res) return TSPDF_ERR_ALLOC;
+    }
 
     if (res->type == TSPDF_OBJ_REF) {
         TspdfObj *resolved = resolve_maybe_ref(doc, res);
@@ -537,6 +545,42 @@ static TspdfObj *get_or_create_direct_subdict(TspdfReader *doc, TspdfObj *dict, 
     return sub;
 }
 
+// The page's direct /Resources dict, creating one when the page has none of its
+// own. A freshly created dict is SEEDED from the /Resources the page inherits
+// from its /Pages ancestors, so a content edit extends the page's fonts instead
+// of shadowing them with a fresh empty dict. Sub-dict VALUES (/Font, /XObject,
+// …) are shallow-copied so appending to them stays local to this page — the
+// inherited dict is shared by sibling pages. Leaf values inside a sub-dict are
+// shared refs: same document, same lifetime, exactly what the page saw.
+static TspdfObj *get_or_create_page_resources(TspdfReader *doc, TspdfObj *page_dict) {
+    TspdfObj *own = resolve_maybe_ref(doc, tspdf_dict_get(page_dict, "Resources"));
+    if (own && own->type == TSPDF_OBJ_DICT) return own;
+
+    TspdfArena *arena = &doc->arena;
+    TspdfObj *res = tspdf_arena_alloc_zero(arena, sizeof(TspdfObj));
+    if (!res) return NULL;
+    res->type = TSPDF_OBJ_DICT;
+
+    TspdfParser parser;
+    tspdf_parser_init(&parser, doc->data, doc->data_len, &doc->arena);
+    TspdfObj *inherited = tspdf_page_inherited_resources(doc, &parser, page_dict);
+    if (inherited && inherited->type == TSPDF_OBJ_DICT) {
+        for (size_t i = 0; i < inherited->dict.count; i++) {
+            const char *key = inherited->dict.entries[i].key;
+            TspdfObj *value = resolve_maybe_ref(doc, inherited->dict.entries[i].value);
+            if (value && value->type == TSPDF_OBJ_DICT) {
+                value = shallow_copy_dict(arena, value);
+                if (!value) return NULL;
+            } else {
+                value = inherited->dict.entries[i].value;
+            }
+            if (!dict_set(res, arena, key, value)) return NULL;
+        }
+    }
+    if (!dict_set(page_dict, arena, "Resources", res)) return NULL;
+    return res;
+}
+
 const char *tspdf_page_add_xobject(TspdfReader *doc, size_t page_index, uint32_t xobj_num) {
     if (!doc || page_index >= doc->pages.count || xobj_num == 0) return NULL;
     if ((size_t)xobj_num >= doc->xref.count + doc->new_objs.count) return NULL;
@@ -546,8 +590,9 @@ const char *tspdf_page_add_xobject(TspdfReader *doc, size_t page_index, uint32_t
     if (!page_dict || page_dict->type != TSPDF_OBJ_DICT) return NULL;
 
     // /Resources may be an indirect ref (possibly shared between pages);
-    // resolve and mutate the resolved dict in place — we only append names.
-    TspdfObj *resources = get_or_create_direct_subdict(doc, page_dict, "Resources");
+    // resolve and mutate the resolved dict in place — we only append names. A
+    // page with no own /Resources gets one seeded from its inherited dict.
+    TspdfObj *resources = get_or_create_page_resources(doc, page_dict);
     if (!resources) return NULL;
 
     TspdfObj *xobjects = get_or_create_direct_subdict(doc, resources, "XObject");

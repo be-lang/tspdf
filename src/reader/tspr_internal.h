@@ -467,6 +467,13 @@ typedef struct {
     size_t capacity;
 } TspdfRenameMap;
 
+// Effective /Resources for a page: the page's own dict, or the first one found
+// walking the /Pages /Parent chain (refs resolved; depth-capped to break
+// /Parent cycles). NULL when none exists. One walk shared by text extraction,
+// lossy recompression, import, and content editing.
+TspdfObj *tspdf_page_inherited_resources(TspdfReader *doc, TspdfParser *parser,
+                                         TspdfObj *page_dict);
+
 TspdfError tspdf_resources_merge(TspdfObj *page_dict, TspdfObj *new_resources,
                                 TspdfArena *arena, TspdfRenameMap *renames);
 uint8_t *tspdf_content_rewrite(const uint8_t *stream, size_t len,
