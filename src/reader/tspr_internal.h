@@ -138,6 +138,53 @@ void tspr_write_hex_string(TspdfBuffer *buf, const uint8_t *data, size_t len);
 void tspr_write_name(TspdfBuffer *buf, const uint8_t *data, size_t len);
 void tspr_write_obj(TspdfBuffer *buf, TspdfObj *obj, const RenumberMap *map, TspdfReader *doc);
 
+// --- Crypt adapter: the encryption seam on emission (tspr_serialize.c) ---
+//
+// There is ONE serializer; encryption is a seam it emits through. The
+// identity adapter writes plain bytes (unencrypted saves); the crypt adapter
+// encrypts strings and stream payloads with the per-object key and
+// contributes the /Encrypt dictionary and the trailer /ID. Historically the
+// encrypted save was a second full serializer that drifted from the plain
+// one (every save fix had to land twice); the adapter is what remains of it.
+
+typedef struct TspdfCryptAdapter TspdfCryptAdapter;
+struct TspdfCryptAdapter {
+    TspdfCrypt *crypt;  // NULL for the identity adapter
+
+    // Write one PDF string value belonging to indirect object (obj_num, gen):
+    // escaped literal (identity) or object-key-encrypted hex (crypt; on
+    // encryption failure the value falls back to plain hex).
+    void (*write_string)(const TspdfCryptAdapter *ad, TspdfBuffer *buf,
+                         const uint8_t *data, size_t len,
+                         uint32_t obj_num, uint16_t gen);
+
+    // Transform a stream payload before emission. Returns a malloc'd buffer
+    // (caller frees, *out_len set) or NULL meaning "write the input
+    // unchanged" — always for identity; for crypt under the /EncryptMetadata
+    // false XMP exemption (ISO 32000 §7.6.3.2) or on encryption failure.
+    // `stream_obj` is the stream being written (for the exemption check).
+    uint8_t *(*transform_stream)(const TspdfCryptAdapter *ad, TspdfObj *stream_obj,
+                                 uint32_t obj_num, uint16_t gen,
+                                 const uint8_t *data, size_t len, size_t *out_len);
+
+    // Emit the /Encrypt dictionary body ("<< ... >>", no obj wrapper):
+    // the preserved source dict verbatim, or a fresh V4/V5 Standard dict.
+    // Its strings are never object-key encrypted (the spec's one exemption).
+    // doc/parser resolve indirect refs inside a preserved source dict.
+    // NULL on the identity adapter: no /Encrypt object exists.
+    void (*emit_encrypt_dict)(const TspdfCryptAdapter *ad, TspdfBuffer *buf,
+                              TspdfReader *doc, TspdfParser *parser);
+
+    // Append the two-element trailer /ID array body: the crypt's file id
+    // (key material for V<5 — must survive byte-identical), then an MD5 of
+    // the bytes serialized so far (deterministic, no time()/rand()).
+    // NULL on the identity adapter.
+    void (*emit_trailer_id)(const TspdfCryptAdapter *ad, TspdfBuffer *buf);
+};
+
+TspdfCryptAdapter tspr_crypt_adapter_identity(void);
+TspdfCryptAdapter tspr_crypt_adapter_encrypt(TspdfCrypt *crypt);
+
 // --- Info dict plan (tspr_infoplan.c) ---
 //
 // One module decides what happens to the trailer /Info dictionary on save and

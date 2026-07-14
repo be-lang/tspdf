@@ -53,10 +53,12 @@ echo "plain-save      three_pages.pdf $h" >> "$MANIFEST"
 # writer emits (object set, dict shapes, /Length) from the crypto randomness.
 # The fixture is supplied by $3 so both the before- and after-runs reserialize
 # the same encrypted input.
-ENCFIX="${3:-}"
+# Defaults to the committed AES-128 fixture (user password "secret").
+ENCFIX="${3:-tests/data/form_fields_enc.pdf}"
+ENCPW="${ENCPW:-secret}"
 if [ -n "$ENCFIX" ] && [ -f "$ENCFIX" ]; then
-    if "$BIN" rotate "$ENCFIX" --password pw --angle 90 -o "$TMP/enc2.pdf" >/dev/null 2>&1 &&
-       "$BIN" decrypt "$TMP/enc2.pdf" --password pw -o "$TMP/enc2_plain.pdf" >/dev/null 2>&1; then
+    if "$BIN" rotate "$ENCFIX" --password "$ENCPW" --angle 90 -o "$TMP/enc2.pdf" >/dev/null 2>&1 &&
+       "$BIN" decrypt "$TMP/enc2.pdf" --password "$ENCPW" -o "$TMP/enc2_plain.pdf" >/dev/null 2>&1; then
         # Drop the /ID array line (random, carried from the source) before hashing.
         h2="$(grep -av '/ID' "$TMP/enc2_plain.pdf" | sha256sum | cut -d' ' -f1)"
     else
