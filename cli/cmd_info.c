@@ -294,7 +294,10 @@ int cmd_info(int argc, char **argv) {
             printf("\nThis PDF is encrypted. Use --password <pass> or --password-file <file> to open it.\n");
             return 0;
         }
-        fprintf(stderr, "tspdf info: failed to open '%s': %s\n", input, tspdf_error_string(err));
+        if (err == TSPDF_ERR_BAD_PASSWORD)
+            fprintf(stderr, "tspdf info: wrong password for '%s'\n", input);
+        else
+            fprintf(stderr, "tspdf info: failed to open '%s': %s\n", input, tspdf_error_string(err));
         if (as_json) {
             // Machine consumers read stdout: always give them a JSON object.
             printf("{");

@@ -108,17 +108,9 @@ int cmd_stamp(int argc, char **argv) {
     }
 
     TspdfError err = TSPDF_OK;
-    TspdfReader *doc = password
-        ? tspdf_reader_open_file_with_password(input, password, &err)
-        : tspdf_reader_open_file(input, &err);
+    TspdfReader *doc = tspdf_cli_open_input("stamp", input, password,
+                                            NULL, NULL, NULL);
     if (!doc) {
-        if (err == TSPDF_ERR_ENCRYPTED) {
-            fprintf(stderr, "tspdf stamp: '%s' is encrypted; use --password or "
-                            "--password-file\n", input);
-        } else {
-            fprintf(stderr, "tspdf stamp: failed to open '%s': %s\n", input,
-                    tspdf_error_string(err));
-        }
         free(sel);
         return 1;
     }
@@ -135,17 +127,10 @@ int cmd_stamp(int argc, char **argv) {
         }
     }
 
-    TspdfReader *stamp_doc = stamp_password
-        ? tspdf_reader_open_file_with_password(stamp_path, stamp_password, &err)
-        : tspdf_reader_open_file(stamp_path, &err);
+    TspdfReader *stamp_doc = tspdf_cli_open_input("stamp", stamp_path, stamp_password,
+                                                  "--stamp-password",
+                                                  "--stamp-password-file", NULL);
     if (!stamp_doc) {
-        if (err == TSPDF_ERR_ENCRYPTED) {
-            fprintf(stderr, "tspdf stamp: '%s' is encrypted; use --stamp-password "
-                            "or --stamp-password-file\n", stamp_path);
-        } else {
-            fprintf(stderr, "tspdf stamp: failed to open '%s': %s\n", stamp_path,
-                    tspdf_error_string(err));
-        }
         tspdf_reader_destroy(doc);
         free(sel);
         return 1;

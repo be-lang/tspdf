@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdbool.h>
+#include "../include/tspdf.h"
 
 // Parse "--pages 1,3-5,7" into zero-indexed array. Caller frees. NULL on error.
 size_t *parse_page_range(const char *spec, size_t *out_count);
@@ -25,6 +26,18 @@ int collect_positional(int argc, char **argv, const char **out, int out_max);
 
 // First page index in pages[] that is >= total, or total if none is.
 size_t first_out_of_range(const size_t *pages, size_t count, size_t total);
+
+// Open `path` (with `password` when non-NULL) and report any failure on
+// stderr with the one message shape every command shares:
+//   encrypted, no password:  "tspdf CMD: 'PATH' is encrypted; use PW_FLAG or PW_FILE_FLAG"
+//   wrong password:          "tspdf CMD: wrong password for 'PATH'"
+//   anything else:           "tspdf CMD: failed to open 'PATH': <error>"
+// pw_flag/pw_file_flag may be NULL (defaults --password/--password-file);
+// stamp's second input passes its --stamp-password pair. out_err is optional.
+TspdfReader *tspdf_cli_open_input(const char *cmd, const char *path,
+                                  const char *password,
+                                  const char *pw_flag, const char *pw_file_flag,
+                                  TspdfError *out_err);
 
 // Concat a rotation by `rot` degrees CCW about (cx, cy) into a content
 // stream — compensates a page-level /Rotate so drawing reads upright as

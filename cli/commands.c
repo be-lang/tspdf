@@ -1,6 +1,7 @@
 #include "commands.h"
 #include "pipeline.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
@@ -132,4 +133,29 @@ size_t first_out_of_range(const size_t *pages, size_t count, size_t total) {
         if (pages[i] >= total) return pages[i];
     }
     return total;
+}
+
+TspdfReader *tspdf_cli_open_input(const char *cmd, const char *path,
+                                  const char *password,
+                                  const char *pw_flag, const char *pw_file_flag,
+                                  TspdfError *out_err) {
+    if (!pw_flag) pw_flag = "--password";
+    if (!pw_file_flag) pw_file_flag = "--password-file";
+    TspdfError err = TSPDF_OK;
+    TspdfReader *doc = password
+        ? tspdf_reader_open_file_with_password(path, password, &err)
+        : tspdf_reader_open_file(path, &err);
+    if (!doc) {
+        if (err == TSPDF_ERR_ENCRYPTED) {
+            fprintf(stderr, "tspdf %s: '%s' is encrypted; use %s or %s\n",
+                    cmd, path, pw_flag, pw_file_flag);
+        } else if (err == TSPDF_ERR_BAD_PASSWORD) {
+            fprintf(stderr, "tspdf %s: wrong password for '%s'\n", cmd, path);
+        } else {
+            fprintf(stderr, "tspdf %s: failed to open '%s': %s\n",
+                    cmd, path, tspdf_error_string(err));
+        }
+    }
+    if (out_err) *out_err = err;
+    return doc;
 }

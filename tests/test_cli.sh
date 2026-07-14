@@ -351,6 +351,29 @@ run_test "merge wrong password names the input it cannot unlock" bash -c "
   fi
   grep -q 'wrong password' \"$TMPDIR/pwop_m2.err\" && grep -q 'pwop_enc.pdf' \"$TMPDIR/pwop_m2.err\"
 "
+
+# --- round 4: open-error parity — every command that opens a PDF reports
+# --- "wrong password" specifically, not a generic open failure.
+$TSPDF encrypt $INPUT -o $TMPDIR/openerr_enc.pdf --password r4secret > /dev/null 2>&1
+run_test "rotate wrong password message" bash -c "
+  ! \"$TSPDF\" rotate \"$TMPDIR/openerr_enc.pdf\" --angle 90 --password nope -o \"$TMPDIR/openerr_rot.pdf\" 2> \"$TMPDIR/openerr.err\" &&
+  grep -q 'wrong password' \"$TMPDIR/openerr.err\" && grep -q 'openerr_enc.pdf' \"$TMPDIR/openerr.err\""
+run_test "attach wrong password message" bash -c "
+  ! \"$TSPDF\" attach list \"$TMPDIR/openerr_enc.pdf\" --password nope > /dev/null 2> \"$TMPDIR/openerr.err\" &&
+  grep -q 'wrong password' \"$TMPDIR/openerr.err\""
+run_test "nup wrong password message" bash -c "
+  ! \"$TSPDF\" nup 4 \"$TMPDIR/openerr_enc.pdf\" --password nope -o \"$TMPDIR/openerr_nup.pdf\" 2> \"$TMPDIR/openerr.err\" &&
+  grep -q 'wrong password' \"$TMPDIR/openerr.err\""
+run_test "form wrong password message" bash -c "
+  ! \"$TSPDF\" form list \"$TMPDIR/openerr_enc.pdf\" --password nope > /dev/null 2> \"$TMPDIR/openerr.err\" &&
+  grep -q 'wrong password' \"$TMPDIR/openerr.err\""
+run_test "stamp wrong password message" bash -c "
+  ! \"$TSPDF\" stamp \"$TMPDIR/openerr_enc.pdf\" --stamp \"$INPUT\" --password nope -o \"$TMPDIR/openerr_st.pdf\" 2> \"$TMPDIR/openerr.err\" &&
+  grep -q 'wrong password' \"$TMPDIR/openerr.err\""
+run_test "bookmark wrong password message" bash -c "
+  ! \"$TSPDF\" bookmark list \"$TMPDIR/openerr_enc.pdf\" --password nope > /dev/null 2> \"$TMPDIR/openerr.err\" &&
+  grep -q 'wrong password' \"$TMPDIR/openerr.err\""
+
 run_test "merge encrypted input without password fails with hint" bash -c "
   if \"$TSPDF\" merge \"$TMPDIR/pwop_enc.pdf\" \"$INPUT\" -o \"$TMPDIR/pwop_m3.pdf\" < /dev/null > /dev/null 2> \"$TMPDIR/pwop_m3.err\"; then
     exit 1
