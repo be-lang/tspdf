@@ -1620,6 +1620,16 @@ assert found, \"cp1252-encoded RÉSUMÉ not found in any content stream\"
     ! "$TSPDF" info "${TMPDIR}/serve_prot.pdf" --password wrongpw > /dev/null 2>&1
   '
 
+  # Pinning tests: pin current behavior of routes before the serve_edit refactor
+  run_serve_test "serve POST /api/split" bash -c "curl -sf --retry 3 --retry-delay 1 --max-time 10 -F 'pdf_file=@$INPUT' -F 'config={\"pages\":\"1-2\"}' http://localhost:${SERVE_PORT}/api/split -o $TMPDIR/serve_split.pdf && $TSPDF info $TMPDIR/serve_split.pdf | grep -q 'Pages:      2'"
+  run_serve_test "serve POST /api/delete-pages" bash -c "curl -sf --retry 3 --retry-delay 1 --max-time 10 -F 'pdf_file=@$INPUT' -F 'config={\"pages\":\"1\"}' http://localhost:${SERVE_PORT}/api/delete-pages -o $TMPDIR/serve_del.pdf && $TSPDF info $TMPDIR/serve_del.pdf | grep -q 'Pages:      2'"
+  run_serve_test "serve POST /api/rotate" bash -c "curl -sf --retry 3 --retry-delay 1 --max-time 10 -F 'pdf_file=@$INPUT' -F 'config={\"pages\":\"all\",\"angle\":\"90\"}' http://localhost:${SERVE_PORT}/api/rotate -o $TMPDIR/serve_rot.pdf && $TSPDF info $TMPDIR/serve_rot.pdf > /dev/null"
+  run_serve_test "serve POST /api/reorder" bash -c "curl -sf --retry 3 --retry-delay 1 --max-time 10 -F 'pdf_file=@$INPUT' -F 'config={\"order\":\"3,2,1\"}' http://localhost:${SERVE_PORT}/api/reorder -o $TMPDIR/serve_reord.pdf && $TSPDF info $TMPDIR/serve_reord.pdf > /dev/null"
+  $TSPDF encrypt $INPUT -o $TMPDIR/serve_enc.pdf --password srvpw > /dev/null 2>&1
+  run_serve_test "serve POST /api/unlock" bash -c "curl -sf --retry 3 --retry-delay 1 --max-time 10 -F 'pdf_file=@$TMPDIR/serve_enc.pdf' -F 'config={\"password\":\"srvpw\"}' http://localhost:${SERVE_PORT}/api/unlock -o $TMPDIR/serve_unlock.pdf && $TSPDF info $TMPDIR/serve_unlock.pdf | grep -vq 'Encrypted:.*yes'"
+  run_serve_test "serve POST /api/password-protect" bash -c "curl -sf --retry 3 --retry-delay 1 --max-time 10 -F 'pdf_file=@$INPUT' -F 'config={\"password\":\"newpw\"}' http://localhost:${SERVE_PORT}/api/password-protect -o $TMPDIR/serve_prot.pdf && $TSPDF info $TMPDIR/serve_prot.pdf | grep -q 'Encrypted:.*yes'"
+  run_serve_test "serve rotate encrypted upload with password" bash -c "curl -sf --retry 3 --retry-delay 1 --max-time 10 -F 'pdf_file=@$TMPDIR/serve_enc.pdf' -F 'config={\"pages\":\"all\",\"angle\":\"90\",\"password\":\"srvpw\"}' http://localhost:${SERVE_PORT}/api/rotate -o $TMPDIR/serve_rot_enc.pdf && $TSPDF info $TMPDIR/serve_rot_enc.pdf --password srvpw > /dev/null"
+
   kill $SERVE_PID 2>/dev/null || true
   wait $SERVE_PID 2>/dev/null || true
   # Serve failures don't fail the suite (flaky due to single-threaded server)
