@@ -23,7 +23,7 @@ printf '# tspdf wasm fixture\n\nParagraph one for the wasm gate.\n\n- item a\n- 
 # wasm shim must match (same content stream placement) when the bug is fixed.
 ./build/tspdf watermark "$OUT/fixture_rotate90.pdf" --text "ROTATE TEST" -o "$OUT/fixture_rotate90_wm_ref.pdf"
 
-node wasm/test/wasm-test.js "$OUT/fixture_a.pdf" "$OUT/fixture_b.pdf" "$OUT/fixture_rotate90.pdf" "$OUT/fixture_rotate90_wm_ref.pdf" "$OUT"
+node wasm/test/wasm-test.js "$OUT/fixture_a.pdf" "$OUT/fixture_b.pdf" "$OUT/fixture_rotate90.pdf" "$OUT/fixture_rotate90_wm_ref.pdf" tests/data/xmp_meta_full.pdf "$OUT"
 
 # Demo backend gate: lay the browser backend out next to the module the way
 # the demo site ships it (so its relative imports resolve) and drive it under
