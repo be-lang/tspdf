@@ -287,13 +287,15 @@ typedef struct TspdfFormFallback TspdfFormFallback;
 // the shared resources (FontFile streams etc.), bloating the output.
 //
 // Constraints (keys hold the source by pointer):
-//   1. The source must outlive the destination until the destination is saved
-//      — the documented derived-document rule (see the "Manipulate" section of
-//      tspr.h: "The source document must outlive the returned document unless
-//      saved first"). Corollary: if a source IS destroyed early (which the
-//      import API itself permits) and a new reader happens to be allocated at
-//      the same address, a later import from it into the same destination
-//      could alias a stale key. Acceptable under rule 1; no CLI flow does it.
+//   1. Derived docs hold a reference on their source (tspdf_reader_hold_source)
+//      so the source's actual free is deferred until the last derived doc is
+//      destroyed. The cache therefore operates on memory that stays live for the
+//      full lifetime of any destination reader. Corollary: if a source address
+//      were somehow reused (possible only if an independent reader happened to
+//      land at the same address after the source was freed and its ref count had
+//      already reached zero) a later import into the same destination could alias
+//      a stale key. This is now much harder to trigger than under the old "caller
+//      must keep source alive" rule, but the cache provides no generation guard.
 //   2. Mutating a source between imports into the same destination leaves the
 //      cached copies stale (the dedup returns the pre-mutation import). The
 //      CLI flows (nup, stamp, watermark) never mutate the source; this is a

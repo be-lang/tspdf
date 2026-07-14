@@ -4528,6 +4528,54 @@ TEST(test_derived_chain_defers_whole_chain) {
     free(pdf);
 }
 
+// Two deriveds from one source. derived_refs reaches 2 when both are live, so
+// destroying the source must stay deferred past the first derived release and
+// only actually free when the second is destroyed. The intermediate state is
+// verified by saving the remaining derived after the first is gone: if the
+// source freed too early, ASan reports a UAF on that save.
+TEST(test_derived_two_holders_source_defers_until_last_release) {
+    size_t pdf_len = 0;
+    uint8_t *pdf = dt_writer_pdf(4, false, false, "TWO", "Helvetica", &pdf_len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err = TSPDF_OK;
+    TspdfReader *src = tspdf_reader_open(pdf, pdf_len, &err);
+    ASSERT(src != NULL);
+
+    size_t pA[] = {0, 1};
+    TspdfReader *derivedA = tspdf_reader_extract(src, pA, 2, &err);
+    ASSERT(derivedA != NULL);
+
+    size_t pB[] = {2, 3};
+    TspdfReader *derivedB = tspdf_reader_extract(src, pB, 2, &err);
+    ASSERT(derivedB != NULL);
+
+    // Source has two holders (derived_refs == 2). Destroying it now must defer.
+    tspdf_reader_destroy(src);
+
+    // Release the first holder — refs drop to 1, source must still be alive.
+    tspdf_reader_destroy(derivedA);
+
+    // Save derivedB: it still aliases the (deferred) source memory. A UAF would
+    // show up here under ASan if the source freed when derivedA was released.
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(derivedB, &out, &out_len);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(out_len > 0);
+
+    TspdfReader *re = tspdf_reader_open(out, out_len, &err);
+    ASSERT(re != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(re), 2);
+    tspdf_reader_destroy(re);
+    free(out);
+
+    // Releasing the last holder must trigger the deferred free of the source.
+    // ASan's leak checker confirms nothing is orphaned.
+    tspdf_reader_destroy(derivedB);
+    free(pdf);
+}
+
 // The deferred-free path must not leak when the derived doc is released while
 // the source is still alive (source outlives derived — the ordinary order).
 // Destroying the source afterward frees immediately (refcount already 0).
@@ -4665,5 +4713,6 @@ void run_docops_tests(void) {
     printf("\n  Derived-document lifetime:\n");
     RUN(test_derived_survives_source_destroy_before_save);
     RUN(test_derived_chain_defers_whole_chain);
+    RUN(test_derived_two_holders_source_defers_until_last_release);
     RUN(test_derived_release_first_then_source);
 }

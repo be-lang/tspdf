@@ -499,8 +499,8 @@ void tspdf_reader_destroy(TspdfReader *doc) {
 
     // Caller-visible semantics are unchanged: the handle is dead now. But if
     // live derived docs still alias this doc's memory, defer the actual free
-    // until the last of them is released (see reader_free). Idempotent against
-    // a repeated destroy on the same already-pending handle.
+    // until the last of them is released (see reader_free). Only call destroy
+    // once per handle; a second call on an already-pending doc is undefined.
     if (doc->derived_refs > 0) {
         doc->destroy_pending = true;
         return;
