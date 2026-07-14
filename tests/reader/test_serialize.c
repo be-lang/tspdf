@@ -1435,6 +1435,377 @@ TEST(test_streamplan_lossy_filter_keeps) {
     ASSERT_EQ_INT(p.action, TSPDF_STREAM_KEEP);
 }
 
+/* --- Crypt-adapter seam (r3 task A) -------------------------------------
+ * The one serializer emits strings, stream payloads, the /Encrypt dict, and
+ * the trailer /ID through a TspdfCryptAdapter. The identity adapter is the
+ * plain save; the crypt adapter encrypts with the per-object key. These
+ * matrix tests pin the seam at byte level: the pinned vectors are the exact
+ * bytes the pre-unification encrypted path emitted. */
+
+static TspdfCrypt ca_rc4_crypt(void) {
+    TspdfCrypt c = {0};
+    const uint8_t key[5] = {0x01, 0x23, 0x45, 0x67, 0x89};
+    memcpy(c.file_key, key, sizeof(key));
+    c.key_len = 5;
+    c.version = 2;
+    c.revision = 3;
+    c.use_aes = false;
+    c.encrypt_metadata = true;
+    return c;
+}
+
+TEST(test_cryptadapter_identity_string_is_escaped_literal) {
+    TspdfCryptAdapter ad = tspr_crypt_adapter_identity();
+    ASSERT(ad.crypt == NULL);
+
+    TspdfBuffer buf = tspdf_buffer_create(64);
+    TspdfBuffer ref = tspdf_buffer_create(64);
+    const uint8_t s[] = "He(l\\l)o";
+    ad.write_string(&ad, &buf, s, sizeof(s) - 1, 7, 0);
+    tspr_write_string_escaped(&ref, s, sizeof(s) - 1);
+
+    ASSERT_EQ_SIZE(buf.len, ref.len);
+    ASSERT(memcmp(buf.data, ref.data, buf.len) == 0);
+    tspdf_buffer_destroy(&buf);
+    tspdf_buffer_destroy(&ref);
+}
+
+TEST(test_cryptadapter_identity_stream_untouched) {
+    TspdfCryptAdapter ad = tspr_crypt_adapter_identity();
+    TspdfObj dict = sp_dict(NULL, 0);
+    TspdfObj stm = sp_stream(&dict);
+    size_t out_len = 123;
+    uint8_t *out = ad.transform_stream(&ad, &stm, 9, 0,
+                                       (const uint8_t *)"stream-bytes", 12, &out_len);
+    // NULL means "use the input unchanged" — the plain writer never copies.
+    ASSERT(out == NULL);
+    // The identity adapter contributes no /Encrypt object and no trailer /ID.
+    ASSERT(ad.emit_encrypt_dict == NULL);
+    ASSERT(ad.emit_trailer_id == NULL);
+}
+
+TEST(test_cryptadapter_rc4_string_pinned) {
+    TspdfCrypt c = ca_rc4_crypt();
+    TspdfCryptAdapter ad = tspr_crypt_adapter_encrypt(&c);
+    ASSERT(ad.crypt == &c);
+
+    TspdfBuffer buf = tspdf_buffer_create(64);
+    ad.write_string(&ad, &buf, (const uint8_t *)"Hello", 5, 7, 0);
+    // RC4 with the object key derived for obj 7 gen 0 from the 40-bit file
+    // key 0123456789, hex-encoded — byte-for-byte what the old path wrote.
+    ASSERT_EQ_SIZE(buf.len, strlen("<3740C3E979>"));
+    ASSERT(memcmp(buf.data, "<3740C3E979>", buf.len) == 0);
+    tspdf_buffer_destroy(&buf);
+}
+
+TEST(test_cryptadapter_rc4_string_key_is_per_object) {
+    TspdfCrypt c = ca_rc4_crypt();
+    TspdfCryptAdapter ad = tspr_crypt_adapter_encrypt(&c);
+
+    TspdfBuffer b7 = tspdf_buffer_create(64);
+    TspdfBuffer b8 = tspdf_buffer_create(64);
+    ad.write_string(&ad, &b7, (const uint8_t *)"Hello", 5, 7, 0);
+    ad.write_string(&ad, &b8, (const uint8_t *)"Hello", 5, 8, 0);
+    // Same plaintext, different object number: different object key.
+    ASSERT(b7.len == b8.len && memcmp(b7.data, b8.data, b7.len) != 0);
+    tspdf_buffer_destroy(&b7);
+    tspdf_buffer_destroy(&b8);
+}
+
+static int ca_hex_nibble(uint8_t c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+
+TEST(test_cryptadapter_aes_string_roundtrips) {
+    TspdfCrypt c = {0};
+    for (int i = 0; i < 16; i++) c.file_key[i] = (uint8_t)i;
+    c.key_len = 16;
+    c.version = 4;
+    c.revision = 4;
+    c.use_aes = true;
+    c.encrypt_metadata = true;
+
+    TspdfCryptAdapter ad = tspr_crypt_adapter_encrypt(&c);
+    TspdfBuffer buf = tspdf_buffer_create(128);
+    const uint8_t plain[] = "Secret title";
+    ad.write_string(&ad, &buf, plain, sizeof(plain) - 1, 12, 0);
+
+    // A hex string <...> whose ciphertext decrypts back with the same key.
+    ASSERT(buf.len >= 2 && buf.data[0] == '<' && buf.data[buf.len - 1] == '>');
+    uint8_t raw[128];
+    size_t raw_len = 0;
+    for (size_t i = 1; i + 1 < buf.len; i += 2) {
+        int hi = ca_hex_nibble(buf.data[i]), lo = ca_hex_nibble(buf.data[i + 1]);
+        ASSERT(hi >= 0 && lo >= 0);
+        raw[raw_len++] = (uint8_t)((hi << 4) | lo);
+    }
+    // AES-CBC: 16-byte IV plus at least one padded block.
+    ASSERT(raw_len >= 32);
+    size_t dec_len = raw_len;
+    ASSERT_EQ_INT(tspdf_crypt_decrypt_string(&c, 12, 0, raw, &dec_len), TSPDF_OK);
+    ASSERT_EQ_SIZE(dec_len, sizeof(plain) - 1);
+    ASSERT(memcmp(raw, plain, dec_len) == 0);
+    tspdf_buffer_destroy(&buf);
+}
+
+TEST(test_cryptadapter_rc4_stream_pinned) {
+    TspdfCrypt c = ca_rc4_crypt();
+    TspdfCryptAdapter ad = tspr_crypt_adapter_encrypt(&c);
+    TspdfObj dict = sp_dict(NULL, 0);
+    TspdfObj stm = sp_stream(&dict);
+
+    size_t out_len = 0;
+    uint8_t *out = ad.transform_stream(&ad, &stm, 9, 0,
+                                       (const uint8_t *)"stream-bytes", 12, &out_len);
+    ASSERT(out != NULL);
+    // RC4 keystream for obj 9 gen 0 over "stream-bytes" (pinned vector).
+    const uint8_t expect[12] = {0xEC, 0xA5, 0xCC, 0x98, 0xF2, 0xBE,
+                                0x54, 0x1A, 0x9B, 0xAA, 0x6D, 0x71};
+    ASSERT_EQ_SIZE(out_len, sizeof(expect));
+    ASSERT(memcmp(out, expect, sizeof(expect)) == 0);
+    free(out);
+}
+
+TEST(test_cryptadapter_stream_metadata_exemption) {
+    // /EncryptMetadata false: the XMP metadata stream is stored in the clear
+    // (ISO 32000 §7.6.3.2), so the adapter must leave it untouched.
+    TspdfCrypt c = ca_rc4_crypt();
+    c.encrypt_metadata = false;
+    TspdfCryptAdapter ad = tspr_crypt_adapter_encrypt(&c);
+
+    TspdfObj mtype = sp_name("Metadata");
+    TspdfDictEntry e[] = {{ (char *)"Type", &mtype }};
+    TspdfObj dict = sp_dict(e, 1);
+    TspdfObj stm = sp_stream(&dict);
+
+    size_t out_len = 0;
+    uint8_t *out = ad.transform_stream(&ad, &stm, 9, 0,
+                                       (const uint8_t *)"<xml/>", 6, &out_len);
+    ASSERT(out == NULL);
+
+    // With /EncryptMetadata true the same stream IS encrypted.
+    c.encrypt_metadata = true;
+    out = ad.transform_stream(&ad, &stm, 9, 0, (const uint8_t *)"<xml/>", 6, &out_len);
+    ASSERT(out != NULL);
+    ASSERT_EQ_SIZE(out_len, 6);
+    free(out);
+}
+
+TEST(test_cryptadapter_encrypt_dict_v4_pinned) {
+    TspdfCrypt c = {0};
+    c.version = 4;
+    c.revision = 4;
+    c.use_aes = true;
+    c.key_len = 16;
+    c.O_len = 32;
+    c.U_len = 32;
+    for (int i = 0; i < 32; i++) c.O[i] = (uint8_t)i;
+    for (int i = 0; i < 32; i++) c.U[i] = (uint8_t)(0x40 + i);
+    c.permissions = 0xFFFFF0C0u;  /* -3904 as int32 */
+
+    TspdfCryptAdapter ad = tspr_crypt_adapter_encrypt(&c);
+    ASSERT(ad.emit_encrypt_dict != NULL);
+    TspdfBuffer buf = tspdf_buffer_create(512);
+    ad.emit_encrypt_dict(&ad, &buf, NULL, NULL);
+
+    const char *expect =
+        "<< /Filter /Standard /V 4 /R 4 /Length 128"
+        " /CF << /StdCF << /CFM /AESV2 /Length 16 /AuthEvent /DocOpen >> >>"
+        " /StmF /StdCF /StrF /StdCF"
+        " /O <000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F>"
+        " /U <404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F>"
+        " /P -3904 >>";
+    ASSERT_EQ_SIZE(buf.len, strlen(expect));
+    ASSERT(memcmp(buf.data, expect, buf.len) == 0);
+    tspdf_buffer_destroy(&buf);
+}
+
+TEST(test_cryptadapter_encrypt_dict_v5_pinned) {
+    TspdfCrypt c = {0};
+    c.version = 5;
+    c.revision = 6;
+    c.use_aes = true;
+    c.key_len = 32;
+    c.O_len = 48;
+    c.U_len = 48;
+    memset(c.O, 0x11, 48);
+    memset(c.U, 0x22, 48);
+    memset(c.OE, 0x33, 32);
+    memset(c.UE, 0x44, 32);
+    memset(c.Perms, 0x55, 16);
+    c.permissions = 0xFFFFFFFCu;  /* -4 as int32 */
+
+    TspdfCryptAdapter ad = tspr_crypt_adapter_encrypt(&c);
+    TspdfBuffer buf = tspdf_buffer_create(1024);
+    ad.emit_encrypt_dict(&ad, &buf, NULL, NULL);
+
+    const char *expect =
+        "<< /Filter /Standard /V 5 /R 6 /Length 256"
+        " /CF << /StdCF << /CFM /AESV3 /Length 32 /AuthEvent /DocOpen >> >>"
+        " /StmF /StdCF /StrF /StdCF"
+        " /O <111111111111111111111111111111111111111111111111"
+        "111111111111111111111111111111111111111111111111>"
+        " /U <222222222222222222222222222222222222222222222222"
+        "222222222222222222222222222222222222222222222222>"
+        " /OE <3333333333333333333333333333333333333333333333333333333333333333>"
+        " /UE <4444444444444444444444444444444444444444444444444444444444444444>"
+        " /Perms <55555555555555555555555555555555>"
+        " /P -4 >>";
+    ASSERT_EQ_SIZE(buf.len, strlen(expect));
+    ASSERT(memcmp(buf.data, expect, buf.len) == 0);
+    tspdf_buffer_destroy(&buf);
+}
+
+TEST(test_cryptadapter_encrypt_dict_preserves_source) {
+    // A crypt opened from an existing file carries the source /Encrypt dict;
+    // the adapter must copy it verbatim, strings as raw hex (never object-key
+    // encrypted — the one dict the spec exempts).
+    TspdfObj vnum = {0};
+    vnum.type = TSPDF_OBJ_INT;
+    vnum.integer = 2;
+    TspdfObj ostr = {0};
+    ostr.type = TSPDF_OBJ_STRING;
+    ostr.string.data = (uint8_t *)"\x01\xFF";
+    ostr.string.len = 2;
+    TspdfObj fname = sp_name("Standard");
+    TspdfDictEntry e[] = {
+        { (char *)"Filter", &fname },
+        { (char *)"V", &vnum },
+        { (char *)"O", &ostr },
+    };
+    TspdfObj src = sp_dict(e, 3);
+
+    TspdfCrypt c = ca_rc4_crypt();
+    c.src_encrypt_dict = &src;
+
+    TspdfCryptAdapter ad = tspr_crypt_adapter_encrypt(&c);
+    TspdfBuffer buf = tspdf_buffer_create(128);
+    ad.emit_encrypt_dict(&ad, &buf, NULL, NULL);
+
+    const char *expect = "<< /Filter /Standard /V 2 /O <01FF> >>";
+    ASSERT_EQ_SIZE(buf.len, strlen(expect));
+    ASSERT(memcmp(buf.data, expect, buf.len) == 0);
+    tspdf_buffer_destroy(&buf);
+}
+
+TEST(test_cryptadapter_trailer_id_pinned) {
+    uint8_t fid[16];
+    for (int i = 0; i < 16; i++) fid[i] = (uint8_t)(0xA0 + i);
+    TspdfCrypt c = ca_rc4_crypt();
+    c.file_id = fid;
+    c.file_id_len = sizeof(fid);
+
+    TspdfCryptAdapter ad = tspr_crypt_adapter_encrypt(&c);
+    ASSERT(ad.emit_trailer_id != NULL);
+    TspdfBuffer buf = tspdf_buffer_create(256);
+    tspdf_buffer_append_str(&buf, "seed");
+    ad.emit_trailer_id(&ad, &buf);
+
+    // First ID string: the crypt file id verbatim. Second: MD5 of the bytes
+    // serialized so far ("seed"), so equal content stays byte-identical.
+    uint8_t digest[16];
+    md5_hash((const uint8_t *)"seed", 4, digest);
+    char expect[256];
+    size_t pos = 0;
+    pos += (size_t)snprintf(expect + pos, sizeof(expect) - pos, "seed<");
+    for (int i = 0; i < 16; i++)
+        pos += (size_t)snprintf(expect + pos, sizeof(expect) - pos, "%02X", fid[i]);
+    pos += (size_t)snprintf(expect + pos, sizeof(expect) - pos, "> <");
+    for (int i = 0; i < 16; i++)
+        pos += (size_t)snprintf(expect + pos, sizeof(expect) - pos, "%02X", digest[i]);
+    pos += (size_t)snprintf(expect + pos, sizeof(expect) - pos, ">");
+
+    ASSERT_EQ_SIZE(buf.len, pos);
+    ASSERT(memcmp(buf.data, expect, buf.len) == 0);
+    tspdf_buffer_destroy(&buf);
+}
+
+TEST(test_encrypted_save_ignores_size_options) {
+    // Difference pin: encrypted saves ignore the size-focused save options.
+    // recompress_streams / use_xref_stream must not trigger ObjStm packing or
+    // an xref stream when the (classic) input didn't use object streams.
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/one_page.pdf", &err);
+    ASSERT(doc != NULL);
+    uint8_t *enc = NULL;
+    size_t enc_len = 0;
+    err = tspdf_reader_save_to_memory_encrypted(doc, &enc, &enc_len,
+                                                "pw", "pw", 0xFFFFFFFC, 128);
+    tspdf_reader_destroy(doc);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    TspdfReader *opened = tspdf_reader_open_with_password(enc, enc_len, "pw", &err);
+    ASSERT(opened != NULL);
+    TspdfSaveOptions opts = tspdf_save_options_default();
+    opts.recompress_streams = true;
+    opts.use_xref_stream = true;
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory_with_options(opened, &out, &out_len, &opts);
+    tspdf_reader_destroy(opened);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+
+    ASSERT(bytes_contains(out, out_len, "/Encrypt "));
+    ASSERT(!bytes_contains(out, out_len, "/Type /ObjStm"));
+    ASSERT(!bytes_contains(out, out_len, "/Type /XRef"));
+    ASSERT(bytes_contains(out, out_len, "xref\n0 "));
+
+    TspdfReader *reopened = tspdf_reader_open_with_password(out, out_len, "pw", &err);
+    ASSERT(reopened != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(reopened), 1);
+    tspdf_reader_destroy(reopened);
+    free(out);
+    free(enc);
+}
+
+TEST(test_encrypted_save_repacks_objstm_input) {
+    // Difference pin: an encrypted save DOES pack object streams when the
+    // input stored objects that way (preserve-style rule, shared with plain).
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open_file("tests/data/one_page.pdf", &err);
+    ASSERT(doc != NULL);
+    TspdfSaveOptions opts = tspdf_save_options_default();
+    opts.recompress_streams = true;  // packs into ObjStm
+    uint8_t *packed = NULL;
+    size_t packed_len = 0;
+    err = tspdf_reader_save_to_memory_with_options(doc, &packed, &packed_len, &opts);
+    tspdf_reader_destroy(doc);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(bytes_contains(packed, packed_len, "/Type /ObjStm"));
+
+    TspdfReader *pdoc = tspdf_reader_open(packed, packed_len, &err);
+    ASSERT(pdoc != NULL);
+    uint8_t *enc = NULL;
+    size_t enc_len = 0;
+    err = tspdf_reader_save_to_memory_encrypted(pdoc, &enc, &enc_len,
+                                                "pw", "pw", 0xFFFFFFFC, 128);
+    tspdf_reader_destroy(pdoc);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(bytes_contains(enc, enc_len, "/Type /ObjStm"));
+    ASSERT(bytes_contains(enc, enc_len, "/Type /XRef"));
+
+    // And the preserved-encryption resave keeps packing.
+    TspdfReader *opened = tspdf_reader_open_with_password(enc, enc_len, "pw", &err);
+    ASSERT(opened != NULL);
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    err = tspdf_reader_save_to_memory(opened, &out, &out_len);
+    tspdf_reader_destroy(opened);
+    ASSERT_EQ_INT(err, TSPDF_OK);
+    ASSERT(bytes_contains(out, out_len, "/Type /ObjStm"));
+
+    TspdfReader *reopened = tspdf_reader_open_with_password(out, out_len, "pw", &err);
+    ASSERT(reopened != NULL);
+    ASSERT_EQ_SIZE(tspdf_reader_page_count(reopened), 1);
+    tspdf_reader_destroy(reopened);
+    free(out);
+    free(enc);
+    free(packed);
+}
+
 void run_serialize_tests(void) {
     printf("\n  Serialization:\n");
     RUN(test_round_trip_save_reopen);
@@ -1496,4 +1867,19 @@ void run_serialize_tests(void) {
     RUN(test_streamplan_armor_indirect_decodeparms_refuses);
     RUN(test_streamplan_armor_indirect_decodeparms_array_refuses);
     RUN(test_streamplan_lossy_filter_keeps);
+
+    printf("\n  Crypt adapter seam:\n");
+    RUN(test_cryptadapter_identity_string_is_escaped_literal);
+    RUN(test_cryptadapter_identity_stream_untouched);
+    RUN(test_cryptadapter_rc4_string_pinned);
+    RUN(test_cryptadapter_rc4_string_key_is_per_object);
+    RUN(test_cryptadapter_aes_string_roundtrips);
+    RUN(test_cryptadapter_rc4_stream_pinned);
+    RUN(test_cryptadapter_stream_metadata_exemption);
+    RUN(test_cryptadapter_encrypt_dict_v4_pinned);
+    RUN(test_cryptadapter_encrypt_dict_v5_pinned);
+    RUN(test_cryptadapter_encrypt_dict_preserves_source);
+    RUN(test_cryptadapter_trailer_id_pinned);
+    RUN(test_encrypted_save_ignores_size_options);
+    RUN(test_encrypted_save_repacks_objstm_input);
 }

@@ -104,8 +104,15 @@ bool tspdf_reader_has_outlines(const TspdfReader *doc);
 bool tspdf_reader_has_acroform(const TspdfReader *doc);
 
 // Manipulate (returns new document, source unchanged).
-// The source document must outlive the returned document unless saved first,
-// because the returned document references the source's stream data.
+// The returned document references the source's stream data, so it is not
+// self-contained until saved. The recommended order is still save-then-destroy
+// the source. But destroying the source early is now defended: the library
+// holds an internal reference from the derived document to its source, so
+// tspdf_reader_destroy on a source with live derived documents defers the
+// actual free until the last derived document is destroyed. The source handle
+// is dead to the caller the instant destroy returns (its memory lifetime is the
+// library's own business); the derived document can still be saved afterward.
+// Chains (a derived document of a derived document) release up the chain.
 // Merge copies stream data, so merged documents are self-contained.
 TspdfReader *tspdf_reader_extract(TspdfReader *doc, const size_t *pages, size_t count, TspdfError *err);
 TspdfReader *tspdf_reader_delete(TspdfReader *doc, const size_t *pages, size_t count, TspdfError *err);

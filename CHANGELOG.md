@@ -7,6 +7,29 @@ on 0.x, the CLI is considered stable but the low-level C API may still change.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-07-14
+
+### Fixed
+- Destroying a source reader before saving a document derived from it
+  (extract/delete/rotate/reorder/crop/scale/resize/n-up, which alias the
+  source's data until saved) is no longer a use-after-free: the library holds
+  an internal reference from the derived document to its source and defers the
+  source's free until the last derived document is destroyed. This covers
+  sources opened from caller-owned memory buffers too — the library takes a
+  private copy of the buffer when the first derived document is created, so
+  the buffer may be freed as soon as the source handle is destroyed. The
+  source handle is still dead to the caller the moment `tspdf_reader_destroy`
+  returns; only the memory lifetime is deferred. Save-then-destroy remains
+  the recommended order.
+- Web-demo metadata edits now update the XMP packet (previously the wasm shim
+  called Info setters directly without syncing the XMP stream, leaving the
+  packet stale for viewers that prefer XMP over the Info dictionary).
+
+### Internal
+- The encrypted save path is no longer a separate serializer: one save
+  pipeline with encryption behind a small adapter seam, byte-identical
+  output. Save-path fixes now land in one place.
+
 ## [0.5.0] - 2026-07-14
 
 ### Changed
