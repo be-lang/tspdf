@@ -7,6 +7,11 @@ on 0.x, the CLI is considered stable but the low-level C API may still change.
 
 ## [Unreleased]
 
+### Fixed
+- Web-demo metadata edits now update the XMP packet (previously the wasm shim
+  called Info setters directly without syncing the XMP stream, leaving the
+  packet stale for viewers that prefer XMP over the Info dictionary).
+
 ## [0.5.0] - 2026-07-14
 
 ### Changed

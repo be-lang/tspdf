@@ -2,6 +2,7 @@
 
 #include "../../include/tspdf_overlay.h"
 #include "../util/pdftext.h"
+#include "../reader/tspr.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -131,6 +132,7 @@ bool tsops_metadata_set(TspdfReader *doc, const char *key, size_t key_len,
         if (strlen(fields[i].name) == key_len &&
             strncmp(key, fields[i].name, key_len) == 0) {
             fields[i].set(doc, value);
+            tspdf_reader_sync_xmp_metadata(doc);
             return true;
         }
     }

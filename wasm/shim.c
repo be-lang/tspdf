@@ -285,7 +285,9 @@ WASM_EXPORT uint8_t *tspdf_wasm_watermark_text(int h, const char *text,
 }
 
 // Metadata setters: NULL leaves a field unchanged (pass "" to clear it, as
-// the web UI does). Mutates the handle's document, then saves it.
+// the web UI does). Mutates the handle's document (including the XMP packet
+// when present), then saves it. Delegates to tsops_metadata_set so XMP sync
+// is guaranteed — the same path the CLI and server take.
 WASM_EXPORT uint8_t *tspdf_wasm_set_metadata(int h, const char *title,
                                              const char *author,
                                              const char *subject,
@@ -293,10 +295,10 @@ WASM_EXPORT uint8_t *tspdf_wasm_set_metadata(int h, const char *title,
                                              uint32_t *out_len) {
     TspdfReader *doc = wasm_get(h);
     if (!doc) return NULL;
-    if (title) tspdf_reader_set_title(doc, title);
-    if (author) tspdf_reader_set_author(doc, author);
-    if (subject) tspdf_reader_set_subject(doc, subject);
-    if (keywords) tspdf_reader_set_keywords(doc, keywords);
+    if (title)    tsops_metadata_set(doc, "title",    5, title);
+    if (author)   tsops_metadata_set(doc, "author",   6, author);
+    if (subject)  tsops_metadata_set(doc, "subject",  7, subject);
+    if (keywords) tsops_metadata_set(doc, "keywords", 8, keywords);
     return wasm_save_doc(doc, out_len);
 }
 

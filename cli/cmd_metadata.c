@@ -78,27 +78,6 @@ static int run(TspdfCmdCtx *ctx) {
         }
     }
 
-    // Apply the edits to the XMP packet too — some viewers (Acrobat) prefer
-    // XMP over /Info. Fields the packet cannot take (property absent, or a
-    // packet we cannot edit safely) stay stale there; say so once on stderr.
-    unsigned stale = tspdf_reader_sync_xmp_metadata(doc);
-    if (stale) {
-        static const struct { unsigned bit; const char *name; } xmp_fields[] = {
-            {TSPDF_XMP_TITLE, "title"},       {TSPDF_XMP_AUTHOR, "author"},
-            {TSPDF_XMP_SUBJECT, "subject"},   {TSPDF_XMP_KEYWORDS, "keywords"},
-            {TSPDF_XMP_CREATOR, "creator"},   {TSPDF_XMP_PRODUCER, "producer"},
-        };
-        fprintf(stderr, "note: XMP metadata present but not updated for");
-        const char *sep = " ";
-        for (size_t i = 0; i < sizeof(xmp_fields) / sizeof(xmp_fields[0]); i++) {
-            if (stale & xmp_fields[i].bit) {
-                fprintf(stderr, "%s%s", sep, xmp_fields[i].name);
-                sep = ", ";
-            }
-        }
-        fprintf(stderr, "; viewers preferring XMP may show old values\n");
-    }
-
     err = tspdf_reader_save(doc, output);
     if (err != TSPDF_OK) {
         fprintf(stderr, "tspdf metadata: failed to save '%s': %s\n", output, tspdf_error_string(err));

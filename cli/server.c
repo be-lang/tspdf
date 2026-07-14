@@ -1547,9 +1547,6 @@ static void api_metadata(int fd, MultipartForm *form)
             if (json_get_string(config_buf, keys[k], val, sizeof(val)) == 0)
                 tsops_metadata_set(doc, keys[k], strlen(keys[k]), val);
         }
-        // Keep any XMP packet in step with the Info edits (best effort;
-        // fields the packet does not carry simply stay as they were).
-        tspdf_reader_sync_xmp_metadata(doc);
     }
 
     uint8_t *out = NULL;
