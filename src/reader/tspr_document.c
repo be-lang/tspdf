@@ -488,8 +488,29 @@ static void reader_free(TspdfReader *doc) {
 // by the derived-document constructors (create_doc_from_pages, nup) after the
 // derived reader is fully built and cannot fail. Passing a NULL source (a merge
 // output has none) leaves the derived doc self-contained.
+//
+// Data-buffer ownership: if the source was opened against a caller-owned buffer
+// (owns_data == false), the caller may free that buffer any time after
+// tspdf_reader_destroy(source) returns. But derived docs alias source->data and
+// read it during serialization. To close this gap, we take a malloc copy of the
+// buffer and transfer ownership to the source here, so reader_free (which runs
+// after the last derived doc is released) frees the copy. derived->data is
+// updated to point at the same copy. If the malloc fails we leave both pointing
+// at the caller's buffer — the caller must then keep it live until after saving
+// (same discipline as the old "caller keeps source alive" rule).
 void tspdf_reader_hold_source(TspdfReader *derived, TspdfReader *source) {
     if (!derived || !source) return;
+
+    if (!source->owns_data && source->data && source->data_len > 0) {
+        uint8_t *copy = (uint8_t *)malloc(source->data_len);
+        if (copy) {
+            memcpy(copy, source->data, source->data_len);
+            source->data = copy;
+            source->owns_data = true;
+            derived->data = copy;
+        }
+    }
+
     derived->derived_source = source;
     source->derived_refs++;
 }

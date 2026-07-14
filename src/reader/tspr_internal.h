@@ -334,15 +334,17 @@ typedef struct TspdfFormFallback TspdfFormFallback;
 // the shared resources (FontFile streams etc.), bloating the output.
 //
 // Constraints (keys hold the source by pointer):
-//   1. Derived docs hold a reference on their source (tspdf_reader_hold_source)
-//      so the source's actual free is deferred until the last derived doc is
-//      destroyed. The cache therefore operates on memory that stays live for the
-//      full lifetime of any destination reader. Corollary: if a source address
-//      were somehow reused (possible only if an independent reader happened to
-//      land at the same address after the source was freed and its ref count had
-//      already reached zero) a later import into the same destination could alias
-//      a stale key. This is now much harder to trigger than under the old "caller
-//      must keep source alive" rule, but the cache provides no generation guard.
+//   1. Structural derived sources (tspdf_reader_extract, nup, page-subset ops)
+//      hold a reference via tspdf_reader_hold_source, so their arena stays live
+//      until the last derived doc is destroyed — the cache keys remain valid for
+//      those sources without any caller discipline. Independent import sources
+//      (stamp, watermark, or any overlay PDF imported via
+//      tspdf_reader_import_page_xobject into an otherwise unrelated destination)
+//      take no such hold; the caller must keep them live for the full duration of
+//      all imports into that destination. Corollary: if an independent source
+//      address were reused after it was freed, a later import into the same
+//      destination could alias a stale cache key. The cache provides no generation
+//      guard against this; it is a documented constraint of the import API.
 //   2. Mutating a source between imports into the same destination leaves the
 //      cached copies stale (the dedup returns the pre-mutation import). The
 //      CLI flows (nup, stamp, watermark) never mutate the source; this is a
