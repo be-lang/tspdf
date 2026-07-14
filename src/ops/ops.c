@@ -115,7 +115,7 @@ TspdfError tsops_watermark_text(TspdfReader *doc,
 }
 
 bool tsops_metadata_set(TspdfReader *doc, const char *key, size_t key_len,
-                        const char *value)
+                        const char *value, unsigned *xmp_stale)
 {
     static const struct {
         const char *name;
@@ -132,7 +132,10 @@ bool tsops_metadata_set(TspdfReader *doc, const char *key, size_t key_len,
         if (strlen(fields[i].name) == key_len &&
             strncmp(key, fields[i].name, key_len) == 0) {
             fields[i].set(doc, value);
-            tspdf_reader_sync_xmp_metadata(doc);
+            // Per-field-set sync cost: N sets = N syncs; each is idempotent
+            // and the final saved state is correct. Minor redundant cost only.
+            unsigned stale = tspdf_reader_sync_xmp_metadata(doc);
+            if (xmp_stale) *xmp_stale |= stale;
             return true;
         }
     }

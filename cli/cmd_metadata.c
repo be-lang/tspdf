@@ -2,6 +2,7 @@
 #include "pipeline.h"
 #include "../src/ops/ops.h"
 #include "../include/tspdf.h"
+#include "../src/reader/tspr.h"
 #include "../src/util/pdfdate.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,6 +57,8 @@ static int run(TspdfCmdCtx *ctx) {
         return 1;
     }
 
+    unsigned xmp_stale = 0;
+
     for (int i = 0; i < nsets; i++) {
         const char *eq = strchr(sets[i], '=');
         if (!eq) {
@@ -63,7 +66,7 @@ static int run(TspdfCmdCtx *ctx) {
             return 1;
         }
         size_t key_len = (size_t)(eq - sets[i]);
-        if (!tsops_metadata_set(doc, sets[i], key_len, eq + 1)) {
+        if (!tsops_metadata_set(doc, sets[i], key_len, eq + 1, &xmp_stale)) {
             fprintf(stderr, "tspdf metadata: unknown key '%.*s'\n", (int)key_len, sets[i]);
             return 1;
         }
@@ -72,10 +75,30 @@ static int run(TspdfCmdCtx *ctx) {
     // Clearing passes NULL through the setter: the serializer sees the
     // field as overridden-with-nothing and omits it from the Info dict.
     for (int i = 0; i < nclears; i++) {
-        if (!tsops_metadata_set(doc, clears[i], strlen(clears[i]), NULL)) {
+        if (!tsops_metadata_set(doc, clears[i], strlen(clears[i]), NULL, &xmp_stale)) {
             fprintf(stderr, "tspdf metadata: unknown key '%s'\n", clears[i]);
             return 1;
         }
+    }
+
+    // Apply the edits to the XMP packet too — some viewers (Acrobat) prefer
+    // XMP over /Info. Fields the packet cannot take (property absent, or a
+    // packet we cannot edit safely) stay stale there; say so once on stderr.
+    if (xmp_stale) {
+        static const struct { unsigned bit; const char *name; } xmp_fields[] = {
+            {TSPDF_XMP_TITLE, "title"},       {TSPDF_XMP_AUTHOR, "author"},
+            {TSPDF_XMP_SUBJECT, "subject"},   {TSPDF_XMP_KEYWORDS, "keywords"},
+            {TSPDF_XMP_CREATOR, "creator"},   {TSPDF_XMP_PRODUCER, "producer"},
+        };
+        fprintf(stderr, "note: XMP metadata present but not updated for");
+        const char *sep = " ";
+        for (size_t i = 0; i < sizeof(xmp_fields) / sizeof(xmp_fields[0]); i++) {
+            if (xmp_stale & xmp_fields[i].bit) {
+                fprintf(stderr, "%s%s", sep, xmp_fields[i].name);
+                sep = ", ";
+            }
+        }
+        fprintf(stderr, "; viewers preferring XMP may show old values\n");
     }
 
     err = tspdf_reader_save(doc, output);

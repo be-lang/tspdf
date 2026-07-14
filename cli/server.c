@@ -1545,7 +1545,7 @@ static void api_metadata(int fd, MultipartForm *form)
         char val[512];
         for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
             if (json_get_string(config_buf, keys[k], val, sizeof(val)) == 0)
-                tsops_metadata_set(doc, keys[k], strlen(keys[k]), val);
+                tsops_metadata_set(doc, keys[k], strlen(keys[k]), val, NULL);
         }
     }
 

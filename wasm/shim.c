@@ -295,10 +295,10 @@ WASM_EXPORT uint8_t *tspdf_wasm_set_metadata(int h, const char *title,
                                              uint32_t *out_len) {
     TspdfReader *doc = wasm_get(h);
     if (!doc) return NULL;
-    if (title)    tsops_metadata_set(doc, "title",    5, title);
-    if (author)   tsops_metadata_set(doc, "author",   6, author);
-    if (subject)  tsops_metadata_set(doc, "subject",  7, subject);
-    if (keywords) tsops_metadata_set(doc, "keywords", 8, keywords);
+    if (title)    tsops_metadata_set(doc, "title",    5, title,    NULL);
+    if (author)   tsops_metadata_set(doc, "author",   6, author,   NULL);
+    if (subject)  tsops_metadata_set(doc, "subject",  7, subject,  NULL);
+    if (keywords) tsops_metadata_set(doc, "keywords", 8, keywords, NULL);
     return wasm_save_doc(doc, out_len);
 }
 

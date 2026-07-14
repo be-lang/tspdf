@@ -542,6 +542,57 @@ else
   echo "  SKIP  XMP objstm/encrypted sync assertions (qpdf not found)"
 fi
 
+# Pin test: stale-XMP notice appears when the XMP packet is present but not
+# editable (UTF-16 BOM in <?xpacket begin=...> — not the UTF-8 BOM tspdf
+# accepts). The Info /Title is set; the XMP packet cannot be rewritten; the
+# notice names "title" on stderr. (RED without the xmp_stale out-param fix;
+# GREEN after it.)
+if command -v python3 > /dev/null 2>&1; then
+  python3 - $TMPDIR/xmp_nonedit.pdf << 'PYEOF'
+# Minimal PDF with an XMP packet whose <?xpacket begin=...> carries a UTF-16LE
+# BOM (0xFF 0xFE), making xmp_packet_editable() return false.
+import sys
+xmp = (
+    b'<?xpacket begin="\xff\xfe" id="W5M0MpCehiHzreSzNTczkc9d"?>'
+    b'<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+    b'<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+    b'<rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/">'
+    b'<dc:title><rdf:Alt><rdf:li xml:lang="x-default">Old title</rdf:li></rdf:Alt></dc:title>'
+    b'</rdf:Description></rdf:RDF></x:xmpmeta>'
+    b'<?xpacket end="w"?>'
+)
+# Object layout: 1=Catalog, 2=Pages, 3=Page, 4=Metadata stream, 5=Content
+content = b'BT /F1 12 Tf 72 720 Td (hello) Tj ET\n'
+objs = [
+    b'<< /Type /Catalog /Pages 2 0 R /Metadata 4 0 R >>',
+    b'<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    b'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R >>',
+    (b'<< /Type /Metadata /Subtype /XML /Length %d >>\nstream\n' % len(xmp))
+    + xmp + b'\nendstream',
+    (b'<< /Length %d >>\nstream\n' % len(content)) + content + b'\nendstream',
+]
+out = bytearray(b'%PDF-1.4\n')
+offs = []
+for i, body in enumerate(objs, 1):
+    offs.append(len(out))
+    out += (b'%d 0 obj\n' % i) + body + b'\nendobj\n'
+xref = len(out)
+n = len(objs) + 1
+out += b'xref\n0 %d\n' % n + b'0000000000 65535 f \n'
+for o in offs:
+    out += b'%010d 00000 n \n' % o
+out += b'trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n' % (n, xref)
+open(sys.argv[1], 'wb').write(out)
+PYEOF
+  run_test "stale-XMP notice when XMP packet is not editable (UTF-16 begin)" bash -c "
+    set -e
+    $TSPDF metadata $TMPDIR/xmp_nonedit.pdf --set title='New Title' -o $TMPDIR/xmp_nonedit_out.pdf 2> $TMPDIR/xmp_nonedit.err > /dev/null
+    grep -q 'note: XMP metadata present but not updated for' $TMPDIR/xmp_nonedit.err
+    grep -q 'title' $TMPDIR/xmp_nonedit.err"
+else
+  echo "  SKIP  stale-XMP notice pin test (python3 not found)"
+fi
+
 # Object-stream re-packing: rewriting a file that used object streams must
 # re-pack them (not explode every member into a classic top-level object,
 # which roughly doubles such files); classic inputs stay classic.

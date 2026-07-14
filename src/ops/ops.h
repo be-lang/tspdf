@@ -65,12 +65,16 @@ TspdfError tsops_watermark_text(TspdfReader *doc,
 
 // ── Metadata field setter ───────────────────────────────────────────────
 //
-// Set one Info-dictionary field by name. `value == NULL` clears the field (the
-// serializer then omits it from the rebuilt Info dict). Returns false if `key`
-// (its first `key_len` bytes) is not one of the supported keys: title, author,
-// subject, keywords, creator, producer.
+// Set one Info-dictionary field by name and sync the XMP packet. `value == NULL`
+// clears the field (the serializer then omits it from the rebuilt Info dict).
+// Returns false if `key` (its first `key_len` bytes) is not one of the
+// supported keys: title, author, subject, keywords, creator, producer.
+//
+// `xmp_stale` (nullable): if non-NULL, the TSPDF_XMP_* bits for any field
+// that was set in /Info but could not be synced to the XMP packet are OR'd in.
+// The caller may print a notice after the field loop; server/wasm pass NULL.
 bool tsops_metadata_set(TspdfReader *doc, const char *key, size_t key_len,
-                        const char *value);
+                        const char *value, unsigned *xmp_stale);
 
 // ── Unlock / decrypt save-options ───────────────────────────────────────
 //
