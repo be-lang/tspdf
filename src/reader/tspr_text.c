@@ -445,13 +445,7 @@ static void tx_load_page_content(TextCtx *ctx, TspdfObj *page_dict, TspdfBuffer 
 
 // Page /Resources with Pages-tree inheritance via the /Parent chain.
 static TspdfObj *tx_page_resources(TextCtx *ctx, TspdfObj *page_dict) {
-    TspdfObj *cur = page_dict;
-    for (size_t depth = 0; cur && cur->type == TSPDF_OBJ_DICT && depth < 64; depth++) {
-        TspdfObj *res = tx_resolve(ctx, tspdf_dict_get(cur, "Resources"));
-        if (res && res->type == TSPDF_OBJ_DICT) return res;
-        cur = tx_resolve(ctx, tspdf_dict_get(cur, "Parent"));
-    }
-    return NULL;
+    return tspdf_page_inherited_resources(ctx->doc, &ctx->rp, page_dict);
 }
 
 // --- ToUnicode CMap parsing ---

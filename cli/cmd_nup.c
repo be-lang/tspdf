@@ -104,15 +104,9 @@ int cmd_nup(int argc, char **argv) {
                                                   false, pwbuf, sizeof(pwbuf));
 
     TspdfError err = TSPDF_OK;
-    TspdfReader *doc = password
-        ? tspdf_reader_open_file_with_password(input, password, &err)
-        : tspdf_reader_open_file(input, &err);
+    TspdfReader *doc = tspdf_cli_open_input("nup", input, password,
+                                            NULL, NULL, NULL);
     if (!doc) {
-        if (err == TSPDF_ERR_ENCRYPTED) {
-            fprintf(stderr, "tspdf nup: '%s' is encrypted; use --password or --password-file\n", input);
-        } else {
-            fprintf(stderr, "tspdf nup: failed to open '%s': %s\n", input, tspdf_error_string(err));
-        }
         free(sel);
         return 1;
     }

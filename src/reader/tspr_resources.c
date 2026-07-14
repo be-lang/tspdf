@@ -121,6 +121,28 @@ static void merge_category(TspdfObj *existing_dict, TspdfObj *new_dict,
     }
 }
 
+// --- Public: effective /Resources with Pages-tree inheritance ---
+
+TspdfObj *tspdf_page_inherited_resources(TspdfReader *doc, TspdfParser *parser,
+                                         TspdfObj *page_dict) {
+    TspdfObj *cur = page_dict;
+    for (size_t depth = 0; cur && cur->type == TSPDF_OBJ_DICT && depth < 64;
+         depth++) {
+        TspdfObj *res = tspdf_dict_get(cur, "Resources");
+        if (res && res->type == TSPDF_OBJ_REF && res->ref.num < doc->xref.count)
+            res = tspdf_xref_resolve(&doc->xref, parser, res->ref.num,
+                                     doc->obj_cache, doc->crypt);
+        if (res && res->type == TSPDF_OBJ_DICT) return res;
+        TspdfObj *parent = tspdf_dict_get(cur, "Parent");
+        if (parent && parent->type == TSPDF_OBJ_REF &&
+            parent->ref.num < doc->xref.count)
+            parent = tspdf_xref_resolve(&doc->xref, parser, parent->ref.num,
+                                        doc->obj_cache, doc->crypt);
+        cur = parent;
+    }
+    return NULL;
+}
+
 // --- Public: merge new resources into page's resource dict ---
 
 TspdfError tspdf_resources_merge(TspdfObj *page_dict, TspdfObj *new_resources,

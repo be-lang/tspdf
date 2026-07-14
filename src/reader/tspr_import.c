@@ -484,22 +484,7 @@ uint32_t tspdf_reader_import_page_xobject(TspdfReader *dst, TspdfReader *src,
     }
     if (!res_src || res_src->type != TSPDF_OBJ_DICT) {
         // Walk up the page tree for inherited /Resources.
-        TspdfObj *node = page_dict;
-        res_src = NULL;
-        size_t hops = src->xref.count + 32;
-        while (node && node->type == TSPDF_OBJ_DICT && hops-- > 0) {
-            TspdfObj *parent = tspdf_dict_get(node, "Parent");
-            if (!parent || parent->type != TSPDF_OBJ_REF || parent->ref.num >= src->xref.count) break;
-            node = tspdf_xref_resolve(&src->xref, &parser, parent->ref.num,
-                                      src->obj_cache, src->crypt);
-            if (!node || node->type != TSPDF_OBJ_DICT) break;
-            TspdfObj *r = tspdf_dict_get(node, "Resources");
-            if (r && r->type == TSPDF_OBJ_REF && r->ref.num < src->xref.count) {
-                r = tspdf_xref_resolve(&src->xref, &parser, r->ref.num,
-                                       src->obj_cache, src->crypt);
-            }
-            if (r && r->type == TSPDF_OBJ_DICT) { res_src = r; break; }
-        }
+        res_src = tspdf_page_inherited_resources(src, &parser, page_dict);
         if (res_src) {
             // The inherited resources were not part of the page's
             // self-containment walk: detach their streams too.

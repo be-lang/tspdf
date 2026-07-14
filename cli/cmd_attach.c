@@ -44,21 +44,7 @@ static TspdfReader *attach_open(int argc, char **argv, const char *input) {
                                                   "--password", "--password-file",
                                                   "attach", "Password: ",
                                                   false, pwbuf, sizeof(pwbuf));
-
-    TspdfError err = TSPDF_OK;
-    TspdfReader *doc = password
-        ? tspdf_reader_open_file_with_password(input, password, &err)
-        : tspdf_reader_open_file(input, &err);
-    if (!doc) {
-        if (err == TSPDF_ERR_ENCRYPTED) {
-            fprintf(stderr, "tspdf attach: '%s' is encrypted; use --password or "
-                            "--password-file\n", input);
-        } else {
-            fprintf(stderr, "tspdf attach: failed to open '%s': %s\n",
-                    input, tspdf_error_string(err));
-        }
-    }
-    return doc;
+    return tspdf_cli_open_input("attach", input, password, NULL, NULL, NULL);
 }
 
 static uint8_t *attach_read_file(const char *path, size_t *out_len) {

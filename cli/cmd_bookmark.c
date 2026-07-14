@@ -45,20 +45,7 @@ static TspdfReader *bookmark_open(int argc, char **argv, const char *input) {
                                                   "--password", "--password-file",
                                                   "bookmark", "Password: ",
                                                   false, pwbuf, sizeof(pwbuf));
-    TspdfError err = TSPDF_OK;
-    TspdfReader *doc = password
-        ? tspdf_reader_open_file_with_password(input, password, &err)
-        : tspdf_reader_open_file(input, &err);
-    if (!doc) {
-        if (err == TSPDF_ERR_ENCRYPTED) {
-            fprintf(stderr, "tspdf bookmark: '%s' is encrypted; use --password or "
-                            "--password-file\n", input);
-        } else {
-            fprintf(stderr, "tspdf bookmark: failed to open '%s': %s\n",
-                    input, tspdf_error_string(err));
-        }
-    }
-    return doc;
+    return tspdf_cli_open_input("bookmark", input, password, NULL, NULL, NULL);
 }
 
 static void bookmark_json_string(const char *s) {

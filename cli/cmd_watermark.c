@@ -25,18 +25,7 @@ typedef enum {
 // Open `input`, honoring an optional password; prints the error (with the
 // standard --password hint for encrypted files) on failure.
 static TspdfReader *watermark_open(const char *input, const char *password) {
-    TspdfError err = TSPDF_OK;
-    TspdfReader *doc = password
-        ? tspdf_reader_open_file_with_password(input, password, &err)
-        : tspdf_reader_open_file(input, &err);
-    if (!doc) {
-        if (err == TSPDF_ERR_ENCRYPTED) {
-            fprintf(stderr, "tspdf watermark: '%s' is encrypted; use --password or --password-file\n", input);
-        } else {
-            fprintf(stderr, "tspdf watermark: failed to open '%s': %s\n", input, tspdf_error_string(err));
-        }
-    }
-    return doc;
+    return tspdf_cli_open_input("watermark", input, password, NULL, NULL, NULL);
 }
 
 // Build a one-page PDF holding just the image at its pixel size (72 dpi) and

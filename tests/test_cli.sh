@@ -351,6 +351,29 @@ run_test "merge wrong password names the input it cannot unlock" bash -c "
   fi
   grep -q 'wrong password' \"$TMPDIR/pwop_m2.err\" && grep -q 'pwop_enc.pdf' \"$TMPDIR/pwop_m2.err\"
 "
+
+# --- round 4: open-error parity — every command that opens a PDF reports
+# --- "wrong password" specifically, not a generic open failure.
+$TSPDF encrypt $INPUT -o $TMPDIR/openerr_enc.pdf --password r4secret > /dev/null 2>&1
+run_test "rotate wrong password message" bash -c "
+  ! \"$TSPDF\" rotate \"$TMPDIR/openerr_enc.pdf\" --angle 90 --password nope -o \"$TMPDIR/openerr_rot.pdf\" 2> \"$TMPDIR/openerr.err\" &&
+  grep -q \"wrong password for '\" \"$TMPDIR/openerr.err\" && grep -q \"openerr_enc.pdf'\" \"$TMPDIR/openerr.err\" && ! grep -q 'failed to open' \"$TMPDIR/openerr.err\""
+run_test "attach wrong password message" bash -c "
+  ! \"$TSPDF\" attach list \"$TMPDIR/openerr_enc.pdf\" --password nope > /dev/null 2> \"$TMPDIR/openerr.err\" &&
+  grep -q \"wrong password for '\" \"$TMPDIR/openerr.err\" && grep -q \"openerr_enc.pdf'\" \"$TMPDIR/openerr.err\" && ! grep -q 'failed to open' \"$TMPDIR/openerr.err\""
+run_test "nup wrong password message" bash -c "
+  ! \"$TSPDF\" nup 4 \"$TMPDIR/openerr_enc.pdf\" --password nope -o \"$TMPDIR/openerr_nup.pdf\" 2> \"$TMPDIR/openerr.err\" &&
+  grep -q \"wrong password for '\" \"$TMPDIR/openerr.err\" && grep -q \"openerr_enc.pdf'\" \"$TMPDIR/openerr.err\" && ! grep -q 'failed to open' \"$TMPDIR/openerr.err\""
+run_test "form wrong password message" bash -c "
+  ! \"$TSPDF\" form list \"$TMPDIR/openerr_enc.pdf\" --password nope > /dev/null 2> \"$TMPDIR/openerr.err\" &&
+  grep -q \"wrong password for '\" \"$TMPDIR/openerr.err\" && grep -q \"openerr_enc.pdf'\" \"$TMPDIR/openerr.err\" && ! grep -q 'failed to open' \"$TMPDIR/openerr.err\""
+run_test "stamp wrong password message" bash -c "
+  ! \"$TSPDF\" stamp \"$TMPDIR/openerr_enc.pdf\" --stamp \"$INPUT\" --password nope -o \"$TMPDIR/openerr_st.pdf\" 2> \"$TMPDIR/openerr.err\" &&
+  grep -q \"wrong password for '\" \"$TMPDIR/openerr.err\" && grep -q \"openerr_enc.pdf'\" \"$TMPDIR/openerr.err\" && ! grep -q 'failed to open' \"$TMPDIR/openerr.err\""
+run_test "bookmark wrong password message" bash -c "
+  ! \"$TSPDF\" bookmark list \"$TMPDIR/openerr_enc.pdf\" --password nope > /dev/null 2> \"$TMPDIR/openerr.err\" &&
+  grep -q \"wrong password for '\" \"$TMPDIR/openerr.err\" && grep -q \"openerr_enc.pdf'\" \"$TMPDIR/openerr.err\" && ! grep -q 'failed to open' \"$TMPDIR/openerr.err\""
+
 run_test "merge encrypted input without password fails with hint" bash -c "
   if \"$TSPDF\" merge \"$TMPDIR/pwop_enc.pdf\" \"$INPUT\" -o \"$TMPDIR/pwop_m3.pdf\" < /dev/null > /dev/null 2> \"$TMPDIR/pwop_m3.err\"; then
     exit 1
@@ -1596,6 +1619,16 @@ assert found, \"cp1252-encoded RÉSUMÉ not found in any content stream\"
     "$TSPDF" info "${TMPDIR}/serve_prot.pdf" --password userpw > /dev/null &&
     ! "$TSPDF" info "${TMPDIR}/serve_prot.pdf" --password wrongpw > /dev/null 2>&1
   '
+
+  # Pinning tests: pin current behavior of routes before the serve_edit refactor
+  run_serve_test "serve POST /api/split" bash -c "curl -sf --retry 3 --retry-delay 1 --max-time 10 -F 'pdf_file=@$INPUT' -F 'config={\"pages\":\"1-2\"}' http://localhost:${SERVE_PORT}/api/split -o $TMPDIR/serve_split.pdf && $TSPDF info $TMPDIR/serve_split.pdf | grep -q 'Pages:      2'"
+  run_serve_test "serve POST /api/delete-pages" bash -c "curl -sf --retry 3 --retry-delay 1 --max-time 10 -F 'pdf_file=@$INPUT' -F 'config={\"pages\":\"1\"}' http://localhost:${SERVE_PORT}/api/delete-pages -o $TMPDIR/serve_del.pdf && $TSPDF info $TMPDIR/serve_del.pdf | grep -q 'Pages:      2'"
+  run_serve_test "serve POST /api/rotate" bash -c "curl -sf --retry 3 --retry-delay 1 --max-time 10 -F 'pdf_file=@$INPUT' -F 'config={\"pages\":\"all\",\"angle\":\"90\"}' http://localhost:${SERVE_PORT}/api/rotate -o $TMPDIR/serve_rot.pdf && $TSPDF info $TMPDIR/serve_rot.pdf > /dev/null"
+  run_serve_test "serve POST /api/reorder" bash -c "curl -sf --retry 3 --retry-delay 1 --max-time 10 -F 'pdf_file=@$INPUT' -F 'config={\"order\":\"3,2,1\"}' http://localhost:${SERVE_PORT}/api/reorder -o $TMPDIR/serve_reord.pdf && $TSPDF info $TMPDIR/serve_reord.pdf > /dev/null"
+  $TSPDF encrypt $INPUT -o $TMPDIR/serve_enc.pdf --password srvpw > /dev/null 2>&1
+  run_serve_test "serve POST /api/unlock" bash -c "curl -sf --retry 3 --retry-delay 1 --max-time 10 -F 'pdf_file=@$TMPDIR/serve_enc.pdf' -F 'config={\"password\":\"srvpw\"}' http://localhost:${SERVE_PORT}/api/unlock -o $TMPDIR/serve_unlock.pdf && ! ($TSPDF info $TMPDIR/serve_unlock.pdf | grep -q 'Encrypted:.*yes')"
+  run_serve_test "serve POST /api/password-protect" bash -c "curl -sf --retry 3 --retry-delay 1 --max-time 10 -F 'pdf_file=@$INPUT' -F 'config={\"password\":\"newpw\"}' http://localhost:${SERVE_PORT}/api/password-protect -o $TMPDIR/serve_prot.pdf && $TSPDF info $TMPDIR/serve_prot.pdf | grep -q 'Encrypted:.*yes'"
+  run_serve_test "serve rotate encrypted upload with password" bash -c "curl -sf --retry 3 --retry-delay 1 --max-time 10 -F 'pdf_file=@$TMPDIR/serve_enc.pdf' -F 'config={\"pages\":\"all\",\"angle\":\"90\",\"password\":\"srvpw\"}' http://localhost:${SERVE_PORT}/api/rotate -o $TMPDIR/serve_rot_enc.pdf && $TSPDF info $TMPDIR/serve_rot_enc.pdf --password srvpw > /dev/null"
 
   kill $SERVE_PID 2>/dev/null || true
   wait $SERVE_PID 2>/dev/null || true

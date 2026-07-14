@@ -126,20 +126,9 @@ int tspdf_cli_run(const char *name, int argc, char **argv) {
 
     // Open the input document.
     if (spec->needs & TSPDF_CMD_OPENS_INPUT) {
-        TspdfError err = TSPDF_OK;
-        ctx.doc = ctx.password
-            ? tspdf_reader_open_file_with_password(ctx.input, ctx.password, &err)
-            : tspdf_reader_open_file(ctx.input, &err);
-        if (!ctx.doc) {
-            if (err == TSPDF_ERR_ENCRYPTED) {
-                fprintf(stderr, "tspdf %s: '%s' is encrypted; use --password or "
-                        "--password-file\n", spec->name, ctx.input);
-            } else {
-                fprintf(stderr, "tspdf %s: failed to open '%s': %s\n",
-                        spec->name, ctx.input, tspdf_error_string(err));
-            }
-            return 1;
-        }
+        ctx.doc = tspdf_cli_open_input(spec->name, ctx.input, ctx.password,
+                                       NULL, NULL, NULL);
+        if (!ctx.doc) return 1;
     }
 
     int rc = spec->run(&ctx);

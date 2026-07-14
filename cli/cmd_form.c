@@ -346,20 +346,7 @@ static char *form_read_all(const char *path) {
 // --- shared open helper ---
 
 static TspdfReader *form_open(const char *input, const char *password) {
-    TspdfError err = TSPDF_OK;
-    TspdfReader *doc = password
-        ? tspdf_reader_open_file_with_password(input, password, &err)
-        : tspdf_reader_open_file(input, &err);
-    if (!doc) {
-        if (err == TSPDF_ERR_ENCRYPTED) {
-            fprintf(stderr, "tspdf form: '%s' is encrypted; use --password or --password-file\n",
-                    input);
-        } else {
-            fprintf(stderr, "tspdf form: failed to open '%s': %s\n", input,
-                    tspdf_error_string(err));
-        }
-    }
-    return doc;
+    return tspdf_cli_open_input("form", input, password, NULL, NULL, NULL);
 }
 
 static const char *form_type_string(TspdfFieldType type) {

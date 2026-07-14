@@ -22,6 +22,7 @@
 #include "../../include/tspdf/version.h"
 
 #include "../../src/reader/tspr_text.h"
+#include "../../src/ops/ops.h"
 #include "helpers.h"
 
 static char *make_inherited_page_attrs_pdf(size_t *out_len) {
@@ -2131,6 +2132,70 @@ TEST(test_phase3_full_pipeline) {
     tspdf_reader_destroy(doc2);
     free(enc);
     tspdf_reader_destroy(doc);
+}
+
+// The shared /Resources walk finds the dict inherited from the /Pages node:
+// text extraction sees /F1's "Hi" even though the page carries no own /Resources.
+TEST(test_inherited_resources_found_on_pages_node) {
+    size_t len = 0;
+    char *pdf = make_inherited_page_attrs_pdf(&len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    ASSERT(tspdf_dict_get(tspdf_reader_get_page(doc, 0)->page_dict, "Resources") == NULL);
+
+    const char *text = tspdf_reader_page_text(doc, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT(strstr(text, "Hi") != NULL);
+
+    tspdf_reader_destroy(doc);
+    free(pdf);
+}
+
+// THE BUG: a content edit on a page that inherits /Resources must not drop the
+// inherited fonts. The overlay used to create a fresh empty /Resources that
+// shadowed the inherited dict, losing /F1 (so "Hi" no longer extracted).
+TEST(test_content_edit_preserves_inherited_resources) {
+    size_t len = 0;
+    char *pdf = make_inherited_page_attrs_pdf(&len);
+    ASSERT(pdf != NULL);
+
+    TspdfError err;
+    TspdfReader *doc = tspdf_reader_open((const uint8_t *)pdf, len, &err);
+    ASSERT(doc != NULL);
+    ASSERT(tspdf_dict_get(tspdf_reader_get_page(doc, 0)->page_dict, "Resources") == NULL);
+
+    TsopsWatermarkText params = { .text = "DRAFT", .opacity = 0.3, .font_size = 48.0 };
+    ASSERT_EQ_INT(tsops_watermark_text(doc, &params, NULL), TSPDF_OK);
+
+    // The page now has a direct /Resources /Font holding BOTH the inherited F1
+    // and the watermark's own font.
+    TspdfObj *resources = tspdf_dict_get(tspdf_reader_get_page(doc, 0)->page_dict, "Resources");
+    ASSERT(resources != NULL);
+    ASSERT_EQ_INT(resources->type, TSPDF_OBJ_DICT);
+    TspdfObj *fonts = dt_get(doc, resources, "Font");
+    ASSERT(fonts != NULL);
+    ASSERT_EQ_INT(fonts->type, TSPDF_OBJ_DICT);
+    ASSERT(tspdf_dict_get(fonts, "F1") != NULL);
+    ASSERT(fonts->dict.count > 1);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    ASSERT_EQ_INT(tspdf_reader_save_to_memory(doc, &out, &out_len), TSPDF_OK);
+    tspdf_reader_destroy(doc);
+
+    // Reopen: the inherited /F1 survives round-trip and "Hi" still extracts.
+    TspdfReader *doc2 = tspdf_reader_open(out, out_len, &err);
+    ASSERT(doc2 != NULL);
+    const char *text = tspdf_reader_page_text(doc2, 0, &err);
+    ASSERT(text != NULL);
+    ASSERT(strstr(text, "Hi") != NULL);
+
+    tspdf_reader_destroy(doc2);
+    free(out);
+    free(pdf);
 }
 
 TEST(test_large_document_500_pages) {
@@ -4707,6 +4772,8 @@ void run_docops_tests(void) {
     RUN(test_full_pipeline);
     printf("\n  Phase 3 integration:\n");
     RUN(test_phase3_full_pipeline);
+    RUN(test_inherited_resources_found_on_pages_node);
+    RUN(test_content_edit_preserves_inherited_resources);
     printf("\n  Large document:\n");
     RUN(test_large_document_500_pages);
     printf("\n  Audit fixes (reader-core):\n");

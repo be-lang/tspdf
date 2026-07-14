@@ -7,6 +7,29 @@ on 0.x, the CLI is considered stable but the low-level C API may still change.
 
 ## [Unreleased]
 
+### Added
+- The server API routes that take one PDF (`/api/split`, `/api/delete-pages`,
+  `/api/rotate`, `/api/reorder`, `/api/compress`, `/api/password-protect`,
+  `/api/metadata`, `/api/watermark-existing`) now accept an optional
+  `"password"` key in the config part, so encrypted uploads work everywhere,
+  not just on `/api/unlock`.
+
+### Changed
+- Every CLI command that opens a PDF now reports open failures the same way,
+  including a specific "wrong password for 'file'" message (previously only
+  `merge` distinguished a wrong password from other open failures).
+
+### Fixed
+- Watermark, stamp, and page-number overlays on pages that inherit their
+  /Resources from a /Pages ancestor no longer lose the inherited fonts: the
+  page's new /Resources dictionary starts from the inherited entries instead
+  of shadowing them with an empty one.
+
+### Internal
+- One CLI open-with-password helper, one server document-edit flow shared by
+  the single-PDF routes, and one page-tree /Resources inheritance walk shared
+  by text extraction, lossy recompression, import, and content editing.
+
 ## [0.5.1] - 2026-07-14
 
 ### Fixed

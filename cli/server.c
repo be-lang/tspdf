@@ -1094,6 +1094,87 @@ static void handle_get(int fd, const char *path)
 
 /* ── POST API handlers ─────────────────────────────────────────────── */
 
+/* ── Shared single-document edit flow ────────────────────────────────
+ * Every "one pdf_file in, one PDF download out" route shares this flow:
+ * pull pdf_file + config from the form, open (honoring an optional
+ * "password" config key — any of these routes now accepts an encrypted
+ * upload), run the route's op, save, respond, clean up. An op owns only
+ * its config parsing and the library call. */
+typedef struct {
+    TspdfReader *result;         /* doc to save; preset to the input doc */
+    TspdfSaveOptions opts;       /* used when use_opts is set */
+    bool use_opts;
+    char encrypt_user[256];      /* either non-empty → save encrypted */
+    char encrypt_owner[256];
+    uint32_t    encrypt_permissions;
+    int         encrypt_bits;
+    const char *save_error;      /* 500 text when saving fails */
+} ServeEdit;
+
+/* Returns false after sending its own error response; on true, serve_edit
+ * saves se->result and sends it. */
+typedef bool (*ServeEditOp)(int fd, TspdfReader *doc, const char *config,
+                            ServeEdit *se);
+
+static void serve_edit(int fd, MultipartForm *form, const char *out_name,
+                       ServeEditOp op)
+{
+    FormPart *file = form_find(form, "pdf_file");
+    if (!file || !file->is_file) { send_error(fd, 400, "Missing pdf_file"); return; }
+
+    char config_buf[4096] = {0};
+    FormPart *cfg = form_find(form, "config");
+    if (cfg) {
+        size_t clen = cfg->data_len < sizeof(config_buf) - 1
+                          ? cfg->data_len : sizeof(config_buf) - 1;
+        memcpy(config_buf, cfg->data, clen);
+        config_buf[clen] = '\0';
+    }
+
+    char password[512] = {0};
+    json_get_string(config_buf, "password", password, sizeof(password));
+
+    TspdfError err = TSPDF_OK;
+    TspdfReader *doc = password[0]
+        ? tspdf_reader_open_with_password((const uint8_t *)file->data,
+                                          file->data_len, password, &err)
+        : tspdf_reader_open((const uint8_t *)file->data, file->data_len, &err);
+    if (!doc) {
+        send_error(fd, 400, password[0] ? "Failed to open PDF (wrong password?)"
+                                        : "Failed to open PDF");
+        return;
+    }
+
+    ServeEdit se = { .result = doc, .save_error = "Save failed" };
+    if (!op(fd, doc, config_buf, &se)) {
+        if (se.result && se.result != doc) tspdf_reader_destroy(se.result);
+        tspdf_reader_destroy(doc);
+        return;
+    }
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    if (se.encrypt_user[0] || se.encrypt_owner[0]) {
+        err = tspdf_reader_save_to_memory_encrypted(se.result, &out, &out_len,
+                                                    se.encrypt_user,
+                                                    se.encrypt_owner[0] ? se.encrypt_owner
+                                                                        : se.encrypt_user,
+                                                    se.encrypt_permissions,
+                                                    se.encrypt_bits);
+    } else if (se.use_opts) {
+        err = tspdf_reader_save_to_memory_with_options(se.result, &out,
+                                                       &out_len, &se.opts);
+    } else {
+        err = tspdf_reader_save_to_memory(se.result, &out, &out_len);
+    }
+    if (se.result != doc) tspdf_reader_destroy(se.result);
+    tspdf_reader_destroy(doc);
+
+    if (err != TSPDF_OK) { free(out); send_error(fd, 500, se.save_error); return; }
+    send_pdf_response(fd, out_name, out, out_len);
+    free(out);
+}
+
 static void api_merge(int fd, MultipartForm *form)
 {
     /* Collect all pdf_file parts (pdf_file, pdf_file_1, pdf_file_2, ...) */
@@ -1145,126 +1226,60 @@ static void api_merge(int fd, MultipartForm *form)
     free(out);
 }
 
-static void api_split(int fd, MultipartForm *form)
+static bool op_split(int fd, TspdfReader *doc, const char *config, ServeEdit *se)
 {
-    FormPart *file = form_find(form, "pdf_file");
-    FormPart *cfg = form_find(form, "config");
-    if (!file || !file->is_file) { send_error(fd, 400, "Missing pdf_file"); return; }
-
     char pages_str[256] = {0};
-    if (cfg) {
-        char config_buf[1024];
-        size_t clen = cfg->data_len < sizeof(config_buf)-1 ? cfg->data_len : sizeof(config_buf)-1;
-        memcpy(config_buf, cfg->data, clen);
-        config_buf[clen] = '\0';
-        json_get_string(config_buf, "pages", pages_str, sizeof(pages_str));
-    }
-
-    if (!pages_str[0]) { send_error(fd, 400, "Missing pages in config"); return; }
-
-    TspdfError err = TSPDF_OK;
-    TspdfReader *doc = tspdf_reader_open(
-        (const uint8_t *)file->data, file->data_len, &err);
-    if (!doc) { send_error(fd, 400, "Failed to open PDF"); return; }
+    json_get_string(config, "pages", pages_str, sizeof(pages_str));
+    if (!pages_str[0]) { send_error(fd, 400, "Missing pages in config"); return false; }
 
     size_t count = 0;
     size_t *indices = parse_page_range(pages_str, &count);
-    if (!indices || count == 0) {
-        tspdf_reader_destroy(doc);
-        send_error(fd, 400, "Invalid page range");
-        return;
-    }
+    if (!indices || count == 0) { send_error(fd, 400, "Invalid page range"); return false; }
 
+    TspdfError err = TSPDF_OK;
     TspdfReader *result = tspdf_reader_extract(doc, indices, count, &err);
     free(indices);
-    if (!result) {
-        tspdf_reader_destroy(doc);
-        send_error(fd, 500, "Extract failed");
-        return;
-    }
+    if (!result) { send_error(fd, 500, "Extract failed"); return false; }
+    se->result = result;
+    return true;
+}
 
-    uint8_t *out = NULL;
-    size_t out_len = 0;
-    err = tspdf_reader_save_to_memory(result, &out, &out_len);
-    tspdf_reader_destroy(result);
-    tspdf_reader_destroy(doc);
+static void api_split(int fd, MultipartForm *form)
+{
+    serve_edit(fd, form, "split.pdf", op_split);
+}
 
-    if (err != TSPDF_OK) { free(out); send_error(fd, 500, "Save failed"); return; }
-    send_pdf_response(fd, "split.pdf", out, out_len);
-    free(out);
+static bool op_delete_pages(int fd, TspdfReader *doc, const char *config, ServeEdit *se)
+{
+    char pages_str[256] = {0};
+    json_get_string(config, "pages", pages_str, sizeof(pages_str));
+    if (!pages_str[0]) { send_error(fd, 400, "Missing pages in config"); return false; }
+
+    size_t count = 0;
+    size_t *indices = parse_page_range(pages_str, &count);
+    if (!indices || count == 0) { send_error(fd, 400, "Invalid page range"); return false; }
+
+    TspdfError err = TSPDF_OK;
+    TspdfReader *result = tspdf_reader_delete(doc, indices, count, &err);
+    free(indices);
+    if (!result) { send_error(fd, 500, "Delete pages failed"); return false; }
+    se->result = result;
+    return true;
 }
 
 static void api_delete_pages(int fd, MultipartForm *form)
 {
-    FormPart *file = form_find(form, "pdf_file");
-    FormPart *cfg = form_find(form, "config");
-    if (!file || !file->is_file) { send_error(fd, 400, "Missing pdf_file"); return; }
-
-    char pages_str[256] = {0};
-    if (cfg) {
-        char config_buf[1024];
-        size_t clen = cfg->data_len < sizeof(config_buf)-1 ? cfg->data_len : sizeof(config_buf)-1;
-        memcpy(config_buf, cfg->data, clen);
-        config_buf[clen] = '\0';
-        json_get_string(config_buf, "pages", pages_str, sizeof(pages_str));
-    }
-    if (!pages_str[0]) { send_error(fd, 400, "Missing pages in config"); return; }
-
-    TspdfError err = TSPDF_OK;
-    TspdfReader *doc = tspdf_reader_open(
-        (const uint8_t *)file->data, file->data_len, &err);
-    if (!doc) { send_error(fd, 400, "Failed to open PDF"); return; }
-
-    size_t count = 0;
-    size_t *indices = parse_page_range(pages_str, &count);
-    if (!indices || count == 0) {
-        tspdf_reader_destroy(doc);
-        send_error(fd, 400, "Invalid page range");
-        return;
-    }
-
-    TspdfReader *result = tspdf_reader_delete(doc, indices, count, &err);
-    free(indices);
-    if (!result) {
-        tspdf_reader_destroy(doc);
-        send_error(fd, 500, "Delete pages failed");
-        return;
-    }
-
-    uint8_t *out = NULL;
-    size_t out_len = 0;
-    err = tspdf_reader_save_to_memory(result, &out, &out_len);
-    tspdf_reader_destroy(result);
-    tspdf_reader_destroy(doc);
-
-    if (err != TSPDF_OK) { free(out); send_error(fd, 500, "Save failed"); return; }
-    send_pdf_response(fd, "deleted.pdf", out, out_len);
-    free(out);
+    serve_edit(fd, form, "deleted.pdf", op_delete_pages);
 }
 
-static void api_rotate(int fd, MultipartForm *form)
+static bool op_rotate(int fd, TspdfReader *doc, const char *config, ServeEdit *se)
 {
-    FormPart *file = form_find(form, "pdf_file");
-    FormPart *cfg = form_find(form, "config");
-    if (!file || !file->is_file) { send_error(fd, 400, "Missing pdf_file"); return; }
-
     char pages_str[256] = {0};
     char angle_str[32] = {0};
-    if (cfg) {
-        char config_buf[1024];
-        size_t clen = cfg->data_len < sizeof(config_buf)-1 ? cfg->data_len : sizeof(config_buf)-1;
-        memcpy(config_buf, cfg->data, clen);
-        config_buf[clen] = '\0';
-        json_get_string(config_buf, "pages", pages_str, sizeof(pages_str));
-        json_get_string(config_buf, "angle", angle_str, sizeof(angle_str));
-    }
+    json_get_string(config, "pages", pages_str, sizeof(pages_str));
+    json_get_string(config, "angle", angle_str, sizeof(angle_str));
 
     int angle = angle_str[0] ? atoi(angle_str) : 90;
-
-    TspdfError err = TSPDF_OK;
-    TspdfReader *doc = tspdf_reader_open(
-        (const uint8_t *)file->data, file->data_len, &err);
-    if (!doc) { send_error(fd, 400, "Failed to open PDF"); return; }
 
     size_t count = 0;
     size_t *indices = NULL;
@@ -1272,56 +1287,32 @@ static void api_rotate(int fd, MultipartForm *form)
     int all_pages = !pages_str[0] || strcasecmp(pages_str, "all") == 0;
     if (!all_pages) {
         indices = parse_page_range(pages_str, &count);
-        if (!indices) {
-            tspdf_reader_destroy(doc);
-            send_error(fd, 400, "Invalid page range");
-            return;
-        }
+        if (!indices) { send_error(fd, 400, "Invalid page range"); return false; }
     } else {
         count = tspdf_reader_page_count(doc);
         indices = malloc(count * sizeof(size_t));
-        if (!indices) {
-            tspdf_reader_destroy(doc);
-            send_error(fd, 500, "Out of memory");
-            return;
-        }
+        if (!indices) { send_error(fd, 500, "Out of memory"); return false; }
         for (size_t i = 0; i < count; i++) indices[i] = i;
     }
 
+    TspdfError err = TSPDF_OK;
     TspdfReader *result = tspdf_reader_rotate(doc, indices, count, angle, &err);
     free(indices);
-    if (!result) {
-        tspdf_reader_destroy(doc);
-        send_error(fd, 500, "Rotate failed");
-        return;
-    }
-
-    uint8_t *out = NULL;
-    size_t out_len = 0;
-    err = tspdf_reader_save_to_memory(result, &out, &out_len);
-    tspdf_reader_destroy(result);
-    tspdf_reader_destroy(doc);
-
-    if (err != TSPDF_OK) { free(out); send_error(fd, 500, "Save failed"); return; }
-    send_pdf_response(fd, "rotated.pdf", out, out_len);
-    free(out);
+    if (!result) { send_error(fd, 500, "Rotate failed"); return false; }
+    se->result = result;
+    return true;
 }
 
-static void api_reorder(int fd, MultipartForm *form)
+static void api_rotate(int fd, MultipartForm *form)
 {
-    FormPart *file = form_find(form, "pdf_file");
-    FormPart *cfg = form_find(form, "config");
-    if (!file || !file->is_file) { send_error(fd, 400, "Missing pdf_file"); return; }
+    serve_edit(fd, form, "rotated.pdf", op_rotate);
+}
 
+static bool op_reorder(int fd, TspdfReader *doc, const char *config, ServeEdit *se)
+{
     char order_str[1024] = {0};
-    if (cfg) {
-        char config_buf[2048];
-        size_t clen = cfg->data_len < sizeof(config_buf)-1 ? cfg->data_len : sizeof(config_buf)-1;
-        memcpy(config_buf, cfg->data, clen);
-        config_buf[clen] = '\0';
-        json_get_string(config_buf, "order", order_str, sizeof(order_str));
-    }
-    if (!order_str[0]) { send_error(fd, 400, "Missing order in config"); return; }
+    json_get_string(config, "order", order_str, sizeof(order_str));
+    if (!order_str[0]) { send_error(fd, 400, "Missing order in config"); return false; }
 
     /* Parse comma-separated 1-based page numbers */
     size_t order[512];
@@ -1329,129 +1320,77 @@ static void api_reorder(int fd, MultipartForm *form)
     char *tok = strtok(order_str, ",");
     while (tok && count < 512) {
         int pg = atoi(tok);
-        if (pg < 1) { send_error(fd, 400, "Invalid page number in order"); return; }
+        if (pg < 1) { send_error(fd, 400, "Invalid page number in order"); return false; }
         order[count++] = (size_t)(pg - 1);
         tok = strtok(NULL, ",");
     }
 
     TspdfError err = TSPDF_OK;
-    TspdfReader *doc = tspdf_reader_open(
-        (const uint8_t *)file->data, file->data_len, &err);
-    if (!doc) { send_error(fd, 400, "Failed to open PDF"); return; }
-
     TspdfReader *result = tspdf_reader_reorder(doc, order, count, &err);
-    if (!result) {
-        tspdf_reader_destroy(doc);
-        send_error(fd, 500, "Reorder failed");
-        return;
-    }
+    if (!result) { send_error(fd, 500, "Reorder failed"); return false; }
+    se->result = result;
+    return true;
+}
 
-    uint8_t *out = NULL;
-    size_t out_len = 0;
-    err = tspdf_reader_save_to_memory(result, &out, &out_len);
-    tspdf_reader_destroy(result);
-    tspdf_reader_destroy(doc);
+static void api_reorder(int fd, MultipartForm *form)
+{
+    serve_edit(fd, form, "reordered.pdf", op_reorder);
+}
 
-    if (err != TSPDF_OK) { free(out); send_error(fd, 500, "Save failed"); return; }
-    send_pdf_response(fd, "reordered.pdf", out, out_len);
-    free(out);
+static bool op_compress(int fd, TspdfReader *doc, const char *config, ServeEdit *se)
+{
+    (void)fd; (void)doc; (void)config;
+    se->opts = tspdf_save_options_default();
+    se->opts.strip_unused_objects = true;
+    se->opts.recompress_streams = true;
+    se->use_opts = true;
+    se->save_error = "Compress failed";
+    return true;
 }
 
 static void api_compress(int fd, MultipartForm *form)
 {
-    FormPart *file = form_find(form, "pdf_file");
-    if (!file || !file->is_file) { send_error(fd, 400, "Missing pdf_file"); return; }
+    serve_edit(fd, form, "compressed.pdf", op_compress);
+}
 
-    TspdfError err = TSPDF_OK;
-    TspdfReader *doc = tspdf_reader_open(
-        (const uint8_t *)file->data, file->data_len, &err);
-    if (!doc) { send_error(fd, 400, "Failed to open PDF"); return; }
-
-    TspdfSaveOptions opts = tspdf_save_options_default();
-    opts.strip_unused_objects = true;
-    opts.recompress_streams = true;
-
-    uint8_t *out = NULL;
-    size_t out_len = 0;
-    err = tspdf_reader_save_to_memory_with_options(doc, &out, &out_len, &opts);
-    tspdf_reader_destroy(doc);
-
-    if (err != TSPDF_OK) { free(out); send_error(fd, 500, "Compress failed"); return; }
-    send_pdf_response(fd, "compressed.pdf", out, out_len);
-    free(out);
+static bool op_unlock(int fd, TspdfReader *doc, const char *config, ServeEdit *se)
+{
+    (void)fd; (void)doc; (void)config;
+    /* serve_edit already opened with the password config key; just opt out of
+     * re-encrypting on save. Saves preserve encryption by default; unlocking
+     * is the explicit opt-out. */
+    se->opts = tsops_unlock_save_options();
+    se->use_opts = true;
+    return true;
 }
 
 static void api_unlock(int fd, MultipartForm *form)
 {
-    FormPart *file = form_find(form, "pdf_file");
-    FormPart *cfg = form_find(form, "config");
-    if (!file || !file->is_file) { send_error(fd, 400, "Missing pdf_file"); return; }
+    serve_edit(fd, form, "unlocked.pdf", op_unlock);
+}
 
-    char password[256] = {0};
-    if (cfg) {
-        char config_buf[1024];
-        size_t clen = cfg->data_len < sizeof(config_buf)-1 ? cfg->data_len : sizeof(config_buf)-1;
-        memcpy(config_buf, cfg->data, clen);
-        config_buf[clen] = '\0';
-        json_get_string(config_buf, "password", password, sizeof(password));
-    }
+static bool op_password_protect(int fd, TspdfReader *doc, const char *config,
+                                 ServeEdit *se)
+{
+    (void)doc;
+    char bits_str[32] = {0};
+    json_get_string(config, "password",       se->encrypt_user,  sizeof(se->encrypt_user));
+    json_get_string(config, "owner_password", se->encrypt_owner, sizeof(se->encrypt_owner));
+    json_get_string(config, "bits",           bits_str,          sizeof(bits_str));
 
-    TspdfError err = TSPDF_OK;
-    TspdfReader *doc = tspdf_reader_open_with_password(
-        (const uint8_t *)file->data, file->data_len, password, &err);
-    if (!doc) { send_error(fd, 400, "Failed to open PDF (wrong password?)"); return; }
+    if (!se->encrypt_user[0]) { send_error(fd, 400, "Missing password in config"); return false; }
+    int bits = bits_str[0] ? atoi(bits_str) : 128;
+    if (bits != 128 && bits != 256) bits = 128;
 
-    // Saves preserve encryption by default; unlocking is the explicit opt-out.
-    TspdfSaveOptions opts = tsops_unlock_save_options();
-    uint8_t *out = NULL;
-    size_t out_len = 0;
-    err = tspdf_reader_save_to_memory_with_options(doc, &out, &out_len, &opts);
-    tspdf_reader_destroy(doc);
-
-    if (err != TSPDF_OK) { free(out); send_error(fd, 500, "Save failed"); return; }
-    send_pdf_response(fd, "unlocked.pdf", out, out_len);
-    free(out);
+    se->encrypt_permissions = 0xFFFFFFFF;
+    se->encrypt_bits        = bits;
+    se->save_error          = "Encryption failed";
+    return true;
 }
 
 static void api_password_protect(int fd, MultipartForm *form)
 {
-    FormPart *file = form_find(form, "pdf_file");
-    FormPart *cfg = form_find(form, "config");
-    if (!file || !file->is_file) { send_error(fd, 400, "Missing pdf_file"); return; }
-
-    char password[256] = {0};
-    char owner_password[256] = {0};
-    char bits_str[32] = {0};
-    if (cfg) {
-        char config_buf[1024];
-        size_t clen = cfg->data_len < sizeof(config_buf)-1 ? cfg->data_len : sizeof(config_buf)-1;
-        memcpy(config_buf, cfg->data, clen);
-        config_buf[clen] = '\0';
-        json_get_string(config_buf, "password", password, sizeof(password));
-        json_get_string(config_buf, "owner_password", owner_password, sizeof(owner_password));
-        json_get_string(config_buf, "bits", bits_str, sizeof(bits_str));
-    }
-
-    if (!password[0]) { send_error(fd, 400, "Missing password in config"); return; }
-    int bits = bits_str[0] ? atoi(bits_str) : 128;
-    if (bits != 128 && bits != 256) bits = 128;
-
-    TspdfError err = TSPDF_OK;
-    TspdfReader *doc = tspdf_reader_open(
-        (const uint8_t *)file->data, file->data_len, &err);
-    if (!doc) { send_error(fd, 400, "Failed to open PDF"); return; }
-
-    uint8_t *out = NULL;
-    size_t out_len = 0;
-    err = tspdf_reader_save_to_memory_encrypted(doc, &out, &out_len,
-                                                 password,
-                                                 owner_password[0] ? owner_password : password,
-                                                 0xFFFFFFFF, bits);
-    tspdf_reader_destroy(doc);
-
-    if (err != TSPDF_OK) { free(out); send_error(fd, 500, "Encryption failed"); return; }
-    send_pdf_response(fd, "protected.pdf", out, out_len);
-    free(out);
+    serve_edit(fd, form, "protected.pdf", op_password_protect);
 }
 
 static void api_metadata_view(int fd, MultipartForm *form)
@@ -1520,78 +1459,47 @@ meta_json_err:
     send_error(fd, 500, "Metadata JSON overflow");
 }
 
-static void api_metadata(int fd, MultipartForm *form)
+static bool op_metadata(int fd, TspdfReader *doc, const char *config, ServeEdit *se)
 {
-    FormPart *file = form_find(form, "pdf_file");
-    FormPart *cfg = form_find(form, "config");
-    if (!file || !file->is_file) { send_error(fd, 400, "Missing pdf_file"); return; }
-
-    TspdfError err = TSPDF_OK;
-    TspdfReader *doc = tspdf_reader_open(
-        (const uint8_t *)file->data, file->data_len, &err);
-    if (!doc) { send_error(fd, 400, "Failed to open PDF"); return; }
-
-    if (cfg) {
-        char config_buf[4096];
-        size_t clen = cfg->data_len < sizeof(config_buf)-1 ? cfg->data_len : sizeof(config_buf)-1;
-        memcpy(config_buf, cfg->data, clen);
-        config_buf[clen] = '\0';
-
-        // Each config key maps to an Info field; the shared op is the single
-        // field-setter loop (same one the CLI's --set drives).
-        static const char *const keys[] = {
-            "title", "author", "subject", "keywords", "creator", "producer",
-        };
-        char val[512];
-        for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
-            if (json_get_string(config_buf, keys[k], val, sizeof(val)) == 0)
-                tsops_metadata_set(doc, keys[k], strlen(keys[k]), val, NULL);
-        }
+    (void)fd; (void)se;
+    // Each config key maps to an Info field; the shared op is the single
+    // field-setter loop (same one the CLI's --set drives).
+    static const char *const keys[] = {
+        "title", "author", "subject", "keywords", "creator", "producer",
+    };
+    char val[512];
+    for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
+        if (json_get_string(config, keys[k], val, sizeof(val)) == 0)
+            tsops_metadata_set(doc, keys[k], strlen(keys[k]), val, NULL);
     }
-
-    uint8_t *out = NULL;
-    size_t out_len = 0;
-    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
-    tspdf_reader_destroy(doc);
-
-    if (err != TSPDF_OK) { free(out); send_error(fd, 500, "Save failed"); return; }
-    send_pdf_response(fd, "metadata.pdf", out, out_len);
-    free(out);
+    return true;
 }
 
-static void api_watermark(int fd, MultipartForm *form)
+static void api_metadata(int fd, MultipartForm *form)
 {
-    FormPart *file = form_find(form, "pdf_file");
-    FormPart *cfg = form_find(form, "config");
-    if (!file || !file->is_file) { send_error(fd, 400, "Missing pdf_file"); return; }
+    serve_edit(fd, form, "metadata.pdf", op_metadata);
+}
 
+static bool op_watermark(int fd, TspdfReader *doc, const char *config, ServeEdit *se)
+{
+    (void)se;
     char text[256] = "DRAFT";
     char opacity_str[32] = {0};
     char font_size_str[32] = {0};
-    if (cfg) {
-        char config_buf[1024];
-        size_t clen = cfg->data_len < sizeof(config_buf)-1 ? cfg->data_len : sizeof(config_buf)-1;
-        memcpy(config_buf, cfg->data, clen);
-        config_buf[clen] = '\0';
-        /* The watermark tool page sends "watermark_text"; keep "text" as a
-         * fallback for direct API callers. */
-        json_get_string(config_buf, "watermark_text", text, sizeof(text));
-        if (!text[0] || strcmp(text, "DRAFT") == 0)
-            json_get_string(config_buf, "text", text, sizeof(text));
-        if (!text[0]) snprintf(text, sizeof(text), "DRAFT");
-        json_get_string(config_buf, "opacity", opacity_str, sizeof(opacity_str));
-        json_get_string(config_buf, "font_size", font_size_str, sizeof(font_size_str));
-    }
+
+    /* The watermark tool page sends "watermark_text"; keep "text" as a
+     * fallback for direct API callers. */
+    json_get_string(config, "watermark_text", text, sizeof(text));
+    if (!text[0] || strcmp(text, "DRAFT") == 0)
+        json_get_string(config, "text", text, sizeof(text));
+    if (!text[0]) snprintf(text, sizeof(text), "DRAFT");
+    json_get_string(config, "opacity", opacity_str, sizeof(opacity_str));
+    json_get_string(config, "font_size", font_size_str, sizeof(font_size_str));
 
     double opacity = opacity_str[0] ? atof(opacity_str) : 0.3;
     if (opacity <= 0.0 || opacity > 1.0) opacity = 0.3;
     double cfg_font_size = font_size_str[0] ? atof(font_size_str) : 48.0;
     if (cfg_font_size < 6.0 || cfg_font_size > 144.0) cfg_font_size = 48.0;
-
-    TspdfError err = TSPDF_OK;
-    TspdfReader *doc = tspdf_reader_open(
-        (const uint8_t *)file->data, file->data_len, &err);
-    if (!doc) { send_error(fd, 400, "Failed to open PDF"); return; }
 
     /* Same placement/rotation math and cp1252 re-encoding as the CLI: the web
      * endpoint now shares cmd_watermark.c's operation, so non-ASCII watermark
@@ -1599,24 +1507,20 @@ static void api_watermark(int fd, MultipartForm *form)
     TsopsWatermarkText params = {
         .text = text, .opacity = opacity, .font_size = cfg_font_size,
     };
-    err = tsops_watermark_text(doc, &params, NULL);
+    TspdfError err = tsops_watermark_text(doc, &params, NULL);
     if (err != TSPDF_OK) {
-        tspdf_reader_destroy(doc);
         if (err == TSPDF_ERR_UNSUPPORTED || err == TSPDF_ERR_ENCODING)
             send_error(fd, 400, "Watermark text cannot be shown with the built-in fonts");
         else
             send_error(fd, 500, "Watermark overlay failed");
-        return;
+        return false;
     }
+    return true;
+}
 
-    uint8_t *out = NULL;
-    size_t out_len = 0;
-    err = tspdf_reader_save_to_memory(doc, &out, &out_len);
-    tspdf_reader_destroy(doc);
-
-    if (err != TSPDF_OK) { free(out); send_error(fd, 500, "Save failed"); return; }
-    send_pdf_response(fd, "watermarked.pdf", out, out_len);
-    free(out);
+static void api_watermark(int fd, MultipartForm *form)
+{
+    serve_edit(fd, form, "watermarked.pdf", op_watermark);
 }
 
 /* ── img2pdf API handler ───────────────────────────────────────────── */

@@ -59,20 +59,9 @@ int cmd_merge(int argc, char **argv) {
     TspdfError err = TSPDF_OK;
 
     for (int i = 0; i < npos; i++) {
-        docs[i] = password
-            ? tspdf_reader_open_file_with_password(inputs[i], password, &err)
-            : tspdf_reader_open_file(inputs[i], &err);
+        docs[i] = tspdf_cli_open_input("merge", inputs[i], password,
+                                       NULL, NULL, &err);
         if (!docs[i]) {
-            if (err == TSPDF_ERR_ENCRYPTED) {
-                fprintf(stderr, "tspdf merge: '%s' is encrypted; use --password or "
-                                "--password-file (applied to every input)\n", inputs[i]);
-            } else if (err == TSPDF_ERR_BAD_PASSWORD) {
-                fprintf(stderr, "tspdf merge: wrong password for '%s' (the one "
-                                "--password is tried on every input)\n", inputs[i]);
-            } else {
-                fprintf(stderr, "tspdf merge: failed to open '%s': %s\n",
-                        inputs[i], tspdf_error_string(err));
-            }
             ret = 1;
             goto cleanup;
         }
