@@ -331,10 +331,33 @@ struct TspdfReader {
     TspdfImportCache import_cache;  // cross-import dedup (see typedef above)
     bool modified;              // set by manipulation/annotation/metadata functions
     TspdfFormFallback *form_fallback;  // lazy fallback font cache (malloc'd)
+
+    // --- Derived-document lifetime (see the "Manipulate" section of tspr.h) ---
+    // A derived document (extract/delete/rotate/nup, ...) aliases its source's
+    // data buffer, xref and (when encrypted) crypt clone. To make the interface
+    // defend itself, the derived doc holds a reference on its source:
+    //   derived_source  -> the immediate source (NULL for a self-contained doc,
+    //                      e.g. a freshly opened file or a merge output). Chains
+    //                      form naturally: a derived-of-derived points at its
+    //                      parent derived doc, which points at the original.
+    //   derived_refs    -> number of live derived docs that reference THIS doc.
+    //   destroy_pending -> tspdf_reader_destroy was called while derived_refs>0,
+    //                      so the real free was deferred until the last release.
+    // The handle is dead to the caller the instant destroy returns; only the
+    // memory lifetime is deferred (see tspdf_reader_destroy).
+    struct TspdfReader *derived_source;
+    size_t derived_refs;
+    bool destroy_pending;
 };
 
 // Free doc->form_fallback (safe when NULL). Defined in tspr_form.c.
 void tspdf_form_fallback_free(struct TspdfReader *doc);
+
+// Register that `derived` aliases `source`'s memory (data/xref/crypt), so a
+// tspdf_reader_destroy on the source defers the free until every derived doc is
+// released. Call once, on a fully-built derived reader that cannot fail after.
+// Defined in tspr_document.c; used by the derived-document constructors.
+void tspdf_reader_hold_source(struct TspdfReader *derived, struct TspdfReader *source);
 
 // Resource name used in appearance streams and /DR for the embedded fallback
 // font (CIDFontType2 / Identity-H). Defined here so tests can reference it
@@ -372,8 +395,9 @@ uint8_t *tspdf_crypt_encrypt_stream(TspdfCrypt *crypt, uint32_t obj_num,
                                     size_t len, size_t *out_len);
 // Clone a reader's crypt into a derived document so its save preserves the
 // source encryption (malloc'd; freed by tspdf_reader_destroy). The clone's
-// src_encrypt_dict points into the source's arena: valid only under the
-// derived-document rule that the source outlives it until it is saved.
+// src_encrypt_dict points into the source's arena, which stays valid because
+// the derived document holds a reference on the source (tspdf_reader_hold_source
+// defers the source's arena free until the derived document is destroyed).
 TspdfCrypt *tspdf_crypt_clone(const TspdfCrypt *src);
 void tspdf_random_bytes(uint8_t *buf, size_t len);
 TspdfError tspdf_serialize_encrypted(TspdfReader *doc, TspdfCrypt *crypt,

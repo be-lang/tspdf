@@ -9,10 +9,11 @@
 // numbering works — new objects are numbered from src->xref.count upward — then
 //
 // LIFETIME: the returned document is NOT self-contained. It references the
-// source's trailer, xref and backing data until it is serialized, so the SOURCE
-// MUST OUTLIVE the returned document until that document is saved; destroying
-// the source first is a use-after-free. The tspdf CLI observes this order
-// (nup -> save -> destroy source).
+// source's trailer, xref and backing data until it is serialized. The output
+// holds an internal reference on the source (tspdf_reader_hold_source), so
+// destroying the source before the output is saved is defended — the source's
+// free is deferred until the output is destroyed. The tspdf CLI still observes
+// the natural order (nup -> save -> destroy source).
 //
 // REPLACE the page list with freshly registered blank sheet page dicts. Each
 // selected source page is imported as a self-contained /Form XObject (which
@@ -412,6 +413,12 @@ TspdfReader *tspdf_reader_nup(TspdfReader *src, const TspdfNupOptions *opts,
             return NULL;
         }
     }
+
+    // The output aliases src's data/xref/trailer (and crypt when cloned above):
+    // hold a reference so destroying src before this doc is saved defers the
+    // free. Set last, on the fully-built reader — every failure path above
+    // destroys `out` before it holds any reference.
+    tspdf_reader_hold_source(out, src);
 
     out->modified = true;
     return out;

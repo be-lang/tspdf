@@ -45,9 +45,10 @@ static void free_reader_crypt(TspdfCrypt *crypt) {
 
 // Clone a reader's crypt for a derived document (extract, nup, ...) so its
 // save preserves the source encryption. The clone owns its file_id copy;
-// src_encrypt_dict still points into the SOURCE document's arena, which the
-// derived-document lifetime rules already require to outlive the clone
-// (source must outlive the derived document until it is saved).
+// src_encrypt_dict still points into the SOURCE document's arena, which stays
+// alive because the derived document holds a reference on the source
+// (tspdf_reader_hold_source defers the source's free until the derived doc is
+// destroyed).
 TspdfCrypt *tspdf_crypt_clone(const TspdfCrypt *src) {
     if (!src) return NULL;
 
@@ -441,8 +442,13 @@ static void free_stream_data(TspdfReader *doc) {
     }
 }
 
-void tspdf_reader_destroy(TspdfReader *doc) {
-    if (!doc) return;
+// Actually free the reader's owned memory and the struct. Assumes no live
+// derived docs still reference it (derived_refs == 0). After freeing, if this
+// doc was itself derived from another, release that source's reference — which
+// may cascade a deferred free up the chain (derived-of-derived).
+static void reader_free(TspdfReader *doc) {
+    TspdfReader *source = doc->derived_source;
+
     free_stream_data(doc);
     free_reader_crypt(doc->crypt);
     if (doc->metadata) {
@@ -465,6 +471,41 @@ void tspdf_reader_destroy(TspdfReader *doc) {
         free((void *)doc->data);
     }
     free(doc);
+
+    // Release the reference this derived doc held on its source. If that was
+    // the last live derived doc and the source's own destroy was deferred,
+    // free the source now (recursing further up a derived-of-derived chain).
+    if (source) {
+        source->derived_refs--;
+        if (source->derived_refs == 0 && source->destroy_pending) {
+            reader_free(source);
+        }
+    }
+}
+
+// Record that `derived` aliases `source`'s memory, so a destroy on the source
+// defers its free until `derived` (and every other holder) is released. Called
+// by the derived-document constructors (create_doc_from_pages, nup) after the
+// derived reader is fully built and cannot fail. Passing a NULL source (a merge
+// output has none) leaves the derived doc self-contained.
+void tspdf_reader_hold_source(TspdfReader *derived, TspdfReader *source) {
+    if (!derived || !source) return;
+    derived->derived_source = source;
+    source->derived_refs++;
+}
+
+void tspdf_reader_destroy(TspdfReader *doc) {
+    if (!doc) return;
+
+    // Caller-visible semantics are unchanged: the handle is dead now. But if
+    // live derived docs still alias this doc's memory, defer the actual free
+    // until the last of them is released (see reader_free). Idempotent against
+    // a repeated destroy on the same already-pending handle.
+    if (doc->derived_refs > 0) {
+        doc->destroy_pending = true;
+        return;
+    }
+    reader_free(doc);
 }
 
 uint32_t tspdf_register_new_obj(TspdfReader *doc, TspdfObj *obj) {
@@ -786,6 +827,10 @@ static TspdfReader *create_doc_from_pages(TspdfReader *src, const size_t *page_i
             return NULL;
         }
     }
+
+    // This document aliases src's data/xref/obj_cache/crypt: hold a reference
+    // so destroying src before this doc is saved defers src's free.
+    tspdf_reader_hold_source(doc, src);
 
     doc->modified = true;
     if (err) *err = TSPDF_OK;

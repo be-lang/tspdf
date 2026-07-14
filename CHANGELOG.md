@@ -7,6 +7,16 @@ on 0.x, the CLI is considered stable but the low-level C API may still change.
 
 ## [Unreleased]
 
+### Fixed
+- Destroying a source reader before saving a document derived from it
+  (extract/delete/rotate/reorder/crop/scale/resize/n-up, which alias the
+  source's data until saved) is no longer a use-after-free: the library holds
+  an internal reference from the derived document to its source and defers the
+  source's free until the last derived document is destroyed. The source handle
+  is still dead to the caller the moment `tspdf_reader_destroy` returns; only
+  the memory lifetime is deferred. Save-then-destroy remains the recommended
+  order.
+
 ## [0.5.0] - 2026-07-14
 
 ### Changed
